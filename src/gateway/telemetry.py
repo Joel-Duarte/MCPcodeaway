@@ -14,7 +14,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
 
 from gateway.auth import CallerIdentity
-from gateway.dispatcher import SubcallRecord
+from gateway.dispatcher import OutputRedactor, SubcallRecord
 from gateway.state import AuditStore
 
 _OTEL_CONFIGURED = False
@@ -227,9 +227,9 @@ class TelemetryRecorder:
             "client_id": identity.client_id,
             "catalog_version": catalog_version,
             "tool_name": tool_name,
-            "code": code,
-            "stdout": stdout,
-            "error": error,
+            "code": OutputRedactor.redact_text(code) if code else None,
+            "stdout": OutputRedactor.redact_text(stdout) if stdout else "",
+            "error": OutputRedactor.redact_text(error) if error else None,
             "subcalls": [sc.model_dump() for sc in subcalls],
             "subcall_count": len(subcalls),
             "token_hops": token_hops,

@@ -142,7 +142,8 @@ def extract_entity_identifiers(value: Any) -> set[str]:
         for item in value:
             found.update(extract_entity_identifiers(item))
     elif isinstance(value, dict):
-        for v in value.values():
+        for k, v in value.items():
+            found.update(extract_entity_identifiers(k))
             found.update(extract_entity_identifiers(v))
     return found
 
@@ -297,7 +298,13 @@ def _apply_pre_call_abac(
         if not rule.enforce_on_args or not rule.arg_name:
             continue
         allowed_vals = _resolve_identity_claim_values(identity, rule.claim)
+        if "ALL" in allowed_vals or "*" in allowed_vals:
+            continue
         if not allowed_vals:
+            if rule.require_claim:
+                raise PermissionError(
+                    f"ABAC policy denied: caller token missing required claim '{rule.claim}'"
+                )
             continue
         if rule.arg_name in updated and updated[rule.arg_name] is not None:
             requested = str(updated[rule.arg_name])
@@ -322,7 +329,13 @@ def _apply_post_call_abac_with_count(
         if not rule.filter_response_rows or not rule.row_field:
             continue
         allowed_vals = _resolve_identity_claim_values(identity, rule.claim)
+        if "ALL" in allowed_vals or "*" in allowed_vals:
+            continue
         if not allowed_vals:
+            if rule.require_claim:
+                raise PermissionError(
+                    f"ABAC policy denied: caller token missing required claim '{rule.claim}'"
+                )
             continue
         field = rule.row_field
         if (

@@ -319,6 +319,7 @@ class GatewayRuntime:
         self.preloaded_tools = preloaded_tools or {}
         self.startup_warnings: list[str] = []
         self._startup_retry_task: asyncio.Task[None] | None = None
+        self._retention_task: asyncio.Task[None] | None = None
         self.demo_traffic = DemoTrafficRunner(self)
         self.alert_evaluator = AlertEvaluator()
 
@@ -377,30 +378,36 @@ class GatewayRuntime:
             self.catalog.set_server_tools(cfg, tools)
 
         effective_identity = identity or self._dev_discovery_identity()
-        warnings: list[str] = []
-        for upstream in upstreams:
+        sem = asyncio.Semaphore(16)
+
+        async def _discover_one(upstream: UpstreamConfig) -> str | None:
             if upstream.name in self.preloaded_tools:
-                continue
+                return None
             headers: dict[str, str] = {}
-            try:
-                if upstream.type == "openapi" and upstream.openapi_spec_url:
-                    headers = {}
-                elif upstream.auth_type != "delegated_token":
-                    headers, _, _ = await self.dispatcher.resolve_upstream_headers(
-                        effective_identity
-                        or CallerIdentity(sub="gateway-discovery", tenant_id="system"),
-                        upstream,
-                    )
-                elif effective_identity is not None:
-                    headers, _, _ = await self.dispatcher.resolve_upstream_headers(
-                        effective_identity, upstream
-                    )
-                else:
-                    continue
-                tools = await self.client_manager.discover_tools(upstream, auth_headers=headers)
-                self.catalog.set_server_tools(upstream, tools)
-            except Exception as exc:
-                warnings.append(f"Upstream '{upstream.name}' discovery failed: {exc}")
+            async with sem:
+                try:
+                    if upstream.type == "openapi" and upstream.openapi_spec_url:
+                        headers = {}
+                    elif upstream.auth_type != "delegated_token":
+                        headers, _, _ = await self.dispatcher.resolve_upstream_headers(
+                            effective_identity
+                            or CallerIdentity(sub="gateway-discovery", tenant_id="system"),
+                            upstream,
+                        )
+                    elif effective_identity is not None:
+                        headers, _, _ = await self.dispatcher.resolve_upstream_headers(
+                            effective_identity, upstream
+                        )
+                    else:
+                        return None
+                    tools = await self.client_manager.discover_tools(upstream, auth_headers=headers)
+                    self.catalog.set_server_tools(upstream, tools)
+                    return None
+                except Exception as exc:
+                    return f"Upstream '{upstream.name}' discovery failed: {exc}"
+
+        results = await asyncio.gather(*(_discover_one(u) for u in upstreams))
+        warnings = [w for w in results if w is not None]
         self.startup_warnings = warnings
         return warnings
 
@@ -527,6 +534,25 @@ class GatewayRuntime:
             if not self.startup_warnings:
                 return
 
+    async def _retention_loop(self) -> None:
+        """Background compliance retention scheduler executing saved hourly/daily prune policy."""
+        while True:
+            await asyncio.sleep(60.0)
+            try:
+                if not hasattr(self.store, "get_setting"):
+                    continue
+                saved = await self.store.get_setting("retention_policy") or {}
+                interval = str(saved.get("auto_interval", "off"))
+                if interval not in {"hourly", "daily"}:
+                    continue
+                days = int(saved.get("retention_days", self.settings.audit_retention_days))
+                if bool(saved.get("prune_after_archive", True)):
+                    await self.store.prune_runs_older_than(days)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                continue
+
     async def startup(self) -> None:
         await self.store.init()
         if hasattr(self.store, "get_setting"):
@@ -536,9 +562,14 @@ class GatewayRuntime:
         await self.refresh_catalog()
         if self.startup_warnings:
             self._startup_retry_task = asyncio.create_task(self._retry_failed_startup_upstreams())
+        self._retention_task = asyncio.create_task(self._retention_loop())
 
     async def shutdown(self) -> None:
         await self.demo_traffic.stop()
+        if self._retention_task is not None and not self._retention_task.done():
+            self._retention_task.cancel()
+            await asyncio.gather(self._retention_task, return_exceptions=True)
+        self._retention_task = None
         if self._startup_retry_task is not None and not self._startup_retry_task.done():
             self._startup_retry_task.cancel()
             await asyncio.gather(self._startup_retry_task, return_exceptions=True)
@@ -550,23 +581,39 @@ class GatewayRuntime:
         if hasattr(self.store, "close"):
             await self.store.close()  # type: ignore[attr-defined]
 
-    async def _publish_live_summary(self, run: dict[str, Any], identity: CallerIdentity) -> None:
-        if not hasattr(self.cache, "publish_event"):
-            return
-        event = {
+    def _publish_live_summary_payload(
+        self, run: dict[str, Any], identity: CallerIdentity
+    ) -> dict[str, Any]:
+        return {
             "type": "run_recorded",
             "run_id": run.get("run_id"),
             "created_at": run.get("created_at"),
             "mode": run.get("mode"),
             "tool_name": run.get("tool_name"),
+            "tenant_id": identity.tenant_id,
             "company_group": (identity.groups[0] if identity.groups else "ungrouped"),
             "user_sub": identity.sub,
+            "user_email": identity.email,
+            "user_groups": list(identity.groups),
             "ok": bool(run.get("ok")),
             "grounding_blocked": bool(run.get("grounding_blocked", False)),
             "duration_ms": run.get("duration_ms"),
-            "tokens_saved": run.get("tokens_saved", 0),
+            "subcall_count": int(run.get("subcall_count", 0)),
+            "raw_upstream_bytes": int(run.get("raw_upstream_bytes", 0)),
+            "returned_bytes": int(run.get("returned_bytes", 0)),
+            "tokens_saved": run.get("tokens_saved", 0)
+            or (int(run.get("estimated_tokens_saved", 0)) + int(run.get("schema_tokens_saved", 0))),
+            "estimated_tokens_saved": int(run.get("estimated_tokens_saved", 0)),
+            "schema_tokens_saved": int(run.get("schema_tokens_saved", 0)),
+            "abac_rows_filtered": int(run.get("abac_rows_filtered", 0)),
+            "redactions_count": int(run.get("redactions_count", 0)),
             "mode_decision_reason": run.get("mode_decision_reason"),
         }
+
+    async def _publish_live_summary(self, run: dict[str, Any], identity: CallerIdentity) -> None:
+        if not hasattr(self.cache, "publish_event"):
+            return
+        event = self._publish_live_summary_payload(run, identity)
         try:
             await self.cache.publish_event("mcpcodeaway:telemetry", json.dumps(event, default=str))
         except Exception:
@@ -1697,14 +1744,21 @@ def create_gateway_app(
         if admin_cookie:
             cookie_id = runtime.admin_sessions.verify_session_token(admin_cookie)
             if cookie_id is not None:
-                if require_admin_role and not (
-                    set(cookie_id.roles) & set(runtime.settings.admin_roles)
-                ):
+                allowed_roles = set(runtime.settings.admin_roles)
+                if allow_viewer:
+                    allowed_roles |= set(runtime.settings.viewer_roles)
+                if require_admin_role and not (set(cookie_id.roles) & allowed_roles):
                     raise HTTPException(
                         status_code=403,
                         detail="Admin role required for control-plane access.",
                     )
                 return cookie_id
+            if runtime.settings.admin_auth_required:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid or expired admin session cookie.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
         if runtime.settings.admin_auth_required:
             runtime.metrics.inc_counter(
                 "gateway_auth_denials_total",
@@ -1889,7 +1943,10 @@ def create_gateway_app(
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
             await _authorize_control_plane(
-                authorization, mcpcodeaway_admin_session, require_admin_role=True
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
             )
             custom: dict[str, dict[str, float]] = {}
             if hasattr(runtime.store, "list_model_pricing"):
@@ -1913,7 +1970,10 @@ def create_gateway_app(
             auth_hdr = f"Bearer {token}" if token else websocket.headers.get("authorization")
             try:
                 await _authorize_control_plane(
-                    auth_hdr, mcpcodeaway_admin_session, require_admin_role=True
+                    auth_hdr,
+                    mcpcodeaway_admin_session,
+                    require_admin_role=True,
+                    allow_viewer=True,
                 )
             except HTTPException:
                 await websocket.close(code=4403)
@@ -1954,6 +2014,12 @@ def create_gateway_app(
                         startup_warnings=runtime.startup_warnings,
                         worker_status=rt_snap.get("sandbox_worker", {}),
                     )
+                    await runtime.alert_evaluator.notify_webhook_if_needed(
+                        tick_alerts,
+                        app_env=runtime.settings.app_env,
+                        block_private_ips_in_prod=runtime.settings.block_private_ips_in_prod,
+                        allowed_hosts=runtime.settings.allowed_upstream_hosts,
+                    )
                     await websocket.send_json(
                         {
                             "type": "runtime_tick",
@@ -1981,7 +2047,10 @@ def create_gateway_app(
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
             await _authorize_control_plane(
-                authorization, mcpcodeaway_admin_session, require_admin_role=True
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
             )
             roles: set[str] = set()
             groups: set[str] = set()
@@ -1999,7 +2068,10 @@ def create_gateway_app(
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
             await _authorize_control_plane(
-                authorization, mcpcodeaway_admin_session, require_admin_role=True
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
             )
             rt_snap = await collect_runtime_telemetry(runtime)
             recent = await runtime.store.list_runs(limit=50)
@@ -2008,6 +2080,12 @@ def create_gateway_app(
                 drift_warnings=runtime.catalog.drift_warnings,
                 startup_warnings=runtime.startup_warnings,
                 worker_status=rt_snap.get("sandbox_worker", {}),
+            )
+            await runtime.alert_evaluator.notify_webhook_if_needed(
+                alerts,
+                app_env=runtime.settings.app_env,
+                block_private_ips_in_prod=runtime.settings.block_private_ips_in_prod,
+                allowed_hosts=runtime.settings.allowed_upstream_hosts,
             )
             return {
                 "alerts": alerts,
@@ -2020,7 +2098,10 @@ def create_gateway_app(
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
             await _authorize_control_plane(
-                authorization, mcpcodeaway_admin_session, require_admin_role=True
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
             )
             return runtime.alert_evaluator.rules.model_dump()
 
@@ -2037,7 +2118,10 @@ def create_gateway_app(
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
             await _authorize_control_plane(
-                authorization, mcpcodeaway_admin_session, require_admin_role=True
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
             )
             await runtime.sync_catalog_if_stale()
             all_upstreams = runtime.registry.list_upstreams(include_disabled=True)
@@ -2093,7 +2177,10 @@ def create_gateway_app(
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
             await _authorize_control_plane(
-                authorization, mcpcodeaway_admin_session, require_admin_role=True
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
             )
             return await collect_runtime_telemetry(runtime)
 
@@ -2103,7 +2190,10 @@ def create_gateway_app(
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
             await _authorize_control_plane(
-                authorization, mcpcodeaway_admin_session, require_admin_role=True
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
             )
             analytics = await runtime.telemetry.analytics_report(
                 limit=1000,
@@ -2257,7 +2347,8 @@ def create_gateway_app(
                     s3 = boto3.client("s3", **client_kwargs)
                     prefix = runtime.settings.audit_archive_s3_prefix.strip("/")
                     key = f"{prefix}/{filename}" if prefix else filename
-                    s3.put_object(
+                    await asyncio.to_thread(
+                        s3.put_object,
                         Bucket=bucket,
                         Key=key,
                         Body=jsonl_payload.encode("utf-8"),

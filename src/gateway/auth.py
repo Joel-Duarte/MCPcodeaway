@@ -507,7 +507,14 @@ class DelegatedTokenExchanger:
             span.set_attribute("auth.audience", audience)
             span.set_attribute("tenant.id", identity.tenant_id)
 
-            cache_key = f"delegated:{identity.tenant_id}:{identity.sub}:{audience}:{scope}"
+            token_fp = (
+                hashlib.sha256(identity.raw_token.encode("utf-8")).hexdigest()[:16]
+                if identity.raw_token
+                else "no_raw"
+            )
+            cache_key = (
+                f"delegated:{identity.tenant_id}:{identity.sub}:{token_fp}:{audience}:{scope}"
+            )
             cached = await self.cache.get(cache_key)
             if cached is not None:
                 span.set_attribute("auth.cache_hit", True)
@@ -549,7 +556,17 @@ class DelegatedTokenExchanger:
                     scope=scope,
                 )
 
-            cache_ttl = min(max(expires_in - 30, 1), self.settings.token_cache_ttl_seconds)
+            caller_exp = identity.claims.get("exp") if isinstance(identity.claims, dict) else None
+            caller_rem = (
+                max(1, int(caller_exp) - int(time.time()))
+                if isinstance(caller_exp, int | float)
+                else self.settings.token_cache_ttl_seconds
+            )
+            cache_ttl = min(
+                max(expires_in - 30, 1),
+                self.settings.token_cache_ttl_seconds,
+                caller_rem,
+            )
             await self.cache.set(cache_key, access_token, ttl_seconds=cache_ttl)
             log_event(
                 "auth.obo.exchanged",

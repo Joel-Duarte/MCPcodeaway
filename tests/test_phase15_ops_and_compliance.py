@@ -50,7 +50,7 @@ def test_admin_upstreams_filtering_and_audit_archive(tmp_path) -> None:
     db_path = tmp_path / "phase15.db"
     settings = GatewaySettings(
         profile="demo",
-        sqlite_db_path=str(db_path),
+        sqlite_path=str(db_path),
         upstreams_config_path="config/upstreams.yaml",
     )
     app = create_gateway_app(settings=settings)
@@ -138,3 +138,97 @@ def test_admin_upstreams_filtering_and_audit_archive(tmp_path) -> None:
         fdata = fuzzy.json()
         assert fdata["summary"]["total_runs"] >= 1
         assert fdata["timeline_by_group"][0]["group"] == "finance"
+
+        # 4. Self-Admin MCP admin_save_upstream and read-only optimize-mode (no AttributeError)
+        mcp_save = client.post(
+            "/admin/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "tools/call",
+                "params": {
+                    "name": "admin_save_upstream",
+                    "arguments": {
+                        "upstream": {
+                            "name": "self_admin_inline_api",
+                            "type": "openapi",
+                            "url": "http://127.0.0.1:8001",
+                            "openapi_spec": {
+                                "openapi": "3.1.0",
+                                "info": {"title": "Inline", "version": "1.0.0"},
+                                "paths": {
+                                    "/ping": {
+                                        "get": {
+                                            "operationId": "ping",
+                                            "responses": {"200": {"description": "ok"}},
+                                        }
+                                    }
+                                },
+                            },
+                            "auth_type": "none",
+                        }
+                    },
+                },
+            },
+        )
+        assert mcp_save.status_code == 200
+        mcp_res = mcp_save.json()["result"]
+        assert mcp_res["isError"] is False
+        assert mcp_res["structuredContent"]["saved"] is True
+
+        runtime.settings.allow_dynamic_upstreams = False
+        ro_opt = client.post("/admin/upstreams/billing_legacy_eu/optimize-mode?target_mode=auto")
+        assert ro_opt.status_code == 200
+        assert ro_opt.json()["preferred_mode"] == "auto"
+
+
+def test_operator_viewer_rbac_and_audit_redaction_and_ssrf_rebinding(tmp_path) -> None:
+    db_path = tmp_path / "hardening_audit.db"
+    settings = GatewaySettings(
+        profile="demo",
+        require_admin_auth=True,
+        sqlite_path=str(db_path),
+        upstreams_config_path=str(tmp_path / "none.yaml"),
+    )
+    app = create_gateway_app(settings=settings, preloaded_tools={})
+    with TestClient(app) as client:
+        rt = app.state.runtime
+        viewer_tok = rt.dev_keys.issue_user_token(
+            overrides={
+                "sub": "viewer-01",
+                "tenant_id": "tenant-acme-dev",
+                "roles": ["operator_viewer"],
+                "groups": ["platform"],
+            }
+        )
+        viewer_headers = {"Authorization": f"Bearer {viewer_tok}"}
+        # operator_viewer is permitted on read-only /admin/* routes, denied on mutating /admin/*
+        assert client.get("/admin/upstreams", headers=viewer_headers).status_code == 200
+        assert client.get("/admin/telemetry/runtime", headers=viewer_headers).status_code == 200
+        assert client.get("/admin/alerts", headers=viewer_headers).status_code == 200
+        assert client.post("/admin/catalog/refresh", headers=viewer_headers).status_code == 403
+
+        # Audit store redacts secrets in code and error strings before writing to SQLite
+        fin_id = client.portal.call(
+            rt.validator.validate_token,
+            rt.dev_keys.issue_user_token(persona="finance_analyst"),
+        )
+        recorded = client.portal.call(
+            lambda: rt.telemetry.record_execution(
+                mode="codemode",
+                identity=fin_id,
+                catalog_version="v1",
+                schema_tokens=10,
+                subcalls=[],
+                returned_payload={"ok": False},
+                duration_ms=5.0,
+                ok=False,
+                code="secret = 'sk-live1234567890abcdef'",
+                error="Upstream leaked sk-live1234567890abcdef and SSN 123-45-6789",
+            )
+        )
+        stored = client.portal.call(rt.store.get_run, recorded["run_id"])
+        assert "[REDACTED_SECRET]" in stored["code"]
+        assert "sk-live1234567890abcdef" not in stored["code"]
+        assert "[REDACTED_SECRET]" in stored["error"]
+        assert "[REDACTED_SSN]" in stored["error"]

@@ -119,6 +119,14 @@ class RedisCacheBackend:
         now = time.time()
         cutoff = now - window_seconds
         member = f"{now}:{uuid.uuid4().hex}"
+        if hasattr(client, "pipeline"):
+            pipe = client.pipeline(transaction=True)
+            pipe.zremrangebyscore(key, 0, cutoff)
+            pipe.zadd(key, {member: now})
+            pipe.zcard(key)
+            pipe.expire(key, max(window_seconds, 1))
+            res = await pipe.execute()
+            return int(res[2])
         await client.zremrangebyscore(key, 0, cutoff)
         await client.zadd(key, {member: now})
         count = int(await client.zcard(key))

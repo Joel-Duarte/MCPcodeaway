@@ -6,8 +6,9 @@ import hashlib
 import ipaddress
 import json
 import re
+import socket
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 import yaml
@@ -30,12 +31,37 @@ _CLOUD_METADATA_HOSTS = {
 }
 
 
+def _check_resolved_ip(
+    ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    host: str,
+    *,
+    app_env: str,
+    block_private_ips_in_prod: bool,
+) -> None:
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        ip_obj = ip_obj.ipv4_mapped
+    if str(ip_obj) in _CLOUD_METADATA_HOSTS:
+        raise ValueError(f"Blocked cloud metadata endpoint IP '{ip_obj}' for host '{host}'")
+    if ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified:
+        raise ValueError(f"Blocked link-local or unspecified IP '{ip_obj}' in upstream URL")
+    if (
+        app_env == "prod"
+        and block_private_ips_in_prod
+        and (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved)
+    ):
+        raise ValueError(
+            f"Blocked private/loopback IP '{ip_obj}' ({host}) in prod; "
+            "add host to allowed_upstream_hosts"
+        )
+
+
 def validate_upstream_url(
     url: str | None,
     *,
     app_env: str = "sandbox",
     block_private_ips_in_prod: bool = True,
     allowed_hosts: list[str] | None = None,
+    resolve_dns: bool = False,
 ) -> None:
     """Reject unsafe URL schemes, cloud metadata hosts, and unallowlisted internal IPs."""
     if not url:
@@ -54,7 +80,12 @@ def validate_upstream_url(
     if host in allowset:
         return
 
-    if host in _CLOUD_METADATA_HOSTS or host.endswith(".metadata.google.internal"):
+    if (
+        host in _CLOUD_METADATA_HOSTS
+        or host.endswith(".metadata.google.internal")
+        or "169.254.169.254" in host
+        or "100.100.100.200" in host
+    ):
         raise ValueError(f"Blocked cloud metadata endpoint host '{host}' in upstream URL")
 
     try:
@@ -63,24 +94,38 @@ def validate_upstream_url(
         ip_obj = None
 
     if ip_obj is not None:
-        if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
-            ip_obj = ip_obj.ipv4_mapped
-        if ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified:
-            raise ValueError(f"Blocked link-local or unspecified IP '{host}' in upstream URL")
-        if (
-            app_env == "prod"
-            and block_private_ips_in_prod
-            and (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved)
-        ):
-            raise ValueError(
-                f"Blocked private/loopback IP '{host}' in prod; add host to allowed_upstream_hosts"
-            )
+        _check_resolved_ip(
+            ip_obj,
+            host,
+            app_env=app_env,
+            block_private_ips_in_prod=block_private_ips_in_prod,
+        )
     elif app_env == "prod" and block_private_ips_in_prod:
-        if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        if host == "localhost" or host.endswith(
+            (".localhost", ".local", ".internal", ".nip.io", ".sslip.io", ".localtest.me")
+        ):
             raise ValueError(
                 f"Blocked local/internal hostname '{host}' in prod; "
                 "add host to allowed_upstream_hosts"
             )
+        if resolve_dns:
+            try:
+                infos = socket.getaddrinfo(host, None)
+            except socket.gaierror:
+                infos = []
+            for info in infos:
+                sockaddr = info[4]
+                if sockaddr:
+                    try:
+                        resolved_ip = ipaddress.ip_address(str(sockaddr[0]).split("%")[0])
+                    except ValueError:
+                        continue
+                    _check_resolved_ip(
+                        resolved_ip,
+                        host,
+                        app_env=app_env,
+                        block_private_ips_in_prod=block_private_ips_in_prod,
+                    )
 
 
 _MUTATING_PREFIXES = (
@@ -671,7 +716,8 @@ class UpstreamClientManager:
         for pname in tool.path_params:
             if pname not in arguments:
                 raise ValueError(f"Missing required path parameter '{pname}'")
-            resolved_path = resolved_path.replace(f"{{{pname}}}", str(arguments[pname]))
+            safe_val = quote(str(arguments[pname]), safe="")
+            resolved_path = resolved_path.replace(f"{{{pname}}}", safe_val)
 
         query: dict[str, Any] = {}
         body: dict[str, Any] = {}

@@ -134,7 +134,8 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
         )
 
     def _require_admin(identity: CallerIdentity) -> None:
-        if not (set(identity.roles) & set(settings.admin_roles)):
+        allowed = set(settings.admin_roles) | set(settings.viewer_roles)
+        if not (set(identity.roles) & allowed):
             log_event(
                 "auth.denied",
                 level=logging.WARNING,

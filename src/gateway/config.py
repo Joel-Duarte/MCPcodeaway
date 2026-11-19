@@ -50,6 +50,7 @@ class AbacRuleConfig(BaseModel):
     row_field: str | None = None
     enforce_on_args: bool = True
     filter_response_rows: bool = True
+    require_claim: bool = False
 
 
 class AbExperimentConfig(BaseModel):
@@ -324,3 +325,15 @@ class UpstreamRegistry:
             if cfg.name == name:
                 return cfg
         return None
+
+    def upsert(self, cfg: UpstreamConfig) -> None:
+        """Update an upstream configuration in-memory in the static registry."""
+        self._static[cfg.name] = cfg
+
+    async def save_upstream(self, cfg: UpstreamConfig) -> None:
+        """Persist a dynamic upstream to AuditStore (when permitted) and update registry."""
+        if self.store is not None and self.settings.dynamic_upstreams_permitted:
+            await self.store.save_dynamic_upstream(cfg.name, cfg.model_dump(exclude_none=True))
+            self._dynamic[cfg.name] = cfg
+        else:
+            self.upsert(cfg)
