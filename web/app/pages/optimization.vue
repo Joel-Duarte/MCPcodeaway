@@ -41,7 +41,7 @@ interface ExperimentsResponse {
 }
 
 const { apiFetch } = useAdminApi();
-const { subscribeTelemetry } = useLiveTelemetry();
+const { totalRunsTick } = useLiveTelemetry();
 
 const loading = ref(true);
 const errorMessage = ref("");
@@ -66,18 +66,12 @@ async function fetchOptimization() {
   }
 }
 
-let unsub: (() => void) | null = null;
 onMounted(() => {
   void fetchOptimization();
-  unsub = subscribeTelemetry((ev) => {
-    if (ev.type === "run_recorded") {
-      void fetchOptimization();
-    }
-  });
 });
 
-onBeforeUnmount(() => {
-  unsub?.();
+watch(totalRunsTick, () => {
+  void fetchOptimization();
 });
 
 const modelOptions = computed(() => {

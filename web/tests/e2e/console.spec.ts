@@ -29,27 +29,33 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
       await page.waitForTimeout(900);
     }
 
-    // 2. Analytics & Cost populated + Empirical Proof + Reactive Filters
-    await page.getByRole("link", { name: /Analytics & Cost/i }).click();
-    await expect(page.getByRole("heading", { name: /Analytics, Groups & Model Cost/i })).toBeVisible();
-    await expect(page.getByText(/Empirical Proof: Why Code Mode Saves Money/i)).toBeVisible();
+    // 2. Gateway Usage populated + Reactive Filters
+    await page.getByRole("link", { name: /Gateway Usage/i }).click();
+    await expect(page.getByRole("heading", { name: /Gateway Usage, Groups & Cost Attribution/i })).toBeVisible();
     await expect(page.getByText(/Code Mode vs\. Classic Volume/i)).toBeVisible();
 
-    // 3. Upstreams & Splits renders live servers
-    await page.getByRole("link", { name: /Upstreams & Splits/i }).click();
+    // 2b. Dedicated Optimization & ROI page
+    await page.getByRole("link", { name: /Optimization & ROI/i }).click();
+    await expect(page.getByRole("heading", { name: /Optimization, Cost Savings & A\/B Splits/i })).toBeVisible();
+    await expect(page.getByText(/Empirical 9B Baseline/i)).toBeVisible();
+
+    // 3. Upstreams Catalog renders live servers + 500-server search
+    await page.getByRole("link", { name: /Upstreams Catalog/i }).click();
     await expect(page.getByText("billing_legacy_eu").first()).toBeVisible();
     await expect(page.getByText("snowflake_ledger").first()).toBeVisible();
 
-    // 4. Audit & Retention renders recorded runs + status filters + pagination
-    await page.getByRole("link", { name: /Audit & Retention/i }).click();
+    // 4. Audit & Compliance renders recorded runs + Real-Time toggle + Detection Guide
+    await page.getByRole("link", { name: /Audit & Compliance/i }).click();
     await expect(page.getByRole("heading", { name: /Audit Runs, Provenance & Retention/i })).toBeVisible();
+    await expect(page.getByText("Real-Time")).toBeVisible();
     await expect(page.getByRole("button", { name: /Errors Only/i })).toBeVisible();
     await expect(page.locator("table tbody tr").first()).toBeVisible();
 
-    // 5. Settings & Alerts page renders Custom Model Pricing & Alert Rules
+    // 5. Settings & Alerts page renders Model Pricing, Custom Alert Rules & Compliance Archive
     await page.getByRole("link", { name: /Settings & Alerts/i }).click();
-    await expect(page.getByRole("heading", { name: /Gateway Settings, Model Pricing & Alerts/i })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /Gateway Settings, Alert Rules & Compliance Retention/i })).toBeVisible();
     await expect(page.getByText("qwen3.5-9b")).toBeVisible();
+    await expect(page.getByText(/Custom Alert Rules/i)).toBeVisible();
 
     // 6. Onboarding 3-Step Progressive Wizard (Step 2 locked until Inspect Schema)
     await page.getByRole("link", { name: /Onboarding & A\/B Lab/i }).click();
@@ -76,7 +82,7 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     page,
   }) => {
     await page.setViewportSize({ width: 375, height: 812 });
-    for (const path of ["/dashboard/", "/dashboard/analytics", "/dashboard/onboarding", "/dashboard/upstreams", "/dashboard/audit"]) {
+    for (const path of ["/dashboard/", "/dashboard/analytics", "/dashboard/optimization", "/dashboard/onboarding", "/dashboard/upstreams", "/dashboard/audit", "/dashboard/settings"]) {
       await page.goto(`${BASE}${path}`, { waitUntil: "networkidle" });
       const overflow = await page.evaluate(
         () => document.documentElement.scrollWidth - document.documentElement.clientWidth
