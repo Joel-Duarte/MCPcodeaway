@@ -1,0 +1,233 @@
+@layer ui-sdk;
+@import "tailwindcss";
+@import "@ui-sdk/core/web.css" layer(components);
+
+:root {
+  color-scheme: light;
+  --ui-background: #ffffff;
+  --ui-foreground: #09090b;
+  --ui-muted: #f4f4f5;
+  --ui-muted-foreground: #52525b;
+  --ui-border: #e4e4e7;
+  --ui-input: #d4d4d8;
+  --ui-primary: #0f766e;
+  --ui-primary-foreground: #ffffff;
+  --ui-destructive: #dc2626;
+  --ui-ring: rgb(15 118 110 / 0.22);
+  --ui-ring-border: #0f766e;
+  --ui-overlay: rgb(9 9 11 / 0.35);
+  --ui-shadow: 0 4px 12px rgb(9 9 11 / 0.08);
+  --ui-radius: 6px;
+  --ui-font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --ui-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #fafafa;
+  color: #09090b;
+  font-family: var(--ui-font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: rgb(15 118 110 / 0.16);
+  color: #042f2e;
+}
+
+:focus-visible {
+  outline: 2px solid #0f766e;
+  outline-offset: 2px;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.font-mono-data {
+  font-family: var(--ui-font-mono);
+}
+
+/* Override ui-sdk meter min-width so mobile panels never overflow horizontally */
+[data-slot="meter"],
+[data-slot="progress"] {
+  min-width: 0;
+  width: 100%;
+}
+
+[data-slot="meter-indicator"] {
+  transition: width 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Crisp control sizing & Precision Light variants */
+:is(
+  [data-slot="button"],
+  [data-slot="dialog-trigger"],
+  [data-slot="dialog-close"],
+  [data-slot="drawer-trigger"],
+  [data-slot="drawer-close"]
+) {
+  height: auto;
+  min-height: 2.125rem;
+  padding-block: 0.4375rem;
+  padding-inline: 0.875rem;
+  transition:
+    background-color 150ms cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 150ms cubic-bezier(0.16, 1, 0.3, 1),
+    color 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+[data-slot="button"][data-variant="primary"],
+[data-slot="dialog-close"][data-variant="primary"] {
+  border-color: #0f766e;
+  background-color: #0f766e;
+  color: #ffffff;
+}
+
+[data-slot="button"][data-variant="primary"]:hover:not([data-disabled]),
+[data-slot="dialog-close"][data-variant="primary"]:hover:not([data-disabled]) {
+  background-color: #115e59;
+  border-color: #115e59;
+}
+
+[data-slot="button"][data-variant="ghost"] {
+  border-color: transparent;
+  background-color: transparent;
+  color: #52525b;
+}
+
+[data-slot="button"][data-variant="ghost"]:hover:not([data-disabled]) {
+  background-color: #f4f4f5;
+  color: #09090b;
+}
+
+[data-slot="button"][data-variant="danger"],
+[data-slot="dialog-close"][data-variant="danger"] {
+  border-color: #fecaca;
+  background-color: #fef2f2;
+  color: #dc2626;
+}
+
+[data-slot="button"][data-variant="danger"]:hover:not([data-disabled]),
+[data-slot="dialog-close"][data-variant="danger"]:hover:not([data-disabled]) {
+  background-color: #fee2e2;
+  border-color: #fca5a5;
+}
+
+/* Form inputs & select triggers aligned to DESIGN.md borders & height */
+:is([data-slot="input"], [data-slot="select-trigger"]) {
+  width: 100%;
+  min-height: 2.25rem;
+  height: auto;
+  padding-block: 0.4375rem;
+  padding-inline: 0.75rem;
+  border: 1px solid #d4d4d8;
+  border-radius: 6px;
+  background-color: #ffffff;
+  color: #09090b;
+  font-size: 0.875rem;
+}
+
+[data-slot="textarea"] {
+  width: 100%;
+  border: 1px solid #d4d4d8;
+  border-radius: 6px;
+  background-color: #ffffff;
+  color: #09090b;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+}
+
+[data-slot="select-content"] {
+  z-index: 60;
+  border: 1px solid #e4e4e7;
+  border-radius: 8px;
+  background-color: #ffffff;
+  box-shadow: 0 4px 12px rgb(9 9 11 / 0.08);
+  padding: 0.25rem;
+}
+
+[data-slot="select-item"] {
+  border-radius: 5px;
+  padding: 0.4375rem 0.625rem;
+  font-size: 0.8125rem;
+}
+
+[data-slot="select-item"][data-highlighted] {
+  background-color: #f4f4f5;
+}
+
+[data-slot="tabs-list"] {
+  gap: 0.25rem;
+  overflow-x: auto;
+  border-bottom: 1px solid #e4e4e7;
+}
+
+[data-slot="tabs-tab"] {
+  white-space: nowrap;
+  min-height: 2.375rem;
+  color: #52525b;
+  border-bottom: 2px solid transparent;
+  transition: color 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+[data-slot="tabs-tab"][data-selected] {
+  border-color: #0f766e;
+  color: #0f766e;
+}
+
+[data-slot="switch"][data-checked] {
+  background-color: #0f766e;
+  border-color: #0f766e;
+}
+
+[data-slot="drawer-backdrop"],
+[data-slot="dialog-backdrop"] {
+  transition: opacity 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+[data-slot="drawer-backdrop"]:is([data-starting-style], [data-ending-style]),
+[data-slot="dialog-backdrop"]:is([data-starting-style], [data-ending-style]) {
+  opacity: 0;
+}
+
+[data-slot="dialog-content"] {
+  transition:
+    opacity 180ms cubic-bezier(0.16, 1, 0.3, 1),
+    transform 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+[data-slot="dialog-content"]:is([data-starting-style], [data-ending-style]) {
+  opacity: 0;
+  transform: translateY(6px);
+}
+
+@media (max-width: 639px) {
+  :is(
+    [data-slot="button"],
+    [data-slot="dialog-trigger"],
+    [data-slot="dialog-close"],
+    [data-slot="drawer-trigger"],
+    [data-slot="drawer-close"],
+    [data-slot="select-trigger"],
+    [data-slot="input"]
+  ) {
+    min-height: 2.75rem;
+  }
+}
+
+/* Subtle horizontal scrollbar for dense data tables */
+.table-scroll::-webkit-scrollbar {
+  height: 6px;
+}
+
+.table-scroll::-webkit-scrollbar-thumb {
+  background: #d4d4d8;
+  border-radius: 9999px;
+}
+
+.table-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
