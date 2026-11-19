@@ -122,19 +122,102 @@ const authOptions = [
 ];
 
 const modeOptions = [
-  { value: "auto", label: "auto (algorithmic)" },
-  { value: "codemode", label: "codemode" },
-  { value: "codemode_upfront", label: "codemode_upfront" },
-  { value: "traditional", label: "traditional" },
-  { value: "traditional_discover", label: "traditional_discover" },
-  { value: "hybrid", label: "hybrid" },
+  { value: "auto", label: "Auto — Algorithmic Router (Recommended)" },
+  { value: "codemode", label: "Code Mode — Deferred Search & Sandbox" },
+  { value: "traditional_discover", label: "Classic MCP — Discover & Direct Calls" },
+  { value: "hybrid", label: "Hybrid — Code Mode Reads, Confirmed Writes" },
 ];
+
+const schemaVerified = ref(false);
+const testCallResult = ref<string>("");
+const testCallBusy = ref(false);
+const availableRoles = ref<string[]>([
+  "finance_analyst",
+  "ops_engineer",
+  "support_agent",
+  "readonly_auditor",
+  "gateway_admin",
+]);
+
+onMounted(async () => {
+  try {
+    const res = await apiFetch<{ roles?: string[] }>("/admin/roles", {}, true);
+    if (res.roles && res.roles.length > 0) {
+      availableRoles.value = res.roles;
+    }
+  } catch {
+    // Keep default role list if roles endpoint unavailable
+  }
+});
+
+const selectedRoleSet = computed(() => {
+  return new Set(
+    draftRoles.value
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+});
+
+function toggleRole(role: string) {
+  const next = new Set(selectedRoleSet.value);
+  if (next.has(role)) {
+    next.delete(role);
+  } else {
+    next.add(role);
+  }
+  draftRoles.value = Array.from(next).join(", ");
+}
+
+const authHelpText = computed(() => {
+  if (draftAuthType.value === "delegated_token") {
+    return "Exchanges the caller's JWT via OBO/RFC 8693 for a downstream token scoped to this user.";
+  }
+  if (draftAuthType.value === "api_key") {
+    return "Injects a secret API key from an environment variable on the gateway host (never exposed to Monty).";
+  }
+  if (draftAuthType.value === "bearer_secret") {
+    return "Sends a static service Bearer token from a host secret environment variable.";
+  }
+  return "No downstream credentials sent — suitable only for internal read-only sandboxes.";
+});
+
+const sessionAdvice = computed(() => {
+  const count = inspectResult.value?.inspection.tool_count ?? 0;
+  return {
+    statefulHint:
+      sourceKind.value === "mcp_http"
+        ? "Auto-detect recommended: only enable Stateful MCP Session if the server rejects stateless POST /mcp without Mcp-Session-Id."
+        : "Keep OFF for REST/OpenAPI backends — HTTP OpenAPI calls are naturally stateless.",
+    abHint:
+      count >= 10
+        ? `Recommended: ${count} tools detected — run a Live Traffic A/B Experiment to prove Code Mode token savings.`
+        : "Optional: small tool catalog (< 10 tools) works well in Auto or Classic Discover mode.",
+  };
+});
+
+function applyLocalLlmPreset(kind: "lmstudio" | "ollama") {
+  llmEnabled.value = true;
+  if (kind === "lmstudio") {
+    llmBaseUrl.value = "http://host.docker.internal:1234/v1";
+    llmModel.value = "qwen3.5-9b";
+  } else {
+    llmBaseUrl.value = "http://host.docker.internal:11434/v1";
+    llmModel.value = "qwen3:8b";
+  }
+  statusMessage.value = `Configured local ${kind === "lmstudio" ? "LM Studio" : "Ollama"} endpoint.`;
+}
 
 const onboardingStep = ref<1 | 2 | 3>(1);
 const promptTab = ref("prompt");
 const sourceKind = ref<"openapi_url" | "openapi_inline" | "rest_builder" | "mcp_http">(
   "openapi_url"
 );
+
+watch([sourceKind, draftUrl, draftSpecUrl], () => {
+  schemaVerified.value = false;
+  testCallResult.value = "";
+});
 const inlineSpecText = ref(
   JSON.stringify(
     {
@@ -283,14 +366,42 @@ onMounted(async () => {
 async function handleInspect() {
   errorMessage.value = "";
   statusMessage.value = "";
+  testCallResult.value = "";
   try {
     inspectResult.value = await apiFetch<InspectResponse>("/admin/upstreams/inspect", {
       method: "POST",
       body: buildUpstreamPayload(),
     });
-    statusMessage.value = `Inspected '${inspectResult.value.inspection.upstream}' (${inspectResult.value.inspection.tool_count} tools).`;
+    schemaVerified.value = true;
+    statusMessage.value = `Inspected '${inspectResult.value.inspection.upstream}' (${inspectResult.value.inspection.tool_count} tools). Step 2 unlocked.`;
+  } catch (err) {
+    schemaVerified.value = false;
+    errorMessage.value = extractErrorMessage(err);
+  }
+}
+
+async function handleTestCall(toolName: string) {
+  testCallBusy.value = true;
+  errorMessage.value = "";
+  testCallResult.value = "";
+  try {
+    const res = await apiFetch<{ ok: boolean; tool: string; result: unknown }>(
+      "/admin/upstreams/test-call",
+      {
+        method: "POST",
+        body: {
+          upstream: buildUpstreamPayload(),
+          tool_name: toolName,
+          arguments: {},
+        },
+      }
+    );
+    testCallResult.value = JSON.stringify(res.result, null, 2);
+    statusMessage.value = `Live test call '${res.tool}' succeeded.`;
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
+  } finally {
+    testCallBusy.value = false;
   }
 }
 
@@ -475,6 +586,7 @@ async function copyPromptText() {
         </Button>
         <Button
           :data-variant="onboardingStep === 2 ? 'primary' : undefined"
+          :disabled="!schemaVerified"
           class="text-xs"
           @click="onboardingStep = 2"
         >
@@ -482,6 +594,7 @@ async function copyPromptText() {
         </Button>
         <Button
           :data-variant="onboardingStep === 3 ? 'primary' : undefined"
+          :disabled="!schemaVerified"
           class="text-xs"
           @click="onboardingStep = 3"
         >
@@ -594,9 +707,14 @@ async function copyPromptText() {
         <Button pending-announcement="Inspecting schema" @click="handleInspect">
           Inspect Schema
         </Button>
-        <Button data-variant="primary" @click="onboardingStep = 2">
-          Next: Policy &amp; Guardrails →
-        </Button>
+        <div class="flex items-center gap-2">
+          <span v-if="!schemaVerified" class="text-xs text-[#D97706]">
+            Inspect schema first to unlock Policy &amp; Guardrails
+          </span>
+          <Button data-variant="primary" :disabled="!schemaVerified" @click="onboardingStep = 2">
+            Next: Policy &amp; Guardrails →
+          </Button>
+        </div>
       </div>
 
       <!-- Discovered Tools Preview -->
@@ -614,6 +732,7 @@ async function copyPromptText() {
                 <th class="px-3 py-2 whitespace-nowrap">Tool</th>
                 <th class="px-3 py-2 whitespace-nowrap">Mutating</th>
                 <th class="px-3 py-2 whitespace-nowrap">Output Schema</th>
+                <th class="px-3 py-2 text-right whitespace-nowrap">Verify</th>
               </tr>
             </thead>
             <tbody class="divide-y divide-[#E4E4E7]">
@@ -625,10 +744,25 @@ async function copyPromptText() {
                     {{ t.output_schema ? "typed" : "untyped" }}
                   </span>
                 </td>
+                <td class="px-3 py-2 text-right whitespace-nowrap">
+                  <Button
+                    v-if="!t.mutating"
+                    class="px-2 py-0.5 text-[11px]"
+                    :disabled="testCallBusy"
+                    @click="handleTestCall(t.name)"
+                  >
+                    Test Call
+                  </Button>
+                  <span v-else class="text-[#71717A]">write skipped</span>
+                </td>
               </tr>
             </tbody>
           </table>
         </div>
+        <pre
+          v-if="testCallResult"
+          class="max-h-40 overflow-auto rounded border border-[#99F6E4] bg-[#F0FDFA] p-3 font-mono-data text-xs text-[#09090B]"
+        >{{ testCallResult }}</pre>
       </div>
     </div>
 
@@ -660,6 +794,7 @@ async function copyPromptText() {
               </SelectItem>
             </SelectContent>
           </Select>
+          <FieldDescription>{{ authHelpText }}</FieldDescription>
         </Field>
 
         <Field>
@@ -682,10 +817,34 @@ async function copyPromptText() {
           </Select>
         </Field>
 
-        <Field class="sm:col-span-2">
-          <FieldLabel>Allowed RBAC Roles (comma-separated)</FieldLabel>
-          <Input v-model="draftRoles" class="font-mono-data text-xs" />
-        </Field>
+        <div class="sm:col-span-2 space-y-2">
+          <div class="text-xs font-medium text-[#09090B]">Allowed RBAC Roles (click to toggle)</div>
+          <div class="flex flex-wrap gap-1.5">
+            <button
+              v-for="role in availableRoles"
+              :key="role"
+              type="button"
+              class="rounded border px-2.5 py-1 text-xs font-medium transition-colors"
+              :class="
+                selectedRoleSet.has(role)
+                  ? 'border-[#0F766E] bg-[#F0FDFA] text-[#0F766E]'
+                  : 'border-[#E4E4E7] bg-white text-[#52525B] hover:bg-[#F4F4F5]'
+              "
+              @click="toggleRole(role)"
+            >
+              {{ role }}
+            </button>
+          </div>
+          <Field>
+            <FieldLabel>Custom / Selected Roles</FieldLabel>
+            <Input v-model="draftRoles" class="font-mono-data text-xs" />
+          </Field>
+        </div>
+      </div>
+
+      <div class="rounded border border-[#99F6E4] bg-[#F0FDFA] p-3 text-xs text-[#09090B] space-y-1">
+        <div><strong class="text-[#0F766E]">Session Advice:</strong> {{ sessionAdvice.statefulHint }}</div>
+        <div><strong class="text-[#0F766E]">A/B Advice:</strong> {{ sessionAdvice.abHint }}</div>
       </div>
 
       <details class="rounded border border-[#E4E4E7] bg-[#FAFAFA] p-3">
@@ -802,6 +961,15 @@ async function copyPromptText() {
               </div>
             </Field>
             <div v-if="llmEnabled" class="space-y-3">
+              <div class="flex flex-wrap items-center gap-2 text-xs">
+                <span class="text-[#52525B]">Local LLM presets:</span>
+                <Button class="px-2 py-0.5 text-[11px]" @click="applyLocalLlmPreset('lmstudio')">
+                  LM Studio (:1234)
+                </Button>
+                <Button class="px-2 py-0.5 text-[11px]" @click="applyLocalLlmPreset('ollama')">
+                  Ollama (:11434)
+                </Button>
+              </div>
               <Field>
                 <FieldLabel>Base URL</FieldLabel>
                 <Input v-model="llmBaseUrl" class="font-mono-data text-xs" />

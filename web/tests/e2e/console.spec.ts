@@ -29,10 +29,10 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
       await page.waitForTimeout(900);
     }
 
-    // 2. Analytics & Cost populated + 9B baseline + Custom Model Pricing
+    // 2. Analytics & Cost populated + Empirical Proof + Reactive Filters
     await page.getByRole("link", { name: /Analytics & Cost/i }).click();
     await expect(page.getByRole("heading", { name: /Analytics, Groups & Model Cost/i })).toBeVisible();
-    await expect(page.getByText(/API Token Cost Simulator/i)).toBeVisible();
+    await expect(page.getByText(/Empirical Proof: Why Code Mode Saves Money/i)).toBeVisible();
     await expect(page.getByText(/Code Mode vs\. Classic Volume/i)).toBeVisible();
 
     // 3. Upstreams & Splits renders live servers
@@ -40,15 +40,23 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     await expect(page.getByText("billing_legacy_eu").first()).toBeVisible();
     await expect(page.getByText("snowflake_ledger").first()).toBeVisible();
 
-    // 4. Audit & Retention renders recorded runs
+    // 4. Audit & Retention renders recorded runs + status filters + pagination
     await page.getByRole("link", { name: /Audit & Retention/i }).click();
     await expect(page.getByRole("heading", { name: /Audit Runs, Provenance & Retention/i })).toBeVisible();
+    await expect(page.getByRole("button", { name: /Errors Only/i })).toBeVisible();
     await expect(page.locator("table tbody tr").first()).toBeVisible();
 
-    // 5. Onboarding 3-Step Progressive Wizard + Quick REST Builder + Agent Prompt Modal
+    // 5. Settings & Alerts page renders Custom Model Pricing & Alert Rules
+    await page.getByRole("link", { name: /Settings & Alerts/i }).click();
+    await expect(page.getByRole("heading", { name: /Gateway Settings, Model Pricing & Alerts/i })).toBeVisible();
+    await expect(page.getByText("qwen3.5-9b")).toBeVisible();
+
+    // 6. Onboarding 3-Step Progressive Wizard (Step 2 locked until Inspect Schema)
     await page.getByRole("link", { name: /Onboarding & A\/B Lab/i }).click();
-    await expect(page.getByRole("button", { name: /1\. Connect & Inspect/i })).toBeVisible();
-    await expect(page.getByRole("button", { name: /Quick REST Builder/i })).toBeVisible();
+    await expect(page.getByRole("button", { name: /2\. Policy & Mode/i })).toBeDisabled();
+    await page.getByRole("button", { name: /Mock OpenAPI/i }).click();
+    await page.getByRole("button", { name: /Inspect Schema/i }).click();
+    await expect(page.getByRole("button", { name: /2\. Policy & Mode/i })).toBeEnabled({ timeout: 5000 });
     await page.getByRole("button", { name: /2\. Policy & Mode/i }).click();
     await expect(page.getByText(/Step 2 — Access Control/i)).toBeVisible();
     await page.getByRole("button", { name: /3\. A\/B Test & Save/i }).click();

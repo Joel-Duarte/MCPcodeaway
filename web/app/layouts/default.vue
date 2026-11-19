@@ -42,6 +42,7 @@ const navItems: { to: string; label: string; icon: IconName }[] = [
   { to: "/onboarding", label: "Onboarding & A/B Lab", icon: "onboarding" },
   { to: "/upstreams", label: "Upstreams & Splits", icon: "upstreams" },
   { to: "/audit", label: "Audit & Retention", icon: "audit" },
+  { to: "/settings", label: "Settings & Alerts", icon: "shield" },
 ];
 
 function isActiveRoute(to: string): boolean {

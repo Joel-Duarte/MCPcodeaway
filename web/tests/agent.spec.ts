@@ -90,6 +90,13 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
   expect(editRes.ok, editRes.error?.message).toBe(true);
   expect((wrapper.find("input").element as HTMLInputElement).value).toBe("crm_partner_api");
 
+  // Inspect Schema first so Step 2 & Step 3 unlock cleanly
+  const inspectStep = await agent.act({
+    steps: [{ ref: "Inspect Schema", action: "press" }],
+  });
+  expect(inspectStep.ok, inspectStep.error?.message).toBe(true);
+  await Promise.resolve();
+
   // Advance to Step 3 so Register Upstream mounts cleanly
   const navStep3 = await agent.act({
     steps: [{ ref: "3. A/B Test & Save", action: "press" }],

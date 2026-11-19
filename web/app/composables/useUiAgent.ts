@@ -168,6 +168,14 @@ export function useDemoTraffic() {
   };
 }
 
+export interface LiveAlertItem {
+  id: string;
+  severity: "critical" | "warning" | string;
+  title: string;
+  detail: string;
+  observed_at: string;
+}
+
 export function useLiveTelemetry() {
   const config = useRuntimeConfig();
   const { bearerToken } = useAdminApi();
@@ -179,6 +187,7 @@ export function useLiveTelemetry() {
     "ws-telemetry-runtime",
     () => null
   );
+  const alerts = useState<LiveAlertItem[]>("ws-telemetry-alerts", () => []);
   const totalRunsTick = useState<number>("ws-telemetry-runs-tick", () => 0);
 
   let ws: WebSocket | null = null;
@@ -219,6 +228,7 @@ export function useLiveTelemetry() {
           const data = JSON.parse(String(msg.data));
           if (data.type === "snapshot" || data.type === "runtime_tick") {
             if (data.runtime) latestRuntime.value = data.runtime;
+            if (Array.isArray(data.alerts)) alerts.value = data.alerts;
             if (data.demo_traffic && demoStatus.value) {
               demoStatus.value = data.demo_traffic;
             }
@@ -265,6 +275,7 @@ export function useLiveTelemetry() {
     connected,
     events,
     latestRuntime,
+    alerts,
     totalRunsTick,
     connect,
     disconnect,

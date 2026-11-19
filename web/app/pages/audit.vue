@@ -45,13 +45,21 @@ interface AuditRun {
 }
 
 const { apiFetch } = useAdminApi();
+const { events: wsEvents } = useLiveTelemetry();
 
 const loading = ref(true);
 const errorMessage = ref("");
 const statusMessage = ref("");
-const limitFilter = ref("50");
+const limitFilter = ref("25");
+const offset = ref(0);
+const totalCount = ref(0);
+const statusFilter = ref<"all" | "errors" | "grounding_blocked" | "ok">("all");
+const modeFilter = ref("all");
+const searchQuery = ref("");
+const liveMode = ref(true);
 const tenantFilter = ref("");
 const runs = ref<AuditRun[]>([]);
+let searchDebounce: ReturnType<typeof setTimeout> | null = null;
 
 const drawerOpen = ref(false);
 const selectedRun = ref<AuditRun | null>(null);
@@ -60,26 +68,95 @@ const pruneDialogOpen = ref(false);
 const retentionDays = ref("30");
 
 const limitOptions = [
-  { value: "25", label: "Last 25 runs" },
-  { value: "50", label: "Last 50 runs" },
-  { value: "100", label: "Last 100 runs" },
-  { value: "200", label: "Last 200 runs" },
+  { value: "25", label: "25 per page" },
+  { value: "50", label: "50 per page" },
+  { value: "100", label: "100 per page" },
 ];
 
-async function fetchRuns() {
+async function fetchRuns(resetOffset = false) {
+  if (resetOffset) offset.value = 0;
   errorMessage.value = "";
   const params = new URLSearchParams();
-  params.set("limit", limitFilter.value || "50");
+  params.set("limit", limitFilter.value || "25");
+  params.set("offset", String(offset.value));
+  params.set("status", statusFilter.value);
+  if (modeFilter.value !== "all") {
+    params.set("mode", modeFilter.value);
+  }
+  if (searchQuery.value.trim()) {
+    params.set("q", searchQuery.value.trim());
+  }
   if (tenantFilter.value.trim()) {
     params.set("tenant_id", tenantFilter.value.trim());
   }
   try {
-    const res = await apiFetch<{ count: number; runs: AuditRun[] }>(`/audit/runs?${params.toString()}`);
+    const res = await apiFetch<{ count: number; total_count?: number; runs: AuditRun[] }>(
+      `/audit/runs?${params.toString()}`
+    );
     runs.value = res.runs;
+    totalCount.value = res.total_count ?? res.count;
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
   } finally {
     loading.value = false;
+  }
+}
+
+watch(wsEvents, (list) => {
+  if (!liveMode.value || offset.value > 0 || list.length === 0) return;
+  const latest = list[0];
+  if (!latest) return;
+  if (statusFilter.value === "errors" && latest.ok) return;
+  if (statusFilter.value === "ok" && !latest.ok) return;
+  if (statusFilter.value === "grounding_blocked" && !latest.grounding_blocked) return;
+  if (modeFilter.value !== "all" && latest.mode !== modeFilter.value) return;
+  if (runs.value.some((r) => r.run_id === latest.run_id)) return;
+  const row: AuditRun = {
+    run_id: latest.run_id,
+    created_at: latest.created_at,
+    mode: latest.mode,
+    ok: latest.ok,
+    duration_ms: latest.duration_ms,
+    tenant_id: "",
+    user_sub: latest.user_sub,
+    subcall_count: 0,
+    raw_upstream_bytes: 0,
+    returned_bytes: 0,
+    estimated_tokens_saved: latest.tokens_saved,
+    schema_tokens_saved: 0,
+    abac_rows_filtered: 0,
+    redactions_count: 0,
+    mode_decision_reason: latest.mode_decision_reason,
+    provenance: { grounded: !latest.grounding_blocked },
+  };
+  const pageCap = Number.parseInt(limitFilter.value || "25", 10) || 25;
+  runs.value = [row, ...runs.value].slice(0, pageCap);
+  totalCount.value += 1;
+});
+
+watch([searchQuery, tenantFilter], () => {
+  if (searchDebounce) clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(() => {
+    void fetchRuns(true);
+  }, 300);
+});
+
+function setStatusFilter(val: "all" | "errors" | "grounding_blocked" | "ok") {
+  statusFilter.value = val;
+  void fetchRuns(true);
+}
+
+function prevPage() {
+  const step = Number.parseInt(limitFilter.value || "25", 10) || 25;
+  offset.value = Math.max(0, offset.value - step);
+  void fetchRuns();
+}
+
+function nextPage() {
+  const step = Number.parseInt(limitFilter.value || "25", 10) || 25;
+  if (offset.value + step < totalCount.value) {
+    offset.value += step;
+    void fetchRuns();
   }
 }
 
@@ -127,7 +204,13 @@ onMounted(() => {
         </p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
-        <Button pending-announcement="Refreshing runs" @click="fetchRuns">
+        <label class="flex items-center gap-2 rounded-md border border-[#E4E4E7] bg-white px-2.5 py-1.5 text-xs font-medium text-[#09090B] cursor-pointer">
+          <Switch v-model:checked="liveMode">
+            <SwitchThumb />
+          </Switch>
+          <span>Live Stream</span>
+        </label>
+        <Button pending-announcement="Refreshing runs" @click="fetchRuns(false)">
           <AppIcon name="refresh" :size="15" />
           <span>Refresh</span>
         </Button>
@@ -138,15 +221,38 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- Filters -->
-    <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-      <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+    <!-- Search, Status Chips & Pagination Controls -->
+    <section class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="text-xs font-medium text-[#52525B]">Status:</span>
+        <Button
+          v-for="s in [
+            { value: 'all', label: 'All Runs' },
+            { value: 'errors', label: 'Errors Only' },
+            { value: 'grounding_blocked', label: 'Grounding Blocked' },
+            { value: 'ok', label: 'Succeeded' },
+          ] as const"
+          :key="s.value"
+          :data-variant="statusFilter === s.value ? 'primary' : undefined"
+          class="px-2.5 py-1 text-xs"
+          @click="setStatusFilter(s.value)"
+        >
+          {{ s.label }}
+        </Button>
+      </div>
+
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <Field>
-          <FieldLabel>Window Size</FieldLabel>
+          <FieldLabel>Search Run / User / Error</FieldLabel>
+          <Input v-model="searchQuery" placeholder="run_id, user, or error text..." />
+        </Field>
+
+        <Field>
+          <FieldLabel>Page Size</FieldLabel>
           <Select
             :items="limitOptions"
             :value="limitFilter"
-            @value-change="(v) => { if (v) { limitFilter = String(v); void fetchRuns(); } }"
+            @value-change="(v) => { if (v) { limitFilter = String(v); void fetchRuns(true); } }"
           >
             <SelectTrigger>
               <SelectValue />
@@ -247,6 +353,23 @@ onMounted(() => {
             </tr>
           </tbody>
         </table>
+      </div>
+      <div class="flex flex-wrap items-center justify-between gap-2 border-t border-[#E4E4E7] bg-[#FAFAFA] px-4 py-2.5 text-xs text-[#52525B]">
+        <span class="tabular-nums">
+          Showing {{ runs.length ? offset + 1 : 0 }}–{{ offset + runs.length }} of {{ totalCount }} total runs
+        </span>
+        <div class="flex items-center gap-2">
+          <Button class="px-2.5 py-1 text-xs" :disabled="offset === 0" @click="prevPage">
+            Previous
+          </Button>
+          <Button
+            class="px-2.5 py-1 text-xs"
+            :disabled="offset + runs.length >= totalCount"
+            @click="nextPage"
+          >
+            Next
+          </Button>
+        </div>
       </div>
     </section>
 

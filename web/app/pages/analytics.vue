@@ -80,11 +80,8 @@ const userFilter = ref("");
 const upstreamFilter = ref("");
 const analytics = ref<AnalyticsResponse | null>(null);
 const customModelNames = ref<string[]>([]);
-const customModelInput = ref("custom-local-9b");
-const customInPrice = ref("0.20");
-const customOutPrice = ref("0.60");
-const pricingSaving = ref(false);
 let liveDebounce: ReturnType<typeof setTimeout> | null = null;
+let filterDebounce: ReturnType<typeof setTimeout> | null = null;
 
 async function fetchPricingModels() {
   try {
@@ -95,39 +92,26 @@ async function fetchPricingModels() {
   }
 }
 
-async function saveCustomModel() {
-  if (!customModelInput.value.trim()) return;
-  pricingSaving.value = true;
-  errorMessage.value = "";
-  try {
-    const name = customModelInput.value.trim();
-    await apiFetch("/admin/pricing/models", {
-      method: "POST",
-      body: {
-        model_name: name,
-        input_per_1m_usd: Number(customInPrice.value) || 0,
-        output_per_1m_usd: Number(customOutPrice.value) || 0,
-      },
-    });
-    selectedModel.value = name;
-    await Promise.all([fetchPricingModels(), fetchAnalytics()]);
-  } catch (err) {
-    errorMessage.value = extractErrorMessage(err);
-  } finally {
-    pricingSaving.value = false;
-  }
+function clearAllFilters() {
+  groupFilter.value = "";
+  userFilter.value = "";
+  upstreamFilter.value = "";
+  void fetchAnalytics();
 }
 
-async function deleteCustomModel(name: string) {
-  try {
-    await apiFetch(`/admin/pricing/models/${encodeURIComponent(name)}`, { method: "DELETE" });
-    if (selectedModel.value === name) {
-      selectedModel.value = "qwen3.5-9b";
-    }
-    await Promise.all([fetchPricingModels(), fetchAnalytics()]);
-  } catch (err) {
-    errorMessage.value = extractErrorMessage(err);
-  }
+const activeFilterChips = computed(() => {
+  const chips: { key: "group" | "user" | "upstream"; label: string }[] = [];
+  if (groupFilter.value.trim()) chips.push({ key: "group", label: `Group: ${groupFilter.value.trim()}` });
+  if (userFilter.value.trim()) chips.push({ key: "user", label: `User: ${userFilter.value.trim()}` });
+  if (upstreamFilter.value.trim()) chips.push({ key: "upstream", label: `Upstream: ${upstreamFilter.value.trim()}` });
+  return chips;
+});
+
+function clearChip(key: "group" | "user" | "upstream") {
+  if (key === "group") groupFilter.value = "";
+  if (key === "user") userFilter.value = "";
+  if (key === "upstream") upstreamFilter.value = "";
+  void fetchAnalytics();
 }
 
 async function fetchAnalytics() {
@@ -147,6 +131,13 @@ async function fetchAnalytics() {
   }
 }
 
+watch([groupFilter, userFilter, upstreamFilter], () => {
+  if (filterDebounce) clearTimeout(filterDebounce);
+  filterDebounce = setTimeout(() => {
+    void fetchAnalytics();
+  }, 300);
+});
+
 watch(totalRunsTick, () => {
   if (liveDebounce) clearTimeout(liveDebounce);
   liveDebounce = setTimeout(() => {
@@ -162,6 +153,10 @@ onBeforeUnmount(() => {
   if (liveDebounce) {
     clearTimeout(liveDebounce);
     liveDebounce = null;
+  }
+  if (filterDebounce) {
+    clearTimeout(filterDebounce);
+    filterDebounce = null;
   }
 });
 
@@ -190,14 +185,17 @@ function formatUsd(n: number | undefined): string {
           Attribute gateway token savings, LLM cost estimates, client groups, and mode selection reasons.
         </p>
       </div>
-      <Button data-variant="primary" pending-announcement="Refreshing analytics" @click="fetchAnalytics">
-        <AppIcon name="refresh" :size="15" />
-        <span>Apply Filters</span>
-      </Button>
+      <NuxtLink
+        to="/settings"
+        class="no-underline inline-flex items-center gap-1.5 rounded-md border border-[#D4D4D8] bg-white px-3 py-1.5 text-xs font-medium text-[#09090B] hover:bg-[#F4F4F5]"
+      >
+        <AppIcon name="shield" :size="14" />
+        <span>Custom Model Pricing</span>
+      </NuxtLink>
     </div>
 
-    <!-- Filters Bar -->
-    <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
+    <!-- Reactive Filters Bar (auto-applies on change) -->
+    <section class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Field>
           <FieldLabel>Model Pricing</FieldLabel>
@@ -223,18 +221,39 @@ function formatUsd(n: number | undefined): string {
 
         <Field>
           <FieldLabel>Company Group</FieldLabel>
-          <Input v-model="groupFilter" placeholder="e.g. finance" />
+          <Input v-model="groupFilter" placeholder="Filter by group (e.g. finance)" />
         </Field>
 
         <Field>
           <FieldLabel>User Subject / Email</FieldLabel>
-          <Input v-model="userFilter" placeholder="e.g. carol@acme.test" />
+          <Input v-model="userFilter" placeholder="Filter by user email" />
         </Field>
 
         <Field>
           <FieldLabel>Upstream Server</FieldLabel>
-          <Input v-model="upstreamFilter" placeholder="e.g. ledger_api" />
+          <Input v-model="upstreamFilter" placeholder="Filter by upstream" />
         </Field>
+      </div>
+
+      <div v-if="activeFilterChips.length > 0" class="flex flex-wrap items-center gap-2 border-t border-[#E4E4E7] pt-2.5 text-xs">
+        <span class="text-[#71717A]">Active filters:</span>
+        <button
+          v-for="chip in activeFilterChips"
+          :key="chip.key"
+          type="button"
+          class="inline-flex items-center gap-1 rounded border border-[#99F6E4] bg-[#F0FDFA] px-2 py-0.5 font-medium text-[#0F766E] hover:bg-[#CCFBF1]"
+          @click="clearChip(chip.key)"
+        >
+          <span>{{ chip.label }}</span>
+          <span>×</span>
+        </button>
+        <button
+          type="button"
+          class="text-[#52525B] underline hover:text-[#09090B]"
+          @click="clearAllFilters"
+        >
+          Clear all
+        </button>
       </div>
     </section>
 
@@ -268,51 +287,25 @@ function formatUsd(n: number | undefined): string {
         </Button>
       </section>
 
-      <!-- Custom Model API Pricing Panel -->
-      <section aria-label="Custom model token pricing" class="rounded-lg border border-[#E4E4E7] bg-white p-4">
+      <!-- Empirical Code Mode vs. Classic Proof Banner -->
+      <section aria-label="Empirical Code Mode value proof" class="rounded-lg border border-[#99F6E4] bg-[#F0FDFA] p-4">
         <div class="flex flex-wrap items-center justify-between gap-2">
           <div>
-            <h2 class="text-[15px] font-semibold text-[#09090B]">
-              API Token Cost Simulator (Baseline: <span class="font-mono-data text-[#0F766E]">{{ analytics.pricing.model }}</span>)
+            <h2 class="text-[15px] font-semibold text-[#0F766E]">
+              Empirical Proof: Why Code Mode Saves Money ({{ analytics.pricing.model }})
             </h2>
-            <p class="text-xs text-[#71717A]">
-              Calculates per-token API spend ($/1M input &amp; output tokens); client subscription plans are not exposed by MCP.
+            <p class="mt-0.5 text-xs text-[#52525B]">
+              Code Mode executes multi-tool joins inside the Monty sandbox instead of streaming raw JSON through LLM context. Per-token API pricing is modeled ($/1M in &amp; out); subscription plans are not exposed by MCP.
             </p>
           </div>
-          <div class="flex flex-wrap items-center gap-1.5">
-            <span
-              v-for="cm in customModelNames"
-              :key="cm"
-              class="inline-flex items-center gap-1 rounded border border-[#99F6E4] bg-[#F0FDFA] px-2 py-0.5 text-xs text-[#0F766E]"
-            >
-              <span class="font-mono-data">{{ cm }}</span>
-              <button
-                type="button"
-                class="ml-0.5 text-[#0F766E] hover:text-[#DC2626]"
-                :aria-label="`Remove custom model ${cm}`"
-                @click="deleteCustomModel(cm)"
-              >
-                ×
-              </button>
+          <div class="flex flex-wrap items-center gap-4 text-xs tabular-nums">
+            <span class="font-semibold text-[#09090B]">
+              {{ formatInt(analytics.summary.total_tokens_saved) }} tokens saved
+            </span>
+            <span class="font-semibold text-[#059669]">
+              {{ formatUsd(analytics.summary.estimated_cost_saved_usd) }} avoided
             </span>
           </div>
-        </div>
-        <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-4 sm:items-end">
-          <Field>
-            <FieldLabel>Custom Model ID</FieldLabel>
-            <Input v-model="customModelInput" class="font-mono-data text-xs" placeholder="e.g. llama-3.3-70b" />
-          </Field>
-          <Field>
-            <FieldLabel>Input $/1M Tokens</FieldLabel>
-            <Input v-model="customInPrice" inputmode="decimal" class="tabular-nums text-xs" />
-          </Field>
-          <Field>
-            <FieldLabel>Output $/1M Tokens</FieldLabel>
-            <Input v-model="customOutPrice" inputmode="decimal" class="tabular-nums text-xs" />
-          </Field>
-          <Button :disabled="pricingSaving" @click="saveCustomModel">
-            Save Custom Model Price
-          </Button>
         </div>
       </section>
 

@@ -82,6 +82,7 @@ const {
   connected: wsConnected,
   events: liveEvents,
   latestRuntime,
+  alerts: liveAlerts,
   totalRunsTick,
 } = useLiveTelemetry();
 
@@ -236,6 +237,36 @@ function formatUsd(n: number | undefined): string {
         <Button data-variant="primary" :disabled="demoBusy" @click="triggerOverviewBurst">
           Run Demo Burst (+8)
         </Button>
+      </section>
+
+      <!-- Active Alerts & System Health Banner -->
+      <section aria-label="Active monitoring alerts" class="space-y-2">
+        <div
+          v-if="liveAlerts.length === 0"
+          class="flex items-center justify-between gap-2 rounded-lg border border-[#A7F3D0] bg-[#ECFDF5] px-4 py-2.5 text-xs text-[#059669]"
+        >
+          <span class="font-medium">System Health Nominal — 0 active SLA, drift, or security alerts.</span>
+          <NuxtLink to="/settings" class="font-medium text-[#0F766E] hover:underline">
+            Configure Alert Rules →
+          </NuxtLink>
+        </div>
+        <div
+          v-for="al in liveAlerts"
+          :key="al.id"
+          role="alert"
+          class="flex flex-wrap items-center justify-between gap-2 rounded-lg border px-4 py-2.5 text-xs"
+          :class="
+            al.severity === 'critical'
+              ? 'border-[#FECACA] bg-[#FEF2F2] text-[#DC2626]'
+              : 'border-[#FDE68A] bg-[#FFFBEB] text-[#D97706]'
+          "
+        >
+          <div>
+            <strong class="font-semibold">{{ al.title }}</strong>
+            <span class="ml-2 text-[#52525B]">{{ al.detail }}</span>
+          </div>
+          <NuxtLink to="/settings" class="font-medium underline">Rules</NuxtLink>
+        </div>
       </section>
 
       <!-- 4-column KPI strip -->
