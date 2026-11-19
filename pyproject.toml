@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcpcodeaway"
+version = "0.1.0"
+description = "Vendor-agnostic Code-Mode Universal MCP Gateway with OIDC/RFC 8693 delegation and Monty sandboxing"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "mcp>=1.9",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "pydantic-monty",
+    "httpx>=0.28",
+    "pyjwt[crypto]>=2.10",
+    "jsonschema>=4.23",
+    "opentelemetry-api>=1.29",
+    "opentelemetry-sdk>=1.29",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+redis = ["redis>=5.2"]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.8",
+]
+
+[project.scripts]
+gateway = "gateway.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gateway"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"benchmarks/*.py" = ["E402"]
