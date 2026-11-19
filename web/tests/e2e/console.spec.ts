@@ -55,7 +55,7 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     await page.getByRole("link", { name: /Settings & Alerts/i }).click();
     await expect(page.getByRole("heading", { name: /Gateway Settings, Alert Rules & Compliance Retention/i })).toBeVisible();
     await expect(page.getByText("qwen3.5-9b")).toBeVisible();
-    await expect(page.getByText(/Custom Alert Rules/i)).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Custom Alert Rules", exact: true })).toBeVisible();
 
     // 6. Onboarding 3-Step Progressive Wizard (Step 2 locked until Inspect Schema)
     await page.getByRole("link", { name: /Onboarding & A\/B Lab/i }).click();
