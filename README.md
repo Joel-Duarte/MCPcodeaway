@@ -78,41 +78,30 @@ uv run gateway compare --scenario reconcile_overdue --persona finance_analyst
 
 Full methodology and raw breakdowns live in [BENCHMARKS.md](BENCHMARKS.md) ([benchmarks/live_llm_results.json](benchmarks/live_llm_results.json) and [benchmarks/subagent_flash_results.json](benchmarks/subagent_flash_results.json)).
 
-### 1. Local `qwen/qwen3.5-9b` (`reasoning_effort=none`, Concurrency 3 in LM Studio)
+MCPcodeaway delivers performance wins across **two orthogonal stages**:
 
-Measured via `benchmarks/live_llm_bench.py` (`--model qwen/qwen3.5-9b --reasoning-effort none --concurrency 3`) against the 4 fake enterprise MCP/OpenAPI servers:
+### Stage 1: SOTA Discovery Compression (Applies to BOTH Classic MCP & Code Mode)
 
-| Workload | Mode | Turns | MCP Calls | Subcalls | Total Tokens | Wall Time (ms) | Retries | Grounded | Correct |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: |
-| `reconcile_overdue` (30-row join) | `traditional` | **3** | 12 | 12 | **10,968** | **95,636.15** | **0** | — | ✅ |
-| `reconcile_overdue` (30-row join) | `codemode` | 10 | 9 | 7 | 47,373 | 179,253.67 | 4 | ✅ | ✅ |
-| `reconcile_bulk_200` (200-row join) | `traditional` | 2 | 3 | 3 | 39,230 | 62,034.48 | 0 | — | ❌ |
-| `reconcile_bulk_200` (200-row join) | `codemode` | **3** | **2** | **3** | **7,336 (-81.3%)** | **45,700.87 (-26.3%)** | **0** | ✅ | ✅ |
-| `trial_balance_audit` (variance + lookup) | `traditional` | **3** | 4 | 4 | **4,304** | **16,213.88** | **0** | — | ✅ |
-| `trial_balance_audit` (variance + lookup) | `codemode` | 3 | 4 | 4 | 10,323 | 34,515.09 | 0 | ✅ | ✅ |
-| `single_lookup` (1 point read) | `traditional` | **2** | **1** | 1 | **2,065** | **6,590.28** | **0** | — | ✅ |
-| `single_lookup` (1 point read) | `codemode` | 3 | 2 | 1 | 4,866 | 10,039.20 | 0 | ✅ | ✅ |
+Before an agent executes any tool, deferred discovery (`list_servers` + `search_tools` with `BM25`, `Embedding`, or `System 1`—or zero-round-trip `X-Intent` on initial connect) keeps the initial prompt surface constant instead of loading every enterprise MCP schema on every turn:
 
-### 2. Frontier `flash` Agent (`antigravity_flash_mcp`) on the Same Fake MCP Servers
+| Enterprise Catalog Size | Standard Upfront MCP (`tools/list` on every turn) | MCPcodeaway Deferred Discovery (`list_servers` + `search_tools` + `execute_code`) | Upfront Schema Savings |
+| :--- | :---: | :---: | :---: |
+| **16 tools** (Base 4 servers) | ~1,600 tokens | **~463 tokens** (3 meta-tools) | **71.1% fewer tokens** |
+| **66 tools** (+50 synthetic tools) | ~5,073 tokens | **~463 tokens** (3 meta-tools) | **90.9% fewer tokens** |
+| **500 tools** (Enterprise scale) | ~50,726 tokens | **~463 tokens** (3 meta-tools) | **99.1% fewer tokens** |
 
-Measured over live HTTP JSON-RPC (`POST /mcp?mode=traditional` vs. `POST /mcp?mode=codemode&require_grounding=true`):
+### Stage 2: Execution & Payload Quadrant (Classic MCP vs. Code Mode)
 
-| Workload | Mode | HTTP Trips | MCP Calls | Subcalls | Wire Bytes | Est. Tokens | Latency (ms) | Grounded | Correct | Code Mode Delta |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: | :--- |
-| `reconcile_overdue` (30-row join) | `traditional` | 4 | 3 | 3 | 14,199 B | 3,550 | 112.81 | — | ✅ | — |
-| `reconcile_overdue` (30-row join) | `codemode` | **3** | **2** | 3 | **12,491 B** | **3,123** | **25.73** | ✅ | ✅ | **-12.03% tokens / -1 trip (4.4x faster)** |
-| `reconcile_bulk_200` (200-row join) | `traditional` | 4 | 3 | 3 | 199,817 B | 49,955 | 23.84 | — | ✅ | — |
-| `reconcile_bulk_200` (200-row join) | `codemode` | **3** | **2** | 3 | **12,593 B** | **3,149** | **28.88** | ✅ | ✅ | **-93.70% tokens / -93.70% bytes / -1 trip** |
-| `trial_balance_audit` (4-call fanout) | `traditional` | 5 | 4 | 4 | **8,937 B** | **2,235** | 15.08 | — | ✅ | — |
-| `trial_balance_audit` (4-call fanout) | `codemode` | **3** | **2** | 4 | 11,464 B | 2,866 | **13.62** | ✅ | ✅ | **-2 HTTP trips (+28.23% stub tokens)** |
-| `single_lookup` (1 point read) | `traditional` | **2** | **1** | 1 | **6,474 B** | **1,619** | **4.68** | — | ✅ | — |
-| `single_lookup` (1 point read) | `codemode` | 3 | 2 | 1 | 9,529 B | 2,383 | 8.15 | ✅ | ✅ | **Classic wins (+47.19% tokens in codemode)** |
+Measured against the 4 fake enterprise MCP/OpenAPI servers comparing a local non-reasoning 9B model (`qwen/qwen3.5-9b`, `reasoning_effort=none`, concurrency 3 in LM Studio) and a frontier coding agent (`antigravity_flash_mcp` / Gemini Flash subagent):
 
-### 3. When to Use Classic MCP vs. Code Mode (Model & Workload Guide)
+| Task Shape | Small Non-Reasoning Model (`qwen/qwen3.5-9b`, `reasoning_effort=none`, Concurrency 3) | Capable Coding Model (`flash` Subagent) | Why? |
+| :--- | :--- | :--- | :--- |
+| **1-Call Point Lookup**<br>*(`single_lookup`: fetch 1 contract)* | **Classic Wins**<br>`2,065` vs `4,866` tok (**2.4x cheaper**, `2` vs `3` turns) | **Classic Wins**<br>`1,619` vs `2,383` tok (**1.5x cheaper**, `4.68 ms` vs `8.15 ms`) | No loop or filtering needed; direct JSON-RPC call has lower overhead than writing a Python script. |
+| **Small Fan-Out**<br>*(`trial_balance_audit`: 4 small reads)* | **Classic Wins**<br>`4,304` vs `10,323` tok (`16.2 s` vs `34.5 s`) | **Tie / Slight Classic Token Edge**<br>`2,235` vs `2,866` tok, but Code Mode saves **2 HTTP trips** (`13.62 ms` vs `15.08 ms`) | Payloads are tiny (`<9 KB`), so stub discovery overhead slightly exceeds raw response size unless network RTT is high. |
+| **Medium Multi-Step Join**<br>*(`reconcile_overdue`: 30 rows + cross-system join)* | **Classic Wins**<br>`10,968` vs `47,373` tok *(non-reasoning 9B hit 4 Python dict-key retries in Monty)* | **Code Mode Wins**<br>**`3,123` vs `3,550` tok (-12.0%)** and **4.4x faster** (`25.73 ms` vs `112.81 ms`) | Small non-reasoning models fumble nested dict keys in Python without reasoning tokens; capable coding models write 1 clean `asyncio.gather` script with `0` retries. |
+| **Large Bulk Join**<br>*(`reconcile_bulk_200`: 200 rows, ~200 KB raw JSON)* | **Code Mode Wins Decisively**<br>**`7,336` tok (`✅ Pass`)** vs `39,230` tok (`❌ Fail`) (**81.3% fewer tokens**, **26.3% faster**) | **Code Mode Wins Decisively**<br>**`3,149` tok (`✅ Pass`)** vs `49,955` tok (`✅ Pass`) (**93.7% fewer tokens**, `12.6 KB` vs `199.8 KB`) | Raw 200-row JSON dumps flood the LLM context in Classic MCP (causing 9B to lose track of arithmetic and fail), whereas Monty filters 200 KB in-memory and returns 120 bytes. |
 
-- **Smaller / Non-Reasoning Models (`qwen/qwen3.5-9b`, `reasoning_effort=none`) on Small Payloads:** Classic MCP (`traditional`) is more token-efficient on small catalogs and small responses (`single_lookup`: `2,065` vs `4,866` tokens; `trial_balance_audit`: `4,304` vs `10,323` tokens; `reconcile_overdue`: `10,968` vs `47,373` tokens where 9B took 4 code retries).
-- **Large Payloads & Multi-System Joins (`reconcile_bulk_200`, 200 rows):** Classic MCP dumped `39,230` tokens of raw JSON into `qwen/qwen3.5-9b` and **failed accuracy (`correct=False`)**, whereas Code Mode filtered the 200 rows inside Monty in 1 script (`0` retries), succeeded (`correct=True`, `grounded=True`), and cut tokens by **81.3%** on `qwen/qwen3.5-9b` (`7,336` tokens) and **93.7%** on `flash` (`3,149` vs `49,955` tokens).
-- **Stronger Coding Models (`flash`+):** Write zero-retry `asyncio.gather` Monty scripts immediately, winning on multi-backend joins (`reconcile_overdue` and `reconcile_bulk_200`) while Classic MCP remains ideal for 1-call point lookups (`single_lookup`) via `?execution=auto`.
+> **Automated Routing (`?execution=auto`) & Live A/B Testing:** MCPcodeaway's algorithmic scorer ([`src/gateway/ab_testing.py`](src/gateway/ab_testing.py)) and per-upstream A/B traffic splitter automatically route simple point lookups to **Classic MCP** and multi-tool/large-payload joins to **Code Mode**, while tracking per-model and per-group outcomes at `/admin/analytics/usage`.
 
 ## Vendor-Agnostic Integrations & Scaling
 
