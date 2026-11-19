@@ -60,6 +60,8 @@ class AbExperimentConfig(BaseModel):
     experiment_id: str = ""
     codemode_traffic_pct: int = Field(default=50, ge=0, le=100)
     read_only_only: bool = True
+    auto_promote_min_runs: int = Field(default=10, ge=2, le=10000)
+    auto_switch_enabled: bool = True
 
 
 class UpstreamConfig(BaseModel):

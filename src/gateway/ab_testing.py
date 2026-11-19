@@ -40,6 +40,33 @@ _BATCH_INTENT_KEYWORDS = (
     "correlate",
 )
 
+_SMALL_MODEL_HINTS = (
+    "9b",
+    "8b",
+    "7b",
+    "4b",
+    "3b",
+    "1b",
+    "mini",
+    "nano",
+    "lite",
+    "small",
+)
+
+_STRONG_CODING_MODEL_HINTS = (
+    "flash",
+    "pro",
+    "sonnet",
+    "opus",
+    "gpt-5",
+    "gpt-6",
+    "o3",
+    "o4",
+    "codex",
+    "70b",
+    "72b",
+)
+
 
 class ModeFactor(BaseModel):
     """Single scored factor explaining an algorithmic execution mode choice."""
@@ -93,6 +120,7 @@ def evaluate_mode_algorithm(
     typed_output_ratio: float = 0.0,
     intent: str | None = None,
     server_count: int = 1,
+    model_name: str | None = None,
 ) -> ModeDecision:
     """Compute a deterministic 0-100 Code Mode suitability score and execution decision."""
     score = 40.0
@@ -185,6 +213,30 @@ def evaluate_mode_algorithm(
             )
         )
 
+    model_lower = (model_name or "").strip().lower()
+    if model_lower:
+        if any(hint in model_lower for hint in _STRONG_CODING_MODEL_HINTS):
+            score += 15.0
+            factors.append(
+                ModeFactor(
+                    name="coding_model_boost",
+                    delta=15.0,
+                    detail=f"Model '{model_name}' supports zero-retry async Monty Python synthesis",
+                )
+            )
+        elif any(hint in model_lower for hint in _SMALL_MODEL_HINTS) and avg_payload_bytes < 16384:
+            score -= 18.0
+            factors.append(
+                ModeFactor(
+                    name="small_model_classic_preference",
+                    delta=-18.0,
+                    detail=(
+                        f"Model '{model_name}' prefers direct Classic tool calls on small/medium "
+                        "payloads"
+                    ),
+                )
+            )
+
     score = max(0.0, min(100.0, round(score, 1)))
     if score >= 55.0:
         disc: DiscoveryMode = (
@@ -224,12 +276,68 @@ def resolve_ab_experiment_variant(
     upstream: UpstreamConfig,
     identity: CallerIdentity,
     request_id: str,
+    *,
+    historical_runs: list[dict[str, Any]] | None = None,
+    model_name: str | None = None,
 ) -> tuple[GatewayMode, str, str, str] | None:
-    """Deterministically assign a caller request into an upstream Classic vs Code Mode split."""
+    """Assign a request into a Classic vs. Code Mode A/B split or auto-promote winner."""
     exp = upstream.ab_experiment
     if exp is None or not exp.enabled:
         return None
     exp_id = exp.experiment_id or f"exp_{upstream.name}"
+
+    if exp.auto_switch_enabled and historical_runs:
+        scoped_runs = [
+            r
+            for r in historical_runs
+            if r.get("experiment_id") == exp_id
+            and (not model_name or (r.get("model_name") or "") == model_name)
+        ]
+        if len(scoped_runs) >= exp.auto_promote_min_runs:
+            arms: dict[str, dict[str, float]] = {}
+            for r in scoped_runs:
+                v = str(r.get("ab_variant") or "")
+                if v not in {"codemode", "classic"}:
+                    continue
+                b = arms.setdefault(
+                    v,
+                    {"runs": 0.0, "errors": 0.0, "tokens_saved": 0.0, "tokens_used": 0.0},
+                )
+                b["runs"] += 1.0
+                if not r.get("ok"):
+                    b["errors"] += 1.0
+                b["tokens_saved"] += float(r.get("estimated_tokens_saved", 0)) + float(
+                    r.get("schema_tokens_saved", 0)
+                )
+                b["tokens_used"] += float(r.get("tokens_used_est", 0))
+            cm = arms.get("codemode")
+            cl = arms.get("classic")
+            if cm and cl and cm["runs"] >= 1.0 and cl["runs"] >= 1.0:
+                cm_err = (cm["errors"] / cm["runs"]) * 100.0
+                cl_err = (cl["errors"] / cl["runs"]) * 100.0
+                cm_avg_saved = cm["tokens_saved"] / cm["runs"]
+                cl_avg_saved = cl["tokens_saved"] / cl["runs"]
+                model_tag = f" model={model_name}" if model_name else ""
+                if cm_avg_saved >= cl_avg_saved and cm_err <= cl_err + 5.0:
+                    return (
+                        "codemode",
+                        exp_id,
+                        "codemode",
+                        (
+                            f"ab_auto_promoted:{exp_id}:codemode "
+                            f"(n={len(scoped_runs)}{model_tag} saved={round(cm_avg_saved, 1)})"
+                        ),
+                    )
+                return (
+                    "traditional",
+                    exp_id,
+                    "classic",
+                    (
+                        f"ab_auto_promoted:{exp_id}:classic "
+                        f"(n={len(scoped_runs)}{model_tag} err_cm={round(cm_err, 1)}%)"
+                    ),
+                )
+
     seed = f"{exp_id}:{identity.tenant_id}:{identity.sub}:{request_id}".encode()
     bucket = int.from_bytes(hashlib.sha256(seed).digest()[:4], "big") % 100
     if bucket < exp.codemode_traffic_pct:

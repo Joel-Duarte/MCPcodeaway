@@ -92,3 +92,41 @@ MCPcodeaway turns these benchmark findings into automated runtime routing ([`src
 1. **Zero-Round-Trip Intent Discovery (`X-Intent` / `discovery=x_intent`):** When the agent harness passes `X-Intent` on connect (or `tools/list` `params.query`), the gateway pre-hydrates only the matching Python stubs or Classic tool schemas on Turn 1—eliminating the extra `search_tools` round-trip.
 2. **Algorithmic Auto-Router (`?execution=auto`):** Scores each request (`0–100`) using accessible tool count, historical payload size (`raw_upstream_bytes`), mutating tool ratio, and intent keywords (`reconcile`, `join`, `bulk`, `compare`)—routing 1-call point lookups to **Classic MCP** and multi-tool/large-payload joins to **Code Mode**.
 3. **Per-Upstream A/B Traffic Splitting & Model Analytics:** Operators can enable `ab_experiment` (`codemode_traffic_pct: 50`) on any upstream and pass `X-Model-Name` (or `client_id`) to compare error rates, latency, and token savings per model/group at `/admin/analytics/usage` (`ab_experiments[exp_id].recommended_winner`).
+
+---
+
+<details>
+<summary><strong>Appendix: SOTA Discovery Backend Benchmarks (BM25 vs. Embeddings vs. Local System 1 Sidecar) & Pros/Cons</strong></summary>
+
+Measured live against local LM Studio (`http://127.0.0.1:1234/v1`) across 20 queries (10 direct keyword queries + 10 paraphrased semantic queries with zero identifier overlap) at 10, 60, and 160 tools using `benchmarks/discovery_benchmark.py --live-lmstudio`:
+- **Embedding model:** `text-embedding-qwen3-embedding-0.6b` (cached per `catalog_version`)
+- **System 1 sidecar model:** `laya` (`POST /v1/systemone` calibrated `noul` probability endpoint)
+
+| Catalog Size | Discovery Backend | Overall Recall@5 | Direct Recall@5 | Semantic Recall@5 | MRR | Server Routing Acc | Mean Latency (ms) | Extra Token / GPU Cost |
+| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| **10 tools** | `bm25` (Default) | 0.833 | **1.000** | 0.667 | 0.777 | 0.800 | **0.11 ms** | **0 (CPU-only, stdlib)** |
+| **10 tools** | `embedding` | **0.958** | **1.000** | **0.917** | **0.975** | 0.900 | 104.07 ms | Low (cached vectors) |
+| **10 tools** | `hybrid_system1` | 0.950 | **1.000** | 0.900 | 0.917 | **0.950** | 87.94 ms | Moderate (2 LLM sidecar calls) |
+| **60 tools** | `bm25` (Default) | 0.800 | **1.000** | 0.600 | 0.742 | 0.800 | **0.60 ms** | **0 (CPU-only, stdlib)** |
+| **60 tools** | `embedding` | **0.925** | **1.000** | **0.850** | **0.925** | **0.900** | 102.73 ms | Low (1 query embedding after warm cache) |
+| **60 tools** | `hybrid_system1` | 0.825 | **1.000** | 0.650 | 0.825 | 0.800 | 138.91 ms | High (scores top-25 BM25 candidates via LLM) |
+| **60 tools** | `system1` (raw) | 0.625 | 0.900 | 0.350 | 0.650 | 0.650 | 299.20 ms | Very High (40+ parallel `noul` questions) |
+| **160 tools** | `bm25` (Default) | 0.800 | **1.000** | 0.600 | 0.742 | 0.800 | **1.32 ms** | **0 (CPU-only, stdlib)** |
+| **160 tools** | `embedding` | **0.925** | **1.000** | **0.850** | **0.925** | **0.900** | 169.31 ms | Low (1 query embedding after warm cache) |
+| **160 tools** | `hybrid_system1` | 0.825 | **1.000** | 0.650 | 0.825 | 0.800 | 140.12 ms | High (2 batched `/v1/systemone` calls per search) |
+| **160 tools** | `system1` (raw) | 0.625 | 0.900 | 0.350 | 0.650 | 0.650 | 311.28 ms | Very High (truncates past 40 tools) |
+
+### Pros & Cons of Each Discovery Strategy
+
+1. **`bm25` (Default Production Choice — `GATEWAY_DISCOVERY_BACKEND=bm25`)**
+   - **Pros:** Sub-millisecond (`0.1–1.3 ms` even at 160 tools), **zero token cost**, zero external GPU/API dependency, `100%` recall when the agent uses domain keywords (which agents almost always do when calling `search_tools(query="overdue invoices snowflake")`).
+   - **Cons:** Lower recall (`60%`) on purely conversational user queries that share zero words with the tool names (e.g., *"Why cannot shoppers tap their credit cards?"* -> `list_terminal_incidents`).
+2. **`embedding` (Recommended SOTA Upgrade for Raw Natural-Language `X-Intent` — `GATEWAY_DISCOVERY_BACKEND=embedding`)**
+   - **Pros:** Highest accuracy across all catalog sizes (**`92.5%–95.8%` Recall@5, `0.925–0.975` MRR**), caches tool vectors in-memory per `catalog_version` so runtime searches only embed the short query string, and automatically falls back to `bm25` if the embedding server is unreachable.
+   - **Cons:** Requires an OpenAI-compatible `/v1/embeddings` endpoint (`text-embedding-qwen3-embedding-0.6b`, `nomic-embed-text`, etc.) and adds `~15–100 ms` per uncached query.
+3. **`system1` / `hybrid_system1` (Experimental LLM Sidecar — Optional)**
+   - **Pros:** Useful for two-stage hierarchical server routing on small catalogs (`95%` server routing accuracy at 10 tools).
+   - **Cons:** Slower (`140–311 ms`), consumes LLM inference tokens/compute on every discovery call, and degrades as catalog size grows (`62.5%` raw recall at 60–160 tools) compared to cached vector embeddings (`92.5%`). Keep disabled by default in favor of **`bm25` + `embedding`**.
+
+</details>
+

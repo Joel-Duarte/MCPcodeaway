@@ -436,6 +436,7 @@ class GatewayRuntime:
         intent: str | None,
         request_id: str,
         explicit_override: bool,
+        model_name: str | None = None,
     ) -> tuple[
         ExecutionMode,
         DiscoveryMode,
@@ -453,9 +454,16 @@ class GatewayRuntime:
             if self.policy.can_access_upstream(identity, upstream)[0]:
                 accessible_srvs.append(upstream)
 
+        recent = await self.store.list_runs(limit=50, tenant_id=identity.tenant_id)
         if not explicit_override or requested_exec == "auto":
             for upstream in accessible_srvs:
-                split = resolve_ab_experiment_variant(upstream, identity, request_id)
+                split = resolve_ab_experiment_variant(
+                    upstream,
+                    identity,
+                    request_id,
+                    historical_runs=recent,
+                    model_name=model_name,
+                )
                 if split is not None:
                     var_mode, exp_id, variant_lbl, reason = split
                     var_exec, var_disc = _MODE_TO_AXES[var_mode]
@@ -481,9 +489,8 @@ class GatewayRuntime:
         typed_ratio = (
             sum(1 for t in tools if t.output_schema is not None) / tool_count if tool_count else 0.0
         )
-        recent = await self.store.list_runs(limit=30, tenant_id=identity.tenant_id)
         avg_bytes = (
-            sum(int(r.get("raw_upstream_bytes", 0)) for r in recent) / len(recent)
+            sum(int(r.get("raw_upstream_bytes", 0)) for r in recent[:30]) / len(recent[:30])
             if recent
             else 0.0
         )
@@ -495,6 +502,7 @@ class GatewayRuntime:
             typed_output_ratio=typed_ratio,
             intent=intent,
             server_count=max(1, len({t.server for t in tools})),
+            model_name=model_name,
         )
         return (
             decision.execution,
@@ -804,6 +812,7 @@ class GatewayRuntime:
         mode_decision_score: float | None = None,
         experiment_id: str | None = None,
         ab_variant: str | None = None,
+        model_name: str | None = None,
     ) -> dict[str, Any]:
         """Run Code Mode Python script in SandboxBackend and record audit telemetry."""
         started = time.perf_counter()
@@ -826,6 +835,7 @@ class GatewayRuntime:
                 mode_decision_score=mode_decision_score,
                 experiment_id=experiment_id,
                 ab_variant=ab_variant,
+                model_name=model_name,
             )
         finally:
             self.process_stats.active_executions = max(0, self.process_stats.active_executions - 1)
@@ -848,6 +858,7 @@ class GatewayRuntime:
         mode_decision_score: float | None = None,
         experiment_id: str | None = None,
         ab_variant: str | None = None,
+        model_name: str | None = None,
     ) -> dict[str, Any]:
         await self.ensure_catalog_for_identity(identity)
         if allowed_servers is not None and servers is not None:
@@ -1012,6 +1023,7 @@ class GatewayRuntime:
             mode_decision_score=mode_decision_score,
             experiment_id=experiment_id,
             ab_variant=ab_variant,
+            model_name=model_name,
             monty_spawn_ms=sandbox_res.monty_spawn_ms,
             monty_exec_ms=sandbox_res.monty_exec_ms,
         )
@@ -1054,6 +1066,7 @@ class GatewayRuntime:
         mode_decision_score: float | None = None,
         experiment_id: str | None = None,
         ab_variant: str | None = None,
+        model_name: str | None = None,
     ) -> dict[str, Any]:
         """Invoke a single upstream tool directly (traditional / traditional_discover / hybrid)."""
         started = time.perf_counter()
@@ -1108,6 +1121,7 @@ class GatewayRuntime:
                 mode_decision_score=mode_decision_score,
                 experiment_id=experiment_id,
                 ab_variant=ab_variant,
+                model_name=model_name,
             )
             self._record_execution_metrics(
                 identity=identity,
@@ -1350,6 +1364,7 @@ def create_gateway_app(
         discovery_mode: str | None = Query(default=None),
         discovery: str | None = Query(default=None),
         servers: str | None = Query(default=None),
+        model: str | None = Query(default=None),
         require_grounding: bool | None = Query(default=None),
         x_gateway_mode: str | None = Header(default=None),
         x_execution_mode: str | None = Header(default=None),
@@ -1357,6 +1372,8 @@ def create_gateway_app(
         x_discovery_backend: str | None = Header(default=None),
         x_mcp_servers: str | None = Header(default=None),
         x_intent: str | None = Header(default=None),
+        x_model_name: str | None = Header(default=None),
+        x_agent_model: str | None = Header(default=None),
         x_require_grounding: str | None = Header(default=None),
         x_request_id: str | None = Header(default=None),
         mcp_session_id: str | None = Header(default=None),
@@ -1426,8 +1443,32 @@ def create_gateway_app(
                 req_id = payload.get("id")
                 method = payload.get("method")
                 params = payload.get("params") or {}
+                client_info = params.get("clientInfo") if isinstance(params, dict) else None
+                client_model = (
+                    (client_info.get("model") or client_info.get("name"))
+                    if isinstance(client_info, dict)
+                    else None
+                )
+                effective_model_name = (
+                    model
+                    or x_model_name
+                    or x_agent_model
+                    or (params.get("model") if isinstance(params, dict) else None)
+                    or client_model
+                )
+                if isinstance(effective_model_name, str):
+                    effective_model_name = effective_model_name.strip() or None
+                else:
+                    effective_model_name = None
+                effective_intent = x_intent or (
+                    str(params.get("intent") or params.get("query") or "").strip() or None
+                    if isinstance(params, dict) and (params.get("intent") or params.get("query"))
+                    else None
+                )
                 mcp_span.set_attribute("mcp.method", str(method))
                 mcp_span.set_attribute("mcp.mode", effective_mode)
+                if effective_model_name:
+                    mcp_span.set_attribute("mcp.model_name", effective_model_name)
 
                 def _finish(resp: JSONResponse, status_label: str = "ok") -> JSONResponse:
                     dur_ms = round((time.perf_counter() - req_started) * 1000, 3)
@@ -1447,12 +1488,15 @@ def create_gateway_app(
                         mode_decision_reason=mode_decision_reason,
                         experiment_id=experiment_id,
                         ab_variant=ab_variant,
+                        model_name=effective_model_name,
                         status=status_label,
                         duration_ms=dur_ms,
                     )
                     resp.headers["X-Request-Id"] = req_corr_id
                     if mode_decision_reason:
                         resp.headers["X-Gateway-Mode-Decision"] = mode_decision_reason
+                    if effective_model_name:
+                        resp.headers["X-Gateway-Model"] = effective_model_name
                     return resp
 
                 if method == "initialize":
@@ -1501,9 +1545,10 @@ def create_gateway_app(
                     requested_disc=eff_disc_mode,
                     requested_mode=effective_mode,
                     allowed_servers=allowed_servers,
-                    intent=x_intent,
+                    intent=effective_intent,
                     request_id=req_corr_id,
                     explicit_override=has_explicit_mode,
+                    model_name=effective_model_name,
                 )
                 mcp_span.set_attribute("mcp.mode", effective_mode)
                 if mode_decision_reason:
@@ -1628,6 +1673,7 @@ def create_gateway_app(
                             mode_decision_score=mode_decision_score,
                             experiment_id=experiment_id,
                             ab_variant=ab_variant,
+                            model_name=effective_model_name,
                         )
                         return _finish(
                             _jsonrpc_ok(
@@ -1666,6 +1712,7 @@ def create_gateway_app(
                             mode_decision_score=mode_decision_score,
                             experiment_id=experiment_id,
                             ab_variant=ab_variant,
+                            model_name=effective_model_name,
                         )
                     except KeyError as exc:
                         return _finish(_jsonrpc_err(req_id, -32601, str(exc)), status_label="error")

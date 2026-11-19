@@ -691,6 +691,78 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
             )
             assert exps.status_code == 200
             assert "exp_inv_split" in exps.json()["results"]
+
+            # Layer 4: Model-aware scoring + self-learning A/B auto-promotion per model.
+            qwen_small = evaluate_mode_algorithm(
+                tool_count=8,
+                classic_schema_tokens=800,
+                avg_payload_bytes=1200,
+                typed_output_ratio=0.5,
+                model_name="qwen/qwen3.5-9b",
+            )
+            flash_strong = evaluate_mode_algorithm(
+                tool_count=8,
+                classic_schema_tokens=800,
+                avg_payload_bytes=1200,
+                typed_output_ratio=0.5,
+                model_name="gemini-2.5-flash",
+            )
+            assert qwen_small.execution == "classic"
+            assert flash_strong.execution == "codemode"
+
+            auto_promote_cfg = cfg.model_copy(
+                update={
+                    "ab_experiment": AbExperimentConfig(
+                        enabled=True,
+                        experiment_id="exp_model_learn",
+                        codemode_traffic_pct=50,
+                        auto_promote_min_runs=2,
+                        auto_switch_enabled=True,
+                    )
+                }
+            )
+            rt.registry.upsert(auto_promote_cfg)
+            await rt.store.record_run(
+                {
+                    "run_id": "learn_cm_1",
+                    "tenant_id": "tenant-acme-dev",
+                    "user_sub": "u1",
+                    "mode": "codemode",
+                    "ok": True,
+                    "experiment_id": "exp_model_learn",
+                    "ab_variant": "codemode",
+                    "model_name": "gemini-2.5-flash",
+                    "estimated_tokens_saved": 4000,
+                    "schema_tokens_saved": 500,
+                }
+            )
+            await rt.store.record_run(
+                {
+                    "run_id": "learn_cl_1",
+                    "tenant_id": "tenant-acme-dev",
+                    "user_sub": "u1",
+                    "mode": "traditional",
+                    "ok": True,
+                    "experiment_id": "exp_model_learn",
+                    "ab_variant": "classic",
+                    "model_name": "gemini-2.5-flash",
+                    "estimated_tokens_saved": 0,
+                    "schema_tokens_saved": 0,
+                }
+            )
+            learned_resp = await gw.post(
+                "/mcp?execution=auto",
+                headers={
+                    "Authorization": f"Bearer {fin_tok}",
+                    "X-Model-Name": "gemini-2.5-flash",
+                },
+                json={"jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {}},
+            )
+            assert learned_resp.status_code == 200
+            assert "ab_auto_promoted:exp_model_learn:codemode" in learned_resp.headers.get(
+                "x-gateway-mode-decision", ""
+            )
+            assert learned_resp.headers.get("x-gateway-model") == "gemini-2.5-flash"
     finally:
         await rt.shutdown()
         await http_client.aclose()
