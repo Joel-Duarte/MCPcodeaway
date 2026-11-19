@@ -64,6 +64,7 @@ from gateway.upstream_clients import (
     UpstreamClientManager,
     build_agent_onboarding_prompt,
     inspect_upstream,
+    validate_upstream_url,
 )
 
 _VALID_MODES: set[str] = {
@@ -208,7 +209,7 @@ class GatewayRuntime:
         preloaded_tools: dict[str, list[DiscoveredTool]] | None = None,
     ) -> None:
         self.settings = settings or GatewaySettings()
-        configure_telemetry()
+        configure_telemetry(otlp_endpoint=self.settings.otlp_endpoint)
         if cache is not None:
             self.cache: CacheBackend = cache
         elif self.settings.redis_url:
@@ -1094,27 +1095,89 @@ def create_gateway_app(
 
         return _jsonrpc_err(req_id, -32601, f"Unsupported MCP method '{method}'")
 
+    async def _authorize_control_plane(
+        authorization: str | None,
+        *,
+        require_admin_role: bool = True,
+    ) -> CallerIdentity | None:
+        if authorization:
+            try:
+                identity = await runtime.validator.validate_authorization_header(authorization)
+            except AuthError as exc:
+                headers = (
+                    {"WWW-Authenticate": exc.www_authenticate} if exc.www_authenticate else None
+                )
+                raise HTTPException(
+                    status_code=exc.status_code, detail=exc.detail, headers=headers
+                ) from exc
+            if require_admin_role and not (set(identity.roles) & set(runtime.settings.admin_roles)):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Admin role required for control-plane access.",
+                )
+            return identity
+        if runtime.settings.admin_auth_required:
+            raise HTTPException(
+                status_code=401,
+                detail="Authorization Bearer token required for control-plane access.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return None
+
+    def _resolve_audit_tenant_scope(
+        identity: CallerIdentity | None,
+        requested_tenant: str | None,
+    ) -> str | None:
+        if identity is None:
+            return requested_tenant
+        if set(identity.roles) & set(runtime.settings.admin_roles):
+            return requested_tenant
+        if requested_tenant is not None and requested_tenant != identity.tenant_id:
+            raise HTTPException(status_code=403, detail="Cross-tenant audit access denied.")
+        return identity.tenant_id
+
     @app.get("/audit/runs")
     async def audit_runs(
         limit: int = Query(default=50, ge=1, le=200),
         tenant_id: str | None = Query(default=None),
+        authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        runs = await runtime.store.list_runs(limit=limit, tenant_id=tenant_id)
+        identity = await _authorize_control_plane(authorization, require_admin_role=False)
+        effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
+        runs = await runtime.store.list_runs(limit=limit, tenant_id=effective_tenant)
         return {"count": len(runs), "runs": runs}
 
     @app.get("/audit/runs/{run_id}")
-    async def audit_run_detail(run_id: str) -> dict[str, Any]:
+    async def audit_run_detail(
+        run_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        identity = await _authorize_control_plane(authorization, require_admin_role=False)
         run = await runtime.store.get_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+        if (
+            identity is not None
+            and not (set(identity.roles) & set(runtime.settings.admin_roles))
+            and run.get("tenant_id") != identity.tenant_id
+        ):
+            raise HTTPException(status_code=403, detail="Cross-tenant audit run access denied.")
         return run
 
     @app.get("/audit/summary")
-    async def audit_summary() -> dict[str, Any]:
-        return await runtime.telemetry.summary()
+    async def audit_summary(
+        tenant_id: str | None = Query(default=None),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        identity = await _authorize_control_plane(authorization, require_admin_role=False)
+        effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
+        return await runtime.telemetry.summary(tenant_id=effective_tenant)
 
     @app.get("/admin/upstreams")
-    async def list_admin_upstreams() -> dict[str, Any]:
+    async def list_admin_upstreams(
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        await _authorize_control_plane(authorization, require_admin_role=True)
         upstreams = runtime.registry.list_upstreams(include_disabled=True)
         return {
             "app_env": runtime.settings.app_env,
@@ -1129,6 +1192,17 @@ def create_gateway_app(
     async def _inspect_candidate(
         cfg: UpstreamConfig, authorization: str | None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if runtime.settings.ssrf_protection_enabled:
+            try:
+                for candidate_url in (cfg.url, cfg.openapi_spec_url):
+                    validate_upstream_url(
+                        candidate_url,
+                        app_env=runtime.settings.app_env,
+                        block_private_ips_in_prod=runtime.settings.block_private_ips_in_prod,
+                        allowed_hosts=runtime.settings.allowed_upstream_hosts,
+                    )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         headers: dict[str, str] = {}
         if authorization:
             try:
@@ -1160,7 +1234,10 @@ def create_gateway_app(
         return inspection, audit
 
     @app.get("/admin/upstreams/agent-prompt")
-    async def admin_agent_onboarding_prompt() -> dict[str, Any]:
+    async def admin_agent_onboarding_prompt(
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        await _authorize_control_plane(authorization, require_admin_role=True)
         return {
             "prompt": build_agent_onboarding_prompt(),
             "schema": UpstreamConfig.model_json_schema(),
@@ -1171,6 +1248,7 @@ def create_gateway_app(
         cfg: UpstreamConfig,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
+        await _authorize_control_plane(authorization, require_admin_role=True)
         inspection, audit = await _inspect_candidate(cfg, authorization)
         return {"inspection": inspection, "onboarding_audit": audit}
 
@@ -1187,6 +1265,7 @@ def create_gateway_app(
             )
         if runtime.settings.app_env == "prod" and cfg.type == "mcp_stdio":
             raise HTTPException(status_code=403, detail="mcp_stdio upstreams are blocked in prod")
+        await _authorize_control_plane(authorization, require_admin_role=True)
 
         inspection, audit = await _inspect_candidate(cfg, authorization)
         await runtime.store.save_dynamic_upstream(cfg.name, cfg.model_dump(exclude_none=True))
@@ -1200,12 +1279,16 @@ def create_gateway_app(
         }
 
     @app.delete("/admin/upstreams/{name}")
-    async def delete_admin_upstream(name: str) -> dict[str, Any]:
+    async def delete_admin_upstream(
+        name: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
         if not runtime.settings.dynamic_upstreams_permitted:
             raise HTTPException(
                 status_code=403,
                 detail="Dynamic upstream deletion is locked in read-only/prod.",
             )
+        await _authorize_control_plane(authorization, require_admin_role=True)
         deleted = await runtime.store.delete_dynamic_upstream(name)
         if not deleted:
             raise HTTPException(

@@ -11,21 +11,56 @@ from typing import Any
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
 
 from gateway.auth import CallerIdentity
 from gateway.dispatcher import SubcallRecord
 from gateway.state import AuditStore
 
 _OTEL_CONFIGURED = False
+_ATTACHED_EXPORTERS: set[int] = set()
 
 
-def configure_telemetry(service_name: str = "mcpcodeaway-gateway") -> trace.Tracer:
-    """Initialize OpenTelemetry TracerProvider once and return the gateway tracer."""
+def configure_telemetry(
+    service_name: str = "mcpcodeaway-gateway",
+    otlp_endpoint: str | None = None,
+    span_exporter: Any | None = None,
+) -> trace.Tracer:
+    """Initialize OpenTelemetry TracerProvider once and optionally attach an exporter."""
     global _OTEL_CONFIGURED
     if not _OTEL_CONFIGURED:
         provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
         trace.set_tracer_provider(provider)
         _OTEL_CONFIGURED = True
+
+    active_provider = trace.get_tracer_provider()
+    exporter = span_exporter
+    use_simple_processor = span_exporter is not None
+    if exporter is None and otlp_endpoint:
+        try:
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                OTLPSpanExporter,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "otlp_endpoint requires optional dependency 'mcpcodeaway[otlp]' "
+                "(opentelemetry-exporter-otlp-proto-http)."
+            ) from exc
+        exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
+
+    if (
+        exporter is not None
+        and isinstance(active_provider, TracerProvider)
+        and id(exporter) not in _ATTACHED_EXPORTERS
+    ):
+        processor = (
+            SimpleSpanProcessor(exporter)
+            if use_simple_processor
+            else BatchSpanProcessor(exporter)
+        )
+        active_provider.add_span_processor(processor)
+        _ATTACHED_EXPORTERS.add(id(exporter))
+
     return trace.get_tracer(service_name)
 
 
@@ -107,8 +142,8 @@ class TelemetryRecorder:
         await self.store.record_run(run)
         return run
 
-    async def summary(self, limit: int = 200) -> dict[str, Any]:
-        runs = await self.store.list_runs(limit=limit)
+    async def summary(self, limit: int = 200, tenant_id: str | None = None) -> dict[str, Any]:
+        runs = await self.store.list_runs(limit=limit, tenant_id=tenant_id)
         by_mode: dict[str, dict[str, Any]] = {}
         for run in runs:
             mode = str(run.get("mode", "unknown"))

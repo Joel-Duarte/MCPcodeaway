@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import yaml
@@ -15,6 +17,64 @@ from pydantic import BaseModel, Field
 from gateway.config import UpstreamConfig
 
 _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_CLOUD_METADATA_HOSTS = {
+    "metadata.google.internal",
+    "metadata",
+    "169.254.169.254",
+    "100.100.100.200",
+    "fd00:ec2::254",
+}
+
+
+def validate_upstream_url(
+    url: str | None,
+    *,
+    app_env: str = "sandbox",
+    block_private_ips_in_prod: bool = True,
+    allowed_hosts: list[str] | None = None,
+) -> None:
+    """Reject unsafe URL schemes, cloud metadata hosts, and unallowlisted internal IPs."""
+    if not url:
+        return
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError(
+            f"Unsupported upstream URL scheme '{parsed.scheme}': only http/https allowed"
+        )
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        raise ValueError(f"Upstream URL '{url}' is missing a valid hostname")
+
+    allowset = {h.strip().lower().rstrip(".") for h in (allowed_hosts or []) if h.strip()}
+    if host in allowset:
+        return
+
+    if host in _CLOUD_METADATA_HOSTS or host.endswith(".metadata.google.internal"):
+        raise ValueError(f"Blocked cloud metadata endpoint host '{host}' in upstream URL")
+
+    try:
+        ip_obj = ipaddress.ip_address(host)
+    except ValueError:
+        ip_obj = None
+
+    if ip_obj is not None:
+        if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+            ip_obj = ip_obj.ipv4_mapped
+        if ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified:
+            raise ValueError(f"Blocked link-local or unspecified IP '{host}' in upstream URL")
+        if app_env == "prod" and block_private_ips_in_prod and (
+            ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved
+        ):
+            raise ValueError(
+                f"Blocked private/loopback IP '{host}' in prod; add host to allowed_upstream_hosts"
+            )
+    elif app_env == "prod" and block_private_ips_in_prod:
+        if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+            raise ValueError(
+                f"Blocked local/internal hostname '{host}' in prod; "
+                "add host to allowed_upstream_hosts"
+            )
 _MUTATING_PREFIXES = (
     "create_",
     "delete_",

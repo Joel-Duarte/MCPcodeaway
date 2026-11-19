@@ -141,10 +141,24 @@ class GatewaySettings(BaseSettings):
     sqlite_path: str = "data/gateway.db"
     upstreams_config_path: str = "config/upstreams.yaml"
 
+    require_admin_auth: bool | None = None
+    admin_roles: list[str] = Field(default_factory=lambda: ["gateway_admin", "platform_admin"])
+    ssrf_protection_enabled: bool = True
+    block_private_ips_in_prod: bool = True
+    allowed_upstream_hosts: list[str] = Field(default_factory=list)
+    otlp_endpoint: str | None = None
+
     @property
     def dynamic_upstreams_permitted(self) -> bool:
         """Dynamic runtime upstream registration is blocked in prod."""
         return self.allow_dynamic_upstreams and self.app_env != "prod"
+
+    @property
+    def admin_auth_required(self) -> bool:
+        """Require authenticated control-plane callers on /admin/* and /audit/* routes."""
+        if self.require_admin_auth is not None:
+            return self.require_admin_auth
+        return self.auth_mode == "oidc"
 
 
 class UpstreamRegistry:

@@ -1,121 +1,122 @@
 # MCPcodeaway — Vendor-Agnostic Code-Mode Universal MCP Gateway
 
-`MCPcodeaway` is a stateless, vendor-agnostic **Universal MCP Gateway** built with **FastAPI**, the official **MCP SDK**, and **Pydantic Monty**. It combines enterprise API governance (OIDC/OAuth 2.1 validation, team/agent RBAC, RFC 8693 / Entra On-Behalf-Of delegation, input schema validation, PII/secret redaction, OpenTelemetry audit logging) with **Code Mode** progressive tool discovery and sandboxed Python orchestration.
-
----
+**MCPcodeaway** is a stateless, vendor-agnostic MCP gateway that bridges enterprise Identity Providers (Entra ID, Okta, Keycloak, or local dev RS256 OIDC) to heterogeneous backends (`mcp_http`, `mcp_stdio`, and `openapi` / Swagger) while executing multi-step workflows inside a networkless **Monty (`pydantic-monty`)** Python sandbox.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    Client["MCP Client (Copilot Studio / Claude / VS Code / Agent)"] -->|"1. RFC 9728 Discovery (/.well-known/oauth-protected-resource)"| GW["FastAPI + Stateless /mcp Gateway"]
-    Client -->|"2. Bearer OIDC JWT -> /mcp?mode=codemode|traditional|hybrid"| Auth["OidcTokenValidator + PolicyEvaluator"]
-    Auth -->|"3. search_tools (RBAC-filtered Python stubs)"| Catalog["Tool & OpenAPI Catalog (SHA-256 Drift Detection)"]
-    Auth -->|"4. execute_code -> SandboxBackend"| Sandbox["Pydantic Monty (Local Pool or Remote WS Worker)"]
-    Sandbox -->|"5. External Host Callbacks (asyncio.gather)"| Dispatch["HostDispatcher (Schema Hints, Budget, Redaction)"]
-    Dispatch -->|"6. RFC 8693 / Entra OBO / Secret (cached per tid+sub+aud)"| IdP["Pluggable IdP (Generic OIDC / Entra / Dev)"]
-    Dispatch -->|"7. Scoped Credentials -> Downstream Backends"| Backends["MCP HTTP / MCP stdio / Swagger OpenAPI"]
-    Dispatch -->|"8. OTLP Spans + Script Transcript + Token Savings"| Obs["OpenTelemetry + SQLite + /dashboard"]
-```
+### Decoupled Execution × Discovery Matrix
 
-### Decoupled Execution × Discovery Matrix (`2 × 2`)
+Callers select execution and discovery strategies independently via query parameters or HTTP headers (`?execution=...&discovery_mode=...`, `X-Execution-Mode`, `X-Discovery-Mode`, `X-Intent`) or legacy `?mode=` presets (`traditional`, `traditional_discover`, `codemode`, `codemode_upfront`, `hybrid`):
 
-Execution style and tool discovery are orthogonal axes controlled via `?execution=classic|codemode|hybrid&discovery_mode=upfront|deferred|x_intent` (headers `X-Execution-Mode` / `X-Discovery-Mode`) or legacy `?mode=` aliases:
+| Execution \ Discovery | `upfront` | `deferred` | `x_intent` |
+|---|---|---|---|
+| `classic` | Traditional upfront `tools/list` + direct JSON-RPC calls | `discover_tools` meta-tool + `call_upstream_tool` | Pre-filtered direct schemas using `X-Intent` header |
+| `codemode` | `execute_code` + upfront tool catalog (`codemode_upfront`, 2 turns) | `discover_tools` + `execute_code` (3-tool ~463-token surface) | Intent pre-filtered stubs injected into `execute_code` |
+| `hybrid` | Upfront catalog + both `call_upstream_tool` & `execute_code` | Deferred discovery + both execution paths | Intent pre-filtered hybrid surface |
 
-| Mode / Axes | `tools/list` Surface | Best For |
-| :--- | :--- | :--- |
-| **`traditional`** (`classic` × `upfront`) | All authorized JSON tool schemas | Small catalogs (`<15` tools), simple lookups |
-| **`traditional_discover`** (`classic` × `deferred`) | `list_servers`, `search_tools` (hydrates JSON schemas on demand) | Large catalogs with small/fast LLMs (`4B–9B`) & moderate payloads |
-| **`codemode_upfront`** (`codemode` × `upfront`) | `execute_code` only (with authorized Python stubs inlined) | Compact/medium catalogs needing 1-shot batched joins without discovery hops |
-| **`codemode`** (`codemode` × `deferred`, default) | `list_servers`, `search_tools`, `execute_code` | Massive catalogs (50–500+ tools) + multi-system filtering in Monty |
-| **`hybrid`** (`hybrid` × `upfront\|deferred`) | `execute_code` + direct mutating MCP tools | Batched read joins in Monty + human-confirmed direct writes |
+### Core Capabilities
 
-> **Why Gateway-Side Monty vs. Local Client-Side Execution?** Client-side code mode only works inside local coding agents (Cursor, Claude Code), leaks upstream round-trips & raw payloads over the WAN, and requires exposing tokens or client SDKs. Gateway-side Monty keeps OIDC/OBO tokens locked inside `HostDispatcher` inside your VPC, works with any MCP client (Copilot Studio, Claude Desktop, web apps), filters hundreds of raw rows before returning to LLM context, and records a single tamper-evident audit transcript (`_provenance` HMAC + `require_tool_grounding` policy).
-
----
+- **Typed Stubs & Shape Recovery**: Extracts `outputSchema` from MCP tools and OpenAPI `200` JSON responses into typed Python sandbox stub docstrings (`Returns: ...`), paired with Monty `KeyError` runtime `observed_output_shapes` hints to eliminate trial-and-error code retries.
+- **Enterprise AuthZ, Delegated OBO, RLS & Host-Side ABAC**:
+  - Validates RS256 JWTs (`OidcTokenValidator` / `LocalDevKeyManager`) with tenant allowlisting (`allowed_tenants`).
+  - Performs per-user delegated OBO token exchange (`DelegatedTokenExchanger`) with isolated `(sub, tenant_id, downstream_audience)` caching, propagating claims such as `client_groups` (`eu_accountant` -> `["EU"]`, `us_accountant` -> `["US"]`) for downstream row-level security.
+  - Enforces host-side `AbacRuleConfig` (`_apply_pre_call_abac`, `_apply_post_call_abac`) before dispatching and after response receipt when talking to shared `api_key` or `bearer_secret` upstreams.
+- **Sandbox Security & Response Grounding**: Monty blocks filesystem, environment variables, sockets, and imports; enforces `max_calls_per_execution`, timeouts, and per-user rate limits; and optionally requires HMAC-signed host tool provenance (`require_tool_grounding`, `provenance_signing_secret`).
+- **HITL Onboarding & Control-Plane Hardening**:
+  - `GET /admin/upstreams/agent-prompt`, `POST /admin/upstreams/inspect`, `POST /admin/upstreams`, `DELETE /admin/upstreams/{name}`, and the browser `/dashboard` provide OpenAPI `securitySchemes` detection, Gateway/IdP/Backend checklists, `allowed_operations` / `excluded_operations` curation, and schema drift pinning.
+  - Control-plane RBAC (`require_admin_auth`, default `True` in `auth_mode="oidc"`) restricts `/admin/*` to `admin_roles` (`gateway_admin`, `platform_admin`) and isolates `/audit/*` (`GET /audit/runs`, `/audit/runs/{run_id}`, `/audit/summary`) strictly by `tenant_id` for non-admin tokens.
+  - SSRF URL guard (`validate_upstream_url`, `ssrf_protection_enabled`) blocks non-HTTP(S) schemes and cloud metadata hosts in all environments, and blocks loopback/private/internal hosts in `prod` unless allowlisted via `allowed_upstream_hosts`.
+- **Observability & Horizontal Scaling**: OpenTelemetry trace spans with optional OTLP HTTP export (`mcpcodeaway[otlp]`, `GATEWAY_OTLP_ENDPOINT`), Redis token/rate-limit store (`mcpcodeaway[redis]`), and egress-isolated remote `sandbox-worker` pods over authenticated WebSocket reverse-RPC (`GATEWAY_SANDBOX_WORKER_SECRET`).
 
 ## Quickstart (Zero External Dependencies)
 
 ```bash
-# 1. Install dependencies (Python 3.13 + uv)
+# 1. Install dependencies (Python 3.12+ + uv)
 uv sync --extra dev
 
 # 2. Start mock enterprise backends (Snowflake MCP, EU/US Billing OpenAPI, Ops Ticketing MCP)
 uv run uvicorn examples.mock_backends:app --port 8001
 
 # 3. Start the gateway in another terminal
-uv run uvicorn gateway.server:app --port 8000 --reload
+uv run uvicorn gateway.server:app --port 8000
 ```
 
-Open **`http://127.0.0.1:8000/dashboard`** for:
-- **Overview & Benchmarks**: Catalog scaling charts and audit telemetry.
-- **Add MCP / Swagger Wizard**: Plug in any `mcp_http`, `mcp_stdio`, or Swagger/OpenAPI spec (`URL` or pasted JSON), inspect tools & risk flags, export `upstreams.yaml` for PR promotion, and review the **Classic MCP vs. Code Mode Onboarding Audit**.
-- **Side-by-Side Playground**: Replay workloads on Classic MCP vs. Code Mode across personas.
-- **OIDC Delegation & RBAC Simulator**: Mint dev tokens and inspect RBAC-filtered tool access.
-- **Code Mode Transcripts**: Inspect executed Python scripts, Monty sub-calls, delegated token hops, and payload byte reduction.
+Open `http://127.0.0.1:8000/dashboard` for the interactive side-by-side playground, HITL onboarding wizard, and agent prompt exporter.
 
-### CLI Onboarding
+### CLI Onboarding & Comparison
 
 ```bash
-# Inspect an OpenAPI/Swagger spec and export a PR-ready upstreams.yaml snippet
+# Inspect an OpenAPI/Swagger spec and export a PR-ready config/upstreams.yaml snippet
 uv run gateway add-mcp \
   --name billing_eu \
   --type openapi \
-  --url http://127.0.0.1:8001/billing-eu \
-  --openapi-spec-url http://127.0.0.1:8001/billing-eu/openapi.json \
+  --url http://127.0.0.1:8001/billing \
+  --openapi-spec-url http://127.0.0.1:8001/billing/openapi.json \
+  --auth-type delegated_token \
+  --downstream-audience api://billing-mcp \
   --export-yaml
 
-# Run Classic vs. Code Mode side-by-side comparison
+# Run Classic MCP vs. Code Mode side-by-side comparison
 uv run gateway compare --scenario reconcile_overdue --persona finance_analyst
 ```
 
----
-
 ## Proof of Performance (Measured Results)
-
-Reproduce locally with zero API keys:
-
-```bash
-uv run python benchmarks/run_benchmark.py
-uv run python benchmarks/load_benchmark.py --users 30 --concurrency 15
-```
 
 ### 1. Catalog Scaling (`tools/list` Schema Bloat vs. Code Mode)
 
-| Catalog Size | Classic MCP Tokens | Code Mode Surface Tokens | Reduction |
-| ---: | ---: | ---: | ---: |
-| 20 tools | 2,030 | 265 | **86.95%** |
-| 50 tools | 5,073 | 265 | **94.78%** |
-| 150 tools | 15,218 | 265 | **98.26%** |
-| 300 tools | 30,436 | 265 | **99.13%** |
-| 500 tools | 50,726 | 265 | **99.48%** |
+From [benchmarks/results.json](benchmarks/results.json): Code Mode keeps its MCP surface constant at **463 tokens** (3 meta-tools) regardless of catalog size:
 
-### 2. Enterprise Workloads (4-Backend Finance & Ops Catalog)
+| Total Tools | Classic Surface Tokens | Code Mode Surface Tokens | Token Reduction |
+|---:|---:|---:|---:|
+| 20 | 2,030 | 463 | **77.19%** |
+| 50 | 5,073 | 463 | **90.87%** |
+| 150 | 15,218 | 463 | **96.96%** |
+| 300 | 30,436 | 463 | **98.48%** |
+| 500 | 50,726 | 463 | **99.09%** |
 
-| Scenario | Classic Tokens | Code Mode Tokens | Savings | Round Trips | Winner |
-| :--- | ---: | ---: | ---: | :---: | :--- |
-| `reconcile_overdue` (Snowflake + EU/US Billing join) | 2,556 | 1,146 | **55.16%** | `4 -> 2` | `code_mode` |
-| `trial_balance_audit` (Variances + contact lookup) | 2,560 | 1,184 | **53.75%** | `5 -> 2` | `code_mode` |
-| `single_lookup` (Control: 1 balance read) | 985 | 1,154 | -17.16% | `2 -> 2` | `classic_or_tie` |
+### 2. Offline Enterprise Workloads (4-Backend Finance & Ops Catalog)
 
-### 3. Concurrent Multi-User Load (30 Requests, 10 Users, Concurrency 15)
+From [benchmarks/results.json](benchmarks/results.json):
 
-| Mode | Throughput | Success Rate | Delegated Token Cache Hit Rate |
-| :--- | ---: | ---: | ---: |
-| `traditional` | 27.10 req/s | 100.0% | 66.67% |
-| `codemode` | 26.63 req/s | 100.0% | 66.67% |
+| Workload | Classic Tokens (Turns) | Code Mode Tokens (Turns) | Savings | Notes |
+|---|---:|---:|---:|---|
+| `reconcile_overdue` | 6,569 (4) | 1,870 (2) | **71.53%** | Cross-system invoice vs. Snowflake join |
+| `reconcile_bulk_200` | 27,365 (4) | 1,881 (2) | **93.13%** | `93,593` raw bytes -> `780` returned bytes |
+| `trial_balance_audit` | 7,385 (5) | 1,908 (2) | **74.16%** | Multi-step Snowflake + ticket correlation |
+| `single_lookup` | 2,915 (2) | 1,878 (2) | **35.57%** | Adaptive router: `classic_or_tie` |
 
-*(Optional live LLM evaluation with OpenAI, Anthropic, or Gemini is available via `uv run python benchmarks/live_llm_bench.py --dry-run` or by setting `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`.)*
+### 3. Discovery Backend Accuracy (160 Tools, 20 Queries)
 
----
+From [benchmarks/discovery_results.json](benchmarks/discovery_results.json) on live LM Studio (`laya` + `text-embedding-qwen3-embedding-0.6b`, `0.0%` fallback rate):
+
+| Backend | Recall@5 | Semantic Hit | Avg Latency |
+|---|---:|---:|---:|
+| `keyword` | 0.700 | 0.400 | 0.233 ms |
+| `bm25` | 0.800 | 0.600 | 1.559 ms |
+| `embedding` | **0.925** | **0.850** | 129.591 ms |
+| `system1` | 0.675 | — | — |
+| `hybrid_system1` | 0.825 | 0.650 | 144.353 ms |
+
+### 4. Live SLM Evaluation (`qwen/qwen3.5-9b`, 32,768 Context, `reasoning_effort=none`)
+
+- **200-Row Overflow Prevention** ([benchmarks/matrix_2x2_results.json](benchmarks/matrix_2x2_results.json)): `bulk_200` crashed **all 4** Classic runs (`HTTP 400 exceed_context_size_error`: `37,710–43,441 > 32,768` tokens), while both Code Mode runs completed (`65,450` / `68,288` tokens, `grounded=True`).
+- **Typed `outputSchema` Stubs** ([benchmarks/typed_stubs_results.json](benchmarks/typed_stubs_results.json)):
+  - `codemode_upfront`: completed all 4 workloads in **2 turns (`0` retries)** (`3,808` / `10,865` / `10,579` / `9,936` tokens; `3/4` accurate).
+  - Deferred `codemode`: completed all 4 workloads in **3 turns (`0` retries, `4/4` accurate)** (`6,282` / `7,283` / `9,231` / `20,071` tokens; up to **9.0x** fewer tokens).
+
+### 5. Concurrent Multi-User Load (30 Requests, 10 Users, Concurrency 15)
+
+From [benchmarks/load_results.json](benchmarks/load_results.json):
+
+| Mode | Wall Time | Throughput | p50 / p95 Latency | Success Rate | Delegated Subcalls / Cache Hit Rate |
+|---|---:|---:|---:|---:|---:|
+| `traditional` | 1.107 s | 27.1 rps | 7.568 / 100.692 ms | 100.0% | 90 subcalls / 66.67% (`60` hits) |
+| `codemode` | 1.127 s | 26.63 rps | 475.03 / 1019.045 ms | 100.0% | 90 subcalls / 66.67% (`60` hits) |
 
 ## Vendor-Agnostic Integrations & Scaling
 
-- **AuthN / AuthZ Presets**: Core relies exclusively on OIDC JWKS + RFC 8693 / RFC 9728 standards. Ready-to-use configurations live in:
-  - [Entra ID + Copilot Studio Preset](examples/integrations/entra_copilot_studio/README.md)
-  - [Keycloak / Okta / Generic OIDC Preset](examples/integrations/keycloak_oidc/gateway.env.example)
-  - [Claude / VS Code / Cursor MCP Client Configs](examples/integrations/mcp_clients/clients.json)
-- **Horizontal Scaling**: Run `docker compose --profile scaled up` for multi-replica stateless gateways, shared Redis token/rate-limit caching, and egress-isolated `sandbox-worker` pods over WebSocket reverse-RPC. See [Cloud & Sandbox Scalability Guide](docs/cloud_scalability.md).
+- **Enterprise IdP & MCP Client Examples**: See [examples/integrations/](examples/integrations/) (`entra_copilot_studio`, `keycloak_oidc`, `mcp_clients`).
+- **Horizontal Scaling**: Run `docker compose --profile scaled up` (using [docker-compose.yml](docker-compose.yml)) for multi-replica stateless gateways, shared Redis caching (`GATEWAY_REDIS_URL`), and egress-isolated `sandbox-worker` pods authenticated with `GATEWAY_SANDBOX_WORKER_SECRET` and `GATEWAY_PROVENANCE_SIGNING_SECRET`. See [docs/cloud_scalability.md](docs/cloud_scalability.md).
 
 ## Verification
 

@@ -116,6 +116,16 @@ DEV_PERSONAS: dict[str, dict[str, Any]] = {
         "scopes": ["mcp.tools", "finance.read"],
         "client_groups": ["US"],
     },
+    "gateway_admin": {
+        "sub": "user-admin-01",
+        "tenant_id": "tenant-acme-dev",
+        "email": "grace.admin@acme.example",
+        "client_id": "platform-control-plane",
+        "roles": ["gateway_admin", "platform_admin"],
+        "groups": ["platform-admins"],
+        "scopes": ["mcp.tools", "mcp.admin", "mcp.audit"],
+        "client_groups": ["ALL"],
+    },
 }
 
 
