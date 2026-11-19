@@ -840,6 +840,40 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
             )
             assert t_stop.status_code == 200
             assert t_stop.json()["running"] is False
+
+            # Alerts rules + evaluation, roles catalog, and paginated audit search
+            roles_r = await gw.get("/admin/roles", headers={"Authorization": f"Bearer {adm_tok}"})
+            assert roles_r.status_code == 200
+            assert "finance_analyst" in roles_r.json()["roles"]
+            assert "engineering" in roles_r.json()["groups"]
+
+            rules_save = await gw.post(
+                "/admin/alerts/rules",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+                json={
+                    "error_rate_pct_max": 10.0,
+                    "p95_latency_ms_max": 500.0,
+                    "grounding_blocks_max": 1,
+                },
+            )
+            assert rules_save.status_code == 200
+            alerts_r = await gw.get("/admin/alerts", headers={"Authorization": f"Bearer {adm_tok}"})
+            assert alerts_r.status_code == 200
+            assert "alerts" in alerts_r.json()
+
+            paged_r = await gw.get(
+                "/audit/runs?limit=1&offset=0&status=all",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+            )
+            assert paged_r.status_code == 200
+            assert paged_r.json()["total_count"] >= 1
+            assert len(paged_r.json()["runs"]) == 1
+            err_r = await gw.get(
+                "/audit/runs?limit=10&offset=0&status=errors",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+            )
+            assert err_r.status_code == 200
+            assert err_r.json()["total_count"] >= 1
     finally:
         await rt.shutdown()
 

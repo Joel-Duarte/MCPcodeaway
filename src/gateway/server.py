@@ -37,6 +37,7 @@ from gateway.ab_testing import (
 )
 from gateway.admin_auth import AdminSessionManager, create_admin_auth_router
 from gateway.admin_mcp import handle_admin_mcp_request
+from gateway.alerts import AlertEvaluator, AlertRulesConfig
 from gateway.auth import (
     DEV_PERSONAS,
     AuthError,
@@ -317,6 +318,7 @@ class GatewayRuntime:
         self.startup_warnings: list[str] = []
         self._startup_retry_task: asyncio.Task[None] | None = None
         self.demo_traffic = DemoTrafficRunner(self)
+        self.alert_evaluator = AlertEvaluator()
 
     def _dev_discovery_identity(self) -> CallerIdentity | None:
         if self.dev_keys is None:
@@ -525,6 +527,10 @@ class GatewayRuntime:
 
     async def startup(self) -> None:
         await self.store.init()
+        if hasattr(self.store, "get_setting"):
+            saved_rules = await self.store.get_setting("alert_rules")
+            if saved_rules:
+                self.alert_evaluator.rules = AlertRulesConfig.model_validate(saved_rules)
         await self.refresh_catalog()
         if self.startup_warnings:
             self._startup_retry_task = asyncio.create_task(self._retry_failed_startup_upstreams())
@@ -1202,6 +1208,12 @@ class ModelPriceBody(BaseModel):
     output_per_1m_usd: float = Field(..., ge=0.0, le=1000.0)
 
 
+class UpstreamTestCallRequest(BaseModel):
+    upstream: UpstreamConfig
+    tool_name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
 def create_gateway_app(
     *,
     settings: GatewaySettings | None = None,
@@ -1747,7 +1759,11 @@ def create_gateway_app(
 
         @app.get("/audit/runs")
         async def audit_runs(
-            limit: int = Query(default=50, ge=1, le=200),
+            limit: int = Query(default=25, ge=1, le=200),
+            offset: int = Query(default=0, ge=0),
+            status: str = Query(default="all"),
+            mode: str | None = Query(default=None),
+            q: str | None = Query(default=None),
             tenant_id: str | None = Query(default=None),
             authorization: str | None = Header(default=None),
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
@@ -1756,8 +1772,25 @@ def create_gateway_app(
                 authorization, mcpcodeaway_admin_session, require_admin_role=False
             )
             effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
-            runs = await runtime.store.list_runs(limit=limit, tenant_id=effective_tenant)
-            return {"count": len(runs), "runs": runs}
+            if hasattr(runtime.store, "query_runs"):
+                runs, total_count = await runtime.store.query_runs(
+                    limit=limit,
+                    offset=offset,
+                    tenant_id=effective_tenant,
+                    status=status,
+                    mode=mode,
+                    q=q,
+                )
+            else:
+                runs = await runtime.store.list_runs(limit=limit, tenant_id=effective_tenant)
+                total_count = len(runs)
+            return {
+                "count": len(runs),
+                "total_count": total_count,
+                "limit": limit,
+                "offset": offset,
+                "runs": runs,
+            }
 
         @app.get("/audit/runs/{run_id}")
         async def audit_run_detail(
@@ -1880,11 +1913,19 @@ def create_gateway_app(
 
             await websocket.accept()
             initial_rt = await collect_runtime_telemetry(runtime)
+            recent_runs = await runtime.store.list_runs(limit=50)
+            initial_alerts = runtime.alert_evaluator.evaluate(
+                runs=recent_runs,
+                drift_warnings=runtime.catalog.drift_warnings,
+                startup_warnings=runtime.startup_warnings,
+                worker_status=initial_rt.get("sandbox_worker", {}),
+            )
             await websocket.send_json(
                 {
                     "type": "snapshot",
                     "runtime": initial_rt,
                     "demo_traffic": runtime.demo_traffic.status(),
+                    "alerts": initial_alerts,
                 }
             )
 
@@ -1898,11 +1939,19 @@ def create_gateway_app(
                 while True:
                     await asyncio.sleep(2.0)
                     rt_snap = await collect_runtime_telemetry(runtime)
+                    tick_runs = await runtime.store.list_runs(limit=50)
+                    tick_alerts = runtime.alert_evaluator.evaluate(
+                        runs=tick_runs,
+                        drift_warnings=runtime.catalog.drift_warnings,
+                        startup_warnings=runtime.startup_warnings,
+                        worker_status=rt_snap.get("sandbox_worker", {}),
+                    )
                     await websocket.send_json(
                         {
                             "type": "runtime_tick",
                             "runtime": rt_snap,
                             "demo_traffic": runtime.demo_traffic.status(),
+                            "alerts": tick_alerts,
                         }
                     )
 
@@ -1917,6 +1966,55 @@ def create_gateway_app(
                 pub_task.cancel()
                 tick_task.cancel()
                 await asyncio.gather(pub_task, tick_task, return_exceptions=True)
+
+        @app.get("/admin/roles")
+        async def admin_list_roles_and_groups(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            roles: set[str] = set()
+            groups: set[str] = set()
+            for persona in DEV_PERSONAS.values():
+                roles.update(persona.get("roles", []))
+                groups.update(persona.get("groups", []))
+            for u in runtime.registry.list_upstreams(include_disabled=True):
+                roles.update(u.allowed_roles)
+                groups.update(u.allowed_groups)
+            return {"roles": sorted(roles), "groups": sorted(groups)}
+
+        @app.get("/admin/alerts")
+        async def admin_list_alerts(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            rt_snap = await collect_runtime_telemetry(runtime)
+            recent = await runtime.store.list_runs(limit=50)
+            alerts = runtime.alert_evaluator.evaluate(
+                runs=recent,
+                drift_warnings=runtime.catalog.drift_warnings,
+                startup_warnings=runtime.startup_warnings,
+                worker_status=rt_snap.get("sandbox_worker", {}),
+            )
+            return {
+                "alerts": alerts,
+                "rules": runtime.alert_evaluator.rules.model_dump(),
+            }
+
+        @app.get("/admin/alerts/rules")
+        async def admin_get_alert_rules(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            return runtime.alert_evaluator.rules.model_dump()
 
         @app.get("/admin/upstreams")
         async def list_admin_upstreams(
@@ -2086,6 +2184,95 @@ def create_gateway_app(
                 authorization, mcpcodeaway_admin_session, require_admin_role=True
             )
             return runtime.demo_traffic.status()
+
+        @app.post("/admin/alerts/rules")
+        async def admin_save_alert_rules(
+            body: AlertRulesConfig,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            if body.webhook_url:
+                try:
+                    validate_upstream_url(
+                        body.webhook_url,
+                        app_env=runtime.settings.app_env,
+                        block_private_ips_in_prod=runtime.settings.block_private_ips_in_prod,
+                        allowed_hosts=runtime.settings.allowed_upstream_hosts,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            runtime.alert_evaluator.rules = body
+            if hasattr(runtime.store, "save_setting"):
+                await runtime.store.save_setting("alert_rules", body.model_dump())
+            return {"saved": True, "rules": body.model_dump()}
+
+        @app.post("/admin/upstreams/test-call")
+        async def admin_test_upstream_call(
+            body: UpstreamTestCallRequest,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            caller = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            if runtime.settings.ssrf_protection_enabled:
+                try:
+                    for candidate_url in (body.upstream.url, body.upstream.openapi_spec_url):
+                        validate_upstream_url(
+                            candidate_url,
+                            app_env=runtime.settings.app_env,
+                            block_private_ips_in_prod=runtime.settings.block_private_ips_in_prod,
+                            allowed_hosts=runtime.settings.allowed_upstream_hosts,
+                        )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            ident = (
+                caller
+                or runtime._dev_discovery_identity()
+                or CallerIdentity(
+                    sub="admin-probe",
+                    tenant_id=(
+                        runtime.settings.allowed_tenants[0]
+                        if runtime.settings.allowed_tenants
+                        else "tenant-acme-dev"
+                    ),
+                    roles=["gateway_admin", "finance_analyst", "ops_engineer"],
+                    groups=["platform"],
+                )
+            )
+            headers: dict[str, str] = {}
+            if body.upstream.auth_type != "none":
+                headers, _, _ = await runtime.dispatcher.resolve_upstream_headers(
+                    ident, body.upstream
+                )
+            tools = await runtime.client_manager.discover_tools(body.upstream, auth_headers=headers)
+            target_tool = next(
+                (
+                    t
+                    for t in tools
+                    if t.name == body.tool_name or t.qualified_name == body.tool_name
+                ),
+                None,
+            )
+            if target_tool is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Tool '{body.tool_name}' not found on upstream"
+                )
+            if target_tool.mutating:
+                raise HTTPException(
+                    status_code=400, detail="Live test call only supports read-only tools"
+                )
+            result = await runtime.client_manager.call_tool(
+                body.upstream, target_tool, body.arguments, auth_headers=headers
+            )
+            return {
+                "ok": True,
+                "tool": target_tool.qualified_name,
+                "result": result,
+            }
 
         @app.post("/admin/pricing/models")
         async def admin_save_model_pricing(
