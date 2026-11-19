@@ -737,14 +737,18 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
     assert "nodejs" not in gw_block
     assert "examples" not in gw_block
 
-    # Legacy fallback remains reachable at /dashboard/legacy even when SPA exists.
+    # Legacy static HTML dashboard is removed cleanly.
+    assert not Path("src/gateway/static/dashboard.html").exists()
+
+    # SPA /dashboard remains reachable, and Demo Traffic + Self-Admin MCP work in demo mode.
+    dev_keys = LocalDevKeyManager()
     settings = GatewaySettings(
         auth_mode="dev",
         profile="demo",
         sqlite_path=str(tmp_path / "dash.db"),
         upstreams_config_path=str(tmp_path / "none.yaml"),
     )
-    app = create_gateway_app(settings=settings, preloaded_tools={})
+    app = create_gateway_app(settings=settings, dev_keys=dev_keys, preloaded_tools={})
     rt = app.state.runtime
     await rt.startup()
     try:
@@ -755,9 +759,34 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
             assert main_dash.status_code == 200
             assert "MCPcodeaway" in main_dash.text
 
-            legacy_dash = await gw.get("/dashboard/legacy")
-            assert legacy_dash.status_code == 200
-            assert "fetchGenericAgentPrompt" in legacy_dash.text
+            adm_tok = dev_keys.issue_user_token(persona="gateway_admin")
+            fin_tok = dev_keys.issue_user_token(persona="finance_analyst")
+
+            # Self-Admin MCP rejects non-admin callers and serves tools to gateway_admin.
+            denied_mcp = await gw.post(
+                "/admin/mcp",
+                headers={"Authorization": f"Bearer {fin_tok}"},
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            )
+            assert denied_mcp.status_code == 403
+
+            listed_mcp = await gw.post(
+                "/admin/mcp",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            )
+            assert listed_mcp.status_code == 200
+            tool_names = {t["name"] for t in listed_mcp.json()["result"]["tools"]}
+            assert {"admin_list_upstreams", "admin_save_upstream", "admin_demo_traffic_burst"} <= (
+                tool_names
+            )
+
+            burst = await gw.post(
+                "/admin/demo/traffic/burst?count=2",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+            )
+            assert burst.status_code == 200
+            assert burst.json()["sent"] == 2
     finally:
         await rt.shutdown()
 

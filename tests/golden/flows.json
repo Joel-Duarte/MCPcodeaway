@@ -78,7 +78,6 @@
       "open_paths": ["/health", "/ready", "/metrics"],
       "blocked_gets": [
         "/dashboard",
-        "/dashboard/legacy",
         "/benchmarks/latest",
         "/dev/oidc/jwks"
       ]

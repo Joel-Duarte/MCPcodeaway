@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 from fastapi import Cookie, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from opentelemetry import trace
 from pydantic import BaseModel
 
@@ -27,6 +27,7 @@ from gateway.ab_testing import (
     run_onboarding_ab_test,
 )
 from gateway.admin_auth import AdminSessionManager, create_admin_auth_router
+from gateway.admin_mcp import handle_admin_mcp_request
 from gateway.auth import (
     DEV_PERSONAS,
     AuthError,
@@ -52,6 +53,7 @@ from gateway.config import (
     UpstreamConfig,
     UpstreamRegistry,
 )
+from gateway.demo_traffic import DemoTrafficRunner
 from gateway.discovery import DiscoveryEngine
 from gateway.dispatcher import (
     ExecutionBudget,
@@ -305,6 +307,7 @@ class GatewayRuntime:
         self.preloaded_tools = preloaded_tools or {}
         self.startup_warnings: list[str] = []
         self._startup_retry_task: asyncio.Task[None] | None = None
+        self.demo_traffic = DemoTrafficRunner(self)
 
     def _dev_discovery_identity(self) -> CallerIdentity | None:
         if self.dev_keys is None:
@@ -518,6 +521,7 @@ class GatewayRuntime:
             self._startup_retry_task = asyncio.create_task(self._retry_failed_startup_upstreams())
 
     async def shutdown(self) -> None:
+        await self.demo_traffic.stop()
         if self._startup_retry_task is not None and not self._startup_retry_task.done():
             self._startup_retry_task.cancel()
             await asyncio.gather(self._startup_retry_task, return_exceptions=True)
@@ -1188,6 +1192,7 @@ def create_gateway_app(
         lifespan=lifespan,
     )
     app.state.runtime = runtime
+    runtime.demo_traffic.bind_app(app)
     if runtime.settings.cors_allowed_origins:
         app.add_middleware(
             CORSMiddleware,
@@ -1940,6 +1945,86 @@ def create_gateway_app(
             deleted = await runtime.store.prune_runs_older_than(days)
             return {"deleted_runs": deleted, "retention_days": days}
 
+        def _ensure_demo_traffic_allowed() -> None:
+            if (
+                runtime.settings.app_env == "prod"
+                or runtime.settings.effective_profile_name == "production"
+            ):
+                raise HTTPException(
+                    status_code=403, detail="Demo traffic simulator is disabled in production"
+                )
+
+        @app.get("/admin/demo/traffic/status")
+        async def admin_demo_traffic_status(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            return runtime.demo_traffic.status()
+
+        @app.post("/admin/demo/traffic/start")
+        async def admin_demo_traffic_start(
+            interval_seconds: float = Query(default=2.0, ge=0.5, le=10.0),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _ensure_demo_traffic_allowed()
+            return await runtime.demo_traffic.start(interval_seconds=interval_seconds)
+
+        @app.post("/admin/demo/traffic/stop")
+        async def admin_demo_traffic_stop(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            return await runtime.demo_traffic.stop()
+
+        @app.post("/admin/demo/traffic/burst")
+        async def admin_demo_traffic_burst(
+            count: int = Query(default=6, ge=1, le=24),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _ensure_demo_traffic_allowed()
+            return await runtime.demo_traffic.burst(count=count)
+
+        @app.post("/admin/mcp", response_model=None)
+        async def admin_mcp_endpoint(
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> JSONResponse:
+            caller = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            payload = await request.json()
+            return await handle_admin_mcp_request(
+                runtime,
+                caller,
+                payload,
+                inspect_fn=lambda cfg: _inspect_candidate(cfg, authorization),
+                analytics_fn=lambda model, tenant: audit_analytics(
+                    model=model,
+                    tenant_id=tenant,
+                    authorization=authorization,
+                    mcpcodeaway_admin_session=mcpcodeaway_admin_session,
+                ),
+                telemetry_fn=lambda: admin_runtime_telemetry(
+                    authorization=authorization,
+                    mcpcodeaway_admin_session=mcpcodeaway_admin_session,
+                ),
+            )
+
         @app.post("/admin/upstreams/ab-test")
         async def admin_upstream_ab_test(
             body: OnboardingAbTestRequest,
@@ -2126,24 +2211,21 @@ def create_gateway_app(
             return None
 
         @app.get("/dashboard", response_model=None)
-        async def dashboard() -> FileResponse | HTMLResponse:
+        async def dashboard() -> FileResponse | JSONResponse:
             spa_dir = _find_spa_dir()
             if spa_dir is not None:
                 return FileResponse(spa_dir / "index.html")
-            html_path = Path(__file__).parent / "static" / "dashboard.html"
-            return HTMLResponse(html_path.read_text(encoding="utf-8"))
-
-        @app.get("/dashboard/legacy", response_class=HTMLResponse)
-        async def dashboard_legacy() -> HTMLResponse:
-            html_path = Path(__file__).parent / "static" / "dashboard.html"
-            return HTMLResponse(html_path.read_text(encoding="utf-8"))
+            return JSONResponse(
+                {"detail": "Admin SPA not built; build web/ first."}, status_code=404
+            )
 
         @app.get("/dashboard/{subpath:path}", response_model=None)
-        async def dashboard_spa(subpath: str) -> FileResponse | HTMLResponse:
+        async def dashboard_spa(subpath: str) -> FileResponse | JSONResponse:
             spa_dir = _find_spa_dir()
             if spa_dir is None:
-                html_path = Path(__file__).parent / "static" / "dashboard.html"
-                return HTMLResponse(html_path.read_text(encoding="utf-8"))
+                return JSONResponse(
+                    {"detail": "Admin SPA not built; build web/ first."}, status_code=404
+                )
             root = spa_dir.resolve()
             target = (root / subpath).resolve()
             if target.is_relative_to(root) and target.is_file():

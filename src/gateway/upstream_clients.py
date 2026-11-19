@@ -785,9 +785,16 @@ def build_agent_onboarding_prompt(
         "`traditional_discover`, `traditional`, or `hybrid`; "
         f"recommended: `{recommended_mode}`).\n\n"
         f"Discovered context:\n{context_block}\n\n"
-        "Once answered, emit ONE valid JSON object matching Gateway `UpstreamConfig` "
-        "(plus separate Corporate IdP / backend setup bullets if OBO is needed) ready "
-        "for `/dashboard` ('Import Agent JSON') or `POST /admin/upstreams`."
+        "You have three ways to apply the human's answers (pick the best one available):\n"
+        "A) **UI / WebMCP (`@ui-sdk/vue`):** If operating inside `/dashboard/onboarding`, "
+        "inspect controls via `snapshot()`, fill fields step-by-step (`1. Connect & Inspect`, "
+        "`2. Policy & Mode`, `3. Test & Activate`), and trigger `Save Upstream` (which pauses "
+        "for explicit human confirmation).\n"
+        "B) **Gateway Self-Admin MCP (`POST /admin/mcp`):** With a `gateway_admin` Bearer "
+        "token, call `admin_inspect_upstream`, `admin_run_ab_test`, and `admin_save_upstream`.\n"
+        "C) **JSON Import:** Emit ONE valid JSON object matching `UpstreamConfig` (plus "
+        "separate Corporate IdP / backend setup bullets if OBO is needed) for "
+        "`/dashboard/onboarding` ('Import Agent JSON') or `POST /admin/upstreams`."
     )
 
 
