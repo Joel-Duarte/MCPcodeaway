@@ -59,7 +59,9 @@ _ADMIN_MCP_TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_gateway_metrics",
-        "description": "Return live gateway runtime, Monty sandbox spawn/exec p50/p95, and ROI savings.",
+        "description": (
+            "Return live gateway runtime, Monty sandbox spawn/exec p50/p95, and ROI savings."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {"model": {"type": "string"}},
