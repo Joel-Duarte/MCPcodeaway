@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Lint with ruff
+        run: uv run ruff check src examples benchmarks tests
+      - name: Run full test suite
+        run: uv run pytest -v
+      - name: Smoke-check offline benchmark
+        run: uv run python benchmarks/run_benchmark.py --output /tmp/bench_results.json

@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "mcpcodeaway-codemode": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp?mode=codemode",
+      "headers": {
+        "Authorization": "Bearer ${MCP_GATEWAY_TOKEN}"
+      }
+    },
+    "mcpcodeaway-hybrid": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp?mode=hybrid",
+      "headers": {
+        "Authorization": "Bearer ${MCP_GATEWAY_TOKEN}"
+      }
+    },
+    "mcpcodeaway-traditional-baseline": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp?mode=traditional",
+      "headers": {
+        "Authorization": "Bearer ${MCP_GATEWAY_TOKEN}"
+      }
+    }
+  }
+}

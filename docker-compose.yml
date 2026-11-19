@@ -1,0 +1,69 @@
+services:
+  mock-backends:
+    build: .
+    command: ["uvicorn", "examples.mock_backends:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      GATEWAY_JWKS_URL: http://gateway:8000/dev/oidc/jwks
+    ports:
+      - "8001:8001"
+    networks:
+      - control_plane
+
+  gateway:
+    build: .
+    depends_on:
+      - mock-backends
+    environment:
+      GATEWAY_APP_ENV: sandbox
+      GATEWAY_AUTH_MODE: dev
+      GATEWAY_UPSTREAMS_CONFIG_PATH: config/upstreams.docker.yaml
+      GATEWAY_SANDBOX_BACKEND: local
+    ports:
+      - "8000:8000"
+    networks:
+      - control_plane
+    profiles: ["", "default"]
+
+  redis:
+    image: redis:7-alpine
+    networks:
+      - control_plane
+    profiles: ["scaled"]
+
+  sandbox-worker:
+    build: .
+    command: ["uvicorn", "gateway.sandbox_worker:app", "--host", "0.0.0.0", "--port", "8002"]
+    deploy:
+      replicas: 2
+    networks:
+      - sandbox_isolated
+    profiles: ["scaled"]
+
+  gateway-scaled:
+    build: .
+    depends_on:
+      - mock-backends
+      - redis
+      - sandbox-worker
+    deploy:
+      replicas: 2
+    environment:
+      GATEWAY_APP_ENV: uat
+      GATEWAY_AUTH_MODE: dev
+      GATEWAY_UPSTREAMS_CONFIG_PATH: config/upstreams.docker.yaml
+      GATEWAY_SANDBOX_BACKEND: remote
+      GATEWAY_SANDBOX_WORKER_URL: ws://sandbox-worker:8002/ws/execute
+      GATEWAY_REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000"
+    networks:
+      - control_plane
+      - sandbox_isolated
+    profiles: ["scaled"]
+
+networks:
+  control_plane:
+    driver: bridge
+  sandbox_isolated:
+    driver: bridge
+    internal: true

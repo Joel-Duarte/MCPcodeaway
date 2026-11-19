@@ -1,0 +1,35 @@
+swagger: "2.0"
+info:
+  title: MCPcodeaway Universal Gateway
+  description: >
+    Code-Mode MCP Gateway connector for Microsoft Copilot Studio with
+    RFC 9728 OAuth 2.1 discovery and Entra ID On-Behalf-Of delegation.
+  version: "0.1.0"
+host: gateway.example.internal
+basePath: /
+schemes:
+  - https
+consumes:
+  - application/json
+produces:
+  - application/json
+securityDefinitions:
+  oauth2_auth:
+    type: oauth2
+    flow: accessCode
+    authorizationUrl: https://login.microsoftonline.com/<TENANT_ID>/oauth2/v2.0/authorize
+    tokenUrl: https://login.microsoftonline.com/<TENANT_ID>/oauth2/v2.0/token
+    scopes:
+      api://<BACKEND_APP_ID>/mcp.tools: Access authorized MCP tools via gateway
+security:
+  - oauth2_auth:
+      - api://<BACKEND_APP_ID>/mcp.tools
+paths:
+  /mcp:
+    post:
+      summary: MCP Streamable HTTP Endpoint
+      operationId: InvokeMCPGateway
+      x-ms-agentic-protocol: mcp-streamable-1.0
+      responses:
+        "200":
+          description: JSON-RPC 2.0 MCP response

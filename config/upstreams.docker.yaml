@@ -1,0 +1,50 @@
+upstreams:
+  - name: snowflake_ledger
+    type: mcp_http
+    url: http://mock-backends:8001/snowflake/mcp
+    auth_type: delegated_token
+    downstream_audience: api://snowflake-ledger
+    downstream_scope: snowflake.read
+    allowed_roles: [finance_analyst, snowflake_reader, readonly_auditor, admin]
+    allowed_groups: [finance, audit, platform]
+    allowed_scopes: [mcp.tools, finance.read]
+    mutating_tools: []
+    enabled: true
+
+  - name: billing_legacy_eu
+    type: openapi
+    url: http://mock-backends:8001/billing-eu
+    openapi_spec_url: http://mock-backends:8001/billing-eu/openapi.json
+    auth_type: delegated_token
+    downstream_audience: api://billing-eu
+    downstream_scope: billing.read
+    allowed_roles: [finance_analyst, billing_reader, readonly_auditor, admin]
+    allowed_groups: [finance, audit, platform]
+    allowed_scopes: [mcp.tools, finance.read]
+    mutating_tools: []
+    enabled: true
+
+  - name: billing_legacy_us
+    type: openapi
+    url: http://mock-backends:8001/billing-us
+    openapi_spec_url: http://mock-backends:8001/billing-us/openapi.json
+    auth_type: delegated_token
+    downstream_audience: api://billing-us
+    downstream_scope: billing.read
+    allowed_roles: [finance_analyst, billing_reader, readonly_auditor, admin]
+    allowed_groups: [finance, audit, platform]
+    allowed_scopes: [mcp.tools, finance.read]
+    mutating_tools: []
+    enabled: true
+
+  - name: ops_ticketing
+    type: mcp_http
+    url: http://mock-backends:8001/ops/mcp
+    auth_type: delegated_token
+    downstream_audience: api://ops-ticketing
+    downstream_scope: ops.tickets
+    allowed_roles: [ops_engineer, ticketing_writer, support_agent, admin]
+    allowed_groups: [operations, support, platform]
+    allowed_scopes: [mcp.tools, ops.read, ops.write]
+    mutating_tools: [create_collection_case]
+    enabled: true
