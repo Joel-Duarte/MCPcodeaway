@@ -79,6 +79,7 @@ services:
       GATEWAY_REDIS_URL: redis://redis:6379/0
       GATEWAY_SANDBOX_WORKER_SECRET: ${GATEWAY_SANDBOX_WORKER_SECRET:-dev-sandbox-worker-secret}
       GATEWAY_PROVENANCE_SIGNING_SECRET: ${GATEWAY_PROVENANCE_SIGNING_SECRET:-dev-provenance-secret}
+      GATEWAY_ADMIN_SESSION_SECRET: ${GATEWAY_ADMIN_SESSION_SECRET:-dev-admin-session-secret}
     ports:
       - "8000"
     networks:
@@ -109,12 +110,26 @@ services:
       GATEWAY_SANDBOX_WORKER_URL: ws://sandbox-worker:8002/ws/execute
       GATEWAY_SANDBOX_WORKER_SECRET: ${GATEWAY_SANDBOX_WORKER_SECRET:-dev-sandbox-worker-secret}
       GATEWAY_PROVENANCE_SIGNING_SECRET: ${GATEWAY_PROVENANCE_SIGNING_SECRET:-dev-provenance-secret}
+      GATEWAY_ADMIN_SESSION_SECRET: ${GATEWAY_ADMIN_SESSION_SECRET:-dev-admin-session-secret}
     ports:
-      - "8000:8000"
+      - "8000"
     networks:
       - control_plane
       - sandbox_isolated
     profiles: ["prod"]
+
+  lb:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/templates/default.conf.template:ro
+    environment:
+      GATEWAY_UPSTREAM_HOST: ${GATEWAY_LB_UPSTREAM_HOST:-gateway-scaled}
+      GATEWAY_UPSTREAM_PORT: ${GATEWAY_LB_UPSTREAM_PORT:-8000}
+    ports:
+      - "8080:80"
+    networks:
+      - control_plane
+    profiles: ["prod", "scaled"]
 
 networks:
   control_plane:
