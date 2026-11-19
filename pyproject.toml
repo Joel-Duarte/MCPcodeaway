@@ -26,6 +26,7 @@ dependencies = [
 redis = ["redis>=5.2"]
 otlp = ["opentelemetry-exporter-otlp-proto-http>=1.30"]
 postgres = ["asyncpg>=0.30"]
+s3 = ["boto3>=1.35"]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
@@ -49,7 +50,13 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "S105", "S106", "S113", "S307", "S324", "S501", "S506"]
 
 [tool.ruff.lint.per-file-ignores]
-"benchmarks/*.py" = ["E402"]
+"benchmarks/*.py" = ["E402", "S105", "S106"]
+"tests/*.py" = ["S105", "S106"]
+"examples/*.py" = ["S105", "S106"]
+"src/gateway/config.py" = ["S105"]
+"src/gateway/dispatcher.py" = ["S105"]
+"src/gateway/admin_auth.py" = ["S105"]
+"src/gateway/auth.py" = ["S105", "S106"]

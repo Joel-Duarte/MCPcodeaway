@@ -404,7 +404,7 @@ async function handleInspect() {
     schemaVerified.value = true;
     const inspectedName =
       inspectResult.value.inspection.name ||
-      inspectResult.value.inspection.upstream ||
+      inspectResult.value.inspection["upstream"] ||
       draftName.value.trim();
     statusMessage.value = `Inspected '${inspectedName}' (${inspectResult.value.inspection.tool_count} tools). Step 2 unlocked.`;
   } catch (err) {

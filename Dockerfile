@@ -34,13 +34,13 @@ FROM base-runtime AS gateway
 ENV GATEWAY_PROFILE=production
 USER appuser
 EXPOSE 8000
-CMD ["uvicorn", "gateway.server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "gateway.server:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
 
 # Target 2: Egress-isolated Monty sandbox worker (WebSocket reverse-RPC)
 FROM base-runtime AS sandbox-worker
 USER appuser
 EXPOSE 8002
-CMD ["uvicorn", "gateway.sandbox_worker:app", "--host", "0.0.0.0", "--port", "8002"]
+CMD ["uvicorn", "gateway.sandbox_worker:app", "--host", "0.0.0.0", "--port", "8002", "--proxy-headers"]
 
 # Target 3: Gateway with compiled Nuxt + @ui-sdk/vue Admin Console SPA
 FROM gateway AS gateway-ui
@@ -48,7 +48,7 @@ COPY --from=web-builder --chown=appuser:appuser /app/web/.output/public ./src/ga
 ENV GATEWAY_PROFILE=staging
 USER appuser
 EXPOSE 8000
-CMD ["uvicorn", "gateway.server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "gateway.server:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
 
 # Target 4: Full local demo workbench (includes examples/ mock servers + Admin Console)
 FROM gateway-ui AS gateway-demo
@@ -56,4 +56,4 @@ COPY --chown=appuser:appuser examples ./examples
 ENV GATEWAY_PROFILE=demo
 USER appuser
 EXPOSE 8000
-CMD ["uvicorn", "gateway.server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "gateway.server:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
