@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -2018,6 +2020,13 @@ def create_gateway_app(
 
         @app.get("/admin/upstreams")
         async def list_admin_upstreams(
+            q: str | None = Query(default=None),
+            group: str | None = Query(default=None),
+            auth_type: str | None = Query(default=None),
+            stateful: bool | None = Query(default=None),
+            mode: str | None = Query(default=None),
+            page: int = Query(default=1, ge=1),
+            page_size: int = Query(default=200, ge=1, le=500),
             authorization: str | None = Header(default=None),
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
@@ -2025,7 +2034,32 @@ def create_gateway_app(
                 authorization, mcpcodeaway_admin_session, require_admin_role=True
             )
             await runtime.sync_catalog_if_stale()
-            upstreams = runtime.registry.list_upstreams(include_disabled=True)
+            all_upstreams = runtime.registry.list_upstreams(include_disabled=True)
+            facets_groups = sorted({g for u in all_upstreams for g in u.allowed_groups})
+            facets_auth = sorted({u.auth_type for u in all_upstreams})
+            facets_modes = sorted({u.preferred_mode for u in all_upstreams})
+
+            filtered = all_upstreams
+            if q:
+                needle = q.strip().lower()
+                filtered = [
+                    u
+                    for u in filtered
+                    if needle in u.name.lower() or needle in (u.url or "").lower()
+                ]
+            if group:
+                filtered = [u for u in filtered if group in u.allowed_groups]
+            if auth_type:
+                filtered = [u for u in filtered if u.auth_type == auth_type]
+            if stateful is not None:
+                filtered = [u for u in filtered if bool(u.stateful_session) is stateful]
+            if mode:
+                filtered = [u for u in filtered if u.preferred_mode == mode]
+
+            total = len(filtered)
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            start = (page - 1) * page_size
+            page_items = filtered[start : start + page_size]
             return {
                 "app_env": runtime.settings.app_env,
                 "profile": runtime.settings.effective_profile_name,
@@ -2033,7 +2067,17 @@ def create_gateway_app(
                 "catalog_version": runtime.catalog.catalog_version,
                 "digests_by_server": runtime.catalog.digests_by_server,
                 "drift_warnings": runtime.catalog.drift_warnings,
-                "upstreams": [u.model_dump(exclude={"openapi_spec"}) for u in upstreams],
+                "upstreams": [u.model_dump(exclude={"openapi_spec"}) for u in page_items],
+                "total": total,
+                "total_registered": len(all_upstreams),
+                "page": page,
+                "page_size": page_size,
+                "total_pages": total_pages,
+                "facets": {
+                    "groups": facets_groups,
+                    "auth_types": facets_auth,
+                    "modes": facets_modes,
+                },
                 "comparison_audit": audit_catalog_comparison(runtime.catalog, runtime.registry),
             }
 
@@ -2166,6 +2210,80 @@ def create_gateway_app(
             deleted = await runtime.store.prune_runs_older_than(days)
             return {"deleted_runs": deleted, "retention_days": days}
 
+        @app.post("/admin/audit/archive")
+        async def admin_archive_audit_runs(
+            retention_days: int | None = Query(default=None, ge=0, le=3650),
+            prune_after_archive: bool = Query(default=False),
+            s3_bucket: str | None = Query(default=None),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            days = (
+                retention_days
+                if retention_days is not None
+                else runtime.settings.audit_retention_days
+            )
+            if not hasattr(runtime.store, "export_runs_older_than"):
+                raise HTTPException(
+                    status_code=501, detail="Active AuditStore does not support archive export"
+                )
+            rows = await runtime.store.export_runs_older_than(days)
+            jsonl_payload = "\n".join(json.dumps(r, default=str) for r in rows)
+            if jsonl_payload:
+                jsonl_payload += "\n"
+            digest = hashlib.sha256(jsonl_payload.encode("utf-8")).hexdigest()
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            filename = f"mcpcodeaway-audit-archive-{stamp}.jsonl"
+            bucket = (s3_bucket or runtime.settings.audit_archive_s3_bucket or "").strip()
+            s3_uri: str | None = None
+            if bucket and rows:
+                try:
+                    import boto3
+
+                    client_kwargs: dict[str, Any] = {
+                        "region_name": runtime.settings.audit_archive_s3_region
+                    }
+                    if runtime.settings.audit_archive_s3_endpoint:
+                        client_kwargs["endpoint_url"] = runtime.settings.audit_archive_s3_endpoint
+                    s3 = boto3.client("s3", **client_kwargs)
+                    prefix = runtime.settings.audit_archive_s3_prefix.strip("/")
+                    key = f"{prefix}/{filename}" if prefix else filename
+                    s3.put_object(
+                        Bucket=bucket,
+                        Key=key,
+                        Body=jsonl_payload.encode("utf-8"),
+                        ContentType="application/x-ndjson",
+                    )
+                    s3_uri = f"s3://{bucket}/{key}"
+                except ImportError as exc:
+                    raise HTTPException(
+                        status_code=501,
+                        detail=(
+                            "boto3 is required for direct S3 upload; "
+                            "omit s3_bucket for JSONL download"
+                        ),
+                    ) from exc
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=502, detail=f"S3 archive upload failed: {exc}"
+                    ) from exc
+
+            deleted = 0
+            if prune_after_archive and rows:
+                deleted = await runtime.store.prune_runs_older_than(days)
+            return {
+                "exported_runs": len(rows),
+                "deleted_runs": deleted,
+                "retention_days": days,
+                "filename": filename,
+                "sha256": digest,
+                "s3_uri": s3_uri,
+                "jsonl_content": None if s3_uri else jsonl_payload,
+            }
+
         def _ensure_demo_traffic_allowed() -> None:
             if (
                 runtime.settings.app_env == "prod"
@@ -2194,20 +2312,74 @@ def create_gateway_app(
             await _authorize_control_plane(
                 authorization, mcpcodeaway_admin_session, require_admin_role=True
             )
-            if body.webhook_url:
-                try:
-                    validate_upstream_url(
-                        body.webhook_url,
-                        app_env=runtime.settings.app_env,
-                        block_private_ips_in_prod=runtime.settings.block_private_ips_in_prod,
-                        allowed_hosts=runtime.settings.allowed_upstream_hosts,
-                    )
-                except ValueError as exc:
-                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            urls_to_check = [body.webhook_url] + [r.webhook_url for r in body.custom_rules]
+            for raw_url in urls_to_check:
+                if raw_url:
+                    try:
+                        validate_upstream_url(
+                            raw_url,
+                            app_env=runtime.settings.app_env,
+                            block_private_ips_in_prod=runtime.settings.block_private_ips_in_prod,
+                            allowed_hosts=runtime.settings.allowed_upstream_hosts,
+                        )
+                    except ValueError as exc:
+                        raise HTTPException(status_code=400, detail=str(exc)) from exc
             runtime.alert_evaluator.rules = body
             if hasattr(runtime.store, "save_setting"):
                 await runtime.store.save_setting("alert_rules", body.model_dump())
             return {"saved": True, "rules": body.model_dump()}
+
+        @app.post("/admin/alerts/test-webhook")
+        async def admin_test_alert_webhook(
+            webhook_url: str | None = Query(default=None),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            target = (webhook_url or runtime.alert_evaluator.rules.webhook_url or "").strip()
+            if not target:
+                raise HTTPException(status_code=400, detail="No webhook_url configured")
+            try:
+                validate_upstream_url(
+                    target,
+                    app_env=runtime.settings.app_env,
+                    block_private_ips_in_prod=runtime.settings.block_private_ips_in_prod,
+                    allowed_hosts=runtime.settings.allowed_upstream_hosts,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            is_https = target.lower().startswith("https://")
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.post(
+                        target,
+                        json={
+                            "source": "mcpcodeaway",
+                            "test": True,
+                            "alerts": [
+                                {
+                                    "id": "webhook_test",
+                                    "severity": "info",
+                                    "title": "MCPcodeaway test alert webhook",
+                                }
+                            ],
+                        },
+                    )
+                return {
+                    "delivered": resp.is_success,
+                    "status_code": resp.status_code,
+                    "https_enforced": is_https,
+                    "detail": f"HTTP {resp.status_code}" if resp.is_success else resp.text[:200],
+                }
+            except Exception as exc:
+                return {
+                    "delivered": False,
+                    "status_code": None,
+                    "https_enforced": is_https,
+                    "detail": str(exc),
+                }
 
         @app.post("/admin/upstreams/test-call")
         async def admin_test_upstream_call(

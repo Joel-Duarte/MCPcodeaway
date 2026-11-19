@@ -4,12 +4,31 @@ from __future__ import annotations
 
 import time
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pydantic import BaseModel, Field
 
 from gateway.upstream_clients import validate_upstream_url
+
+
+class CustomAlertRule(BaseModel):
+    """User-defined metric alert rule evaluated against live gateway telemetry."""
+
+    id: str = Field(..., min_length=1, max_length=64)
+    name: str = Field(..., min_length=1, max_length=120)
+    metric: Literal[
+        "error_rate_pct",
+        "p95_latency_ms",
+        "grounding_blocks",
+        "subcall_errors",
+        "upstream_down",
+    ]
+    operator: Literal[">", ">=", "<", "<=", "=="] = ">="
+    threshold: float = Field(..., ge=0.0, le=1000000.0)
+    severity: Literal["warning", "critical"] = "warning"
+    webhook_url: str | None = None
+    enabled: bool = True
 
 
 class AlertRulesConfig(BaseModel):
@@ -20,6 +39,19 @@ class AlertRulesConfig(BaseModel):
     grounding_blocks_max: int = Field(default=5, ge=1, le=1000)
     webhook_url: str | None = None
     webhook_cooldown_seconds: int = Field(default=60, ge=5, le=3600)
+    custom_rules: list[CustomAlertRule] = Field(default_factory=list)
+
+
+def _compare_metric(value: float, operator: str, threshold: float) -> bool:
+    if operator == ">":
+        return value > threshold
+    if operator == ">=":
+        return value >= threshold
+    if operator == "<":
+        return value < threshold
+    if operator == "<=":
+        return value <= threshold
+    return value == threshold
 
 
 class AlertEvaluator:
@@ -119,7 +151,61 @@ class AlertEvaluator:
                 }
             )
 
-        return alerts
+        return alerts + self._evaluate_custom_rules(
+            runs=runs, startup_warnings=startup_warnings, now_iso=now_iso
+        )
+
+    def _evaluate_custom_rules(
+        self,
+        *,
+        runs: list[dict[str, Any]],
+        startup_warnings: list[str],
+        now_iso: str,
+    ) -> list[dict[str, Any]]:
+        if not self.rules.custom_rules:
+            return []
+        total = len(runs)
+        errors = sum(1 for r in runs if not r.get("ok"))
+        err_pct = round((errors / total) * 100.0, 2) if total else 0.0
+        durations = sorted(float(r.get("duration_ms") or 0.0) for r in runs)
+        p95_ms = (
+            round(durations[min(len(durations) - 1, max(0, int(0.95 * len(durations)) - 1))], 2)
+            if durations
+            else 0.0
+        )
+        grounding_blocks = float(sum(1 for r in runs if r.get("grounding_blocked")))
+        subcall_errors = float(
+            sum(1 for r in runs if not r.get("ok") and not r.get("grounding_blocked"))
+        )
+        upstream_down = float(len(startup_warnings))
+
+        metric_values: dict[str, float] = {
+            "error_rate_pct": err_pct,
+            "p95_latency_ms": p95_ms,
+            "grounding_blocks": grounding_blocks,
+            "subcall_errors": subcall_errors,
+            "upstream_down": upstream_down,
+        }
+        triggered: list[dict[str, Any]] = []
+        for rule in self.rules.custom_rules:
+            if not rule.enabled:
+                continue
+            val = metric_values.get(rule.metric, 0.0)
+            if rule.metric in {"error_rate_pct", "p95_latency_ms"} and total < 5:
+                continue
+            if _compare_metric(val, rule.operator, rule.threshold):
+                triggered.append(
+                    {
+                        "id": f"custom:{rule.id}",
+                        "rule_id": rule.id,
+                        "severity": rule.severity,
+                        "title": f"{rule.name} ({val} {rule.operator} {rule.threshold})",
+                        "detail": f"Custom rule on {rule.metric} across last {total} runs.",
+                        "webhook_url": rule.webhook_url or self.rules.webhook_url,
+                        "observed_at": now_iso,
+                    }
+                )
+        return triggered
 
     async def notify_webhook_if_needed(
         self,
@@ -129,29 +215,35 @@ class AlertEvaluator:
         block_private_ips_in_prod: bool,
         allowed_hosts: list[str],
     ) -> list[str]:
-        url = (self.rules.webhook_url or "").strip()
-        if not url or not alerts:
+        if not alerts:
             return []
-        validate_upstream_url(
-            url,
-            app_env=app_env,
-            block_private_ips_in_prod=block_private_ips_in_prod,
-            allowed_hosts=allowed_hosts,
-        )
+        default_url = (self.rules.webhook_url or "").strip()
+        by_url: dict[str, list[dict[str, Any]]] = {}
         now = time.monotonic()
-        due = [
-            a
-            for a in alerts
-            if (now - self._last_sent.get(a["id"], 0.0)) >= self.rules.webhook_cooldown_seconds
-        ]
-        if not due:
-            return []
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(url, json={"source": "mcpcodeaway", "alerts": due})
-                resp.raise_for_status()
-            for a in due:
-                self._last_sent[a["id"]] = now
-            return [a["id"] for a in due]
-        except Exception:
-            return []
+        for alert in alerts:
+            if (now - self._last_sent.get(alert["id"], 0.0)) < self.rules.webhook_cooldown_seconds:
+                continue
+            target_url = str(alert.get("webhook_url") or default_url).strip()
+            if target_url:
+                by_url.setdefault(target_url, []).append(alert)
+
+        sent_ids: list[str] = []
+        for target_url, batch in by_url.items():
+            validate_upstream_url(
+                target_url,
+                app_env=app_env,
+                block_private_ips_in_prod=block_private_ips_in_prod,
+                allowed_hosts=allowed_hosts,
+            )
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.post(
+                        target_url, json={"source": "mcpcodeaway", "alerts": batch}
+                    )
+                    resp.raise_for_status()
+                for alert in batch:
+                    self._last_sent[alert["id"]] = now
+                    sent_ids.append(alert["id"])
+            except Exception:
+                continue
+        return sent_ids

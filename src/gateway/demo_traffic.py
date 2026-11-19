@@ -200,6 +200,16 @@ class DemoTrafficRunner:
                 },
                 None,
             ),
+            (
+                "readonly_auditor",
+                "mode=traditional",
+                "ops:rbac_denied_probe",
+                {
+                    "name": "ops_ticketing__escalate_incident",
+                    "arguments": {"incident_id": "INC-404", "priority": "sev1"},
+                },
+                None,
+            ),
         ]
 
         # Probe any custom upstreams registered by the admin so they appear live in analytics.

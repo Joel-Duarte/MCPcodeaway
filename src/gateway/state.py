@@ -170,6 +170,8 @@ class AuditStore(Protocol):
 
     async def delete_dynamic_upstream(self, name: str) -> bool: ...
 
+    async def export_runs_older_than(self, retention_days: int) -> list[dict[str, Any]]: ...
+
     async def prune_runs_older_than(self, retention_days: int) -> int: ...
 
 
@@ -389,6 +391,16 @@ class SQLiteAuditStore:
             cursor = conn.execute("DELETE FROM dynamic_upstreams WHERE name = ?", (name,))
             conn.commit()
             return cursor.rowcount > 0
+
+    async def export_runs_older_than(self, retention_days: int) -> list[dict[str, Any]]:
+        cutoff = (datetime.now(UTC) - timedelta(days=max(0, retention_days))).isoformat()
+        async with self._lock:
+            conn = self._ensure_conn()
+            rows = conn.execute(
+                "SELECT payload_json FROM audit_runs WHERE created_at < ? ORDER BY created_at ASC",
+                (cutoff,),
+            ).fetchall()
+        return [json.loads(r["payload_json"]) for r in rows]
 
     async def prune_runs_older_than(self, retention_days: int) -> int:
         cutoff = (datetime.now(UTC) - timedelta(days=max(0, retention_days))).isoformat()
@@ -675,6 +687,15 @@ class PostgresAuditStore:
             return int(str(status).split()[-1]) > 0
         except (IndexError, ValueError):
             return bool(status)
+
+    async def export_runs_older_than(self, retention_days: int) -> list[dict[str, Any]]:
+        cutoff = (datetime.now(UTC) - timedelta(days=max(0, retention_days))).isoformat()
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            "SELECT payload_json FROM audit_runs WHERE created_at < $1 ORDER BY created_at ASC",
+            cutoff,
+        )
+        return [json.loads(r["payload_json"]) for r in rows]
 
     async def prune_runs_older_than(self, retention_days: int) -> int:
         cutoff = (datetime.now(UTC) - timedelta(days=max(0, retention_days))).isoformat()
