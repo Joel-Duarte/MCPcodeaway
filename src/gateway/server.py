@@ -34,6 +34,7 @@ from gateway import __version__
 from gateway.ab_testing import (
     OnboardingAbTestRequest,
     _run_matches_tool,
+    compute_empirical_model_delta,
     evaluate_mode_algorithm,
     resolve_ab_experiment_variant,
     run_onboarding_ab_test,
@@ -510,6 +511,45 @@ class GatewayRuntime:
             if scoped_recent
             else 0.0
         )
+        model_delta: float | None = None
+        model_reason: str | None = None
+        if model_name:
+            saved_scores: dict[str, Any] = {}
+            if hasattr(self.store, "get_setting"):
+                saved_scores = await self.store.get_setting("model_routing_scores") or {}
+            entry = saved_scores.get(model_name) or saved_scores.get(model_name.lower())
+            if isinstance(entry, dict) and entry.get("preferred_mode") in {
+                "classic",
+                "codemode",
+            }:
+                pref = str(entry["preferred_mode"])
+                gw_p: GatewayMode = "codemode" if pref == "codemode" else "traditional"
+                p_exec, p_disc = _MODE_TO_AXES[gw_p]
+                return (
+                    p_exec,
+                    p_disc,
+                    gw_p,
+                    f"model_profile_override:{model_name}->{gw_p}",
+                    None,
+                    None,
+                    None,
+                )
+            if isinstance(entry, (int, float)):
+                model_delta = float(entry)
+                model_reason = f"Admin score override for '{model_name}' ({model_delta:+.1f})"
+            elif isinstance(entry, dict) and isinstance(entry.get("score_delta"), (int, float)):
+                model_delta = float(entry["score_delta"])
+                model_reason = (
+                    str(entry.get("notes") or "")
+                    or f"Admin score override for '{model_name}' ({model_delta:+.1f})"
+                )
+            else:
+                learned = compute_empirical_model_delta(
+                    recent, model_name, target_tool=inferred_tool
+                )
+                if learned is not None:
+                    model_delta, model_reason = learned
+
         decision = evaluate_mode_algorithm(
             tool_count=tool_count,
             classic_schema_tokens=classic_tokens,
@@ -519,6 +559,8 @@ class GatewayRuntime:
             intent=intent,
             server_count=max(1, len({t.server for t in tools})),
             model_name=model_name,
+            model_score_delta=model_delta,
+            model_score_reason=model_reason,
         )
         return (
             decision.execution,
@@ -1287,6 +1329,13 @@ class ModelPriceBody(BaseModel):
     model_name: str = Field(..., min_length=1, max_length=64)
     input_per_1m_usd: float = Field(..., ge=0.0, le=1000.0)
     output_per_1m_usd: float = Field(..., ge=0.0, le=1000.0)
+
+
+class ModelRoutingScoreBody(BaseModel):
+    model_name: str = Field(..., min_length=1, max_length=128)
+    score_delta: float = Field(default=0.0, ge=-50.0, le=50.0)
+    preferred_mode: str | None = None
+    notes: str = ""
 
 
 class UpstreamTestCallRequest(BaseModel):
@@ -2319,6 +2368,31 @@ def create_gateway_app(
                 "mode_decisions": analytics["mode_decisions"],
             }
 
+        @app.get("/admin/routing/models")
+        async def admin_get_model_routing_scores(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            saved: dict[str, Any] = {}
+            if hasattr(runtime.store, "get_setting"):
+                saved = await runtime.store.get_setting("model_routing_scores") or {}
+            recent = await runtime.store.list_runs(limit=250)
+            seen_models = sorted(
+                {str(r.get("model_name")).strip() for r in recent if r.get("model_name")}
+            )
+            learned: dict[str, Any] = {}
+            for m_name in seen_models:
+                emp = compute_empirical_model_delta(recent, m_name)
+                if emp is not None:
+                    learned[m_name] = {"score_delta": emp[0], "reason": emp[1]}
+            return {"admin_overrides": saved, "learned_from_runs": learned}
+
     async def _inspect_candidate(
         cfg: UpstreamConfig, authorization: str | None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2756,6 +2830,55 @@ def create_gateway_app(
             if hasattr(runtime.store, "delete_model_pricing"):
                 deleted = await runtime.store.delete_model_pricing(model_name)
             return {"deleted": deleted, "models": await runtime.merged_model_pricing()}
+
+        @app.post("/admin/routing/models")
+        async def admin_save_model_routing_score(
+            body: ModelRoutingScoreBody,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            if body.preferred_mode is not None and body.preferred_mode not in {
+                "classic",
+                "codemode",
+                "auto",
+            }:
+                raise HTTPException(
+                    status_code=400,
+                    detail="preferred_mode must be 'classic', 'codemode', or 'auto'",
+                )
+            saved: dict[str, Any] = {}
+            if hasattr(runtime.store, "get_setting"):
+                saved = dict(await runtime.store.get_setting("model_routing_scores") or {})
+            saved[body.model_name.strip()] = {
+                "score_delta": body.score_delta,
+                "preferred_mode": (
+                    None if body.preferred_mode in {None, "auto"} else body.preferred_mode
+                ),
+                "notes": body.notes.strip(),
+            }
+            if hasattr(runtime.store, "save_setting"):
+                await runtime.store.save_setting("model_routing_scores", saved)
+            return {"saved": True, "admin_overrides": saved}
+
+        @app.delete("/admin/routing/models/{model_name:path}")
+        async def admin_delete_model_routing_score(
+            model_name: str,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            saved: dict[str, Any] = {}
+            if hasattr(runtime.store, "get_setting"):
+                saved = dict(await runtime.store.get_setting("model_routing_scores") or {})
+            deleted = saved.pop(model_name, None) is not None
+            if hasattr(runtime.store, "save_setting"):
+                await runtime.store.save_setting("model_routing_scores", saved)
+            return {"deleted": deleted, "admin_overrides": saved}
 
         @app.post("/admin/demo/traffic/start")
         async def admin_demo_traffic_start(

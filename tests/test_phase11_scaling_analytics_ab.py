@@ -692,13 +692,14 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
             assert exps.status_code == 200
             assert "exp_inv_split" in exps.json()["results"]
 
-            # Layer 4: Model-aware scoring + self-learning A/B auto-promotion per model.
+            # Layer 4: Empirical model score learning + Admin model score overrides.
             qwen_small = evaluate_mode_algorithm(
                 tool_count=8,
                 classic_schema_tokens=800,
                 avg_payload_bytes=1200,
                 typed_output_ratio=0.5,
                 model_name="qwen/qwen3.5-9b",
+                model_score_delta=-18.0,
             )
             flash_strong = evaluate_mode_algorithm(
                 tool_count=8,
@@ -706,9 +707,30 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
                 avg_payload_bytes=1200,
                 typed_output_ratio=0.5,
                 model_name="gemini-2.5-flash",
+                model_score_delta=15.0,
             )
             assert qwen_small.execution == "classic"
             assert flash_strong.execution == "codemode"
+
+            save_score = await gw.post(
+                "/admin/routing/models",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+                json={
+                    "model_name": "custom-local-7b",
+                    "score_delta": -20.0,
+                    "preferred_mode": "classic",
+                    "notes": "Benchmarked better on Classic MCP",
+                },
+            )
+            assert save_score.status_code == 200
+            assert "custom-local-7b" in save_score.json()["admin_overrides"]
+
+            del_score = await gw.delete(
+                "/admin/routing/models/custom-local-7b",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+            )
+            assert del_score.status_code == 200
+            assert del_score.json()["deleted"] is True
 
             auto_promote_cfg = cfg.model_copy(
                 update={
@@ -811,6 +833,15 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
                 "ab_auto_promoted_tool:exp_model_learn:inv_api__list_items:classic"
                 in tool_learned_resp.headers.get("x-gateway-mode-decision", "")
             )
+
+            routing_models = await gw.get(
+                "/admin/routing/models",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+            )
+            assert routing_models.status_code == 200
+            learned_map = routing_models.json()["learned_from_runs"]
+            assert learned_map["gemini-2.5-flash"]["score_delta"] > 0
+            assert learned_map["qwen/qwen3.5-9b"]["score_delta"] < 0
 
             unauth_mcp = await gw.post(
                 "/mcp",

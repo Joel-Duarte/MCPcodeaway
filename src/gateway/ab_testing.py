@@ -40,33 +40,6 @@ _BATCH_INTENT_KEYWORDS = (
     "correlate",
 )
 
-_SMALL_MODEL_HINTS = (
-    "9b",
-    "8b",
-    "7b",
-    "4b",
-    "3b",
-    "1b",
-    "mini",
-    "nano",
-    "lite",
-    "small",
-)
-
-_STRONG_CODING_MODEL_HINTS = (
-    "flash",
-    "pro",
-    "sonnet",
-    "opus",
-    "gpt-5",
-    "gpt-6",
-    "o3",
-    "o4",
-    "codex",
-    "70b",
-    "72b",
-)
-
 
 class ModeFactor(BaseModel):
     """Single scored factor explaining an algorithmic execution mode choice."""
@@ -111,6 +84,81 @@ class OnboardingAbTestRequest(BaseModel):
     llm_config: OnboardingLlmConfig | None = None
 
 
+def compute_empirical_model_delta(
+    runs: list[dict[str, Any]],
+    model_name: str,
+    *,
+    target_tool: str | None = None,
+) -> tuple[float, str] | None:
+    """Derive a data-driven [-25, +25] Code Mode score delta from quality, speed & tokens."""
+    m_norm = model_name.strip().lower()
+    if not m_norm or not runs:
+        return None
+    model_runs = [r for r in runs if str(r.get("model_name") or "").strip().lower() == m_norm]
+    if not model_runs:
+        return None
+    if target_tool:
+        tool_runs = [r for r in model_runs if _run_matches_tool(r, target_tool)]
+        if len(tool_runs) >= 2:
+            model_runs = tool_runs
+
+    cm_runs = [
+        r
+        for r in model_runs
+        if str(r.get("ab_variant") or "") == "codemode"
+        or str(r.get("mode") or "").startswith("codemode")
+        or str(r.get("mode") or "") == "hybrid"
+    ]
+    cl_runs = [r for r in model_runs if r not in cm_runs]
+    if not cm_runs and not cl_runs:
+        return None
+
+    cm_n = len(cm_runs)
+    cl_n = len(cl_runs)
+    cm_ok_rate = (sum(1 for r in cm_runs if r.get("ok")) / cm_n) if cm_n else None
+    cl_ok_rate = (sum(1 for r in cl_runs if r.get("ok")) / cl_n) if cl_n else None
+    cm_saved = (
+        sum(
+            float(r.get("estimated_tokens_saved", 0)) + float(r.get("schema_tokens_saved", 0))
+            for r in cm_runs
+        )
+        / cm_n
+        if cm_n
+        else 0.0
+    )
+    cm_ms = (sum(float(r.get("duration_ms", 0.0)) for r in cm_runs) / cm_n) if cm_n else 0.0
+    cl_ms = (sum(float(r.get("duration_ms", 0.0)) for r in cl_runs) / cl_n) if cl_n else 0.0
+
+    delta = 0.0
+    # 1. Quality / success rate (primary driver)
+    if cm_ok_rate is not None and cl_ok_rate is not None:
+        delta += (cm_ok_rate - cl_ok_rate) * 25.0
+    elif cm_ok_rate is not None:
+        delta += (cm_ok_rate - 0.75) * 30.0
+    # 2. Token efficiency
+    if cm_saved > 500:
+        delta += min(12.0, cm_saved / 400.0)
+    # 3. Speed / latency comparison
+    if cm_ms > 0 and cl_ms > 0:
+        if cm_ms < cl_ms:
+            delta += 5.0
+        elif cm_ms > cl_ms * 1.5:
+            delta -= 5.0
+
+    delta = max(-25.0, min(25.0, round(delta, 1)))
+    if abs(delta) < 0.5:
+        return None
+    ok_pct = round((cm_ok_rate if cm_ok_rate is not None else 1.0) * 100.0, 1)
+    return (
+        delta,
+        (
+            f"Learned from {len(model_runs)} runs for '{model_name}' "
+            f"(cm_success={ok_pct}%, avg_saved={round(cm_saved, 1)} tok, "
+            f"cm_ms={round(cm_ms, 1)})"
+        ),
+    )
+
+
 def evaluate_mode_algorithm(
     *,
     tool_count: int,
@@ -121,6 +169,8 @@ def evaluate_mode_algorithm(
     intent: str | None = None,
     server_count: int = 1,
     model_name: str | None = None,
+    model_score_delta: float | None = None,
+    model_score_reason: str | None = None,
 ) -> ModeDecision:
     """Compute a deterministic 0-100 Code Mode suitability score and execution decision."""
     score = 40.0
@@ -213,29 +263,16 @@ def evaluate_mode_algorithm(
             )
         )
 
-    model_lower = (model_name or "").strip().lower()
-    if model_lower:
-        if any(hint in model_lower for hint in _STRONG_CODING_MODEL_HINTS):
-            score += 15.0
-            factors.append(
-                ModeFactor(
-                    name="coding_model_boost",
-                    delta=15.0,
-                    detail=f"Model '{model_name}' supports zero-retry async Monty Python synthesis",
-                )
+    if model_score_delta is not None and abs(model_score_delta) > 0.0:
+        score += float(model_score_delta)
+        factors.append(
+            ModeFactor(
+                name="model_profile_score",
+                delta=float(model_score_delta),
+                detail=model_score_reason
+                or f"Model '{model_name or 'configured'}' profile delta ({model_score_delta:+.1f})",
             )
-        elif any(hint in model_lower for hint in _SMALL_MODEL_HINTS) and avg_payload_bytes < 16384:
-            score -= 18.0
-            factors.append(
-                ModeFactor(
-                    name="small_model_classic_preference",
-                    delta=-18.0,
-                    detail=(
-                        f"Model '{model_name}' prefers direct Classic tool calls on small/medium "
-                        "payloads"
-                    ),
-                )
-            )
+        )
 
     score = max(0.0, min(100.0, round(score, 1)))
     if score >= 55.0:
@@ -294,7 +331,13 @@ def _evaluate_learned_arms(
             v = "codemode" if (m.startswith("codemode") or m == "hybrid") else "classic"
         b = arms.setdefault(
             v,
-            {"runs": 0.0, "errors": 0.0, "tokens_saved": 0.0, "tokens_used": 0.0},
+            {
+                "runs": 0.0,
+                "errors": 0.0,
+                "tokens_saved": 0.0,
+                "tokens_used": 0.0,
+                "dur_sum": 0.0,
+            },
         )
         b["runs"] += 1.0
         if not r.get("ok"):
@@ -303,6 +346,7 @@ def _evaluate_learned_arms(
             r.get("schema_tokens_saved", 0)
         )
         b["tokens_used"] += float(r.get("tokens_used_est", 0))
+        b["dur_sum"] += float(r.get("duration_ms", 0.0))
     cm = arms.get("codemode")
     cl = arms.get("classic")
     if not (cm and cl and cm["runs"] >= 1.0 and cl["runs"] >= 1.0):
@@ -311,9 +355,23 @@ def _evaluate_learned_arms(
     cl_err = (cl["errors"] / cl["runs"]) * 100.0
     cm_avg_saved = cm["tokens_saved"] / cm["runs"]
     cl_avg_saved = cl["tokens_saved"] / cl["runs"]
-    if cm_avg_saved >= cl_avg_saved and cm_err <= cl_err + 5.0:
+    cm_avg_ms = cm["dur_sum"] / cm["runs"]
+    cl_avg_ms = cl["dur_sum"] / cl["runs"]
+
+    # 1. Quality / error rate takes top priority
+    if cm_err > cl_err + 5.0:
+        return "classic", cl_avg_saved, cm_err
+    if cl_err > cm_err + 5.0:
         return "codemode", cm_avg_saved, cm_err
-    return "classic", cl_avg_saved, cm_err
+    # 2. Token efficiency
+    if cm_avg_saved > cl_avg_saved:
+        return "codemode", cm_avg_saved, cm_err
+    if cl_avg_saved > cm_avg_saved:
+        return "classic", cl_avg_saved, cm_err
+    # 3. Speed / latency tie-breaker
+    if cm_avg_ms > 0 and cl_avg_ms > 0 and cl_avg_ms < cm_avg_ms:
+        return "classic", cl_avg_saved, cm_err
+    return "codemode", cm_avg_saved, cm_err
 
 
 def resolve_ab_experiment_variant(
