@@ -1,0 +1,12 @@
+title = "MCPcodeaway Gitleaks Configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Exclude intentional offline test/mock JWT and secret fixtures"
+paths = [
+  '''^tests/.*''',
+  '''^examples/.*''',
+  '''^benchmarks/.*\.json$''',
+]

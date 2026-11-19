@@ -1,0 +1,80 @@
+name: Frontend CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    name: Nuxt Build & SPA Asset Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Prepare Nuxt types and modules
+        working-directory: web
+        env:
+          NUXT_TELEMETRY_DISABLED: "1"
+        run: npx nuxt prepare
+
+      - name: Build static Nuxt 4 + @ui-sdk/vue console
+        working-directory: web
+        env:
+          NUXT_TELEMETRY_DISABLED: "1"
+        run: npm run generate
+
+      - name: Set up Python & uv for gateway SPA asset smoke test
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Verify gateway serves /dashboard/ and all compiled _nuxt assets
+        run: |
+          uv sync --extra dev
+          uv run python - <<'PY'
+          import asyncio, re, httpx
+          from gateway.config import GatewaySettings
+          from gateway.server import create_gateway_app
+
+          async def main():
+              app = create_gateway_app(settings=GatewaySettings(profile="demo", require_admin_auth=True, sqlite_path=":memory:"))
+              rt = app.state.runtime
+              await rt.startup()
+              try:
+                  async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gw") as c:
+                      r = await c.get("/dashboard/")
+                      assert r.status_code == 200
+                      assets = sorted(set(re.findall(r'/dashboard/_nuxt/[^"]+', r.text)))
+                      assert any(a.endswith(".css") for a in assets)
+                      assert any(a.endswith(".js") for a in assets)
+                      for a in assets:
+                          ar = await c.get(a)
+                          assert ar.status_code == 200, (a, ar.status_code)
+              finally:
+                  await rt.shutdown()
+
+          asyncio.run(main())
+          PY

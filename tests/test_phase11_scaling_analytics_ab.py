@@ -107,12 +107,8 @@ async def test_shared_cache_mcp_session_and_catalog_epoch(tmp_path: Path) -> Non
     )
     s1 = GatewaySettings(auth_mode="dev", sqlite_path=str(tmp_path / "r1.db"))
     s2 = GatewaySettings(auth_mode="dev", sqlite_path=str(tmp_path / "r1.db"))
-    rt1 = GatewayRuntime(
-        settings=s1, cache=shared_cache, preloaded_tools={"demo": [tool_v1]}
-    )
-    rt2 = GatewayRuntime(
-        settings=s2, cache=shared_cache, preloaded_tools={"demo": [tool_v2]}
-    )
+    rt1 = GatewayRuntime(settings=s1, cache=shared_cache, preloaded_tools={"demo": [tool_v1]})
+    rt2 = GatewayRuntime(settings=s2, cache=shared_cache, preloaded_tools={"demo": [tool_v2]})
     await rt1.store.init()
     await rt2.store.init()
     try:
@@ -454,8 +450,7 @@ async def test_runtime_telemetry_analytics_cors_and_cross_tenant_isolation(
             )
             assert rt_resp.status_code == 200
             assert (
-                rt_resp.headers.get("access-control-allow-origin")
-                == "https://console.example.com"
+                rt_resp.headers.get("access-control-allow-origin") == "https://console.example.com"
             )
             rt_body = rt_resp.json()
             assert rt_body["sandbox_worker"]["status"] == "ok"
@@ -714,9 +709,25 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
     assert "nginx:1.27-alpine" in compose
     assert "lb:" in compose
 
-    ci = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
-    assert "frontend:" in ci
-    assert "npm run generate" in ci
+    for wf_path, needle in (
+        (".github/workflows/backend-ci.yml", "agent_preflight.py"),
+        (".github/workflows/backend-ci.yml", "ruff format --check"),
+        (".github/workflows/frontend-ci.yml", "npm run generate"),
+        (".github/workflows/qa-ci.yml", "--verify-thresholds"),
+        (".github/workflows/security-ci.yml", "codeql-action"),
+        (".github/workflows/security-ci.yml", "gitleaks"),
+        (".github/dependabot.yml", "github-actions"),
+    ):
+        assert needle in Path(wf_path).read_text(encoding="utf-8")
+
+    for doc in (
+        "CLAUDE.md",
+        "tests/golden/flows.json",
+        "benchmarks/thresholds.json",
+        "scripts/agent_preflight.py",
+        "scripts/pre-ci.sh",
+    ):
+        assert Path(doc).is_file(), f"Missing Phase 12 QA/governance file: {doc}"
 
     # Barebones production Docker target must contain zero Node, SPA, or examples.
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
