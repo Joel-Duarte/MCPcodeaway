@@ -87,17 +87,31 @@ jobs:
           asyncio.run(main())
           PY
 
-      - name: Run Playwright E2E & Bombadil UI fuzzer against live gateway
+      - name: Start live mock-backends & gateway for E2E and Bombadil
         run: |
-          uv run uvicorn examples.mock_backends:app --host 127.0.0.1 --port 8001 &
-          MOCK_PID=$!
-          GATEWAY_PROFILE=demo GATEWAY_SQLITE_PATH=/tmp/ci_ui.db uv run uvicorn gateway.server:app --host 127.0.0.1 --port 8000 &
-          GW_PID=$!
-          trap 'kill $GW_PID $MOCK_PID 2>/dev/null || true' EXIT
+          nohup uv run uvicorn examples.mock_backends:app --host 127.0.0.1 --port 8001 >/tmp/ci_mock.log 2>&1 &
+          echo "MOCK_PID=$!" >> "$GITHUB_ENV"
+          GATEWAY_PROFILE=demo GATEWAY_SQLITE_PATH=/tmp/ci_ui.db nohup uv run uvicorn gateway.server:app --host 127.0.0.1 --port 8000 >/tmp/ci_gw.log 2>&1 &
+          echo "GW_PID=$!" >> "$GITHUB_ENV"
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:8000/health | grep -q '"startup_warnings":\[\]' && break
             sleep 0.25
           done
-          cd web
-          npm run test:e2e
-          BOMBADIL_STEPS=15 npm run test:bombadil
+
+      - name: Run Playwright E2E tests against live gateway
+        working-directory: web
+        run: npm run test:e2e
+
+      - name: Run Antithesis Bombadil UI fuzzer
+        uses: antithesishq/bombadil-action@v2
+        with:
+          driver: browser
+          origin: http://127.0.0.1:8000/dashboard/
+          specification: ./web/tests/bombadil/spec.ts
+          time-limit: 1m
+          exit-on-violation: true
+          output-path: bombadil-output
+
+      - name: Stop live gateway & mock-backends
+        if: always()
+        run: kill "${GW_PID:-0}" "${MOCK_PID:-0}" 2>/dev/null || true

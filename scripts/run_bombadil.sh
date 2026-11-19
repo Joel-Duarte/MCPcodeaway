@@ -3,11 +3,32 @@ set -euo pipefail
 
 TARGET_URL="${1:-http://127.0.0.1:8000/dashboard/}"
 STEPS="${BOMBADIL_STEPS:-25}"
+TIME_LIMIT="${BOMBADIL_TIME_LIMIT:-15s}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+BOMBADIL_BIN=""
 if command -v bombadil >/dev/null 2>&1; then
-  echo ">> Running Antithesis Bombadil UI fuzzer against $TARGET_URL..."
-  exec bombadil test "$REPO_ROOT/web/tests/bombadil/spec.ts" "$TARGET_URL"
+  BOMBADIL_BIN="bombadil"
+elif [[ -x "$REPO_ROOT/web/node_modules/.bin/bombadil" ]]; then
+  BOMBADIL_BIN="$REPO_ROOT/web/node_modules/.bin/bombadil"
+fi
+
+if [[ -n "$BOMBADIL_BIN" ]]; then
+  if [[ -z "${CHROME:-}" ]] && ! command -v google-chrome >/dev/null 2>&1 && ! command -v chromium >/dev/null 2>&1; then
+    PW_CHROME="$(find "${HOME}/.cache/ms-playwright" -maxdepth 4 -type f -name chrome 2>/dev/null | sort -V | tail -n 1 || true)"
+    if [[ -n "$PW_CHROME" ]]; then
+      export CHROME="$PW_CHROME"
+      export PATH="$(dirname "$PW_CHROME"):$PATH"
+    fi
+  fi
+  echo ">> Running Antithesis Bombadil UI fuzzer against $TARGET_URL ($TIME_LIMIT)..."
+  exec "$BOMBADIL_BIN" browser test \
+    --headless \
+    --no-sandbox \
+    --exit-on-violation \
+    --time-limit "$TIME_LIMIT" \
+    "$TARGET_URL" \
+    "$REPO_ROOT/web/tests/bombadil/spec.ts"
 fi
 
 echo ">> bombadil CLI not installed; running Playwright property-based UI fuzzer ($STEPS randomized steps) against $TARGET_URL..."
