@@ -243,10 +243,17 @@
               <option value="readonly_auditor">readonly_auditor</option>
               <option value="support_agent">support_agent</option>
             </select>
-            <label>Gateway Mode</label>
-            <select id="auth-mode">
-              <option value="codemode">codemode (Python Stubs + execute_code)</option>
-              <option value="traditional_discover">traditional_discover (Deferred Classic Schemas)</option>
+            <label>Execution Mode</label>
+            <select id="auth-exec">
+              <option value="codemode">codemode (Monty execute_code)</option>
+              <option value="classic">classic (Direct MCP JSON Tools)</option>
+              <option value="hybrid">hybrid (Monty Reads + Direct Writes)</option>
+            </select>
+            <label>Discovery Mode</label>
+            <select id="auth-disc-mode">
+              <option value="deferred">deferred (list_servers + search_tools)</option>
+              <option value="upfront">upfront (Inline All Authorized Tools/Stubs)</option>
+              <option value="x_intent">x_intent (Zero-Turn X-Intent Filter)</option>
             </select>
           </div>
           <div>
@@ -260,6 +267,10 @@
             </select>
             <label>Optional Server Ceiling (?servers=comma,separated)</label>
             <input id="auth-servers" placeholder="e.g. snowflake_ledger,billing_legacy_eu" />
+            <label style="display:flex;align-items:center;gap:8px;margin-top:8px;">
+              <input type="checkbox" id="auth-grounding" style="width:auto;" />
+              Enforce <code>X-Require-Grounding</code> on <code>execute_code</code>
+            </label>
           </div>
         </div>
         <label>Query / X-Intent (optional semantic or keyword query)</label>
@@ -441,10 +452,12 @@
 
     async function simulateAuth() {
       const persona = document.getElementById("auth-persona").value;
-      const mode = document.getElementById("auth-mode").value;
+      const execution = document.getElementById("auth-exec").value;
+      const discoveryMode = document.getElementById("auth-disc-mode").value;
       const discovery = document.getElementById("auth-discovery").value;
       const servers = document.getElementById("auth-servers").value.trim();
       const intent = document.getElementById("auth-intent").value.trim();
+      const requireGrounding = document.getElementById("auth-grounding").checked;
 
       const tokResp = await fetch("/dev/auth/token", {
         method: "POST",
@@ -453,8 +466,13 @@
       }).then((r) => r.json());
       const token = tokResp.access_token;
 
-      const params = new URLSearchParams({ mode, discovery });
+      const params = new URLSearchParams({
+        execution,
+        discovery_mode: discoveryMode,
+        discovery,
+      });
       if (servers) params.set("servers", servers);
+      if (requireGrounding) params.set("require_grounding", "true");
       const mcpUrl = `/mcp?${params.toString()}`;
       const mcpHeaders = {
         "Content-Type": "application/json",

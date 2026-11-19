@@ -153,8 +153,9 @@ class LocalMontyBackend:
 class RemoteMontyWorkerBackend:
     """Executes Code Mode scripts on an egress-isolated sandbox worker over WebSocket RPC."""
 
-    def __init__(self, worker_ws_url: str) -> None:
+    def __init__(self, worker_ws_url: str, *, worker_secret: str = "") -> None:
         self.worker_ws_url = worker_ws_url
+        self.worker_secret = worker_secret
 
     async def close(self) -> None:
         return None
@@ -168,8 +169,14 @@ class RemoteMontyWorkerBackend:
         max_output_bytes: int = 32768,
     ) -> SandboxResult:
         started = time.perf_counter()
+        connect_kwargs: dict[str, Any] = {"max_size": 4 * 1024 * 1024}
+        if self.worker_secret:
+            connect_kwargs["additional_headers"] = {
+                "Authorization": f"Bearer {self.worker_secret}",
+                "X-Worker-Secret": self.worker_secret,
+            }
         try:
-            async with websockets.connect(self.worker_ws_url, max_size=4 * 1024 * 1024) as ws:
+            async with websockets.connect(self.worker_ws_url, **connect_kwargs) as ws:
                 await ws.send(
                     json.dumps(
                         {

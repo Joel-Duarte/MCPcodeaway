@@ -24,10 +24,17 @@ from gateway.auth import (
     OidcTokenValidator,
     PolicyEvaluator,
 )
-from gateway.catalog import ToolCatalog, estimate_tokens, to_mcp_tool_definition
+from gateway.catalog import (
+    ToolCatalog,
+    estimate_tokens,
+    render_python_stub,
+    to_mcp_tool_definition,
+)
 from gateway.comparator import audit_catalog_comparison, run_side_by_side_comparison
 from gateway.config import (
     DiscoveryBackendMode,
+    DiscoveryMode,
+    ExecutionMode,
     GatewayMode,
     GatewaySettings,
     UpstreamConfig,
@@ -39,6 +46,7 @@ from gateway.dispatcher import (
     HostDispatcher,
     SubcallRecord,
     bind_positional_arguments,
+    build_provenance_envelope,
 )
 from gateway.oauth_discovery import create_oauth_discovery_router
 from gateway.sandbox import LocalMontyBackend, RemoteMontyWorkerBackend, SandboxBackend
@@ -52,8 +60,41 @@ from gateway.state import (
 from gateway.telemetry import TelemetryRecorder, configure_telemetry
 from gateway.upstream_clients import DiscoveredTool, UpstreamClientManager, inspect_upstream
 
-_VALID_MODES: set[str] = {"codemode", "traditional", "traditional_discover", "hybrid"}
+_VALID_MODES: set[str] = {
+    "codemode",
+    "codemode_upfront",
+    "traditional",
+    "traditional_discover",
+    "hybrid",
+}
+_VALID_EXECUTION: set[str] = {"classic", "codemode", "hybrid"}
+_VALID_DISCOVERY_MODES: set[str] = {"upfront", "deferred", "x_intent"}
 _VALID_DISCOVERY: set[str] = {"keyword", "bm25", "embedding", "system1", "hybrid_system1"}
+
+_MODE_TO_AXES: dict[GatewayMode, tuple[ExecutionMode, DiscoveryMode]] = {
+    "traditional": ("classic", "upfront"),
+    "traditional_discover": ("classic", "deferred"),
+    "codemode_upfront": ("codemode", "upfront"),
+    "codemode": ("codemode", "deferred"),
+    "hybrid": ("hybrid", "deferred"),
+}
+
+
+def _execute_code_with_stubs(
+    tools: list[DiscoveredTool], *, header_note: str = "Authorized tool stubs:"
+) -> dict[str, Any]:
+    exec_copy = dict(EXECUTE_CODE_DEF)
+    capped = tools[:100]
+    stubs = "\n\n".join(render_python_stub(t) for t in capped)
+    if not stubs:
+        return exec_copy
+    extra = (
+        f"\n\n... ({len(tools) - 100} additional tools omitted; use search_tools)."
+        if len(tools) > 100
+        else ""
+    )
+    exec_copy["description"] = f"{EXECUTE_CODE_DEF['description']}\n\n{header_note}\n{stubs}{extra}"
+    return exec_copy
 
 LIST_SERVERS_DEF: dict[str, Any] = {
     "name": "list_servers",
@@ -203,7 +244,14 @@ class GatewayRuntime:
                 raise ValueError(
                     "sandbox_worker_url must be configured when sandbox_backend='remote'"
                 )
-            self.sandbox = RemoteMontyWorkerBackend(self.settings.sandbox_worker_url)
+            if self.settings.app_env == "prod" and not self.settings.sandbox_worker_secret:
+                raise ValueError(
+                    "sandbox_worker_secret must be configured when sandbox_backend='remote' in prod"
+                )
+            self.sandbox = RemoteMontyWorkerBackend(
+                self.settings.sandbox_worker_url,
+                worker_secret=self.settings.sandbox_worker_secret,
+            )
         else:
             self.sandbox = LocalMontyBackend()
         self.telemetry = TelemetryRecorder(self.store)
@@ -325,19 +373,32 @@ class GatewayRuntime:
         mode: GatewayMode,
         *,
         allowed_servers: set[str] | None = None,
+        execution: ExecutionMode | None = None,
+        discovery_mode: DiscoveryMode | None = None,
     ) -> list[dict[str, Any]]:
-        """Build the baseline MCP tools/list payload for the requested gateway mode."""
+        """Build the baseline MCP tools/list payload for Execution x Discovery."""
         accessible = self.catalog.list_accessible_tools(
             identity, self.policy, self.registry, allowed_servers=allowed_servers
         )
-        if mode == "codemode":
-            return [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, EXECUTE_CODE_DEF]
-        if mode == "traditional_discover":
+        base_exec, base_disc = _MODE_TO_AXES[mode]
+        eff_exec = execution or base_exec
+        eff_disc = discovery_mode or base_disc
+
+        if eff_exec == "classic":
+            if eff_disc == "upfront":
+                return [to_mcp_tool_definition(tool) for tool in accessible]
             return [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF]
-        if mode == "traditional":
-            return [to_mcp_tool_definition(tool) for tool in accessible]
+
+        if eff_exec == "codemode":
+            if eff_disc == "upfront":
+                return [_execute_code_with_stubs(accessible)]
+            return [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, EXECUTE_CODE_DEF]
+
         # hybrid: Code Mode for orchestration + direct MCP definitions for mutating writes
         direct_mutating = [to_mcp_tool_definition(tool) for tool in accessible if tool.mutating]
+        if eff_disc == "upfront":
+            read_only = [tool for tool in accessible if not tool.mutating]
+            return [_execute_code_with_stubs(read_only), *direct_mutating]
         return [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, EXECUTE_CODE_DEF, *direct_mutating]
 
     async def list_tools_for_request(
@@ -347,19 +408,25 @@ class GatewayRuntime:
         *,
         allowed_servers: set[str] | None = None,
         discovery_backend: DiscoveryBackendMode | None = None,
+        execution: ExecutionMode | None = None,
+        discovery_mode: DiscoveryMode | None = None,
         intent: str | None = None,
         query: str | None = None,
         requested_servers: list[str] | None = None,
         limit: int | None = None,
         cursor: str | None = None,
     ) -> dict[str, Any]:
-        """Build tools/list response supporting X-Intent zero-turn hydration and pagination."""
+        """Build tools/list response supporting X-Intent, upfront/deferred axes & pagination."""
         effective_ceiling = allowed_servers
         if requested_servers:
             req_set = set(requested_servers)
             effective_ceiling = (
                 (effective_ceiling & req_set) if effective_ceiling is not None else req_set
             )
+
+        base_exec, base_disc = _MODE_TO_AXES[mode]
+        eff_exec = execution or base_exec
+        eff_disc = discovery_mode or base_disc
 
         filter_text = (intent or query or "").strip()
         if filter_text:
@@ -373,12 +440,13 @@ class GatewayRuntime:
                 allowed_servers=effective_ceiling,
                 backend=discovery_backend,
                 limit=top_k,
-                include_schemas=(mode in {"traditional", "traditional_discover"}),
+                include_schemas=(eff_exec == "classic"),
             )
-            if mode == "traditional":
-                tools = list(discovered["hydrated_tools"])
-            elif mode == "traditional_discover":
-                tools = [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, *discovered["hydrated_tools"]]
+            if eff_exec == "classic":
+                if mode == "traditional" and eff_disc == "upfront":
+                    tools = list(discovered["hydrated_tools"])
+                else:
+                    tools = [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, *discovered["hydrated_tools"]]
             else:
                 exec_copy = dict(EXECUTE_CODE_DEF)
                 stubs = "\n\n".join(t["stub"] for t in discovered["tools"])
@@ -387,8 +455,12 @@ class GatewayRuntime:
                         f"{EXECUTE_CODE_DEF['description']}\n\n"
                         f"Pre-discovered matching stubs ({discovered['backend_used']}):\n{stubs}"
                     )
-                if mode == "codemode":
-                    tools = [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, exec_copy]
+                if eff_exec == "codemode":
+                    tools = (
+                        [exec_copy]
+                        if eff_disc == "upfront"
+                        else [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, exec_copy]
+                    )
                 else:
                     accessible = self.catalog.list_accessible_tools(
                         identity, self.policy, self.registry, allowed_servers=effective_ceiling
@@ -396,9 +468,19 @@ class GatewayRuntime:
                     direct_mutating = [
                         to_mcp_tool_definition(t) for t in accessible if t.mutating
                     ]
-                    tools = [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, exec_copy, *direct_mutating]
+                    tools = (
+                        [exec_copy, *direct_mutating]
+                        if eff_disc == "upfront"
+                        else [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, exec_copy, *direct_mutating]
+                    )
         else:
-            tools = self.tools_for_mode(identity, mode, allowed_servers=effective_ceiling)
+            tools = self.tools_for_mode(
+                identity,
+                mode,
+                allowed_servers=effective_ceiling,
+                execution=eff_exec,
+                discovery_mode=eff_disc,
+            )
 
         if cursor is not None or limit is not None:
             offset = max(0, int(cursor)) if cursor else 0
@@ -416,9 +498,12 @@ class GatewayRuntime:
         code: str,
         *,
         mode: GatewayMode = "codemode",
+        execution: ExecutionMode | None = None,
+        discovery_mode: DiscoveryMode | None = None,
         servers: list[str] | None = None,
         allowed_servers: set[str] | None = None,
         timeout_ms: int = 10000,
+        require_grounding: bool = False,
     ) -> dict[str, Any]:
         """Run Code Mode Python script in SandboxBackend and record audit telemetry."""
         started = time.perf_counter()
@@ -432,19 +517,27 @@ class GatewayRuntime:
         else:
             effective_servers = None
 
+        eff_exec = execution or _MODE_TO_AXES[mode][0]
         accessible = self.catalog.list_accessible_tools(
             identity, self.policy, self.registry, allowed_servers=effective_servers
         )
         schema_tokens = estimate_tokens(
-            self.tools_for_mode(identity, mode, allowed_servers=allowed_servers)
+            self.tools_for_mode(
+                identity,
+                mode,
+                allowed_servers=allowed_servers,
+                execution=eff_exec,
+                discovery_mode=discovery_mode,
+            )
         )
 
         budget = ExecutionBudget(self.settings.max_calls_per_execution)
         subcalls: list[SubcallRecord] = []
+        observed_tool_outputs: list[Any] = []
         external_functions: dict[str, Callable[..., Any]] = {}
 
         for tool in accessible:
-            if mode == "hybrid" and tool.mutating:
+            if eff_exec == "hybrid" and tool.mutating:
                 continue
             upstream = self.registry.get(tool.server)
             if upstream is None:
@@ -464,6 +557,7 @@ class GatewayRuntime:
                     subcalls.append(rec)
                     if isinstance(res, dict) and "_dispatch_error" in res:
                         raise RuntimeError(res["_dispatch_error"])
+                    observed_tool_outputs.append(res)
                     return res
 
                 return _wrapper
@@ -478,17 +572,47 @@ class GatewayRuntime:
         )
         duration_ms = round((time.perf_counter() - started) * 1000, 3)
 
+        provenance = build_provenance_envelope(
+            allowed_servers=effective_servers,
+            subcalls=subcalls,
+            observed_tool_outputs=observed_tool_outputs,
+            returned_value=sandbox_res.result if sandbox_res.ok else None,
+            signing_secret=self.settings.provenance_signing_secret,
+        )
+        effective_ok = sandbox_res.ok
+        effective_result = sandbox_res.result
+        effective_error = sandbox_res.error
+        effective_error_type = sandbox_res.error_type
+        if (self.settings.require_tool_grounding or require_grounding) and effective_ok:
+            if provenance["subcall_count"] == 0 and effective_result is not None:
+                effective_ok = False
+                effective_result = None
+                effective_error_type = "UngroundedResultError"
+                effective_error = (
+                    "Policy require_tool_grounding blocked result returned "
+                    "with 0 allowed tool calls."
+                )
+            elif provenance["unverified_identifiers"]:
+                effective_ok = False
+                effective_result = None
+                effective_error_type = "UnverifiedEntityError"
+                effective_error = (
+                    "Policy require_tool_grounding blocked unverified identifiers not "
+                    f"returned by allowed tools: {provenance['unverified_identifiers']}"
+                )
+
         payload: dict[str, Any] = {
-            "ok": sandbox_res.ok,
-            "result": sandbox_res.result,
+            "ok": effective_ok,
+            "result": effective_result,
             "stdout": sandbox_res.stdout,
             "truncated": sandbox_res.truncated,
             "subcall_count": len(subcalls),
             "duration_ms": duration_ms,
+            "_provenance": provenance,
         }
-        if not sandbox_res.ok:
-            payload["error"] = sandbox_res.error
-            payload["error_type"] = sandbox_res.error_type
+        if not effective_ok:
+            payload["error"] = effective_error
+            payload["error_type"] = effective_error_type
 
         run = await self.telemetry.record_execution(
             mode=mode,
@@ -498,11 +622,12 @@ class GatewayRuntime:
             subcalls=subcalls,
             returned_payload=payload,
             duration_ms=duration_ms,
-            ok=sandbox_res.ok,
+            ok=effective_ok,
             code=code,
             stdout=sandbox_res.stdout,
-            error=sandbox_res.error,
+            error=effective_error,
             tool_name="execute_code",
+            provenance=provenance,
         )
         payload["run_id"] = run["run_id"]
         payload["raw_upstream_bytes"] = run["raw_upstream_bytes"]
@@ -580,6 +705,66 @@ def _resolve_mode(
             detail=f"Invalid gateway mode '{chosen}'. Expected one of: {sorted(_VALID_MODES)}",
         )
     return chosen  # type: ignore[return-value]
+
+
+def _axis_to_gateway_mode(execution: ExecutionMode, discovery_mode: DiscoveryMode) -> GatewayMode:
+    if execution == "classic":
+        return "traditional" if discovery_mode == "upfront" else "traditional_discover"
+    if execution == "codemode":
+        return "codemode_upfront" if discovery_mode == "upfront" else "codemode"
+    return "hybrid"
+
+
+def _resolve_execution_and_discovery(
+    settings: GatewaySettings,
+    *,
+    query_mode: str | None,
+    header_mode: str | None,
+    query_execution: str | None,
+    header_execution: str | None,
+    query_discovery_mode: str | None,
+    header_discovery_mode: str | None,
+    x_intent: str | None,
+) -> tuple[ExecutionMode, DiscoveryMode, GatewayMode]:
+    has_mode_override = bool(query_mode or header_mode)
+    base_mode = _resolve_mode(settings.gateway_mode, query_mode, header_mode)
+    base_exec, base_disc = _MODE_TO_AXES[base_mode]
+
+    raw_exec = query_execution or header_execution or (
+        settings.execution_mode if not has_mode_override else None
+    )
+    if raw_exec is not None and raw_exec not in _VALID_EXECUTION:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid execution mode '{raw_exec}'. "
+                f"Expected one of: {sorted(_VALID_EXECUTION)}"
+            ),
+        )
+    raw_disc = query_discovery_mode or header_discovery_mode or (
+        settings.discovery_mode if not has_mode_override else None
+    )
+    if raw_disc is not None and raw_disc not in _VALID_DISCOVERY_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid discovery mode '{raw_disc}'. "
+                f"Expected one of: {sorted(_VALID_DISCOVERY_MODES)}"
+            ),
+        )
+
+    eff_exec: ExecutionMode = raw_exec or base_exec  # type: ignore[assignment]
+    eff_disc: DiscoveryMode = raw_disc or base_disc  # type: ignore[assignment]
+    if x_intent and x_intent.strip() and raw_disc != "upfront" and not (
+        base_mode == "traditional" and raw_disc is None
+    ):
+        eff_disc = "x_intent"
+    eff_mode = (
+        base_mode
+        if (raw_exec is None and raw_disc is None)
+        else _axis_to_gateway_mode(eff_exec, eff_disc)
+    )
+    return eff_exec, eff_disc, eff_mode
 
 
 def _resolve_discovery(
@@ -683,12 +868,18 @@ def create_gateway_app(
     async def mcp_endpoint(
         request: Request,
         mode: str | None = Query(default=None),
+        execution: str | None = Query(default=None),
+        discovery_mode: str | None = Query(default=None),
         discovery: str | None = Query(default=None),
         servers: str | None = Query(default=None),
+        require_grounding: bool | None = Query(default=None),
         x_gateway_mode: str | None = Header(default=None),
+        x_execution_mode: str | None = Header(default=None),
+        x_discovery_mode: str | None = Header(default=None),
         x_discovery_backend: str | None = Header(default=None),
         x_mcp_servers: str | None = Header(default=None),
         x_intent: str | None = Header(default=None),
+        x_require_grounding: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ) -> JSONResponse:
         try:
@@ -699,11 +890,24 @@ def create_gateway_app(
                 status_code=exc.status_code, detail=exc.detail, headers=headers
             ) from exc
 
-        effective_mode = _resolve_mode(runtime.settings.gateway_mode, mode, x_gateway_mode)
+        eff_exec, eff_disc_mode, effective_mode = _resolve_execution_and_discovery(
+            runtime.settings,
+            query_mode=mode,
+            header_mode=x_gateway_mode,
+            query_execution=execution,
+            header_execution=x_execution_mode,
+            query_discovery_mode=discovery_mode,
+            header_discovery_mode=x_discovery_mode,
+            x_intent=x_intent,
+        )
         effective_discovery = _resolve_discovery(
             runtime.settings.discovery_backend, discovery, x_discovery_backend
         )
         allowed_servers = _parse_servers_ceiling(servers, x_mcp_servers)
+        enforce_grounding = bool(
+            require_grounding
+            or (x_require_grounding and x_require_grounding.strip().lower() in {"1", "true", "yes"})
+        )
         payload = await request.json()
         req_id = payload.get("id")
         method = payload.get("method")
@@ -747,6 +951,8 @@ def create_gateway_app(
                 effective_mode,
                 allowed_servers=allowed_servers,
                 discovery_backend=effective_discovery,
+                execution=eff_exec,
+                discovery_mode=eff_disc_mode,
                 intent=x_intent,
                 query=params.get("query"),
                 requested_servers=req_srvs,
@@ -781,9 +987,9 @@ def create_gateway_app(
                 )
 
             if tool_name == "search_tools":
-                if effective_mode == "traditional":
+                if eff_exec == "classic" and eff_disc_mode == "upfront":
                     return _jsonrpc_err(
-                        req_id, -32601, "search_tools is disabled in traditional mode"
+                        req_id, -32601, "search_tools is disabled in traditional upfront mode"
                     )
                 req_srvs = arguments.get("servers")
                 if not req_srvs and arguments.get("server"):
@@ -798,7 +1004,7 @@ def create_gateway_app(
                     allowed_servers=allowed_servers,
                     backend=effective_discovery,
                     limit=int(arguments.get("limit", 15)),
-                    include_schemas=(effective_mode == "traditional_discover"),
+                    include_schemas=(eff_exec == "classic"),
                 )
                 return _jsonrpc_ok(
                     req_id,
@@ -809,7 +1015,7 @@ def create_gateway_app(
                 )
 
             if tool_name == "execute_code":
-                if effective_mode in {"traditional", "traditional_discover"}:
+                if eff_exec == "classic":
                     return _jsonrpc_err(
                         req_id, -32601, f"execute_code is disabled in {effective_mode} mode"
                     )
@@ -820,9 +1026,12 @@ def create_gateway_app(
                     identity,
                     code,
                     mode=effective_mode,
+                    execution=eff_exec,
+                    discovery_mode=eff_disc_mode,
                     servers=arguments.get("servers"),
                     allowed_servers=allowed_servers,
                     timeout_ms=int(arguments.get("timeout_ms", 10000)),
+                    require_grounding=enforce_grounding,
                 )
                 return _jsonrpc_ok(
                     req_id,
@@ -833,12 +1042,12 @@ def create_gateway_app(
                     },
                 )
 
-            if effective_mode == "codemode":
+            if eff_exec == "codemode":
                 return _jsonrpc_err(
                     req_id,
                     -32601,
                     f"Direct tool '{tool_name}' is not exposed in codemode; "
-                    "discover via search_tools and invoke inside execute_code.",
+                    "invoke authorized tools inside execute_code.",
                 )
 
             try:
@@ -1019,17 +1228,20 @@ def create_gateway_app(
         load_path = Path("benchmarks/load_results.json")
         live_path = Path("benchmarks/live_llm_results.json")
         discovery_path = Path("benchmarks/discovery_results.json")
+        matrix_path = Path("benchmarks/matrix_2x2_results.json")
         payload: dict[str, Any] = {
             "available": (
                 results_path.exists()
                 or load_path.exists()
                 or live_path.exists()
                 or discovery_path.exists()
+                or matrix_path.exists()
             ),
             "offline": None,
             "load": None,
             "live_llm": None,
             "discovery": None,
+            "matrix_2x2": None,
         }
         if results_path.exists():
             payload["offline"] = json.loads(results_path.read_text(encoding="utf-8"))
@@ -1039,6 +1251,8 @@ def create_gateway_app(
             payload["live_llm"] = json.loads(live_path.read_text(encoding="utf-8"))
         if discovery_path.exists():
             payload["discovery"] = json.loads(discovery_path.read_text(encoding="utf-8"))
+        if matrix_path.exists():
+            payload["matrix_2x2"] = json.loads(matrix_path.read_text(encoding="utf-8"))
         return payload
 
     @app.get("/dashboard", response_class=HTMLResponse)

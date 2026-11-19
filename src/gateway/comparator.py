@@ -168,6 +168,40 @@ def _scenario_plan(
         )
         return classic, code
 
+    if scenario == "reconcile_bulk_200":
+        classic = [
+            {
+                "tool": "snowflake_ledger__query_debt_ledger",
+                "arguments": {"status": "overdue", "dataset": "bulk"},
+            },
+            {
+                "tool": "billing_legacy_eu__list_eu_invoices",
+                "arguments": {"status": "overdue", "dataset": "bulk"},
+            },
+            {
+                "tool": "billing_legacy_us__list_us_invoices",
+                "arguments": {"status": "overdue", "dataset": "bulk"},
+            },
+        ]
+        code = (
+            "import asyncio\n"
+            "ledger, eu, us = await asyncio.gather(\n"
+            "    snowflake_ledger__query_debt_ledger(status='overdue', dataset='bulk'),\n"
+            "    billing_legacy_eu__list_eu_invoices(status='overdue', dataset='bulk'),\n"
+            "    billing_legacy_us__list_us_invoices(status='overdue', dataset='bulk'),\n"
+            ")\n"
+            "inv_map = {i['customer_id']: i['amount'] "
+            "for i in eu['invoices'] + us['invoices']}\n"
+            "[\n"
+            "    {'customer_id': r['customer_id'], "
+            "'delta': round(r['ledger_balance'] - inv_map[r['customer_id']], 2)}\n"
+            "    for r in ledger['rows']\n"
+            "    if r['customer_id'] in inv_map "
+            "and r['ledger_balance'] != inv_map[r['customer_id']]\n"
+            "]"
+        )
+        return classic, code
+
     if scenario == "trial_balance_audit":
         classic = [
             {

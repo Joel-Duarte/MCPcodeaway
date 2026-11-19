@@ -111,6 +111,48 @@ def _seed_enterprise_data() -> tuple[
     return debt_ledger, trial_balance, invoices_by_region, customers_by_region, terminal_incidents
 
 
+def _seed_bulk_data() -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Build 200 overdue customers (100 EU + 100 US) with 3 intentional variance rows."""
+    bulk_ledger: list[dict[str, Any]] = []
+    bulk_invoices: dict[str, list[dict[str, Any]]] = {"EU": [], "US": []}
+    discrepancy_map = {41: 615.0, 118: -480.0, 199: 1250.0}
+
+    for idx in range(1, 201):
+        cid = f"CUST-{2000 + idx}"
+        region = "EU" if idx <= 100 else "US"
+        billing_amount = float(1500 + (idx % 25) * 85)
+        ledger_delta = discrepancy_map.get(idx, 0.0)
+        ledger_amount = billing_amount + ledger_delta
+        days_past_due = 30 + (idx % 6) * 15
+        bulk_ledger.append(
+            {
+                "customer_id": cid,
+                "merchant_name": f"Global Merchant {idx:03d} ({region})",
+                "region": region,
+                "ledger_balance": ledger_amount,
+                "currency": "EUR" if region == "EU" else "USD",
+                "status": "overdue",
+                "days_past_due": days_past_due,
+                "cost_center": f"CC-{region}-{(idx % 7) + 1:02d}",
+                "payment_terms": "NET30",
+            }
+        )
+        bulk_invoices[region].append(
+            {
+                "invoice_id": f"INV-{region}-{5000 + idx}",
+                "customer_id": cid,
+                "merchant_name": f"Global Merchant {idx:03d} ({region})",
+                "amount": billing_amount,
+                "currency": "EUR" if region == "EU" else "USD",
+                "status": "overdue",
+                "days_past_due": days_past_due,
+                "cost_center": f"CC-{region}-{(idx % 7) + 1:02d}",
+                "payment_terms": "NET30",
+            }
+        )
+    return bulk_ledger, bulk_invoices
+
+
 def build_synthetic_tools(count: int) -> list[dict[str, Any]]:
     """Deterministically generate synthetic MCP tools for scaling benchmarks."""
     domains = ("ledger", "billing", "erp", "crm", "treasury")
@@ -211,6 +253,7 @@ def _build_billing_subapp(
     region: str,
     audience: str,
     invoices: list[dict[str, Any]],
+    bulk_invoices: list[dict[str, Any]],
     customers: dict[str, dict[str, Any]],
     verifier: _DownstreamTokenVerifier,
 ) -> FastAPI:
@@ -224,10 +267,14 @@ def _build_billing_subapp(
     @subapp.get("/invoices", operation_id=f"list_{region.lower()}_invoices")
     async def list_invoices(
         status: str | None = Query(default=None, description="Filter by invoice status"),
+        dataset: str = Query(
+            default="standard", description="Dataset size: 'standard' or 'bulk' (100 rows)"
+        ),
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         await verifier.verify(authorization, expected_audience=audience, required_roles=required)
-        filtered = [inv for inv in invoices if status is None or inv["status"] == status]
+        source = bulk_invoices if dataset == "bulk" else invoices
+        filtered = [inv for inv in source if status is None or inv["status"] == status]
         return {"region": region, "count": len(filtered), "invoices": filtered}
 
     @subapp.get("/customers/{customer_id}", operation_id=f"get_{region.lower()}_customer")
@@ -314,6 +361,7 @@ def create_mock_backends_app(
     debt_ledger, trial_balance, invoices_by_region, customers_by_region, incidents = (
         _seed_enterprise_data()
     )
+    bulk_ledger, bulk_invoices_by_region = _seed_bulk_data()
     collection_cases: list[dict[str, Any]] = []
 
     app = FastAPI(title="Enterprise Mock Backends", version="0.1.0")
@@ -322,13 +370,19 @@ def create_mock_backends_app(
         {
             "name": "query_debt_ledger",
             "description": (
-                "Query Snowflake debt ledger rows with optional status or region filter."
+                "Query Snowflake debt ledger rows with optional status, region, or dataset filter."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "status": {"type": "string"},
                     "region": {"type": "string"},
+                    "dataset": {
+                        "type": "string",
+                        "description": (
+                            "Optional dataset: 'standard' (default) or 'bulk' (200 rows)."
+                        ),
+                    },
                 },
             },
             "annotations": {"readOnlyHint": True, "destructiveHint": False},
@@ -402,9 +456,10 @@ def create_mock_backends_app(
 
         def call_snowflake(name: str, args: dict[str, Any]) -> Any:
             if name == "query_debt_ledger":
+                source = bulk_ledger if args.get("dataset") == "bulk" else debt_ledger
                 rows = [
                     r
-                    for r in debt_ledger
+                    for r in source
                     if (not args.get("status") or r["status"] == args["status"])
                     and (not args.get("region") or r["region"] == args["region"])
                 ]
@@ -487,6 +542,7 @@ def create_mock_backends_app(
             region="EU",
             audience="api://billing-eu",
             invoices=invoices_by_region["EU"],
+            bulk_invoices=bulk_invoices_by_region["EU"],
             customers=customers_by_region["EU"],
             verifier=verifier,
         ),
@@ -497,6 +553,7 @@ def create_mock_backends_app(
             region="US",
             audience="api://billing-us",
             invoices=invoices_by_region["US"],
+            bulk_invoices=bulk_invoices_by_region["US"],
             customers=customers_by_region["US"],
             verifier=verifier,
         ),

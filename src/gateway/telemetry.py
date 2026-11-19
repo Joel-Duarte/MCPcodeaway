@@ -55,6 +55,7 @@ class TelemetryRecorder:
         stdout: str = "",
         error: str | None = None,
         tool_name: str | None = None,
+        provenance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         raw_upstream_bytes = sum(sc.raw_bytes for sc in subcalls)
         returned_bytes = len(json.dumps(returned_payload, default=str).encode("utf-8"))
@@ -101,6 +102,8 @@ class TelemetryRecorder:
             "estimated_tokens_saved": estimated_tokens_saved,
             "duration_ms": round(duration_ms, 3),
         }
+        if provenance is not None:
+            run["provenance"] = provenance
         await self.store.record_run(run)
         return run
 

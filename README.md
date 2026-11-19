@@ -18,13 +18,19 @@ flowchart LR
     Dispatch -->|"8. OTLP Spans + Script Transcript + Token Savings"| Obs["OpenTelemetry + SQLite + /dashboard"]
 ```
 
-### Three Configurable Gateway Modes
+### Decoupled Execution × Discovery Matrix (`2 × 2`)
 
-| Mode | Tools Exposed on `tools/list` | When to Use |
+Execution style and tool discovery are orthogonal axes controlled via `?execution=classic|codemode|hybrid&discovery_mode=upfront|deferred|x_intent` (headers `X-Execution-Mode` / `X-Discovery-Mode`) or legacy `?mode=` aliases:
+
+| Mode / Axes | `tools/list` Surface | Best For |
 | :--- | :--- | :--- |
-| **`codemode`** (default) | `search_tools`, `execute_code` | Large catalogs (30+ tools), multi-system joins/reconciliations, large payloads filtered before returning to LLM context |
-| **`traditional`** | All RBAC-permitted upstream tools directly | Simple single-tool lookups (<15 tools) and apples-to-apples baseline benchmarking |
-| **`hybrid`** | `search_tools`, `execute_code`, + direct mutating tools | Read orchestration runs in Code Mode while state-changing writes require explicit direct MCP tool confirmation |
+| **`traditional`** (`classic` × `upfront`) | All authorized JSON tool schemas | Small catalogs (`<15` tools), simple lookups |
+| **`traditional_discover`** (`classic` × `deferred`) | `list_servers`, `search_tools` (hydrates JSON schemas on demand) | Large catalogs with small/fast LLMs (`4B–9B`) & moderate payloads |
+| **`codemode_upfront`** (`codemode` × `upfront`) | `execute_code` only (with authorized Python stubs inlined) | Compact/medium catalogs needing 1-shot batched joins without discovery hops |
+| **`codemode`** (`codemode` × `deferred`, default) | `list_servers`, `search_tools`, `execute_code` | Massive catalogs (50–500+ tools) + multi-system filtering in Monty |
+| **`hybrid`** (`hybrid` × `upfront\|deferred`) | `execute_code` + direct mutating MCP tools | Batched read joins in Monty + human-confirmed direct writes |
+
+> **Why Gateway-Side Monty vs. Local Client-Side Execution?** Client-side code mode only works inside local coding agents (Cursor, Claude Code), leaks upstream round-trips & raw payloads over the WAN, and requires exposing tokens or client SDKs. Gateway-side Monty keeps OIDC/OBO tokens locked inside `HostDispatcher` inside your VPC, works with any MCP client (Copilot Studio, Claude Desktop, web apps), filters hundreds of raw rows before returning to LLM context, and records a single tamper-evident audit transcript (`_provenance` HMAC + `require_tool_grounding` policy).
 
 ---
 

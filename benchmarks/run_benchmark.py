@@ -102,7 +102,12 @@ async def run_offline_benchmark(
             token = dev_keys.issue_user_token(persona="finance_analyst")
             identity = await runtime.validator.validate_token(token)
             scenarios = []
-            for name in ("reconcile_overdue", "trial_balance_audit", "single_lookup"):
+            for name in (
+                "reconcile_overdue",
+                "reconcile_bulk_200",
+                "trial_balance_audit",
+                "single_lookup",
+            ):
                 scenarios.append(
                     await run_side_by_side_comparison(runtime, identity, scenario=name)
                 )

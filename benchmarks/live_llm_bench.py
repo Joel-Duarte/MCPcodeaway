@@ -34,6 +34,14 @@ TASK_PROMPT = (
     "(ledger_balance - invoice_amount)."
 )
 
+BULK_200_PROMPT = (
+    "Using dataset='bulk' on snowflake_ledger__query_debt_ledger, "
+    "billing_legacy_eu__list_eu_invoices, and billing_legacy_us__list_us_invoices "
+    "(all with status='overdue'), find the overdue customers whose Snowflake debt ledger "
+    "balance differs from their billing invoice amount, and return each customer_id and exact "
+    "numeric delta (ledger_balance - invoice_amount)."
+)
+
 RBAC_BOUNDARY_PROMPT = (
     "Query the Snowflake debt ledger and tell me the overdue ledger balance for CUST-1003."
 )
@@ -51,13 +59,20 @@ _TRADITIONAL_DISCOVER_SYSTEM = (
     "(ledger_balance - invoice_amount)."
 )
 
+_CODEMODE_UPFRONT_SYSTEM = (
+    "You are an enterprise finance assistant using Upfront Code Mode. "
+    "Exact async Python tool stubs are already in the execute_code tool description. "
+    "Call execute_code ONCE with a single Pydantic Monty Python script using 'import asyncio' "
+    "and asyncio.gather(...) to fetch, join, filter, and return only the mismatched "
+    "customer_id and numeric delta pairs. Do NOT import 'json' or 'requests'."
+)
+
 _CODEMODE_SYSTEM = (
-    "You are an enterprise finance assistant using a Code-Mode MCP Gateway. "
-    "First call search_tools to discover exact async tool names and signatures. "
-    "Then call execute_code with one Python script running inside Pydantic Monty: "
-    "top-level await and 'import asyncio' / asyncio.gather work; do NOT import external "
-    "modules like 'json' or 'requests'; make your final expression the compact result "
-    "dict/list. Return exact customer IDs and numeric deltas (ledger_balance - invoice_amount)."
+    "You are an enterprise finance assistant using Code Mode with deferred discovery. "
+    "First call search_tools ONCE to retrieve exact async tool stubs. Then call execute_code "
+    "ONCE with a complete Pydantic Monty Python script using 'import asyncio' and "
+    "asyncio.gather(...) to fetch, join, filter, and return only the mismatched customer_id and "
+    "numeric delta pairs. Do NOT import external modules like 'json' or 'requests'."
 )
 
 _THINK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
@@ -76,6 +91,41 @@ def score_reconciliation_answer(text: str) -> bool:
         and "CUST-1024" in cleaned
         and "-320" in cleaned
     )
+
+
+def score_bulk_200_answer(text: str) -> bool:
+    """Verify final answer reports the 3 bulk_200 variance pairs."""
+    cleaned = _strip_think(text)
+    return (
+        "CUST-2041" in cleaned
+        and "615" in cleaned
+        and "CUST-2118" in cleaned
+        and "-480" in cleaned
+        and "CUST-2199" in cleaned
+        and "1250" in cleaned
+    )
+
+
+def _parse_mode_spec(mode_spec: str) -> tuple[str, str, str, str]:
+    """Map mode alias or 'execution:discovery_mode' into query string + axis labels."""
+    aliases = {
+        "traditional": ("traditional", "mode=traditional", "classic", "upfront"),
+        "traditional_discover": (
+            "traditional_discover",
+            "mode=traditional_discover",
+            "classic",
+            "deferred",
+        ),
+        "codemode_upfront": ("codemode_upfront", "mode=codemode_upfront", "codemode", "upfront"),
+        "codemode": ("codemode", "mode=codemode", "codemode", "deferred"),
+        "hybrid": ("hybrid", "mode=hybrid", "hybrid", "deferred"),
+    }
+    if mode_spec in aliases:
+        return aliases[mode_spec]
+    if ":" in mode_spec:
+        ex, dm = (part.strip() for part in mode_spec.split(":", 1))
+        return mode_spec, f"execution={ex}&discovery_mode={dm}", ex, dm
+    return mode_spec, f"mode={mode_spec}", "codemode", "deferred"
 
 
 def _detect_provider(preferred: str | None = None) -> tuple[str, str] | None:
@@ -104,11 +154,12 @@ async def _list_mcp_tools(
     discovery_backend: str = "bm25",
     x_intent: str | None = None,
 ) -> list[dict[str, Any]]:
+    _, query_part, _, _ = _parse_mode_spec(mode)
     headers = {"Authorization": f"Bearer {gw_token}"}
     if x_intent:
         headers["X-Intent"] = x_intent
     resp = await gw.post(
-        f"/mcp?mode={mode}&discovery={discovery_backend}",
+        f"/mcp?{query_part}&discovery={discovery_backend}",
         headers=headers,
         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
     )
@@ -126,8 +177,9 @@ async def _call_mcp_tool(
     *,
     discovery_backend: str = "bm25",
 ) -> dict[str, Any]:
+    _, query_part, _, _ = _parse_mode_spec(mode)
     resp = await gw.post(
-        f"/mcp?mode={mode}&discovery={discovery_backend}",
+        f"/mcp?{query_part}&discovery={discovery_backend}",
         headers={"Authorization": f"Bearer {gw_token}"},
         json={
             "jsonrpc": "2.0",
@@ -213,6 +265,8 @@ async def _call_openai_loop(
     discovery_backend: str = "bm25",
     x_intent: str | None = None,
     prompt: str = TASK_PROMPT,
+    task_name: str = "standard",
+    scorer: Any = None,
     system_prompt: str | None = None,
     timeout: float = 180.0,
     temperature: float = 0.0,
@@ -220,8 +274,11 @@ async def _call_openai_loop(
     max_turns: int = 10,
     reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
+    mode_label, _, exec_axis, disc_axis = _parse_mode_spec(mode)
+    if scorer is None:
+        scorer = score_bulk_200_answer if task_name == "bulk_200" else score_reconciliation_answer
     mcp_tools = await _list_mcp_tools(
-        gw, gw_token, mode, discovery_backend=discovery_backend, x_intent=x_intent
+        gw, gw_token, mode_label, discovery_backend=discovery_backend, x_intent=x_intent
     )
 
     def _to_oai(t: dict[str, Any]) -> dict[str, Any]:
@@ -239,9 +296,11 @@ async def _call_openai_loop(
     initial_exposed_count = len(oai_tools)
     if system_prompt:
         sys_msg = system_prompt
-    elif mode == "codemode":
+    elif exec_axis == "codemode" and disc_axis == "upfront":
+        sys_msg = _CODEMODE_UPFRONT_SYSTEM
+    elif exec_axis == "codemode":
         sys_msg = _CODEMODE_SYSTEM
-    elif mode == "traditional_discover":
+    elif exec_axis == "classic" and disc_axis != "upfront":
         sys_msg = _TRADITIONAL_DISCOVER_SYSTEM
     else:
         sys_msg = _TRADITIONAL_SYSTEM
@@ -251,6 +310,7 @@ async def _call_openai_loop(
     ]
     prompt_toks, comp_toks, turns, mcp_calls, self_corrections = 0, 0, 0, 0, 0
     run_ids: list[str] = []
+    provenance_states: list[bool] = []
     started = time.perf_counter()
     chat_url = f"{base_url.rstrip('/')}/chat/completions"
 
@@ -279,7 +339,10 @@ async def _call_openai_loop(
                     prompt_toks = int(prompt_match.group(1))
                 return {
                     "model": model,
-                    "mode": mode,
+                    "task": task_name,
+                    "mode": mode_label,
+                    "execution": exec_axis,
+                    "discovery_mode": disc_axis,
                     "discovery_backend": discovery_backend,
                     "x_intent": bool(x_intent),
                     "reasoning_effort": reasoning_effort,
@@ -288,6 +351,7 @@ async def _call_openai_loop(
                     "turns": turns,
                     "mcp_tool_calls": mcp_calls,
                     "self_corrections": self_corrections,
+                    "provenance_grounded": all(provenance_states) if provenance_states else None,
                     "prompt_tokens": prompt_toks,
                     "completion_tokens": comp_toks,
                     "total_tokens": prompt_toks + comp_toks,
@@ -323,7 +387,10 @@ async def _call_openai_loop(
                         token_hops += len(doc.get("token_hops", []))
                 return {
                     "model": model,
-                    "mode": mode,
+                    "task": task_name,
+                    "mode": mode_label,
+                    "execution": exec_axis,
+                    "discovery_mode": disc_axis,
                     "discovery_backend": discovery_backend,
                     "x_intent": bool(x_intent),
                     "reasoning_effort": reasoning_effort,
@@ -334,11 +401,12 @@ async def _call_openai_loop(
                     "subcalls_total": subcalls_total,
                     "delegated_token_hops": token_hops,
                     "self_corrections": self_corrections,
+                    "provenance_grounded": all(provenance_states) if provenance_states else None,
                     "prompt_tokens": prompt_toks,
                     "completion_tokens": comp_toks,
                     "total_tokens": prompt_toks + comp_toks,
                     "duration_ms": round((time.perf_counter() - started) * 1000, 2),
-                    "correct": score_reconciliation_answer(raw_answer),
+                    "correct": scorer(raw_answer),
                     "answer": clean_answer[:600],
                     "run_ids": run_ids,
                 }
@@ -376,10 +444,12 @@ async def _call_openai_loop(
                 sc = res.get("structuredContent") if isinstance(res, dict) else None
                 if isinstance(sc, dict) and sc.get("run_id"):
                     run_ids.append(str(sc["run_id"]))
+                if isinstance(sc, dict) and isinstance(sc.get("_provenance"), dict):
+                    provenance_states.append(bool(sc["_provenance"].get("grounded")))
 
-                # Deferred tool hydration for traditional_discover
+                # Deferred tool hydration for classic deferred / x_intent discovery
                 if (
-                    mode == "traditional_discover"
+                    exec_axis == "classic"
                     and fn["name"] == "search_tools"
                     and isinstance(sc, dict)
                     and isinstance(sc.get("hydrated_tools"), list)
@@ -414,7 +484,10 @@ async def _call_openai_loop(
 
     return {
         "model": model,
-        "mode": mode,
+        "task": task_name,
+        "mode": mode_label,
+        "execution": exec_axis,
+        "discovery_mode": disc_axis,
         "discovery_backend": discovery_backend,
         "x_intent": bool(x_intent),
         "reasoning_effort": reasoning_effort,
@@ -423,6 +496,7 @@ async def _call_openai_loop(
         "turns": turns,
         "mcp_tool_calls": mcp_calls,
         "self_corrections": self_corrections,
+        "provenance_grounded": all(provenance_states) if provenance_states else None,
         "prompt_tokens": prompt_toks,
         "completion_tokens": comp_toks,
         "total_tokens": prompt_toks + comp_toks,
@@ -586,13 +660,16 @@ async def run_openai_compatible_suite(
     models: list[str],
     synthetic_counts: list[int],
     modes: list[str] | None = None,
+    tasks: list[str] | None = None,
     discovery_backend: str = "bm25",
     use_x_intent: bool = False,
     reasoning_effort: str | None = None,
     output_path: Path | None = Path("benchmarks/live_llm_results.json"),
 ) -> dict[str, Any]:
-    """Run AuthN/RBAC verification and 4B vs 9B Traditional/Discover/CodeMode benchmarks."""
-    chosen_modes = modes or ["traditional", "traditional_discover", "codemode"]
+    """Run AuthN/RBAC verification and decoupled 2x2 Execution x Discovery benchmarks."""
+    chosen_modes = modes or ["traditional", "traditional_discover", "codemode_upfront", "codemode"]
+    chosen_tasks = tasks or ["standard"]
+    task_prompts = {"standard": TASK_PROMPT, "bulk_200": BULK_200_PROMPT}
     runs: list[dict[str, Any]] = []
     rbac_checks: list[dict[str, Any]] = []
     auth_preflight: dict[str, Any] = {}
@@ -643,25 +720,30 @@ async def run_openai_compatible_suite(
                         async with httpx.AsyncClient(
                             transport=httpx.ASGITransport(app=app), base_url="http://gw"
                         ) as gw:
-                            for mode in chosen_modes:
-                                intent_str = (
-                                    TASK_PROMPT
-                                    if (use_x_intent and mode != "traditional")
-                                    else None
-                                )
-                                res = await _call_openai_loop(
-                                    gw,
-                                    fin_token,
-                                    api_key,
-                                    mode,
-                                    model,
-                                    base_url=base_url,
-                                    discovery_backend=discovery_backend,
-                                    x_intent=intent_str,
-                                    reasoning_effort=reasoning_effort,
-                                )
-                                res["extra_synthetic_tools"] = syn
-                                runs.append(res)
+                            for task_name in chosen_tasks:
+                                prompt_text = task_prompts.get(task_name, TASK_PROMPT)
+                                for mode in chosen_modes:
+                                    upfront_modes = {"traditional", "codemode_upfront"}
+                                    intent_str = (
+                                        prompt_text
+                                        if (use_x_intent and mode not in upfront_modes)
+                                        else None
+                                    )
+                                    res = await _call_openai_loop(
+                                        gw,
+                                        fin_token,
+                                        api_key,
+                                        mode,
+                                        model,
+                                        base_url=base_url,
+                                        discovery_backend=discovery_backend,
+                                        x_intent=intent_str,
+                                        prompt=prompt_text,
+                                        task_name=task_name,
+                                        reasoning_effort=reasoning_effort,
+                                    )
+                                    res["extra_synthetic_tools"] = syn
+                                    runs.append(res)
 
                 app0 = apps_by_syn[synthetic_counts[0]]
                 async with app0.router.lifespan_context(app0):
@@ -719,6 +801,7 @@ async def run_live_bench(
     base_url: str | None = None,
     models: list[str] | None = None,
     modes: list[str] | None = None,
+    tasks: list[str] | None = None,
     discovery_backend: str = "bm25",
     use_x_intent: bool = False,
     reasoning_effort: str | None = None,
@@ -747,6 +830,7 @@ async def run_live_bench(
             api_key=api_key,
             models=resolved_models,
             modes=modes,
+            tasks=tasks,
             discovery_backend=discovery_backend,
             use_x_intent=use_x_intent,
             reasoning_effort=reasoning_effort,
@@ -799,23 +883,23 @@ def _print_report(result: dict[str, Any]) -> None:
     print("\n=== Live LLM RBAC Boundary (support_agent asking for Snowflake ledger) ===")
     print(json.dumps(result["rbac_live_boundary"], indent=2))
 
-    print("\n=== Live LLM Comparison: Traditional MCP vs. Code Mode ===")
+    print("\n=== Live LLM Comparison: Execution x Discovery Matrix ===")
     print(
-        "| Model | Extra | Mode | Init->Final Tools | Turns | Prompt Tok | Comp Tok | "
-        "Total Tok | Time (ms) | Retries | Correct |"
+        "| Model | Task | Extra | Mode | Init->Final | Turns | "
+        "Total Tok | Time (ms) | Retries | Grounded | Correct |"
     )
     print(
-        "| :--- | ---: | :--- | :---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |"
+        "| :--- | :--- | ---: | :--- | :---: | ---: | ---: | ---: | ---: | :---: | :---: |"
     )
     for r in result["runs"]:
         init_cnt = r["exposed_tool_count"]
         final_cnt = r.get("final_tool_count", init_cnt)
         tool_span = f"{init_cnt}->{final_cnt}"
         print(
-            f"| {r['model']} | {r['extra_synthetic_tools']} | {r['mode']} | "
-            f"{tool_span} | {r['turns']} | {r['prompt_tokens']} | "
-            f"{r['completion_tokens']} | {r['total_tokens']} | {r['duration_ms']} | "
-            f"{r.get('self_corrections', 0)} | {r.get('correct')} |"
+            f"| {r['model']} | {r.get('task', 'standard')} | {r['extra_synthetic_tools']} | "
+            f"{r['mode']} | {tool_span} | {r['turns']} | {r['total_tokens']} | "
+            f"{r['duration_ms']} | {r.get('self_corrections', 0)} | "
+            f"{r.get('provenance_grounded')} | {r.get('correct')} |"
         )
 
 
@@ -829,7 +913,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--model", default=None)
     parser.add_argument("--models", nargs="+", default=None)
-    parser.add_argument("--modes", default="traditional,traditional_discover,codemode")
+    parser.add_argument(
+        "--modes",
+        default="traditional,traditional_discover,codemode_upfront,codemode",
+    )
+    parser.add_argument("--tasks", default="standard")
     parser.add_argument(
         "--discovery",
         default="bm25",
@@ -848,6 +936,7 @@ def main(argv: list[str] | None = None) -> int:
 
     syn_counts = [int(x.strip()) for x in args.synthetic_tools.split(",") if x.strip()]
     chosen_modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    chosen_tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     result = asyncio.run(
         run_live_bench(
             args.provider,
@@ -856,6 +945,7 @@ def main(argv: list[str] | None = None) -> int:
             base_url=args.base_url,
             models=args.models,
             modes=chosen_modes,
+            tasks=chosen_tasks,
             discovery_backend=args.discovery,
             use_x_intent=args.x_intent,
             reasoning_effort=args.reasoning_effort,

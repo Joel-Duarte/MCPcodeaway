@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -83,7 +85,62 @@ class SubcallRecord(BaseModel):
     auth_type: str
     token_cache_hit: bool = False
     downstream_audience: str | None = None
+    output_sha256: str | None = None
     error: str | None = None
+
+
+_ENTITY_ID_RE = re.compile(r"\b[A-Z]{2,6}-[A-Z0-9-]{2,}\b")
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+
+
+def extract_entity_identifiers(value: Any) -> set[str]:
+    """Extract business entity IDs (e.g. CUST-1003, INV-EU-2003) and emails from JSON values."""
+    found: set[str] = set()
+    if isinstance(value, str):
+        found.update(_ENTITY_ID_RE.findall(value))
+        found.update(m.lower() for m in _EMAIL_RE.findall(value))
+    elif isinstance(value, list | tuple):
+        for item in value:
+            found.update(extract_entity_identifiers(item))
+    elif isinstance(value, dict):
+        for v in value.values():
+            found.update(extract_entity_identifiers(v))
+    return found
+
+
+def build_provenance_envelope(
+    *,
+    allowed_servers: set[str] | None,
+    subcalls: list[SubcallRecord],
+    observed_tool_outputs: list[Any],
+    returned_value: Any,
+    signing_secret: str,
+) -> dict[str, Any]:
+    """Build a tamper-evident host-stamped provenance envelope outside Monty."""
+    ok_calls = [sc for sc in subcalls if sc.status == "ok"]
+    tools_called = list(dict.fromkeys(sc.tool for sc in ok_calls))
+    servers_called = sorted({sc.server for sc in ok_calls})
+    digests = [sc.output_sha256 for sc in ok_calls if sc.output_sha256]
+
+    observed_entities = extract_entity_identifiers(observed_tool_outputs)
+    returned_entities = extract_entity_identifiers(returned_value)
+    unverified_identifiers = sorted(returned_entities - observed_entities)
+
+    grounded = (len(ok_calls) > 0 or returned_value is None) and not unverified_identifiers
+    body = {
+        "enforced_by": "host_dispatcher",
+        "allowed_servers_scope": sorted(allowed_servers) if allowed_servers is not None else None,
+        "tools_called": tools_called,
+        "servers_called": servers_called,
+        "subcall_count": len(ok_calls),
+        "tool_output_digests": digests,
+        "grounded": grounded,
+        "unverified_identifiers": unverified_identifiers,
+    }
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    sig = hmac.new(signing_secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+    body["provenance_hmac"] = sig
+    return body
 
 
 class ExecutionBudget:
@@ -242,7 +299,9 @@ class HostDispatcher:
                 span.record_exception(exc)
                 return {"_dispatch_error": str(exc)}, record
 
-            raw_bytes = len(json.dumps(raw_result, default=str).encode("utf-8"))
+            raw_encoded = json.dumps(raw_result, default=str).encode("utf-8")
+            raw_bytes = len(raw_encoded)
+            output_sha256 = hashlib.sha256(raw_encoded).hexdigest()[:16]
             redacted = OutputRedactor.redact(raw_result)
             duration_ms = round((time.perf_counter() - started) * 1000, 3)
             record = SubcallRecord(
@@ -254,5 +313,6 @@ class HostDispatcher:
                 auth_type=upstream.auth_type,
                 token_cache_hit=cache_hit,
                 downstream_audience=audience,
+                output_sha256=output_sha256,
             )
             return redacted, record

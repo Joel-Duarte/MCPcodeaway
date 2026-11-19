@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
+import os
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -13,12 +15,28 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from gateway.sandbox import LocalMontyBackend
 
 
+def _authorized_worker_ws(ws: WebSocket, expected_secret: str) -> bool:
+    if not expected_secret:
+        return True
+    auth_hdr = ws.headers.get("authorization", "")
+    token = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else ""
+    hdr_secret = ws.headers.get("x-worker-secret", "")
+    presented = token or hdr_secret
+    return bool(presented) and hmac.compare_digest(presented, expected_secret)
+
+
 def create_sandbox_worker_app(
     *,
     min_processes: int = 1,
     max_processes: int = 4,
+    worker_secret: str | None = None,
 ) -> FastAPI:
     """Create a standalone Monty worker service with zero token or network knowledge."""
+    resolved_secret = (
+        worker_secret
+        if worker_secret is not None
+        else os.getenv("GATEWAY_SANDBOX_WORKER_SECRET", "")
+    )
     monty = LocalMontyBackend(min_processes=min_processes, max_processes=max_processes)
 
     @asynccontextmanager
@@ -36,6 +54,9 @@ def create_sandbox_worker_app(
 
     @app.websocket("/ws/execute")
     async def ws_execute(ws: WebSocket) -> None:
+        if not _authorized_worker_ws(ws, resolved_secret):
+            await ws.close(code=1008, reason="Unauthorized sandbox worker caller")
+            return
         await ws.accept()
         reader_task: asyncio.Task[None] | None = None
         pending: dict[str, asyncio.Future[Any]] = {}

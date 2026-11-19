@@ -20,9 +20,18 @@
 ### Why Reverse-RPC Over WebSocket Matters for Enterprise Security
 
 In `RemoteMontyWorkerBackend`:
-1. The gateway opens a WebSocket to `ws://sandbox-worker:8002/ws/execute` on an **internal-only** network (`internal: true` in `docker-compose.yml`, NetworkPolicy deny-all egress in Kubernetes).
+1. The gateway opens a WebSocket to `ws://sandbox-worker:8002/ws/execute` on an **internal-only** network (`internal: true` in `docker-compose.yml`, NetworkPolicy deny-all egress in Kubernetes), authenticated via `GATEWAY_SANDBOX_WORKER_SECRET` (`Authorization: Bearer` / `X-Worker-Secret`, fail-closed when `GATEWAY_APP_ENV=prod`).
 2. `sandbox-worker` never sees the user's OIDC assertion, downstream delegated tokens, API keys, or internal upstream URLs.
 3. When generated Python awaits `snowflake_ledger__query_debt_ledger(...)`, the worker sends `{type: "call", tool, args, kwargs}` back to `HostDispatcher`, which validates RBAC, JSON Schema, and call budgets before calling downstream.
+4. **Host-Stamped Provenance & Grounding**: `HostDispatcher` hashes every downstream response (`output_sha256`) and builds a signed `_provenance` envelope (`tools_called`, `tool_output_digests`, `unverified_identifiers`, `provenance_hmac`) completely outside Monty. Enabling `GATEWAY_REQUIRE_TOOL_GROUNDING=true` (or `X-Require-Grounding: true`) blocks zero-call fabrications (`UngroundedResultError`) and hallucinated entity IDs (`UnverifiedEntityError`) while allowing legitimate Python arithmetic (such as computed deltas).
+
+### Why Gateway-Side Monty Instead of Client-Side Local Execution
+
+Client-side code execution (letting a local coding agent generate and run SDK scripts on a laptop) trades away four properties critical to an enterprise MCP Gateway:
+- **Universal host compatibility:** Non-coding MCP clients (Copilot Studio, web chatbots, SaaS workflows) have no local Python runtime and speak only MCP JSON-RPC.
+- **VPC token & secret containment:** OBO token exchange and API credentials remain strictly inside `HostDispatcher` inside the cluster.
+- **WAN payload containment:** Bulk upstream responses (e.g., 200+ billing/ledger rows) are joined and filtered in Monty next to backends before crossing the network into the LLM context window.
+- **Unified governance:** One host-enforced execution budget, redaction pipeline, OpenTelemetry trace, and cryptographic provenance record per run (no client-side SDK export by design).
 
 ## 3. Handling `mcp_stdio` vs. `mcp_http` / `openapi` at Scale
 

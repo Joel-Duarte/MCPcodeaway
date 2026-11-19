@@ -15,7 +15,11 @@ from gateway.state import AuditStore
 AppEnv = Literal["sandbox", "uat", "prod"]
 AuthMode = Literal["dev", "oidc"]
 TokenExchangeDialect = Literal["dev_local", "rfc8693", "entra_v2_obo"]
-GatewayMode = Literal["codemode", "traditional", "traditional_discover", "hybrid"]
+ExecutionMode = Literal["classic", "codemode", "hybrid"]
+DiscoveryMode = Literal["upfront", "deferred", "x_intent"]
+GatewayMode = Literal[
+    "codemode", "codemode_upfront", "traditional", "traditional_discover", "hybrid"
+]
 DiscoveryBackendMode = Literal["keyword", "bm25", "embedding", "system1", "hybrid_system1"]
 UpstreamType = Literal["mcp_http", "mcp_stdio", "openapi"]
 UpstreamAuthType = Literal["delegated_token", "bearer_secret", "api_key", "none"]
@@ -82,6 +86,8 @@ class GatewaySettings(BaseSettings):
     auth_mode: AuthMode = "dev"
     token_exchange_dialect: TokenExchangeDialect = "dev_local"
     gateway_mode: GatewayMode = "codemode"
+    execution_mode: ExecutionMode | None = None
+    discovery_mode: DiscoveryMode | None = None
     read_only_prod: bool = True
     allow_dynamic_upstreams: bool = True
 
@@ -102,6 +108,9 @@ class GatewaySettings(BaseSettings):
 
     sandbox_backend: Literal["local", "remote"] = "local"
     sandbox_worker_url: str | None = None
+    sandbox_worker_secret: str = ""
+    require_tool_grounding: bool = False
+    provenance_signing_secret: str = "dev-provenance-secret"
     redis_url: str | None = None
 
     discovery_backend: DiscoveryBackendMode = "bm25"
