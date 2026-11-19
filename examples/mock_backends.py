@@ -511,6 +511,33 @@ def create_mock_backends_app(
             },
             "annotations": {"readOnlyHint": True, "destructiveHint": False},
         },
+        {
+            "name": "compute_interest_penalty",
+            "description": (
+                "Compute compound overdue late-fee penalty and total due for a customer balance."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "customer_id": {"type": "string"},
+                    "principal": {"type": "number"},
+                    "days_past_due": {"type": "integer"},
+                    "annual_rate_pct": {"type": "number", "default": 18.0},
+                },
+                "required": ["customer_id", "principal", "days_past_due"],
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "customer_id": {"type": "string"},
+                    "principal": {"type": "number"},
+                    "days_past_due": {"type": "integer"},
+                    "penalty_amount": {"type": "number"},
+                    "total_due": {"type": "number"},
+                },
+            },
+            "annotations": {"readOnlyHint": True, "destructiveHint": False},
+        },
     ]
 
     ops_tools = [
@@ -584,6 +611,70 @@ def create_mock_backends_app(
             },
             "annotations": {"readOnlyHint": False, "destructiveHint": False},
         },
+        {
+            "name": "search_sentry_errors",
+            "description": (
+                "Search Sentry production error stack traces and release SHAs by terminal_id."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"terminal_id": {"type": "string"}},
+                "required": ["terminal_id"],
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string"},
+                    "terminal_id": {"type": "string"},
+                    "release_sha": {"type": "string"},
+                    "error_type": {"type": "string"},
+                    "culprit": {"type": "string"},
+                },
+            },
+            "annotations": {"readOnlyHint": True, "destructiveHint": False},
+        },
+        {
+            "name": "get_github_release_commit",
+            "description": "Look up GitHub PR author and commit metadata by release_sha.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"release_sha": {"type": "string"}},
+                "required": ["release_sha"],
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "release_sha": {"type": "string"},
+                    "pr_number": {"type": "integer"},
+                    "author": {"type": "string"},
+                    "repo": {"type": "string"},
+                },
+            },
+            "annotations": {"readOnlyHint": True, "destructiveHint": False},
+        },
+        {
+            "name": "post_slack_incident_alert",
+            "description": "Post an incident triage alert summary to an operations Slack channel.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string"},
+                    "case_id": {"type": "string"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["channel", "case_id", "summary"],
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_ts": {"type": "string"},
+                    "channel": {"type": "string"},
+                    "case_id": {"type": "string"},
+                    "delivered": {"type": "boolean"},
+                },
+            },
+            "annotations": {"readOnlyHint": True, "destructiveHint": False},
+        },
     ]
 
     @app.post("/snowflake/mcp")
@@ -636,6 +727,19 @@ def create_mock_backends_app(
                         )
                     ]
                 }
+            if name == "compute_interest_penalty":
+                cid = str(args["customer_id"])
+                principal = float(args["principal"])
+                days = int(args["days_past_due"])
+                rate = float(args.get("annual_rate_pct", 18.0))
+                penalty = round(principal * (rate / 100.0) * (days / 365.0), 2)
+                return {
+                    "customer_id": cid,
+                    "principal": principal,
+                    "days_past_due": days,
+                    "penalty_amount": penalty,
+                    "total_due": round(principal + penalty, 2),
+                }
             raise KeyError(f"Unknown tool '{name}'")
 
         return await _handle_mcp_rpc(
@@ -686,6 +790,47 @@ def create_mock_backends_app(
                 }
                 collection_cases.append(case)
                 return case
+            if name == "search_sentry_errors":
+                tid = str(args["terminal_id"])
+                sha_map = {
+                    "TERM-EU-44": ("SEN-8801", "sha-9f4c21a", "SettlementBatchTimeoutError"),
+                    "TERM-US-18": ("SEN-8802", "sha-3b11e04", "PinpadFirmwareMismatchError"),
+                }
+                ev_id, sha, err_type = sha_map.get(
+                    tid, ("SEN-8899", "sha-0000000", "TerminalOfflineError")
+                )
+                return {
+                    "event_id": ev_id,
+                    "terminal_id": tid,
+                    "release_sha": sha,
+                    "error_type": err_type,
+                    "culprit": f"payments.settlement.worker ({tid})",
+                }
+            if name == "get_github_release_commit":
+                sha = str(args["release_sha"])
+                pr_map = {
+                    "sha-9f4c21a": (412, "alice-sre", "acme/payment-terminal-firmware"),
+                    "sha-3b11e04": (389, "bob-embedded", "acme/payment-terminal-firmware"),
+                }
+                pr_num, author, repo = pr_map.get(sha, (100, "release-bot", "acme/core"))
+                return {
+                    "release_sha": sha,
+                    "pr_number": pr_num,
+                    "author": author,
+                    "repo": repo,
+                }
+            if name == "post_slack_incident_alert":
+                roles = set(claims.get("roles", []))
+                if not (roles & {"ticketing_writer", "ops_engineer", "admin"}):
+                    raise HTTPException(
+                        status_code=403, detail="Write role required to post Slack alerts"
+                    )
+                return {
+                    "message_ts": "1732051200.004200",
+                    "channel": str(args["channel"]),
+                    "case_id": str(args["case_id"]),
+                    "delivered": True,
+                }
             raise KeyError(f"Unknown tool '{name}'")
 
         return await _handle_mcp_rpc(

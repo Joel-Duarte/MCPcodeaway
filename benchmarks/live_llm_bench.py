@@ -60,6 +60,29 @@ SINGLE_LOOKUP_PROMPT = (
     "ledger_balance."
 )
 
+COMPUTE_PENALTY_PROMPT = (
+    "Query all overdue rows from snowflake_ledger__query_debt_ledger(status='overdue'), "
+    "then for each overdue EU customer (region=='EU'), call "
+    "snowflake_ledger__compute_interest_penalty(customer_id=..., principal=ledger_balance, "
+    "days_past_due=days_past_due, annual_rate_pct=18.0). Return each EU customer_id, their "
+    "penalty_amount, and the exact sum of all 5 EU penalty_amount values."
+)
+
+MUTATING_TICKET_PROMPT = (
+    "Perform an end-to-end incident triage chain: "
+    "1) List open terminal incidents using ops_ticketing__list_terminal_incidents(status='open') "
+    "and find the incident with severity=='high'. "
+    "2) Pass that incident's terminal_id to ops_ticketing__search_sentry_errors(terminal_id=...) "
+    "to get the failing release_sha. "
+    "3) Pass that release_sha to ops_ticketing__get_github_release_commit(release_sha=...) to "
+    "find the PR author and pr_number. "
+    "4) Call ops_ticketing__create_collection_case(customer_id=..., reason=..., priority='high') "
+    "for that customer_id. "
+    "5) Call ops_ticketing__post_slack_incident_alert(channel='#ops-incidents', case_id=..., "
+    "summary=...) with the created case_id. "
+    "Return the customer_id, release_sha, GitHub author, pr_number, and created case_id."
+)
+
 _TRADITIONAL_SYSTEM = (
     "You are an enterprise finance assistant. Use the provided MCP tools to answer "
     "accurately and concisely. Include exact customer IDs and numeric deltas "
@@ -137,6 +160,28 @@ def score_single_lookup_answer(text: str) -> bool:
     """Verify final answer reports CUST-1003 balance 1825."""
     cleaned = _strip_think(text)
     return "CUST-1003" in cleaned and "1825" in cleaned
+
+
+def score_compute_penalty_answer(text: str) -> bool:
+    """Verify final answer reports the 5 EU overdue penalties and/or their exact sum 399.08."""
+    cleaned = _strip_think(text)
+    return (
+        "CUST-1003" in cleaned
+        and "CUST-1015" in cleaned
+        and ("399.08" in cleaned or ("81" in cleaned and "110.03" in cleaned))
+    )
+
+
+def score_mutating_ticket_answer(text: str) -> bool:
+    """Verify final answer reports CUST-1003, sha-9f4c21a, alice-sre, 412, and CASE-."""
+    cleaned = _strip_think(text)
+    return (
+        "CUST-1003" in cleaned
+        and "sha-9f4c21a" in cleaned
+        and "alice-sre" in cleaned
+        and "412" in cleaned
+        and "CASE-" in cleaned
+    )
 
 
 def _parse_mode_spec(mode_spec: str) -> tuple[str, str, str, str]:
@@ -315,6 +360,10 @@ async def _call_openai_loop(
             scorer = score_trial_balance_answer
         elif task_name == "single_lookup":
             scorer = score_single_lookup_answer
+        elif task_name == "compute_batch_penalties":
+            scorer = score_compute_penalty_answer
+        elif task_name == "mutating_ticket_workflow":
+            scorer = score_mutating_ticket_answer
         else:
             scorer = score_reconciliation_answer
     mcp_tools = await _list_mcp_tools(
@@ -717,6 +766,8 @@ async def run_openai_compatible_suite(
         "reconcile_bulk_200": BULK_200_PROMPT,
         "trial_balance_audit": TRIAL_BALANCE_PROMPT,
         "single_lookup": SINGLE_LOOKUP_PROMPT,
+        "compute_batch_penalties": COMPUTE_PENALTY_PROMPT,
+        "mutating_ticket_workflow": MUTATING_TICKET_PROMPT,
     }
     runs: list[dict[str, Any]] = []
     rbac_checks: list[dict[str, Any]] = []
@@ -760,6 +811,7 @@ async def run_openai_compatible_suite(
                     auth_preflight = await run_auth_rbac_check(gw, dev_keys)
 
             fin_token = dev_keys.issue_user_token(persona="finance_analyst")
+            ops_token = dev_keys.issue_user_token(persona="ops_engineer")
             sup_token = dev_keys.issue_user_token(persona="support_agent")
 
             for model in models:
@@ -789,10 +841,13 @@ async def run_openai_compatible_suite(
                                 cur_model: str = model,
                                 cur_syn: int = syn,
                             ) -> dict[str, Any]:
+                                tok = (
+                                    ops_token if t_name == "mutating_ticket_workflow" else fin_token
+                                )
                                 async with sem:
                                     res = await _call_openai_loop(
                                         gw,
-                                        fin_token,
+                                        tok,
                                         api_key,
                                         m_name,
                                         cur_model,

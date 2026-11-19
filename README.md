@@ -88,25 +88,31 @@ Before an agent executes any tool, deferred discovery (`list_servers` + `search_
 | **66 tools** (+50 synthetic) | ~5,073 tokens | **~463 tokens** | **90.9% saved** |
 | **500 tools** (Enterprise scale) | ~50,726 tokens | **~463 tokens** | **99.1% saved** |
 
-### Win #2: Classic MCP vs. Code Mode (Side-by-Side by Model & Task)
+### Win #2: Classic MCP vs. Code Mode (Side-by-Side Across 6 Enterprise Workloads)
+
+See [BENCHMARKS.md](BENCHMARKS.md#1-what-are-the-6-benchmark-workloads) for full explanations of each workload (**Snowflake** data warehouse joins, **Financial Compute** loops, **Sentry -> GitHub -> Jira -> Slack** 5-step incident triage chains, and point lookups).
 
 #### A. Capable Coding Model (`flash` Subagent)
 
-| Task | Classic MCP | Code Mode | Winner & Why |
+| Workload | Classic MCP | Code Mode (`execute_code`) | Winner & Why |
 | :--- | :--- | :--- | :--- |
-| **1. Bulk 200-Row Join**<br>*(`reconcile_bulk_200`: ~200 KB)* | `49,955 tok` · `23.8 ms` · ✅ | **`3,149 tok`** · `28.9 ms` · ✅ | **Code Mode (-93.7% tokens)** — filters 200 KB in Monty sandbox |
-| **2. Medium 30-Row Join**<br>*(`reconcile_overdue`: 3 servers)* | `3,550 tok` · `112.8 ms` · ✅ | **`3,123 tok`** · **`25.7 ms`** · ✅ | **Code Mode (4.4x faster)** — parallel `asyncio.gather` in 1 script |
-| **3. Small 4-Call Fan-Out**<br>*(`trial_balance_audit`: `<9 KB`)* | **`2,235 tok`** · `15.1 ms` (`5` trips) | `2,866 tok` · **`13.6 ms`** (**`3` trips**) | **Tie** — Code Mode saves 2 HTTP trips; Classic saves 631 stub tokens |
-| **4. Single Point Lookup**<br>*(`single_lookup`: 1 contract)* | **`1,619 tok`** · **`4.7 ms`** (**`2` trips**) | `2,383 tok` · `8.2 ms` (`3` trips) | **Classic (-32% tokens)** — direct JSON-RPC call needs no script |
+| **1. Bulk 200-Row Join**<br>*(`reconcile_bulk_200`: ~200 KB)* | `49,955 tok` · `23.8 ms` · `4` trips · ✅ | **`3,149 tok`** · `28.9 ms` · **`3` trips** · ✅ | **Code Mode (-93.7% tokens)** — filters 200 KB in Monty sandbox |
+| **2. Medium 30-Row Join**<br>*(`reconcile_overdue`: 3 servers)* | `3,550 tok` · `112.8 ms` · `4` trips · ✅ | **`3,123 tok`** · **`25.7 ms`** · **`3` trips** · ✅ | **Code Mode (4.4x faster)** — parallel `asyncio.gather` in 1 script |
+| **3. Batch Financial Compute**<br>*(`compute_batch_penalties`: 6 calls)* | `3,216 tok` · `63.5 ms` · `7` trips · ✅ | **`2,484 tok`** · **`28.9 ms`** · **`3` trips** · ✅ | **Code Mode (-22.8% tokens, 2.2x faster, -4 HTTP trips)** |
+| **4. 5-Step Incident Triage Chain**<br>*(`mutating_ticket_workflow`: Sentry->GH->Ticket->Slack)* | **`1,756 tok`** · `49.6 ms` · `6` trips · ✅ | `2,856 tok` · **`17.7 ms`** · **`3` trips** · ✅ | **Code Mode (2.8x faster, -3 HTTP trips)** — chains 5 steps in 1 script |
+| **5. Small 4-Call Fan-Out**<br>*(`trial_balance_audit`: `<9 KB`)* | **`2,235 tok`** · `15.1 ms` · `5` trips · ✅ | `2,866 tok` · **`13.6 ms`** · **`3` trips** · ✅ | **Tie** — Code Mode saves 2 HTTP trips; Classic saves 631 stub tokens |
+| **6. Single Point Lookup**<br>*(`single_lookup`: 1 contract)* | **`1,619 tok`** · **`4.7 ms`** · **`2` trips** · ✅ | `2,383 tok` · `8.2 ms` · `3` trips · ✅ | **Classic (-32% tokens)** — direct JSON-RPC call needs no script |
 
 #### B. Small Local Non-Reasoning Model (`qwen/qwen3.5-9b`, `reasoning_effort=none`, Concurrency 3)
 
-| Task | Classic MCP | Code Mode | Winner & Why |
+| Workload | Classic MCP | Code Mode (`execute_code`) | Winner & Why |
 | :--- | :--- | :--- | :--- |
 | **1. Bulk 200-Row Join**<br>*(`reconcile_bulk_200`: ~200 KB)* | `39,230 tok` · `62.0 s` · **❌ FAIL** | **`7,336 tok`** · **`45.7 s`** · **✅ PASS** | **Code Mode (-81.3% tokens)** — prevents 9B context/math collapse |
-| **2. Medium 30-Row Join**<br>*(`reconcile_overdue`: 3 servers)* | **`10,968 tok`** · **`95.6 s`** · ✅ | `47,373 tok` · `179.3 s` · ✅ *(4 retries)* | **Classic (4.3x cheaper)** — non-reasoning 9B fumbles Python dict keys |
-| **3. Small 4-Call Fan-Out**<br>*(`trial_balance_audit`: `<9 KB`)* | **`4,304 tok`** · **`16.2 s`** · ✅ | `10,323 tok` · `34.5 s` · ✅ | **Classic (2.4x cheaper & 2.1x faster)** |
-| **4. Single Point Lookup**<br>*(`single_lookup`: 1 contract)* | **`2,065 tok`** · **`6.6 s`** · ✅ | `4,866 tok` · `10.0 s` · ✅ | **Classic (2.4x cheaper & 1.5x faster)** |
+| **2. 5-Step Incident Triage Chain**<br>*(`mutating_ticket_workflow`: Sentry->GH->Ticket->Slack)* | `9,268 tok` · `25.2 s` · **`6` turns** · ✅ | **`6,907 tok`** · **`23.3 s`** · **`3` turns** · ✅ | **Code Mode (-25.5% tokens, 6 -> 3 turns)** — avoids 5 sequential LLM turns |
+| **3. Batch Financial Compute**<br>*(`compute_batch_penalties`: 6 calls)* | **`5,783 tok`** · `30.5 s` (`6` OBO hops) · ✅ | `5,908 tok` · **`29.4 s`** (**`1` OBO hop**) · ✅ | **Tie (`~5.8k` tok, `~29.5s`)** — 9B writes 0-retry loop & saves 5 OBO hops |
+| **4. Medium 30-Row Join**<br>*(`reconcile_overdue`: 3 servers)* | **`10,968 tok`** · **`95.6 s`** · ✅ | `47,373 tok` · `179.3 s` · ✅ *(4 retries)* | **Classic (4.3x cheaper)** — non-reasoning 9B fumbles Python dict keys |
+| **5. Small 4-Call Fan-Out**<br>*(`trial_balance_audit`: `<9 KB`)* | **`4,304 tok`** · **`16.2 s`** · ✅ | `10,323 tok` · `34.5 s` · ✅ | **Classic (2.4x cheaper & 2.1x faster)** |
+| **6. Single Point Lookup**<br>*(`single_lookup`: 1 contract)* | **`2,065 tok`** · **`6.6 s`** · ✅ | `4,866 tok` · `10.0 s` · ✅ | **Classic (2.4x cheaper & 1.5x faster)** |
 
 > **Programmatic Per-Tool & Per-Model Learning (`?execution=auto`):** MCPcodeaway does **not** hardcode model names. Agents identify their model via `X-Model-Name` (or `clientInfo.model`), and [`src/gateway/ab_testing.py`](src/gateway/ab_testing.py) learns from live A/B runs (`ok` quality, tokens saved, and `duration_ms` speed) per `(model_name, server__tool)` to auto-switch each model and tool to its winning mode (with optional admin overrides at `/admin/routing/models`).
 
