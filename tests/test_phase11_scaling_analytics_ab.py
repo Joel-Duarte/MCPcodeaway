@@ -763,6 +763,62 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
                 "x-gateway-mode-decision", ""
             )
             assert learned_resp.headers.get("x-gateway-model") == "gemini-2.5-flash"
+
+            # Layer 5: Per-tool + per-server + per-model auto-promotion & auth remediation guidance
+            await rt.store.record_run(
+                {
+                    "run_id": "tool_cm_fail_1",
+                    "tenant_id": "tenant-acme-dev",
+                    "user_sub": "u1",
+                    "mode": "codemode",
+                    "ok": False,
+                    "tool_name": "execute_code",
+                    "subcalls": [{"server": "inv_api", "tool": "inv_api__list_items"}],
+                    "experiment_id": "exp_model_learn",
+                    "ab_variant": "codemode",
+                    "model_name": "qwen/qwen3.5-9b",
+                    "estimated_tokens_saved": 0,
+                    "schema_tokens_saved": 0,
+                }
+            )
+            await rt.store.record_run(
+                {
+                    "run_id": "tool_cl_ok_1",
+                    "tenant_id": "tenant-acme-dev",
+                    "user_sub": "u1",
+                    "mode": "traditional",
+                    "ok": True,
+                    "tool_name": "inv_api__list_items",
+                    "subcalls": [{"server": "inv_api", "tool": "inv_api__list_items"}],
+                    "experiment_id": "exp_model_learn",
+                    "ab_variant": "classic",
+                    "model_name": "qwen/qwen3.5-9b",
+                    "estimated_tokens_saved": 100,
+                    "schema_tokens_saved": 0,
+                }
+            )
+            tool_learned_resp = await gw.post(
+                "/mcp?execution=auto",
+                headers={
+                    "Authorization": f"Bearer {fin_tok}",
+                    "X-Model-Name": "qwen/qwen3.5-9b",
+                    "X-Intent": "call inv_api__list_items now",
+                },
+                json={"jsonrpc": "2.0", "id": 100, "method": "tools/list", "params": {}},
+            )
+            assert tool_learned_resp.status_code == 200
+            assert (
+                "ab_auto_promoted_tool:exp_model_learn:inv_api__list_items:classic"
+                in tool_learned_resp.headers.get("x-gateway-mode-decision", "")
+            )
+
+            unauth_mcp = await gw.post(
+                "/mcp",
+                json={"jsonrpc": "2.0", "id": 101, "method": "tools/list", "params": {}},
+            )
+            assert unauth_mcp.status_code == 401
+            assert "Remediation for agent/user:" in unauth_mcp.json()["detail"]
+            assert "/.well-known/oauth-protected-resource" in unauth_mcp.json()["detail"]
     finally:
         await rt.shutdown()
         await http_client.aclose()

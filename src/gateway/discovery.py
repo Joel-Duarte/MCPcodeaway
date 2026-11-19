@@ -327,9 +327,9 @@ class System1DiscoveryBackend:
         self._http_client = http_client
         self._fallback = fallback or BM25DiscoveryBackend()
 
-    async def _post_systemone(
+    async def _post_systemone_raw(
         self, state: str, questions: dict[str, dict[str, Any]]
-    ) -> dict[str, float]:
+    ) -> dict[str, Any]:
         if not self.url:
             raise RuntimeError("system1_url is not configured")
         headers = {"Content-Type": "application/json"}
@@ -347,6 +347,12 @@ class System1DiscoveryBackend:
         raw_answers = body.get("answers") or body.get("results") or body
         if not isinstance(raw_answers, dict):
             raise RuntimeError(f"Unexpected System1 response payload: {type(raw_answers).__name__}")
+        return raw_answers
+
+    async def _post_systemone(
+        self, state: str, questions: dict[str, dict[str, Any]]
+    ) -> dict[str, float]:
+        raw_answers = await self._post_systemone_raw(state, questions)
         parsed: dict[str, float] = {}
         for qid in questions:
             prob = _extract_noul_probability(raw_answers.get(qid))
@@ -354,6 +360,45 @@ class System1DiscoveryBackend:
                 raise RuntimeError(f"Missing calibrated probability for question '{qid}'")
             parsed[qid] = prob
         return parsed
+
+    async def _score_tools_single_choice(
+        self,
+        state: str,
+        candidates: list[DiscoveredTool],
+        srv_score_map: dict[str, float],
+    ) -> list[ScoredTool] | None:
+        if not candidates:
+            return []
+        criteria = {
+            tool.qualified_name: f"{tool.qualified_name}: {tool.description}" for tool in candidates
+        }
+        questions = {
+            "tool_choice": {
+                "type": "choice",
+                "instructions": (
+                    "Select the tool that best fulfills the user's request and return "
+                    "calibrated probabilities across all candidate tools."
+                ),
+                "criteria": criteria,
+            }
+        }
+        raw_answers = await self._post_systemone_raw(state, questions)
+        ans = raw_answers.get("tool_choice")
+        if not isinstance(ans, dict) or not isinstance(ans.get("probabilities"), dict):
+            return None
+        probs = ans["probabilities"]
+        ranked: list[ScoredTool] = []
+        for tool in candidates:
+            t_score = max(0.0, min(1.0, float(probs.get(tool.qualified_name, 0.0))))
+            ranked.append(
+                ScoredTool(
+                    tool=tool,
+                    score=round(t_score, 4),
+                    stage1_server_score=round(srv_score_map.get(tool.server, 1.0), 4),
+                )
+            )
+        ranked.sort(key=lambda item: (-item.score, item.tool.qualified_name))
+        return ranked
 
     async def search(
         self,
@@ -411,28 +456,36 @@ class System1DiscoveryBackend:
             elif len(candidates) > 40:
                 candidates = candidates[:40]
 
-            stage2_questions: dict[str, dict[str, Any]] = {}
-            for idx, tool in enumerate(candidates):
-                stage2_questions[f"tool_{idx}"] = {
-                    "type": "noul",
-                    "instructions": (
-                        f"Should tool '{tool.qualified_name}' ({tool.description}) be used "
-                        "to fulfill this request?"
-                    ),
-                }
+            choice_ranked = (
+                await self._score_tools_single_choice(query, candidates, srv_score_map)
+                if self._http_client is None
+                else None
+            )
+            if choice_ranked is not None:
+                ranked = choice_ranked
+            else:
+                stage2_questions: dict[str, dict[str, Any]] = {}
+                for idx, tool in enumerate(candidates):
+                    stage2_questions[f"tool_{idx}"] = {
+                        "type": "noul",
+                        "instructions": (
+                            f"Should tool '{tool.qualified_name}' ({tool.description}) be used "
+                            "to fulfill this request?"
+                        ),
+                    }
 
-            tool_scores = await self._post_systemone(query, stage2_questions)
-            ranked: list[ScoredTool] = []
-            for idx, tool in enumerate(candidates):
-                t_score = tool_scores[f"tool_{idx}"]
-                ranked.append(
-                    ScoredTool(
-                        tool=tool,
-                        score=round(t_score, 4),
-                        stage1_server_score=round(srv_score_map[tool.server], 4),
+                tool_scores = await self._post_systemone(query, stage2_questions)
+                ranked = []
+                for idx, tool in enumerate(candidates):
+                    t_score = tool_scores[f"tool_{idx}"]
+                    ranked.append(
+                        ScoredTool(
+                            tool=tool,
+                            score=round(t_score, 4),
+                            stage1_server_score=round(srv_score_map[tool.server], 4),
+                        )
                     )
-                )
-            ranked.sort(key=lambda item: (-item.score, item.tool.qualified_name))
+                ranked.sort(key=lambda item: (-item.score, item.tool.qualified_name))
 
             return DiscoveryOutcome(
                 tools=ranked[:limit],

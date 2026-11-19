@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -272,6 +272,50 @@ def evaluate_mode_algorithm(
     )
 
 
+def _run_matches_tool(run: dict[str, Any], target_tool: str) -> bool:
+    if run.get("tool_name") == target_tool:
+        return True
+    for sc in run.get("subcalls") or []:
+        if isinstance(sc, dict):
+            sc_tool = str(sc.get("tool") or "")
+            if sc_tool == target_tool or f"{sc.get('server')}__{sc_tool}" == target_tool:
+                return True
+    return False
+
+
+def _evaluate_learned_arms(
+    runs: list[dict[str, Any]],
+) -> tuple[Literal["codemode", "classic"], float, float] | None:
+    arms: dict[str, dict[str, float]] = {}
+    for r in runs:
+        v = str(r.get("ab_variant") or "")
+        if v not in {"codemode", "classic"}:
+            m = str(r.get("mode") or "")
+            v = "codemode" if (m.startswith("codemode") or m == "hybrid") else "classic"
+        b = arms.setdefault(
+            v,
+            {"runs": 0.0, "errors": 0.0, "tokens_saved": 0.0, "tokens_used": 0.0},
+        )
+        b["runs"] += 1.0
+        if not r.get("ok"):
+            b["errors"] += 1.0
+        b["tokens_saved"] += float(r.get("estimated_tokens_saved", 0)) + float(
+            r.get("schema_tokens_saved", 0)
+        )
+        b["tokens_used"] += float(r.get("tokens_used_est", 0))
+    cm = arms.get("codemode")
+    cl = arms.get("classic")
+    if not (cm and cl and cm["runs"] >= 1.0 and cl["runs"] >= 1.0):
+        return None
+    cm_err = (cm["errors"] / cm["runs"]) * 100.0
+    cl_err = (cl["errors"] / cl["runs"]) * 100.0
+    cm_avg_saved = cm["tokens_saved"] / cm["runs"]
+    cl_avg_saved = cl["tokens_saved"] / cl["runs"]
+    if cm_avg_saved >= cl_avg_saved and cm_err <= cl_err + 5.0:
+        return "codemode", cm_avg_saved, cm_err
+    return "classic", cl_avg_saved, cm_err
+
+
 def resolve_ab_experiment_variant(
     upstream: UpstreamConfig,
     identity: CallerIdentity,
@@ -279,6 +323,7 @@ def resolve_ab_experiment_variant(
     *,
     historical_runs: list[dict[str, Any]] | None = None,
     model_name: str | None = None,
+    target_tool: str | None = None,
 ) -> tuple[GatewayMode, str, str, str] | None:
     """Assign a request into a Classic vs. Code Mode A/B split or auto-promote winner."""
     exp = upstream.ab_experiment
@@ -287,54 +332,46 @@ def resolve_ab_experiment_variant(
     exp_id = exp.experiment_id or f"exp_{upstream.name}"
 
     if exp.auto_switch_enabled and historical_runs:
-        scoped_runs = [
+        base_runs = [
             r
             for r in historical_runs
             if r.get("experiment_id") == exp_id
             and (not model_name or (r.get("model_name") or "") == model_name)
         ]
-        if len(scoped_runs) >= exp.auto_promote_min_runs:
-            arms: dict[str, dict[str, float]] = {}
-            for r in scoped_runs:
-                v = str(r.get("ab_variant") or "")
-                if v not in {"codemode", "classic"}:
-                    continue
-                b = arms.setdefault(
-                    v,
-                    {"runs": 0.0, "errors": 0.0, "tokens_saved": 0.0, "tokens_used": 0.0},
-                )
-                b["runs"] += 1.0
-                if not r.get("ok"):
-                    b["errors"] += 1.0
-                b["tokens_saved"] += float(r.get("estimated_tokens_saved", 0)) + float(
-                    r.get("schema_tokens_saved", 0)
-                )
-                b["tokens_used"] += float(r.get("tokens_used_est", 0))
-            cm = arms.get("codemode")
-            cl = arms.get("classic")
-            if cm and cl and cm["runs"] >= 1.0 and cl["runs"] >= 1.0:
-                cm_err = (cm["errors"] / cm["runs"]) * 100.0
-                cl_err = (cl["errors"] / cl["runs"]) * 100.0
-                cm_avg_saved = cm["tokens_saved"] / cm["runs"]
-                cl_avg_saved = cl["tokens_saved"] / cl["runs"]
-                model_tag = f" model={model_name}" if model_name else ""
-                if cm_avg_saved >= cl_avg_saved and cm_err <= cl_err + 5.0:
+        # 1. Fine-grained per-tool + per-server + per-model auto-promotion
+        if target_tool:
+            tool_runs = [r for r in base_runs if _run_matches_tool(r, target_tool)]
+            if len(tool_runs) >= exp.auto_promote_min_runs:
+                verdict = _evaluate_learned_arms(tool_runs)
+                if verdict is not None:
+                    winner, avg_saved, cm_err = verdict
+                    gw_mode: GatewayMode = "codemode" if winner == "codemode" else "traditional"
+                    model_tag = f" model={model_name}" if model_name else ""
                     return (
-                        "codemode",
+                        gw_mode,
                         exp_id,
-                        "codemode",
+                        winner,
                         (
-                            f"ab_auto_promoted:{exp_id}:codemode "
-                            f"(n={len(scoped_runs)}{model_tag} saved={round(cm_avg_saved, 1)})"
+                            f"ab_auto_promoted_tool:{exp_id}:{target_tool}:{winner} "
+                            f"(n={len(tool_runs)}{model_tag} "
+                            f"saved={round(avg_saved, 1)} err_cm={round(cm_err, 1)}%)"
                         ),
                     )
+        # 2. Per-server + per-model auto-promotion fallback
+        if len(base_runs) >= exp.auto_promote_min_runs:
+            verdict = _evaluate_learned_arms(base_runs)
+            if verdict is not None:
+                winner, avg_saved, cm_err = verdict
+                gw_mode = "codemode" if winner == "codemode" else "traditional"
+                model_tag = f" model={model_name}" if model_name else ""
                 return (
-                    "traditional",
+                    gw_mode,
                     exp_id,
-                    "classic",
+                    winner,
                     (
-                        f"ab_auto_promoted:{exp_id}:classic "
-                        f"(n={len(scoped_runs)}{model_tag} err_cm={round(cm_err, 1)}%)"
+                        f"ab_auto_promoted:{exp_id}:{winner} "
+                        f"(n={len(base_runs)}{model_tag} "
+                        f"saved={round(avg_saved, 1)} err_cm={round(cm_err, 1)}%)"
                     ),
                 )
 

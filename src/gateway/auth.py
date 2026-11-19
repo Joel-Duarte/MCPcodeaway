@@ -428,16 +428,44 @@ class PolicyEvaluator:
         if not upstream.enabled:
             return False, f"Upstream '{upstream.name}' is disabled"
         if upstream.allowed_roles and not (set(identity.roles) & set(upstream.allowed_roles)):
-            return False, f"Caller lacks required role for '{upstream.name}'"
+            return (
+                False,
+                (
+                    f"Caller lacks required role for '{upstream.name}' "
+                    f"(requires one of roles {upstream.allowed_roles}; "
+                    f"caller has roles={identity.roles}). "
+                    "Tell the user to request one of the required App Roles from their IdP admin."
+                ),
+            )
         if upstream.allowed_groups and not (set(identity.groups) & set(upstream.allowed_groups)):
-            return False, f"Caller lacks required group for '{upstream.name}'"
+            return (
+                False,
+                (
+                    f"Caller lacks required group for '{upstream.name}' "
+                    f"(requires one of groups {upstream.allowed_groups}; "
+                    f"caller has groups={identity.groups}). "
+                    "Tell the user their account must be added to the required department group."
+                ),
+            )
         if upstream.allowed_clients and identity.client_id not in upstream.allowed_clients:
             return (
                 False,
-                f"Calling client '{identity.client_id}' is not allowed for '{upstream.name}'",
+                (
+                    f"Calling client '{identity.client_id}' is not allowed for '{upstream.name}' "
+                    f"(allowed clients: {upstream.allowed_clients}). "
+                    "Tell the user this agent harness is not authorized for this server."
+                ),
             )
         if upstream.allowed_scopes and not (set(identity.scopes) & set(upstream.allowed_scopes)):
-            return False, f"Caller lacks required scope for '{upstream.name}'"
+            return (
+                False,
+                (
+                    f"Caller lacks required scope for '{upstream.name}' "
+                    f"(requires one of scopes {upstream.allowed_scopes}; "
+                    f"caller has scopes={identity.scopes}). "
+                    "Tell the user to re-consent or grant the required OAuth scope."
+                ),
+            )
         return True, "allowed"
 
     def can_execute_tool(
@@ -457,14 +485,26 @@ class PolicyEvaluator:
             return True, "allowed"
 
         if self.settings.app_env == "prod" and self.settings.read_only_prod:
-            return False, "Mutating tools are blocked in read-only prod environment"
+            return (
+                False,
+                "Mutating tools are blocked in read-only prod environment. "
+                "Tell the user that write operations are disabled by production policy.",
+            )
 
         has_write_role = any(role == "admin" or role.endswith("_writer") for role in identity.roles)
         has_write_scope = any(
             scope == "mcp.write" or scope.endswith(".write") for scope in identity.scopes
         )
         if not has_write_role or not has_write_scope:
-            return False, f"Caller lacks write role/scope for mutating tool '{tool_name}'"
+            return (
+                False,
+                (
+                    f"Caller lacks write role/scope for mutating tool '{tool_name}' "
+                    f"(caller roles={identity.roles}, scopes={identity.scopes}; requires a "
+                    "'*_writer' or 'admin' role and '*.write' or 'mcp.write' scope). "
+                    "Tell the user they have read-only access and need write permissions."
+                ),
+            )
         return True, "allowed"
 
 

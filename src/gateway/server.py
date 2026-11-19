@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 from gateway import __version__
 from gateway.ab_testing import (
     OnboardingAbTestRequest,
+    _run_matches_tool,
     evaluate_mode_algorithm,
     resolve_ab_experiment_variant,
     run_onboarding_ab_test,
@@ -437,6 +438,7 @@ class GatewayRuntime:
         request_id: str,
         explicit_override: bool,
         model_name: str | None = None,
+        target_tool: str | None = None,
     ) -> tuple[
         ExecutionMode,
         DiscoveryMode,
@@ -454,6 +456,17 @@ class GatewayRuntime:
             if self.policy.can_access_upstream(identity, upstream)[0]:
                 accessible_srvs.append(upstream)
 
+        tools = self.catalog.list_accessible_tools(
+            identity, self.policy, self.registry, allowed_servers=allowed_servers
+        )
+        inferred_tool = target_tool
+        if not inferred_tool and intent:
+            intent_low = intent.lower()
+            for t in tools:
+                if t.qualified_name.lower() in intent_low or t.name.lower() in intent_low:
+                    inferred_tool = t.qualified_name
+                    break
+
         recent = await self.store.list_runs(limit=50, tenant_id=identity.tenant_id)
         if not explicit_override or requested_exec == "auto":
             for upstream in accessible_srvs:
@@ -463,6 +476,7 @@ class GatewayRuntime:
                     request_id,
                     historical_runs=recent,
                     model_name=model_name,
+                    target_tool=inferred_tool,
                 )
                 if split is not None:
                     var_mode, exp_id, variant_lbl, reason = split
@@ -480,18 +494,20 @@ class GatewayRuntime:
                 None,
             )
 
-        tools = self.catalog.list_accessible_tools(
-            identity, self.policy, self.registry, allowed_servers=allowed_servers
-        )
         tool_count = len(tools)
         classic_tokens = estimate_tokens([to_mcp_tool_definition(t) for t in tools]) if tools else 0
         mutating_ratio = (sum(1 for t in tools if t.mutating) / tool_count) if tool_count else 0.0
         typed_ratio = (
             sum(1 for t in tools if t.output_schema is not None) / tool_count if tool_count else 0.0
         )
+        scoped_recent = (
+            [r for r in recent if _run_matches_tool(r, inferred_tool)]
+            if inferred_tool
+            else recent[:30]
+        ) or recent[:30]
         avg_bytes = (
-            sum(int(r.get("raw_upstream_bytes", 0)) for r in recent[:30]) / len(recent[:30])
-            if recent
+            sum(int(r.get("raw_upstream_bytes", 0)) for r in scoped_recent) / len(scoped_recent)
+            if scoped_recent
             else 0.0
         )
         decision = evaluate_mode_algorithm(
@@ -1405,8 +1421,30 @@ def create_gateway_app(
                     headers = (
                         {"WWW-Authenticate": exc.www_authenticate} if exc.www_authenticate else None
                     )
+                    base_url = runtime.settings.gateway_public_url.rstrip("/")
+                    if exc.status_code == 401:
+                        guidance = (
+                            f"{exc.detail}. Remediation for agent/user: Authenticate via OIDC SSO "
+                            f"(discover at '{base_url}/.well-known/oauth-protected-resource' "
+                            f"for issuer '{runtime.settings.oidc_issuer}' and audience "
+                            f"'{runtime.settings.oidc_audience}')"
+                        )
+                        if runtime.settings.auth_mode == "dev":
+                            guidance += (
+                                f", or mint a local dev token via POST '{base_url}/dev/auth/token'"
+                            )
+                        guidance += (
+                            " and pass 'Authorization: Bearer <token>'. Inform the user that "
+                            "their MCP session needs to sign in or refresh its credentials."
+                        )
+                    else:
+                        guidance = (
+                            f"{exc.detail}. Remediation for agent/user: Inform the user that "
+                            "their identity token is from an untrusted tenant or lacks access; "
+                            f"permitted tenants: {runtime.settings.allowed_tenants}."
+                        )
                     raise HTTPException(
-                        status_code=exc.status_code, detail=exc.detail, headers=headers
+                        status_code=exc.status_code, detail=guidance, headers=headers
                     ) from exc
 
                 update_request_context(tenant_id=identity.tenant_id, user_sub=identity.sub)
@@ -1531,6 +1569,26 @@ def create_gateway_app(
                     return _finish(JSONResponse({}, status_code=202))
 
                 await runtime.ensure_catalog_for_identity(identity)
+                target_tool_hint: str | None = None
+                if method == "tools/call" and isinstance(params, dict):
+                    raw_tname = str(params.get("name") or "")
+                    if raw_tname and raw_tname not in {
+                        "list_servers",
+                        "search_tools",
+                        "execute_code",
+                    }:
+                        target_tool_hint = raw_tname
+                    elif raw_tname == "execute_code":
+                        code_str = str((params.get("arguments") or {}).get("code") or "")
+                        for t in runtime.catalog.list_accessible_tools(
+                            identity,
+                            runtime.policy,
+                            runtime.registry,
+                            allowed_servers=allowed_servers,
+                        ):
+                            if t.qualified_name in code_str:
+                                target_tool_hint = t.qualified_name
+                                break
                 (
                     eff_exec,
                     eff_disc_mode,
@@ -1549,6 +1607,7 @@ def create_gateway_app(
                     request_id=req_corr_id,
                     explicit_override=has_explicit_mode,
                     model_name=effective_model_name,
+                    target_tool=target_tool_hint,
                 )
                 mcp_span.set_attribute("mcp.mode", effective_mode)
                 if mode_decision_reason:

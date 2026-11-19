@@ -100,33 +100,33 @@ MCPcodeaway turns these benchmark findings into automated runtime routing ([`src
 
 Measured live against local LM Studio (`http://127.0.0.1:1234/v1`) across 20 queries (10 direct keyword queries + 10 paraphrased semantic queries with zero identifier overlap) at 10, 60, and 160 tools using `benchmarks/discovery_benchmark.py --live-lmstudio`:
 - **Embedding model:** `text-embedding-qwen3-embedding-0.6b` (cached per `catalog_version`)
-- **System 1 sidecar model:** `laya` (`POST /v1/systemone` calibrated `noul` probability endpoint)
+- **System 1 sidecar model:** `laya` (`POST /v1/systemone` using Stage-1 server `noul` routing + Stage-2 single-call `type: "choice"` probability distribution across candidate tools instead of 40+ parallel `noul` questions)
 
 | Catalog Size | Discovery Backend | Overall Recall@5 | Direct Recall@5 | Semantic Recall@5 | MRR | Server Routing Acc | Mean Latency (ms) | Extra Token / GPU Cost |
 | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
-| **10 tools** | `bm25` (Default) | 0.833 | **1.000** | 0.667 | 0.777 | 0.800 | **0.11 ms** | **0 (CPU-only, stdlib)** |
-| **10 tools** | `embedding` | **0.958** | **1.000** | **0.917** | **0.975** | 0.900 | 104.07 ms | Low (cached vectors) |
-| **10 tools** | `hybrid_system1` | 0.950 | **1.000** | 0.900 | 0.917 | **0.950** | 87.94 ms | Moderate (2 LLM sidecar calls) |
-| **60 tools** | `bm25` (Default) | 0.800 | **1.000** | 0.600 | 0.742 | 0.800 | **0.60 ms** | **0 (CPU-only, stdlib)** |
-| **60 tools** | `embedding` | **0.925** | **1.000** | **0.850** | **0.925** | **0.900** | 102.73 ms | Low (1 query embedding after warm cache) |
-| **60 tools** | `hybrid_system1` | 0.825 | **1.000** | 0.650 | 0.825 | 0.800 | 138.91 ms | High (scores top-25 BM25 candidates via LLM) |
-| **60 tools** | `system1` (raw) | 0.625 | 0.900 | 0.350 | 0.650 | 0.650 | 299.20 ms | Very High (40+ parallel `noul` questions) |
-| **160 tools** | `bm25` (Default) | 0.800 | **1.000** | 0.600 | 0.742 | 0.800 | **1.32 ms** | **0 (CPU-only, stdlib)** |
-| **160 tools** | `embedding` | **0.925** | **1.000** | **0.850** | **0.925** | **0.900** | 169.31 ms | Low (1 query embedding after warm cache) |
-| **160 tools** | `hybrid_system1` | 0.825 | **1.000** | 0.650 | 0.825 | 0.800 | 140.12 ms | High (2 batched `/v1/systemone` calls per search) |
-| **160 tools** | `system1` (raw) | 0.625 | 0.900 | 0.350 | 0.650 | 0.650 | 311.28 ms | Very High (truncates past 40 tools) |
+| **10 tools** | `bm25` (Default) | 0.833 | **1.000** | 0.667 | 0.777 | 0.800 | **0.09 ms** | **0 (CPU-only, stdlib)** |
+| **10 tools** | `embedding` | **0.958** | **1.000** | **0.917** | **0.975** | 0.900 | 63.16 ms | Low (cached vectors) |
+| **10 tools** | `hybrid_system1` (`choice`) | 0.900 | **1.000** | 0.800 | 0.756 | **0.950** | 71.06 ms | Moderate (Stage-1 `noul` + 1 Stage-2 `choice` distribution) |
+| **60 tools** | `bm25` (Default) | 0.800 | **1.000** | 0.600 | 0.742 | 0.800 | **0.50 ms** | **0 (CPU-only, stdlib)** |
+| **60 tools** | `embedding` | **0.925** | **1.000** | **0.850** | **0.925** | **0.900** | 95.89 ms | Low (1 query embedding after warm cache) |
+| **60 tools** | `hybrid_system1` (`choice`) | 0.842 | **1.000** | 0.683 | 0.768 | 0.800 | **83.84 ms** | Moderate (BM25 top-25 + 1 `choice` probability distribution) |
+| **60 tools** | `system1` (raw `choice`) | 0.625 | 0.900 | 0.350 | 0.525 | 0.650 | 128.74 ms | Moderate (2.3x faster than 40 `noul` prompts, but 40-choice softmax dilutes probability) |
+| **160 tools** | `bm25` (Default) | 0.800 | **1.000** | 0.600 | 0.742 | 0.800 | **1.40 ms** | **0 (CPU-only, stdlib)** |
+| **160 tools** | `embedding` | **0.925** | **1.000** | **0.850** | **0.925** | **0.900** | 162.21 ms | Low (1 query embedding after warm cache) |
+| **160 tools** | `hybrid_system1` (`choice`) | 0.825 | **1.000** | 0.650 | 0.758 | 0.800 | **86.01 ms** | Moderate (BM25 top-25 + 1 `choice` probability distribution) |
+| **160 tools** | `system1` (raw `choice`) | 0.625 | 0.900 | 0.350 | 0.525 | 0.650 | 130.82 ms | Moderate (2.4x faster than 40 `noul` prompts, but truncates past 40 tools) |
 
 ### Pros & Cons of Each Discovery Strategy
 
 1. **`bm25` (Default Production Choice — `GATEWAY_DISCOVERY_BACKEND=bm25`)**
-   - **Pros:** Sub-millisecond (`0.1–1.3 ms` even at 160 tools), **zero token cost**, zero external GPU/API dependency, `100%` recall when the agent uses domain keywords (which agents almost always do when calling `search_tools(query="overdue invoices snowflake")`).
+   - **Pros:** Sub-millisecond (`0.09–1.40 ms` even at 160 tools), **zero token cost**, zero external GPU/API dependency, `100%` recall when the agent uses domain keywords (which agents almost always do when calling `search_tools(query="overdue invoices snowflake")`).
    - **Cons:** Lower recall (`60%`) on purely conversational user queries that share zero words with the tool names (e.g., *"Why cannot shoppers tap their credit cards?"* -> `list_terminal_incidents`).
 2. **`embedding` (Recommended SOTA Upgrade for Raw Natural-Language `X-Intent` — `GATEWAY_DISCOVERY_BACKEND=embedding`)**
    - **Pros:** Highest accuracy across all catalog sizes (**`92.5%–95.8%` Recall@5, `0.925–0.975` MRR**), caches tool vectors in-memory per `catalog_version` so runtime searches only embed the short query string, and automatically falls back to `bm25` if the embedding server is unreachable.
-   - **Cons:** Requires an OpenAI-compatible `/v1/embeddings` endpoint (`text-embedding-qwen3-embedding-0.6b`, `nomic-embed-text`, etc.) and adds `~15–100 ms` per uncached query.
-3. **`system1` / `hybrid_system1` (Experimental LLM Sidecar — Optional)**
-   - **Pros:** Useful for two-stage hierarchical server routing on small catalogs (`95%` server routing accuracy at 10 tools).
-   - **Cons:** Slower (`140–311 ms`), consumes LLM inference tokens/compute on every discovery call, and degrades as catalog size grows (`62.5%` raw recall at 60–160 tools) compared to cached vector embeddings (`92.5%`). Keep disabled by default in favor of **`bm25` + `embedding`**.
+   - **Cons:** Requires an OpenAI-compatible `/v1/embeddings` endpoint (`text-embedding-qwen3-embedding-0.6b`, `nomic-embed-text`, etc.) and adds `~60–160 ms` per uncached query.
+3. **`system1` / `hybrid_system1` (Single-Call `type: "choice"` Confidence Distribution — Optional)**
+   - **Pros:** Switching Stage 2 from 40+ parallel `noul` yes/no prompts to a **single `type: "choice"` probability distribution** cuts latency by **more than half** (`311 ms -> 130 ms` raw, `140 ms -> 83.8 ms` hybrid) and achieves `95%` Stage-1 server routing accuracy at 10 tools and `84.2%` Recall@5 in `hybrid_system1` at 60 tools (faster than embeddings at 60–160 tools: `83–86 ms` vs `95–162 ms`).
+   - **Cons:** Softmax probability over large criteria lists (`>25` tools) dilutes multi-tool recall compared to independent cosine-similarity embeddings (`84.2%` vs `92.5%` Recall@5), and still requires an active `/v1/systemone` LLM sidecar. Keep **`bm25` + `embedding`** as the primary defaults, with `hybrid_system1` (`choice`) available when a local System 1 sidecar is deployed.
 
 </details>
 
