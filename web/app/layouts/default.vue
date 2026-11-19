@@ -9,25 +9,22 @@ const {
   busy: demoBusy,
   refreshStatus: refreshDemoStatus,
   startTraffic,
+  setTier,
   stopTraffic,
   runBurst,
 } = useDemoTraffic();
+const { connected: wsConnected, connect: connectWs, disconnect: disconnectWs } = useLiveTelemetry();
 
 const navOpen = ref(false);
-let demoPoll: ReturnType<typeof setInterval> | null = null;
 
 onMounted(async () => {
   initAgentBridge();
   await refreshDemoStatus();
-  demoPoll = setInterval(() => {
-    if (demoStatus.value.running) {
-      refreshDemoStatus();
-    }
-  }, 3000);
+  connectWs();
 });
 
 onBeforeUnmount(() => {
-  if (demoPoll) clearInterval(demoPoll);
+  disconnectWs();
 });
 
 watch(
@@ -193,6 +190,16 @@ const adminRoleText = computed(() => {
         </div>
 
         <div class="flex shrink-0 items-center gap-2">
+          <span
+            class="hidden sm:inline-flex items-center gap-1.5 rounded border border-[#E4E4E7] bg-white px-2 py-0.5 text-[11px] font-medium text-[#52525B]"
+            :title="wsConnected ? 'WebSocket telemetry connected' : 'WebSocket reconnecting'"
+          >
+            <span
+              class="inline-block h-2 w-2 rounded-full"
+              :class="wsConnected ? 'bg-[#059669]' : 'bg-[#D97706]'"
+            />
+            <span>{{ wsConnected ? "Live WS" : "WS Offline" }}</span>
+          </span>
           <div
             v-if="demoStatus.enabled"
             class="hidden md:flex items-center gap-1.5 rounded-md border border-[#E4E4E7] bg-[#F4F4F5] px-2 py-1 text-xs"
@@ -204,11 +211,21 @@ const adminRoleText = computed(() => {
             <span class="font-medium text-[#09090B] tabular-nums">
               Demo {{ demoStatus.requests_sent }} reqs
             </span>
+            <select
+              aria-label="Demo traffic tier"
+              :value="demoStatus.tier"
+              class="rounded border border-[#D4D4D8] bg-white px-1.5 py-0.5 text-[11px] font-medium text-[#09090B]"
+              @change="(e) => setTier((e.target as HTMLSelectElement).value as 'light' | 'enterprise' | 'stress')"
+            >
+              <option value="light">Light (~0.5 rps)</option>
+              <option value="enterprise">Enterprise (~2 rps)</option>
+              <option value="stress">Stress (~5 rps)</option>
+            </select>
             <Button
               v-if="!demoStatus.running"
               class="px-2 py-0.5 text-[11px]"
               :disabled="demoBusy"
-              @click="startTraffic"
+              @click="startTraffic()"
             >
               Start Demo Traffic
             </Button>
@@ -224,9 +241,9 @@ const adminRoleText = computed(() => {
             <Button
               class="px-2 py-0.5 text-[11px]"
               :disabled="demoBusy"
-              @click="runBurst(6)"
+              @click="runBurst(8)"
             >
-              Burst +6
+              Burst +8
             </Button>
           </div>
           <div class="hidden sm:flex items-center gap-2 text-xs">

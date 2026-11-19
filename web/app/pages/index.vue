@@ -78,20 +78,25 @@ interface AnalyticsSummary {
 
 const { apiFetch, setRuntimeMeta } = useAdminApi();
 const { status: demoStatus, busy: demoBusy, runBurst } = useDemoTraffic();
+const {
+  connected: wsConnected,
+  events: liveEvents,
+  latestRuntime,
+  totalRunsTick,
+} = useLiveTelemetry();
 
 async function triggerOverviewBurst() {
-  await runBurst(6);
+  await runBurst(8);
   await fetchOverview();
 }
 
 const loading = ref(true);
 const errorMessage = ref("");
-const autoRefresh = ref(true);
 const runtimeData = ref<RuntimeTelemetryResponse | null>(null);
 const valueData = ref<AuditValueResponse | null>(null);
 const analyticsData = ref<AnalyticsSummary | null>(null);
 
-let pollTimer: ReturnType<typeof setInterval> | null = null;
+let refreshDebounce: ReturnType<typeof setTimeout> | null = null;
 
 async function fetchOverview() {
   errorMessage.value = "";
@@ -116,30 +121,27 @@ async function fetchOverview() {
   }
 }
 
-watch(
-  autoRefresh,
-  (enabled) => {
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
-    if (enabled && import.meta.client) {
-      pollTimer = setInterval(() => {
-        void fetchOverview();
-      }, 15000);
-    }
-  },
-  { immediate: true }
-);
+watch(latestRuntime, (rt) => {
+  if (rt && typeof rt === "object" && "gateway" in rt) {
+    runtimeData.value = rt as unknown as RuntimeTelemetryResponse;
+  }
+});
+
+watch(totalRunsTick, () => {
+  if (refreshDebounce) clearTimeout(refreshDebounce);
+  refreshDebounce = setTimeout(() => {
+    void fetchOverview();
+  }, 600);
+});
 
 onMounted(() => {
   void fetchOverview();
 });
 
 onBeforeUnmount(() => {
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
+  if (refreshDebounce) {
+    clearTimeout(refreshDebounce);
+    refreshDebounce = null;
   }
 });
 
@@ -187,12 +189,13 @@ function formatUsd(n: number | undefined): string {
         </p>
       </div>
       <div class="flex flex-wrap items-center gap-3">
-        <label class="flex items-center gap-2 text-xs font-medium text-[#52525B] cursor-pointer">
-          <Switch v-model:checked="autoRefresh">
-            <SwitchThumb />
-          </Switch>
-          <span>15s Auto-refresh</span>
-        </label>
+        <span class="inline-flex items-center gap-1.5 rounded-md border border-[#E4E4E7] bg-white px-2.5 py-1 text-xs font-medium text-[#52525B]">
+          <span
+            class="inline-block h-2 w-2 rounded-full"
+            :class="wsConnected ? 'bg-[#059669] animate-pulse' : 'bg-[#D97706]'"
+          />
+          <span>{{ wsConnected ? "WebSocket Live" : "Connecting WS..." }}</span>
+        </span>
         <Button data-variant="primary" pending-announcement="Refreshing metrics" @click="fetchOverview">
           <AppIcon name="refresh" :size="15" />
           <span>Refresh</span>
@@ -231,7 +234,7 @@ function formatUsd(n: number | undefined): string {
           </span>
         </div>
         <Button data-variant="primary" :disabled="demoBusy" @click="triggerOverviewBurst">
-          Run Demo Burst (+6)
+          Run Demo Burst (+8)
         </Button>
       </section>
 
@@ -278,39 +281,65 @@ function formatUsd(n: number | undefined): string {
         </div>
       </section>
 
-      <!-- Mode Split & Efficiency Bar -->
+      <!-- Live Activity Stream (Summary metadata only — no raw payloads or PII) -->
       <section
-        aria-label="Execution mode split"
+        aria-label="Live gateway activity stream"
         class="rounded-lg border border-[#E4E4E7] bg-white p-4"
       >
-        <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
-          <span class="font-semibold text-[#09090B]">Execution Mode Split</span>
-          <div class="flex items-center gap-4 text-[#52525B] tabular-nums">
-            <span class="inline-flex items-center gap-1.5">
-              <span class="inline-block h-2.5 w-2.5 rounded-sm bg-[#0F766E]" />
-              Code Mode: {{ formatInt(analyticsData?.summary.codemode_runs) }} ({{ (analyticsData?.summary.codemode_share_pct ?? 0).toFixed(1) }}%)
-            </span>
-            <span class="inline-flex items-center gap-1.5">
-              <span class="inline-block h-2.5 w-2.5 rounded-sm bg-[#2563EB]" />
-              Classic: {{ formatInt(analyticsData?.summary.classic_runs) }}
-            </span>
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 class="text-[15px] font-semibold text-[#09090B]">
+              Live Gateway Activity Stream
+            </h2>
+            <p class="text-xs text-[#71717A]">
+              Real-time WebSocket execution feed (summary metadata only; payloads redacted by policy).
+            </p>
           </div>
+          <span class="rounded border border-[#E4E4E7] bg-[#F4F4F5] px-2 py-0.5 text-xs font-medium text-[#52525B] tabular-nums">
+            {{ liveEvents.length }} live events
+          </span>
         </div>
-        <div class="mt-2.5 h-2.5 w-full overflow-hidden rounded-full bg-[#F4F4F5] flex">
-          <div
-            class="h-full bg-[#0F766E] transition-all duration-200"
-            :style="{ width: `${analyticsData?.summary.codemode_share_pct ?? 0}%` }"
-          />
-          <div
-            class="h-full bg-[#2563EB] transition-all duration-200"
-            :style="{
-              width: `${
-                (analyticsData?.summary.total_runs ?? 0) > 0
-                  ? Math.max(0, 100 - (analyticsData?.summary.codemode_share_pct ?? 0))
-                  : 0
-              }%`,
-            }"
-          />
+
+        <div v-if="liveEvents.length === 0" class="py-5 text-center text-xs text-[#71717A]">
+          Waiting for live /mcp executions over WebSocket…
+        </div>
+        <div v-else class="mt-3 max-h-56 overflow-x-auto overflow-y-auto rounded border border-[#E4E4E7] table-scroll">
+          <table class="w-full border-collapse text-left text-xs">
+            <thead>
+              <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-[#52525B]">
+                <th class="px-3 py-2 whitespace-nowrap">Group</th>
+                <th class="px-3 py-2 whitespace-nowrap">Target / Tool</th>
+                <th class="px-3 py-2 whitespace-nowrap">Mode</th>
+                <th class="px-3 py-2 text-right whitespace-nowrap">Tokens Saved</th>
+                <th class="px-3 py-2 text-right whitespace-nowrap">Latency</th>
+                <th class="px-3 py-2 whitespace-nowrap">Status</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-[#E4E4E7]">
+              <tr v-for="ev in liveEvents" :key="ev.run_id">
+                <td class="px-3 py-1.5 font-medium text-[#09090B] whitespace-nowrap">{{ ev.company_group }}</td>
+                <td class="px-3 py-1.5 font-mono-data text-[#52525B] whitespace-nowrap">{{ ev.tool_name }}</td>
+                <td class="px-3 py-1.5 whitespace-nowrap">
+                  <span
+                    class="rounded px-1.5 py-0.5 text-[11px] font-medium"
+                    :class="ev.mode === 'codemode' ? 'bg-[#F0FDFA] text-[#0F766E]' : 'bg-[#EFF6FF] text-[#2563EB]'"
+                  >
+                    {{ ev.mode }}
+                  </span>
+                </td>
+                <td class="px-3 py-1.5 text-right text-[#0F766E] tabular-nums whitespace-nowrap">{{ formatInt(ev.tokens_saved) }}</td>
+                <td class="px-3 py-1.5 text-right text-[#52525B] tabular-nums whitespace-nowrap">{{ Number(ev.duration_ms || 0).toFixed(1) }} ms</td>
+                <td class="px-3 py-1.5 whitespace-nowrap">
+                  <span
+                    class="rounded px-1.5 py-0.5 text-[11px] font-medium"
+                    :class="ev.grounding_blocked ? 'bg-[#FEF2F2] text-[#DC2626]' : ev.ok ? 'bg-[#ECFDF5] text-[#059669]' : 'bg-[#FFFBEB] text-[#D97706]'"
+                  >
+                    {{ ev.grounding_blocked ? "GROUNDING BLOCKED" : ev.ok ? "OK" : "DENIED/ERR" }}
+                  </span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </section>
 

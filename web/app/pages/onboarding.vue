@@ -130,6 +130,63 @@ const modeOptions = [
   { value: "hybrid", label: "hybrid" },
 ];
 
+const onboardingStep = ref<1 | 2 | 3>(1);
+const promptTab = ref("prompt");
+const sourceKind = ref<"openapi_url" | "openapi_inline" | "rest_builder" | "mcp_http">(
+  "openapi_url"
+);
+const inlineSpecText = ref(
+  JSON.stringify(
+    {
+      openapi: "3.1.0",
+      info: { title: "Custom REST Service", version: "1.0.0" },
+      paths: {
+        "/items": {
+          get: { operationId: "list_items", summary: "List records" },
+        },
+      },
+    },
+    null,
+    2
+  )
+);
+const restEndpoints = ref([
+  { method: "get", path: "/health", operationId: "get_health", summary: "Health check" },
+  { method: "get", path: "/records", operationId: "list_records", summary: "List records" },
+]);
+
+function addRestEndpoint() {
+  restEndpoints.value.push({
+    method: "get",
+    path: "/resource",
+    operationId: `op_${restEndpoints.value.length + 1}`,
+    summary: "Custom endpoint",
+  });
+}
+
+function removeRestEndpoint(idx: number) {
+  if (restEndpoints.value.length > 1) {
+    restEndpoints.value.splice(idx, 1);
+  }
+}
+
+function buildSynthesizedSpec(): Record<string, unknown> {
+  const paths: Record<string, Record<string, unknown>> = {};
+  for (const ep of restEndpoints.value) {
+    const cleanPath = ep.path.startsWith("/") ? ep.path : `/${ep.path}`;
+    paths[cleanPath] ||= {};
+    paths[cleanPath][ep.method.toLowerCase()] = {
+      operationId: ep.operationId.trim() || undefined,
+      summary: ep.summary.trim() || ep.operationId,
+    };
+  }
+  return {
+    openapi: "3.1.0",
+    info: { title: draftName.value.trim() || "custom_rest_api", version: "1.0.0" },
+    paths,
+  };
+}
+
 function buildUpstreamPayload() {
   const roles = draftRoles.value
     .split(",")
@@ -137,11 +194,29 @@ function buildUpstreamPayload() {
     .filter(Boolean);
   const splitNum = Math.min(100, Math.max(0, Number.parseInt(draftAbSplitPct.value || "50", 10) || 50));
 
+  let resolvedType = draftType.value;
+  let specUrl: string | undefined = undefined;
+  let inlineSpec: Record<string, unknown> | undefined = undefined;
+
+  if (sourceKind.value === "openapi_url") {
+    resolvedType = "openapi";
+    specUrl = draftSpecUrl.value.trim() || undefined;
+  } else if (sourceKind.value === "openapi_inline") {
+    resolvedType = "openapi";
+    inlineSpec = JSON.parse(inlineSpecText.value);
+  } else if (sourceKind.value === "rest_builder") {
+    resolvedType = "openapi";
+    inlineSpec = buildSynthesizedSpec();
+  } else if (sourceKind.value === "mcp_http") {
+    resolvedType = "mcp_http";
+  }
+
   return {
     name: draftName.value.trim(),
-    type: draftType.value,
+    type: resolvedType,
     url: draftUrl.value.trim() || undefined,
-    openapi_spec_url: draftType.value === "openapi" ? draftSpecUrl.value.trim() || undefined : undefined,
+    openapi_spec_url: specUrl,
+    openapi_spec: inlineSpec,
     auth_type: draftAuthType.value,
     allowed_roles: roles,
     stateful_session: draftStateful.value,
@@ -321,11 +396,9 @@ function applyRecommendation(enableLiveSplit = false) {
   statusMessage.value = `Applied recommended mode '${patch.preferred_mode}' to draft form.`;
 }
 
-const onboardingStep = ref<1 | 2 | 3>(1);
-const promptTab = ref("prompt");
-
 function applyQuickPreset(preset: "mock-eu" | "mock-snowflake") {
   if (preset === "mock-eu") {
+    sourceKind.value = "openapi_url";
     draftName.value = "billing_eu_sandbox";
     draftType.value = "openapi";
     draftUrl.value = "http://mock-backends:8001/billing-eu";
@@ -333,6 +406,7 @@ function applyQuickPreset(preset: "mock-eu" | "mock-snowflake") {
     draftAuthType.value = "delegated_token";
     draftRoles.value = "finance_analyst, billing_reader, gateway_admin";
   } else {
+    sourceKind.value = "mcp_http";
     draftName.value = "snowflake_sandbox";
     draftType.value = "mcp_http";
     draftUrl.value = "http://mock-backends:8001/snowflake/mcp";
@@ -421,194 +495,250 @@ async function copyPromptText() {
       </div>
     </section>
 
-    <!-- Split Workspace -->
-    <div class="grid grid-cols-1 gap-6 xl:grid-cols-12">
-      <!-- Left: Upstream Configuration & Schema Inspection -->
-      <section class="space-y-5 rounded-lg border border-[#E4E4E7] bg-white p-5 xl:col-span-7">
-        <div class="flex items-center justify-between gap-2 border-b border-[#E4E4E7] pb-3">
-          <h2 class="text-[15px] font-semibold text-[#09090B]">Service Configuration</h2>
-          <span class="text-xs text-[#52525B]">
-            {{ dynamicPermitted ? "Dynamic Registration" : "GitOps Read-Only" }}
+    <!-- 3-Step Progressive Wizard Workspace -->
+    <div v-if="onboardingStep === 1" class="rounded-lg border border-[#E4E4E7] bg-white p-5 space-y-5">
+      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-[#E4E4E7] pb-3">
+        <div>
+          <h2 class="text-[15px] font-semibold text-[#09090B]">Step 1 — Connect API or MCP Server</h2>
+          <p class="text-xs text-[#52525B]">
+            Import an OpenAPI spec, define REST endpoints directly, or connect an existing MCP server.
+          </p>
+        </div>
+        <span class="text-xs text-[#52525B]">
+          {{ dynamicPermitted ? "Dynamic Registration" : "GitOps Read-Only" }}
+        </span>
+      </div>
+
+      <!-- 4 Input Method Cards -->
+      <div class="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        <Button
+          :data-variant="sourceKind === 'openapi_url' ? 'primary' : undefined"
+          class="justify-start text-xs"
+          @click="sourceKind = 'openapi_url'; draftType = 'openapi'"
+        >
+          OpenAPI Spec URL
+        </Button>
+        <Button
+          :data-variant="sourceKind === 'openapi_inline' ? 'primary' : undefined"
+          class="justify-start text-xs"
+          @click="sourceKind = 'openapi_inline'; draftType = 'openapi'"
+        >
+          Paste OpenAPI JSON
+        </Button>
+        <Button
+          :data-variant="sourceKind === 'rest_builder' ? 'primary' : undefined"
+          class="justify-start text-xs"
+          @click="sourceKind = 'rest_builder'; draftType = 'openapi'"
+        >
+          Quick REST Builder
+        </Button>
+        <Button
+          :data-variant="sourceKind === 'mcp_http' ? 'primary' : undefined"
+          class="justify-start text-xs"
+          @click="sourceKind = 'mcp_http'; draftType = 'mcp_http'"
+        >
+          Existing MCP Server
+        </Button>
+      </div>
+
+      <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <Field>
+          <FieldLabel>Upstream Name</FieldLabel>
+          <Input v-model="draftName" class="font-mono-data" />
+        </Field>
+        <Field>
+          <FieldLabel>Base / MCP Endpoint URL</FieldLabel>
+          <Input v-model="draftUrl" class="font-mono-data text-xs" />
+        </Field>
+        <Field v-if="sourceKind === 'openapi_url'" class="sm:col-span-2">
+          <FieldLabel>OpenAPI Spec URL</FieldLabel>
+          <Input v-model="draftSpecUrl" class="font-mono-data text-xs" />
+        </Field>
+        <Field v-if="sourceKind === 'openapi_inline'" class="sm:col-span-2">
+          <FieldLabel>OpenAPI JSON Document</FieldLabel>
+          <Textarea v-model="inlineSpecText" rows="6" class="font-mono-data text-xs" />
+        </Field>
+      </div>
+
+      <!-- Quick REST Endpoint Builder (for APIs without OpenAPI docs) -->
+      <div v-if="sourceKind === 'rest_builder'" class="space-y-2 rounded border border-[#E4E4E7] bg-[#FAFAFA] p-3">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-semibold text-[#09090B]">
+            Define REST Endpoints (auto-generates MCP tools)
           </span>
+          <Button class="text-xs" @click="addRestEndpoint">+ Add Endpoint</Button>
         </div>
-
-        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <Field>
-            <FieldLabel>Upstream Name</FieldLabel>
-            <Input v-model="draftName" class="font-mono-data" />
-          </Field>
-
-          <Field>
-            <FieldLabel>Transport Type</FieldLabel>
-            <Select
-              :items="typeOptions"
-              :value="draftType"
-              @value-change="(v) => { if (v) draftType = String(v) }"
-            >
-              <SelectTrigger>
-                <SelectValue />
-                <AppIcon name="chevron-down" :size="14" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem v-for="t in typeOptions" :key="t.value" :value="t.value">
-                  {{ t.label }}
-                  <SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator>
-                </SelectItem>
-              </SelectContent>
-            </Select>
-          </Field>
-
-          <Field>
-            <FieldLabel>Base / MCP Endpoint URL</FieldLabel>
-            <Input v-model="draftUrl" class="font-mono-data text-xs" />
-          </Field>
-
-          <Field v-if="draftType === 'openapi'">
-            <FieldLabel>OpenAPI Spec URL</FieldLabel>
-            <Input v-model="draftSpecUrl" class="font-mono-data text-xs" />
-          </Field>
-
-          <Field>
-            <FieldLabel>Upstream Auth Type</FieldLabel>
-            <Select
-              :items="authOptions"
-              :value="draftAuthType"
-              @value-change="(v) => { if (v) draftAuthType = String(v) }"
-            >
-              <SelectTrigger>
-                <SelectValue />
-                <AppIcon name="chevron-down" :size="14" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem v-for="a in authOptions" :key="a.value" :value="a.value">
-                  {{ a.label }}
-                  <SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator>
-                </SelectItem>
-              </SelectContent>
-            </Select>
-          </Field>
-
-          <Field>
-            <FieldLabel>Preferred Execution Mode</FieldLabel>
-            <Select
-              :items="modeOptions"
-              :value="draftPreferredMode"
-              @value-change="(v) => { if (v) draftPreferredMode = String(v) }"
-            >
-              <SelectTrigger>
-                <SelectValue />
-                <AppIcon name="chevron-down" :size="14" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem v-for="m in modeOptions" :key="m.value" :value="m.value">
-                  {{ m.label }}
-                  <SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator>
-                </SelectItem>
-              </SelectContent>
-            </Select>
-          </Field>
+        <div
+          v-for="(ep, idx) in restEndpoints"
+          :key="idx"
+          class="grid grid-cols-1 gap-2 sm:grid-cols-12 sm:items-center"
+        >
+          <select
+            v-model="ep.method"
+            aria-label="HTTP method"
+            class="sm:col-span-2 rounded border border-[#D4D4D8] bg-white px-2 py-1.5 text-xs uppercase"
+          >
+            <option value="get">GET</option>
+            <option value="post">POST</option>
+            <option value="put">PUT</option>
+            <option value="delete">DELETE</option>
+          </select>
+          <Input v-model="ep.path" class="sm:col-span-4 font-mono-data text-xs" placeholder="/orders" />
+          <Input v-model="ep.operationId" class="sm:col-span-3 font-mono-data text-xs" placeholder="list_orders" />
+          <Input v-model="ep.summary" class="sm:col-span-2 text-xs" placeholder="Summary" />
+          <Button class="sm:col-span-1 text-xs" @click="removeRestEndpoint(idx)">×</Button>
         </div>
+      </div>
+
+      <div class="flex flex-wrap items-center justify-between gap-2 border-t border-[#E4E4E7] pt-4">
+        <Button pending-announcement="Inspecting schema" @click="handleInspect">
+          Inspect Schema
+        </Button>
+        <Button data-variant="primary" @click="onboardingStep = 2">
+          Next: Policy &amp; Guardrails →
+        </Button>
+      </div>
+
+      <!-- Discovered Tools Preview -->
+      <div v-if="inspectResult" class="space-y-3 border-t border-[#E4E4E7] pt-4">
+        <div class="flex items-center justify-between">
+          <h3 class="text-sm font-semibold text-[#09090B]">
+            Discovered MCP Tools ({{ inspectResult.inspection.tool_count }})
+          </h3>
+          <span class="text-xs text-[#52525B]">{{ inspectResult.onboarding_audit.summary }}</span>
+        </div>
+        <div class="max-h-56 overflow-x-auto overflow-y-auto rounded border border-[#E4E4E7] table-scroll">
+          <table class="w-full border-collapse text-left text-xs">
+            <thead>
+              <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-[#52525B]">
+                <th class="px-3 py-2 whitespace-nowrap">Tool</th>
+                <th class="px-3 py-2 whitespace-nowrap">Mutating</th>
+                <th class="px-3 py-2 whitespace-nowrap">Output Schema</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-[#E4E4E7]">
+              <tr v-for="t in inspectResult.inspection.tools" :key="t.qualified_name">
+                <td class="px-3 py-2 font-mono-data text-[#09090B] whitespace-nowrap">{{ t.qualified_name }}</td>
+                <td class="px-3 py-2 whitespace-nowrap">{{ t.mutating ? "yes" : "read-only" }}</td>
+                <td class="px-3 py-2 whitespace-nowrap">
+                  <span :class="t.output_schema ? 'text-[#059669]' : 'text-[#D97706]'">
+                    {{ t.output_schema ? "typed" : "untyped" }}
+                  </span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 2: Access & Guardrails -->
+    <div v-else-if="onboardingStep === 2" class="rounded-lg border border-[#E4E4E7] bg-white p-5 space-y-5">
+      <div class="border-b border-[#E4E4E7] pb-3">
+        <h2 class="text-[15px] font-semibold text-[#09090B]">Step 2 — Access Control &amp; Execution Mode</h2>
+        <p class="text-xs text-[#52525B]">
+          Choose authentication, which roles can invoke these tools, and whether Code Mode runs automatically.
+        </p>
+      </div>
+
+      <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <Field>
+          <FieldLabel>Upstream Auth Type</FieldLabel>
+          <Select
+            :items="authOptions"
+            :value="draftAuthType"
+            @value-change="(v) => { if (v) draftAuthType = String(v) }"
+          >
+            <SelectTrigger>
+              <SelectValue />
+              <AppIcon name="chevron-down" :size="14" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem v-for="a in authOptions" :key="a.value" :value="a.value">
+                {{ a.label }}
+                <SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator>
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
 
         <Field>
+          <FieldLabel>Preferred Execution Mode</FieldLabel>
+          <Select
+            :items="modeOptions"
+            :value="draftPreferredMode"
+            @value-change="(v) => { if (v) draftPreferredMode = String(v) }"
+          >
+            <SelectTrigger>
+              <SelectValue />
+              <AppIcon name="chevron-down" :size="14" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem v-for="m in modeOptions" :key="m.value" :value="m.value">
+                {{ m.label }}
+                <SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator>
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
+
+        <Field class="sm:col-span-2">
           <FieldLabel>Allowed RBAC Roles (comma-separated)</FieldLabel>
           <Input v-model="draftRoles" class="font-mono-data text-xs" />
         </Field>
+      </div>
 
-        <div class="grid grid-cols-1 gap-4 border-t border-[#E4E4E7] pt-4 sm:grid-cols-2">
+      <details class="rounded border border-[#E4E4E7] bg-[#FAFAFA] p-3">
+        <summary class="cursor-pointer text-xs font-semibold text-[#09090B]">
+          Advanced Session &amp; A/B Settings (Optional — auto-detected by default)
+        </summary>
+        <div class="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
           <Field>
-            <div class="flex items-center justify-between gap-3">
+            <div class="flex items-center justify-between gap-2">
               <div>
                 <FieldLabel>Stateful MCP Session</FieldLabel>
-                <FieldDescription>Persist Mcp-Session-Id across replicas via Redis</FieldDescription>
+                <FieldDescription>Only enable if upstream requires pinned Mcp-Session-Id</FieldDescription>
               </div>
               <Switch v-model:checked="draftStateful">
                 <SwitchThumb />
               </Switch>
             </div>
           </Field>
-
           <Field>
-            <div class="flex items-center justify-between gap-3">
+            <div class="flex items-center justify-between gap-2">
               <div>
                 <FieldLabel>Live Traffic A/B Experiment</FieldLabel>
-                <FieldDescription>Deterministic user/tenant hash split in /mcp</FieldDescription>
+                <FieldDescription>Split traffic between Classic and Code Mode in /mcp</FieldDescription>
               </div>
               <Switch v-model:checked="draftAbEnabled">
                 <SwitchThumb />
               </Switch>
             </div>
           </Field>
-        </div>
-
-        <div v-if="draftAbEnabled" class="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <Field>
+          <Field v-if="draftAbEnabled">
             <FieldLabel>Experiment ID</FieldLabel>
             <Input v-model="draftAbExpId" class="font-mono-data text-xs" />
           </Field>
-          <Field>
+          <Field v-if="draftAbEnabled">
             <FieldLabel>Code Mode Traffic Split (%)</FieldLabel>
             <Input v-model="draftAbSplitPct" inputmode="numeric" />
           </Field>
         </div>
+      </details>
 
-        <div class="flex flex-wrap items-center gap-2 border-t border-[#E4E4E7] pt-4">
-          <Button pending-announcement="Inspecting schema" @click="handleInspect">
-            Inspect Schema
-          </Button>
-          <Button
-            v-if="dynamicPermitted"
-            data-variant="primary"
-            data-agent-confirm="Register or update this upstream service in the gateway?"
-            pending-announcement="Registering upstream"
-            @click="handleRegister"
-          >
-            Register Upstream
-          </Button>
-          <Button @click="copyYaml">
-            <AppIcon name="copy" :size="14" />
-            <span>Copy GitOps YAML</span>
-          </Button>
-        </div>
+      <div class="flex flex-wrap items-center justify-between gap-2 border-t border-[#E4E4E7] pt-4">
+        <Button @click="onboardingStep = 1">← Back: Connect</Button>
+        <Button data-variant="primary" @click="onboardingStep = 3">Next: Test &amp; Publish →</Button>
+      </div>
+    </div>
 
-        <!-- Discovered Tools Preview -->
-        <div v-if="inspectResult" class="space-y-3 border-t border-[#E4E4E7] pt-4">
-          <div class="flex items-center justify-between">
-            <h3 class="text-sm font-semibold text-[#09090B]">
-              Discovered Tools ({{ inspectResult.inspection.tool_count }})
-            </h3>
-            <span class="text-xs text-[#52525B]">{{ inspectResult.onboarding_audit.summary }}</span>
-          </div>
-          <div class="max-h-64 overflow-x-auto overflow-y-auto rounded border border-[#E4E4E7] table-scroll">
-            <table class="w-full border-collapse text-left text-xs">
-              <thead>
-                <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-[#52525B]">
-                  <th class="px-3 py-2 whitespace-nowrap">Tool</th>
-                  <th class="px-3 py-2 whitespace-nowrap">Mutating</th>
-                  <th class="px-3 py-2 whitespace-nowrap">Output Schema</th>
-                </tr>
-              </thead>
-              <tbody class="divide-y divide-[#E4E4E7]">
-                <tr v-for="t in inspectResult.inspection.tools" :key="t.qualified_name">
-                  <td class="px-3 py-2 font-mono-data text-[#09090B] whitespace-nowrap">{{ t.qualified_name }}</td>
-                  <td class="px-3 py-2 whitespace-nowrap">{{ t.mutating ? "yes" : "read-only" }}</td>
-                  <td class="px-3 py-2 whitespace-nowrap">
-                    <span :class="t.output_schema ? 'text-[#059669]' : 'text-[#D97706]'">
-                      {{ t.output_schema ? "typed" : "untyped" }}
-                    </span>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <!-- Right: Integrated Onboarding A/B Test Lab -->
-      <section class="space-y-5 rounded-lg border border-[#E4E4E7] bg-white p-5 xl:col-span-5">
+    <!-- Step 3: Test & Publish -->
+    <div v-else class="grid grid-cols-1 gap-6 xl:grid-cols-12">
+      <section class="space-y-5 rounded-lg border border-[#E4E4E7] bg-white p-5 xl:col-span-7">
         <div class="flex items-center gap-2 border-b border-[#E4E4E7] pb-3">
           <AppIcon name="flask" :size="16" class="text-[#0F766E]" />
           <h2 class="text-[15px] font-semibold text-[#09090B]">
-            Onboarding A/B Test Lab
+            Step 3 — Onboarding A/B Test Lab &amp; Publish
           </h2>
         </div>
 
@@ -698,15 +828,37 @@ async function copyPromptText() {
           </TabsPanel>
         </Tabs>
 
-        <Button
-          data-variant="primary"
-          class="w-full"
-          pending-announcement="Running A/B evaluation"
-          @click="runAbTest"
-        >
-          <AppIcon name="flask" :size="15" />
-          <span>Run A/B Evaluation</span>
-        </Button>
+        <div class="flex flex-wrap items-center justify-between gap-2 border-t border-[#E4E4E7] pt-4">
+          <Button @click="onboardingStep = 2">← Back: Policy</Button>
+          <div class="flex flex-wrap items-center gap-2">
+            <Button
+              pending-announcement="Running A/B evaluation"
+              @click="runAbTest"
+            >
+              <AppIcon name="flask" :size="15" />
+              <span>Run A/B Evaluation</span>
+            </Button>
+            <Button
+              v-if="dynamicPermitted"
+              data-variant="primary"
+              data-agent-confirm="Register or update this upstream service in the gateway?"
+              pending-announcement="Registering upstream"
+              @click="handleRegister"
+            >
+              Register Upstream
+            </Button>
+            <Button @click="copyYaml">
+              <AppIcon name="copy" :size="14" />
+              <span>Copy GitOps YAML</span>
+            </Button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right: A/B Results & GitOps YAML Preview -->
+      <section class="space-y-4 rounded-lg border border-[#E4E4E7] bg-white p-5 xl:col-span-5">
+        <h3 class="text-sm font-semibold text-[#09090B]">Evaluation &amp; GitOps Preview</h3>
+        <pre class="max-h-56 overflow-auto rounded border border-[#E4E4E7] bg-[#F4F4F5] p-3 font-mono-data text-xs text-[#09090B]">{{ yamlPreview }}</pre>
 
         <!-- A/B Evaluation Results -->
         <div v-if="abResult" class="space-y-4 border-t border-[#E4E4E7] pt-4">

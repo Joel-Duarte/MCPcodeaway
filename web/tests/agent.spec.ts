@@ -75,7 +75,8 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
     "Upstream Name",
     "Base / MCP Endpoint URL",
     "Inspect Schema",
-    "Register Upstream",
+    "Quick REST Builder",
+    "3. A/B Test & Save",
   ]) {
     expect(labels, `Missing control '${requiredLabel}' in agent snapshot`).toContain(requiredLabel);
   }
@@ -88,6 +89,17 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
   });
   expect(editRes.ok, editRes.error?.message).toBe(true);
   expect((wrapper.find("input").element as HTMLInputElement).value).toBe("crm_partner_api");
+
+  // Advance to Step 3 so Register Upstream mounts cleanly
+  const navStep3 = await agent.act({
+    steps: [{ ref: "3. A/B Test & Save", action: "press" }],
+  });
+  expect(navStep3.ok, navStep3.error?.message).toBe(true);
+  const step3Labels = agent
+    .snapshot()
+    .filter((entry) => !entry.offPage && entry.component !== "more")
+    .map((entry) => entry.label);
+  expect(step3Labels).toContain("Register Upstream");
 
   // Mutating Register Upstream must be blocked when allow() denies confirmation.
   const denied = await agent.act({

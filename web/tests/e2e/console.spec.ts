@@ -17,21 +17,22 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
       }
     });
 
-    // 1. Overview & Live Runtime + Demo Burst
+    // 1. Overview & Live Runtime + WebSocket + Demo Burst
     await page.goto(`${BASE}/dashboard/`, { waitUntil: "networkidle" });
     await expect(page.getByRole("heading", { name: /Overview & Live Runtime/i })).toBeVisible();
     await expect(page.getByText(/Gateway Replica/i)).toBeVisible();
+    await expect(page.getByText(/Live Gateway Activity Stream/i)).toBeVisible();
 
-    const burstBtn = page.getByRole("button", { name: /Run Demo Burst|Burst \+6/i }).first();
+    const burstBtn = page.getByRole("button", { name: /Run Demo Burst|Burst \+8/i }).first();
     if (await burstBtn.isVisible()) {
       await burstBtn.click();
-      await page.waitForTimeout(800);
+      await page.waitForTimeout(900);
     }
 
-    // 2. Analytics & Cost populated
+    // 2. Analytics & Cost populated + 9B baseline + Custom Model Pricing
     await page.getByRole("link", { name: /Analytics & Cost/i }).click();
     await expect(page.getByRole("heading", { name: /Analytics, Groups & Model Cost/i })).toBeVisible();
-    await expect(page.getByText(/Analyzed Runs/i)).toBeVisible();
+    await expect(page.getByText(/API Token Cost Simulator/i)).toBeVisible();
     await expect(page.getByText(/Code Mode vs\. Classic Volume/i)).toBeVisible();
 
     // 3. Upstreams & Splits renders live servers
@@ -44,11 +45,14 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     await expect(page.getByRole("heading", { name: /Audit Runs, Provenance & Retention/i })).toBeVisible();
     await expect(page.locator("table tbody tr").first()).toBeVisible();
 
-    // 5. Onboarding 3-Step Stepper & Reworked Agent Prompt Modal
+    // 5. Onboarding 3-Step Progressive Wizard + Quick REST Builder + Agent Prompt Modal
     await page.getByRole("link", { name: /Onboarding & A\/B Lab/i }).click();
     await expect(page.getByRole("button", { name: /1\. Connect & Inspect/i })).toBeVisible();
-    await expect(page.getByRole("button", { name: /2\. Policy & Mode/i })).toBeVisible();
-    await expect(page.getByRole("button", { name: /3\. A\/B Test & Save/i })).toBeVisible();
+    await expect(page.getByRole("button", { name: /Quick REST Builder/i })).toBeVisible();
+    await page.getByRole("button", { name: /2\. Policy & Mode/i }).click();
+    await expect(page.getByText(/Step 2 — Access Control/i)).toBeVisible();
+    await page.getByRole("button", { name: /3\. A\/B Test & Save/i }).click();
+    await expect(page.getByRole("button", { name: /Run A\/B Evaluation/i })).toBeVisible();
 
     await page.getByRole("button", { name: /Agent Onboarding Prompt/i }).click();
     await expect(page.getByRole("tab", { name: /Self-Admin MCP/i })).toBeVisible();
