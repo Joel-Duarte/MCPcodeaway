@@ -12,17 +12,23 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
+from gateway.runtime_stats import ProcessStatsCollector
 from gateway.sandbox import LocalMontyBackend
 
 
+def _parse_worker_secrets(expected_secret: str) -> list[str]:
+    return [s.strip() for s in expected_secret.split(",") if s.strip()]
+
+
 def _authorized_worker_ws(ws: WebSocket, expected_secret: str) -> bool:
-    if not expected_secret:
+    keys = _parse_worker_secrets(expected_secret)
+    if not keys:
         return True
     auth_hdr = ws.headers.get("authorization", "")
     token = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else ""
     hdr_secret = ws.headers.get("x-worker-secret", "")
     presented = token or hdr_secret
-    return bool(presented) and hmac.compare_digest(presented, expected_secret)
+    return bool(presented) and any(hmac.compare_digest(presented, key) for key in keys)
 
 
 def create_sandbox_worker_app(
@@ -38,6 +44,7 @@ def create_sandbox_worker_app(
         else os.getenv("GATEWAY_SANDBOX_WORKER_SECRET", "")
     )
     monty = LocalMontyBackend(min_processes=min_processes, max_processes=max_processes)
+    stats = ProcessStatsCollector()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -49,8 +56,8 @@ def create_sandbox_worker_app(
     app = FastAPI(title="MCPcodeaway Sandbox Worker", version="0.1.0", lifespan=lifespan)
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok", "service": "sandbox-worker"}
+    async def health() -> dict[str, Any]:
+        return {"status": "ok", "service": "sandbox-worker", **stats.snapshot()}
 
     @app.websocket("/ws/execute")
     async def ws_execute(ws: WebSocket) -> None:
@@ -121,12 +128,17 @@ def create_sandbox_worker_app(
 
                 external_functions[tool_name] = _make_proxy(tool_name)
 
-            res = await monty.execute(
-                code,
-                external_functions=external_functions,
-                timeout_seconds=timeout_seconds,
-                max_output_bytes=max_output_bytes,
-            )
+            stats.active_executions += 1
+            stats.total_executions += 1
+            try:
+                res = await monty.execute(
+                    code,
+                    external_functions=external_functions,
+                    timeout_seconds=timeout_seconds,
+                    max_output_bytes=max_output_bytes,
+                )
+            finally:
+                stats.active_executions = max(0, stats.active_executions - 1)
             async with send_lock:
                 await ws.send_json({"type": "done", "sandbox_result": res.model_dump()})
         except WebSocketDisconnect:

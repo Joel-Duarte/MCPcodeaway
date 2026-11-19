@@ -156,6 +156,9 @@ class RemoteMontyWorkerBackend:
     def __init__(self, worker_ws_url: str, *, worker_secret: str = "") -> None:
         self.worker_ws_url = worker_ws_url
         self.worker_secret = worker_secret
+        self._primary_secret = next(
+            (s.strip() for s in worker_secret.split(",") if s.strip()), ""
+        )
 
     async def close(self) -> None:
         return None
@@ -170,10 +173,10 @@ class RemoteMontyWorkerBackend:
     ) -> SandboxResult:
         started = time.perf_counter()
         connect_kwargs: dict[str, Any] = {"max_size": 4 * 1024 * 1024}
-        if self.worker_secret:
+        if self._primary_secret:
             connect_kwargs["additional_headers"] = {
-                "Authorization": f"Bearer {self.worker_secret}",
-                "X-Worker-Secret": self.worker_secret,
+                "Authorization": f"Bearer {self._primary_secret}",
+                "X-Worker-Secret": self._primary_secret,
             }
         try:
             async with websockets.connect(self.worker_ws_url, **connect_kwargs) as ws:

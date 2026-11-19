@@ -173,13 +173,21 @@ def summarize_value_shape(value: Any, *, depth: int = 0) -> Any:
     return type(value).__name__
 
 
+def _parse_signing_secrets(signing_secrets: str | list[str]) -> list[str]:
+    if isinstance(signing_secrets, str):
+        keys = [s.strip() for s in signing_secrets.split(",") if s.strip()]
+    else:
+        keys = [str(s).strip() for s in signing_secrets if str(s).strip()]
+    return keys or ["dev-provenance-secret"]
+
+
 def build_provenance_envelope(
     *,
     allowed_servers: set[str] | None,
     subcalls: list[SubcallRecord],
     observed_tool_outputs: list[Any],
     returned_value: Any,
-    signing_secret: str,
+    signing_secret: str | list[str],
 ) -> dict[str, Any]:
     """Build a tamper-evident host-stamped provenance envelope outside Monty."""
     ok_calls = [sc for sc in subcalls if sc.status == "ok"]
@@ -202,10 +210,27 @@ def build_provenance_envelope(
         "grounded": grounded,
         "unverified_identifiers": unverified_identifiers,
     }
+    primary_key = _parse_signing_secrets(signing_secret)[0]
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    sig = hmac.new(signing_secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+    sig = hmac.new(primary_key.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
     body["provenance_hmac"] = sig
     return body
+
+
+def verify_provenance_envelope(
+    envelope: dict[str, Any], signing_secrets: str | list[str]
+) -> bool:
+    """Verify a provenance envelope HMAC against one or more rotated keys."""
+    presented = str(envelope.get("provenance_hmac") or "")
+    if not presented:
+        return False
+    body = {k: v for k, v in envelope.items() if k != "provenance_hmac"}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    for key in _parse_signing_secrets(signing_secrets):
+        expected = hmac.new(key.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected, presented):
+            return True
+    return False
 
 
 class ExecutionBudget:

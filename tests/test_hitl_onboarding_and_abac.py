@@ -190,7 +190,11 @@ async def test_hitl_onboarding_guidance_curation_and_agent_prompt(tmp_path) -> N
 
                 dash = await gw.get("/dashboard")
                 assert dash.status_code == 200
-                html = dash.text
+                assert "MCPcodeaway" in dash.text
+
+                legacy_dash = await gw.get("/dashboard/legacy")
+                assert legacy_dash.status_code == 200
+                html = legacy_dash.text
                 assert "fetchGenericAgentPrompt" in html
                 assert "importAgentConfig" in html
                 assert "eu_accountant" in html

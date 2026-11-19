@@ -9,7 +9,7 @@ import sqlite3
 import time
 import uuid
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -123,6 +123,8 @@ class AuditStore(Protocol):
     async def list_dynamic_upstreams(self) -> list[dict[str, Any]]: ...
 
     async def delete_dynamic_upstream(self, name: str) -> bool: ...
+
+    async def prune_runs_older_than(self, retention_days: int) -> int: ...
 
 
 class SQLiteAuditStore:
@@ -275,6 +277,14 @@ class SQLiteAuditStore:
             conn.commit()
             return cursor.rowcount > 0
 
+    async def prune_runs_older_than(self, retention_days: int) -> int:
+        cutoff = (datetime.now(UTC) - timedelta(days=max(0, retention_days))).isoformat()
+        async with self._lock:
+            conn = self._ensure_conn()
+            cursor = conn.execute("DELETE FROM audit_runs WHERE created_at < ?", (cutoff,))
+            conn.commit()
+            return cursor.rowcount
+
 
 class PostgresAuditStore:
     """Postgres-backed AuditStore for multi-replica production deployments."""
@@ -421,6 +431,18 @@ class PostgresAuditStore:
             return int(str(status).split()[-1]) > 0
         except (IndexError, ValueError):
             return bool(status)
+
+    async def prune_runs_older_than(self, retention_days: int) -> int:
+        cutoff = (datetime.now(UTC) - timedelta(days=max(0, retention_days))).isoformat()
+        pool = await self._get_pool()
+        status = await pool.execute(
+            "DELETE FROM audit_runs WHERE created_at < $1",
+            cutoff,
+        )
+        try:
+            return int(str(status).split()[-1])
+        except (IndexError, ValueError):
+            return 0
 
     async def close(self) -> None:
         if self._pool is not None and hasattr(self._pool, "close"):

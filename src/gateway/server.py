@@ -12,12 +12,20 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi import Cookie, FastAPI, Header, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from opentelemetry import trace
 from pydantic import BaseModel
 
 from gateway import __version__
+from gateway.ab_testing import (
+    OnboardingAbTestRequest,
+    evaluate_mode_algorithm,
+    resolve_ab_experiment_variant,
+    run_onboarding_ab_test,
+)
+from gateway.admin_auth import AdminSessionManager, create_admin_auth_router
 from gateway.auth import (
     DEV_PERSONAS,
     AuthError,
@@ -61,6 +69,7 @@ from gateway.observability import (
     set_request_context,
     update_request_context,
 )
+from gateway.runtime_stats import ProcessStatsCollector, collect_runtime_telemetry
 from gateway.sandbox import LocalMontyBackend, RemoteMontyWorkerBackend, SandboxBackend
 from gateway.state import (
     AuditStore,
@@ -87,8 +96,9 @@ _VALID_MODES: set[str] = {
     "traditional",
     "traditional_discover",
     "hybrid",
+    "auto",
 }
-_VALID_EXECUTION: set[str] = {"classic", "codemode", "hybrid"}
+_VALID_EXECUTION: set[str] = {"classic", "codemode", "hybrid", "auto"}
 _VALID_DISCOVERY_MODES: set[str] = {"upfront", "deferred", "x_intent"}
 _VALID_DISCOVERY: set[str] = {"keyword", "bm25", "embedding", "system1", "hybrid_system1"}
 
@@ -98,6 +108,7 @@ _MODE_TO_AXES: dict[GatewayMode, tuple[ExecutionMode, DiscoveryMode]] = {
     "codemode_upfront": ("codemode", "upfront"),
     "codemode": ("codemode", "deferred"),
     "hybrid": ("hybrid", "deferred"),
+    "auto": ("auto", "deferred"),
 }
 
 
@@ -252,7 +263,14 @@ class GatewayRuntime:
             http_client=http_client,
         )
         self.registry = UpstreamRegistry(self.settings, store=self.store)
-        self.client_manager = UpstreamClientManager(http_client=http_client)
+        self.client_manager = UpstreamClientManager(
+            http_client=http_client,
+            cache=self.cache,
+            session_ttl_seconds=self.settings.mcp_session_ttl_seconds,
+        )
+        self.process_stats = ProcessStatsCollector()
+        self.admin_sessions = AdminSessionManager(self.settings)
+        self._local_catalog_epoch: str = "0"
         self.catalog = ToolCatalog()
         self.discovery_engine = DiscoveryEngine(
             self.settings, http_client=discovery_http_client
@@ -371,8 +389,104 @@ class GatewayRuntime:
         self.startup_warnings = warnings
         return warnings
 
+    async def bump_catalog_epoch(self) -> str:
+        """Broadcast catalog changes via shared cache so sibling replicas refresh."""
+        epoch = uuid.uuid4().hex[:12]
+        await self.cache.set("gateway:catalog_epoch", epoch, ttl_seconds=86400)
+        self._local_catalog_epoch = epoch
+        return epoch
+
+    async def sync_catalog_if_stale(self) -> None:
+        """Reload upstreams and tool catalog if a sibling replica bumped catalog_epoch."""
+        remote_epoch = await self.cache.get("gateway:catalog_epoch")
+        if remote_epoch is not None and remote_epoch != self._local_catalog_epoch:
+            await self.refresh_catalog()
+            self._local_catalog_epoch = remote_epoch
+
+    async def resolve_dynamic_mode(
+        self,
+        identity: CallerIdentity,
+        *,
+        requested_exec: ExecutionMode,
+        requested_disc: DiscoveryMode,
+        requested_mode: GatewayMode,
+        allowed_servers: set[str] | None,
+        intent: str | None,
+        request_id: str,
+        explicit_override: bool,
+    ) -> tuple[
+        ExecutionMode,
+        DiscoveryMode,
+        GatewayMode,
+        str | None,
+        float | None,
+        str | None,
+        str | None,
+    ]:
+        """Resolve execution mode dynamically via A/B experiment split or algorithmic scorer."""
+        accessible_srvs: list[UpstreamConfig] = []
+        for upstream in self.registry.list_upstreams():
+            if allowed_servers is not None and upstream.name not in allowed_servers:
+                continue
+            if self.policy.can_access_upstream(identity, upstream)[0]:
+                accessible_srvs.append(upstream)
+
+        if not explicit_override or requested_exec == "auto":
+            for upstream in accessible_srvs:
+                split = resolve_ab_experiment_variant(upstream, identity, request_id)
+                if split is not None:
+                    var_mode, exp_id, variant_lbl, reason = split
+                    var_exec, var_disc = _MODE_TO_AXES[var_mode]
+                    return var_exec, var_disc, var_mode, reason, None, exp_id, variant_lbl
+
+        if requested_exec != "auto":
+            return (
+                requested_exec,
+                requested_disc,
+                requested_mode,
+                f"explicit:{requested_mode}",
+                None,
+                None,
+                None,
+            )
+
+        tools = self.catalog.list_accessible_tools(
+            identity, self.policy, self.registry, allowed_servers=allowed_servers
+        )
+        tool_count = len(tools)
+        classic_tokens = estimate_tokens([to_mcp_tool_definition(t) for t in tools]) if tools else 0
+        mutating_ratio = (sum(1 for t in tools if t.mutating) / tool_count) if tool_count else 0.0
+        typed_ratio = (
+            sum(1 for t in tools if t.output_schema is not None) / tool_count if tool_count else 0.0
+        )
+        recent = await self.store.list_runs(limit=30, tenant_id=identity.tenant_id)
+        avg_bytes = (
+            sum(int(r.get("raw_upstream_bytes", 0)) for r in recent) / len(recent)
+            if recent
+            else 0.0
+        )
+        decision = evaluate_mode_algorithm(
+            tool_count=tool_count,
+            classic_schema_tokens=classic_tokens,
+            avg_payload_bytes=avg_bytes,
+            mutating_ratio=mutating_ratio,
+            typed_output_ratio=typed_ratio,
+            intent=intent,
+            server_count=max(1, len({t.server for t in tools})),
+        )
+        return (
+            decision.execution,
+            decision.discovery_mode,
+            decision.gateway_mode,
+            decision.reason,
+            decision.score,
+            None,
+            None,
+        )
+
     async def ensure_catalog_for_identity(self, identity: CallerIdentity) -> None:
         """Lazily introspect any accessible upstreams not yet cached in catalog."""
+        await self.sync_catalog_if_stale()
         for upstream in self.registry.list_upstreams():
             if upstream.name in self.catalog.digests_by_server:
                 continue
@@ -572,9 +686,55 @@ class GatewayRuntime:
         timeout_ms: int = 10000,
         require_grounding: bool = False,
         mcp_session_id: str | None = None,
+        mode_decision_reason: str | None = None,
+        mode_decision_score: float | None = None,
+        experiment_id: str | None = None,
+        ab_variant: str | None = None,
     ) -> dict[str, Any]:
         """Run Code Mode Python script in SandboxBackend and record audit telemetry."""
         started = time.perf_counter()
+        self.process_stats.active_executions += 1
+        self.process_stats.total_executions += 1
+        try:
+            return await self._execute_code_inner(
+                identity,
+                code,
+                started=started,
+                mode=mode,
+                execution=execution,
+                discovery_mode=discovery_mode,
+                servers=servers,
+                allowed_servers=allowed_servers,
+                timeout_ms=timeout_ms,
+                require_grounding=require_grounding,
+                mcp_session_id=mcp_session_id,
+                mode_decision_reason=mode_decision_reason,
+                mode_decision_score=mode_decision_score,
+                experiment_id=experiment_id,
+                ab_variant=ab_variant,
+            )
+        finally:
+            self.process_stats.active_executions = max(0, self.process_stats.active_executions - 1)
+
+    async def _execute_code_inner(
+        self,
+        identity: CallerIdentity,
+        code: str,
+        *,
+        started: float,
+        mode: GatewayMode = "codemode",
+        execution: ExecutionMode | None = None,
+        discovery_mode: DiscoveryMode | None = None,
+        servers: list[str] | None = None,
+        allowed_servers: set[str] | None = None,
+        timeout_ms: int = 10000,
+        require_grounding: bool = False,
+        mcp_session_id: str | None = None,
+        mode_decision_reason: str | None = None,
+        mode_decision_score: float | None = None,
+        experiment_id: str | None = None,
+        ab_variant: str | None = None,
+    ) -> dict[str, Any]:
         await self.ensure_catalog_for_identity(identity)
         if allowed_servers is not None and servers is not None:
             effective_servers: set[str] | None = allowed_servers & set(servers)
@@ -734,6 +894,10 @@ class GatewayRuntime:
             provenance=provenance,
             classic_schema_tokens=classic_schema_tokens,
             grounding_blocked=grounding_blocked,
+            mode_decision_reason=mode_decision_reason,
+            mode_decision_score=mode_decision_score,
+            experiment_id=experiment_id,
+            ab_variant=ab_variant,
         )
         total_saved = self._record_execution_metrics(
             identity=identity,
@@ -769,70 +933,93 @@ class GatewayRuntime:
         mode: GatewayMode = "traditional",
         allowed_servers: set[str] | None = None,
         mcp_session_id: str | None = None,
+        mode_decision_reason: str | None = None,
+        mode_decision_score: float | None = None,
+        experiment_id: str | None = None,
+        ab_variant: str | None = None,
     ) -> dict[str, Any]:
         """Invoke a single upstream tool directly (traditional / traditional_discover / hybrid)."""
         started = time.perf_counter()
-        await self.ensure_catalog_for_identity(identity)
-        tool = self.catalog.get_tool(tool_name)
-        if tool is None:
-            raise KeyError(f"Unknown tool '{tool_name}'")
-        if allowed_servers is not None and tool.server not in allowed_servers:
-            raise PermissionError(
-                f"Server '{tool.server}' is outside the request-level server ceiling"
-            )
-        if mode == "hybrid" and not tool.mutating:
-            raise PermissionError(
-                f"Non-mutating tool '{tool_name}' should run via execute_code in hybrid mode"
-            )
-        upstream = self.registry.get(tool.server)
-        if upstream is None:
-            raise KeyError(f"Upstream '{tool.server}' not found")
+        self.process_stats.active_executions += 1
+        self.process_stats.total_executions += 1
+        try:
+            await self.ensure_catalog_for_identity(identity)
+            tool = self.catalog.get_tool(tool_name)
+            if tool is None:
+                raise KeyError(f"Unknown tool '{tool_name}'")
+            if allowed_servers is not None and tool.server not in allowed_servers:
+                raise PermissionError(
+                    f"Server '{tool.server}' is outside the request-level server ceiling"
+                )
+            if mode == "hybrid" and not tool.mutating:
+                raise PermissionError(
+                    f"Non-mutating tool '{tool_name}' should run via execute_code in hybrid mode"
+                )
+            upstream = self.registry.get(tool.server)
+            if upstream is None:
+                raise KeyError(f"Upstream '{tool.server}' not found")
 
-        schema_tokens = estimate_tokens(
-            self.tools_for_mode(identity, mode, allowed_servers=allowed_servers)
-        )
-        classic_schema_tokens = estimate_tokens(
-            self.tools_for_mode(identity, "traditional", allowed_servers=allowed_servers)
-        )
-        result, rec = await self.dispatcher.invoke_tool(
-            identity,
-            tool,
-            upstream,
-            arguments,
-            code_mode_hints=False,
-            mcp_session_id=mcp_session_id,
-        )
-        duration_ms = round((time.perf_counter() - started) * 1000, 3)
-        ok = rec.status == "ok"
-        run = await self.telemetry.record_execution(
-            mode=mode,
-            identity=identity,
-            catalog_version=self.catalog.catalog_version,
-            schema_tokens=schema_tokens,
-            subcalls=[rec],
-            returned_payload=result,
-            duration_ms=duration_ms,
-            ok=ok,
-            error=rec.error,
-            tool_name=tool.qualified_name,
-            classic_schema_tokens=classic_schema_tokens,
-        )
-        self._record_execution_metrics(
-            identity=identity,
-            mode=mode,
-            ok=ok,
-            duration_ms=duration_ms,
-            run=run,
-        )
-        return {
-            "ok": ok,
-            "result": result,
-            "error": rec.error,
-            "run_id": run["run_id"],
-            "raw_upstream_bytes": run["raw_upstream_bytes"],
-            "returned_bytes": run["returned_bytes"],
-            "duration_ms": duration_ms,
-        }
+            schema_tokens = estimate_tokens(
+                self.tools_for_mode(identity, mode, allowed_servers=allowed_servers)
+            )
+            classic_schema_tokens = estimate_tokens(
+                self.tools_for_mode(identity, "traditional", allowed_servers=allowed_servers)
+            )
+            result, rec = await self.dispatcher.invoke_tool(
+                identity,
+                tool,
+                upstream,
+                arguments,
+                code_mode_hints=False,
+                mcp_session_id=mcp_session_id,
+            )
+            duration_ms = round((time.perf_counter() - started) * 1000, 3)
+            ok = rec.status == "ok"
+            run = await self.telemetry.record_execution(
+                mode=mode,
+                identity=identity,
+                catalog_version=self.catalog.catalog_version,
+                schema_tokens=schema_tokens,
+                subcalls=[rec],
+                returned_payload=result,
+                duration_ms=duration_ms,
+                ok=ok,
+                error=rec.error,
+                tool_name=tool.qualified_name,
+                classic_schema_tokens=classic_schema_tokens,
+                mode_decision_reason=mode_decision_reason,
+                mode_decision_score=mode_decision_score,
+                experiment_id=experiment_id,
+                ab_variant=ab_variant,
+            )
+            self._record_execution_metrics(
+                identity=identity,
+                mode=mode,
+                ok=ok,
+                duration_ms=duration_ms,
+                run=run,
+            )
+            return {
+                "ok": ok,
+                "result": result,
+                "error": rec.error,
+                "run_id": run["run_id"],
+                "raw_upstream_bytes": run["raw_upstream_bytes"],
+                "returned_bytes": run["returned_bytes"],
+                "duration_ms": duration_ms,
+            }
+        finally:
+            self.process_stats.active_executions = max(0, self.process_stats.active_executions - 1)
+
+
+def _axis_to_gateway_mode(execution: ExecutionMode, discovery_mode: DiscoveryMode) -> GatewayMode:
+    if execution == "auto":
+        return "auto"
+    if execution == "classic":
+        return "traditional" if discovery_mode == "upfront" else "traditional_discover"
+    if execution == "codemode":
+        return "codemode_upfront" if discovery_mode == "upfront" else "codemode"
+    return "hybrid"
 
 
 def _resolve_mode(
@@ -847,14 +1034,6 @@ def _resolve_mode(
             detail=f"Invalid gateway mode '{chosen}'. Expected one of: {sorted(_VALID_MODES)}",
         )
     return chosen  # type: ignore[return-value]
-
-
-def _axis_to_gateway_mode(execution: ExecutionMode, discovery_mode: DiscoveryMode) -> GatewayMode:
-    if execution == "classic":
-        return "traditional" if discovery_mode == "upfront" else "traditional_discover"
-    if execution == "codemode":
-        return "codemode_upfront" if discovery_mode == "upfront" else "codemode"
-    return "hybrid"
 
 
 def _resolve_execution_and_discovery(
@@ -988,9 +1167,20 @@ def create_gateway_app(
         lifespan=lifespan,
     )
     app.state.runtime = runtime
+    if runtime.settings.cors_allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=runtime.settings.cors_allowed_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
     app.include_router(
         create_oauth_discovery_router(runtime.settings, runtime.dev_keys, runtime.validator)
     )
+    features = runtime.settings.active_features
+    if features.dashboard_ui or features.admin_read or features.audit_api:
+        app.include_router(create_admin_auth_router(runtime))
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -1079,6 +1269,12 @@ def create_gateway_app(
                     header_discovery_mode=x_discovery_mode,
                     x_intent=x_intent,
                 )
+                has_explicit_mode = bool(mode or x_gateway_mode or execution or x_execution_mode)
+                mode_decision_reason: str | None = f"explicit:{effective_mode}"
+                mode_decision_score: float | None = None
+                experiment_id: str | None = None
+                ab_variant: str | None = None
+
                 effective_discovery = _resolve_discovery(
                     runtime.settings.discovery_backend, discovery, x_discovery_backend
                 )
@@ -1112,10 +1308,15 @@ def create_gateway_app(
                         method=str(method),
                         mode=effective_mode,
                         discovery=effective_discovery,
+                        mode_decision_reason=mode_decision_reason,
+                        experiment_id=experiment_id,
+                        ab_variant=ab_variant,
                         status=status_label,
                         duration_ms=dur_ms,
                     )
                     resp.headers["X-Request-Id"] = req_corr_id
+                    if mode_decision_reason:
+                        resp.headers["X-Gateway-Mode-Decision"] = mode_decision_reason
                     return resp
 
                 if method == "initialize":
@@ -1150,6 +1351,29 @@ def create_gateway_app(
                     return _finish(JSONResponse({}, status_code=202))
 
                 await runtime.ensure_catalog_for_identity(identity)
+                (
+                    eff_exec,
+                    eff_disc_mode,
+                    effective_mode,
+                    mode_decision_reason,
+                    mode_decision_score,
+                    experiment_id,
+                    ab_variant,
+                ) = await runtime.resolve_dynamic_mode(
+                    identity,
+                    requested_exec=eff_exec,
+                    requested_disc=eff_disc_mode,
+                    requested_mode=effective_mode,
+                    allowed_servers=allowed_servers,
+                    intent=x_intent,
+                    request_id=req_corr_id,
+                    explicit_override=has_explicit_mode,
+                )
+                mcp_span.set_attribute("mcp.mode", effective_mode)
+                if mode_decision_reason:
+                    mcp_span.set_attribute("mcp.mode_decision_reason", mode_decision_reason)
+                if experiment_id:
+                    mcp_span.set_attribute("mcp.ab_experiment", experiment_id)
 
                 if method == "tools/list":
                     req_srvs = params.get("servers")
@@ -1264,6 +1488,10 @@ def create_gateway_app(
                             timeout_ms=int(arguments.get("timeout_ms", 10000)),
                             require_grounding=enforce_grounding,
                             mcp_session_id=mcp_session_id,
+                            mode_decision_reason=mode_decision_reason,
+                            mode_decision_score=mode_decision_score,
+                            experiment_id=experiment_id,
+                            ab_variant=ab_variant,
                         )
                         return _finish(
                             _jsonrpc_ok(
@@ -1298,6 +1526,10 @@ def create_gateway_app(
                             mode=effective_mode,
                             allowed_servers=allowed_servers,
                             mcp_session_id=mcp_session_id,
+                            mode_decision_reason=mode_decision_reason,
+                            mode_decision_score=mode_decision_score,
+                            experiment_id=experiment_id,
+                            ab_variant=ab_variant,
                         )
                     except KeyError as exc:
                         return _finish(_jsonrpc_err(req_id, -32601, str(exc)), status_label="error")
@@ -1327,10 +1559,9 @@ def create_gateway_app(
             finally:
                 clear_request_context()
 
-    features = runtime.settings.active_features
-
     async def _authorize_control_plane(
         authorization: str | None,
+        admin_cookie: str | None = None,
         *,
         require_admin_role: bool = True,
     ) -> CallerIdentity | None:
@@ -1372,6 +1603,17 @@ def create_gateway_app(
                     detail="Admin role required for control-plane access.",
                 )
             return identity
+        if admin_cookie:
+            cookie_id = runtime.admin_sessions.verify_session_token(admin_cookie)
+            if cookie_id is not None:
+                if require_admin_role and not (
+                    set(cookie_id.roles) & set(runtime.settings.admin_roles)
+                ):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Admin role required for control-plane access.",
+                    )
+                return cookie_id
         if runtime.settings.admin_auth_required:
             runtime.metrics.inc_counter(
                 "gateway_auth_denials_total",
@@ -1419,9 +1661,12 @@ def create_gateway_app(
         @app.get("/metrics", response_class=PlainTextResponse)
         async def prometheus_metrics(
             authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> PlainTextResponse:
             if runtime.settings.metrics_require_auth:
-                await _authorize_control_plane(authorization, require_admin_role=False)
+                await _authorize_control_plane(
+                    authorization, mcpcodeaway_admin_session, require_admin_role=False
+                )
             return PlainTextResponse(
                 runtime.metrics.render_prometheus(),
                 media_type="text/plain; version=0.0.4; charset=utf-8",
@@ -1434,8 +1679,11 @@ def create_gateway_app(
             limit: int = Query(default=50, ge=1, le=200),
             tenant_id: str | None = Query(default=None),
             authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
-            identity = await _authorize_control_plane(authorization, require_admin_role=False)
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=False
+            )
             effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
             runs = await runtime.store.list_runs(limit=limit, tenant_id=effective_tenant)
             return {"count": len(runs), "runs": runs}
@@ -1444,8 +1692,11 @@ def create_gateway_app(
         async def audit_run_detail(
             run_id: str,
             authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
-            identity = await _authorize_control_plane(authorization, require_admin_role=False)
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=False
+            )
             run = await runtime.store.get_run(run_id)
             if run is None:
                 raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
@@ -1467,8 +1718,11 @@ def create_gateway_app(
         async def audit_summary(
             tenant_id: str | None = Query(default=None),
             authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
-            identity = await _authorize_control_plane(authorization, require_admin_role=False)
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=False
+            )
             effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
             return await runtime.telemetry.summary(tenant_id=effective_tenant)
 
@@ -1477,8 +1731,11 @@ def create_gateway_app(
             limit: int = Query(default=500, ge=1, le=2000),
             tenant_id: str | None = Query(default=None),
             authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
-            identity = await _authorize_control_plane(authorization, require_admin_role=False)
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=False
+            )
             effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
             return await runtime.telemetry.value_report(
                 limit=limit,
@@ -1489,13 +1746,42 @@ def create_gateway_app(
                 ),
             )
 
+        @app.get("/audit/analytics")
+        async def audit_analytics(
+            limit: int = Query(default=1000, ge=1, le=5000),
+            tenant_id: str | None = Query(default=None),
+            group: str | None = Query(default=None),
+            user: str | None = Query(default=None),
+            upstream: str | None = Query(default=None),
+            model: str = Query(default="default"),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=False
+            )
+            effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
+            return await runtime.telemetry.analytics_report(
+                limit=limit,
+                tenant_id=effective_tenant,
+                group_filter=group,
+                user_filter=user,
+                upstream_filter=upstream,
+                model_name=model,
+                model_pricing=runtime.settings.model_pricing,
+            )
+
     if features.admin_read:
 
         @app.get("/admin/upstreams")
         async def list_admin_upstreams(
             authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
-            await _authorize_control_plane(authorization, require_admin_role=True)
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            await runtime.sync_catalog_if_stale()
             upstreams = runtime.registry.list_upstreams(include_disabled=True)
             return {
                 "app_env": runtime.settings.app_env,
@@ -1506,6 +1792,42 @@ def create_gateway_app(
                 "drift_warnings": runtime.catalog.drift_warnings,
                 "upstreams": [u.model_dump(exclude={"openapi_spec"}) for u in upstreams],
                 "comparison_audit": audit_catalog_comparison(runtime.catalog, runtime.registry),
+            }
+
+        @app.get("/admin/telemetry/runtime")
+        async def admin_runtime_telemetry(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            return await collect_runtime_telemetry(runtime)
+
+        @app.get("/admin/ab/experiments")
+        async def admin_ab_experiments(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            analytics = await runtime.telemetry.analytics_report(
+                limit=1000,
+                model_pricing=runtime.settings.model_pricing,
+            )
+            configured = [
+                {
+                    "upstream": u.name,
+                    "preferred_mode": u.preferred_mode,
+                    "ab_experiment": u.ab_experiment.model_dump() if u.ab_experiment else None,
+                }
+                for u in runtime.registry.list_upstreams(include_disabled=True)
+            ]
+            return {
+                "configured": configured,
+                "results": analytics["ab_experiments"],
+                "mode_decisions": analytics["mode_decisions"],
             }
 
     async def _inspect_candidate(
@@ -1557,19 +1879,94 @@ def create_gateway_app(
         @app.get("/admin/upstreams/agent-prompt")
         async def admin_agent_onboarding_prompt(
             authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
-            await _authorize_control_plane(authorization, require_admin_role=True)
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
             return {
                 "prompt": build_agent_onboarding_prompt(),
                 "schema": UpstreamConfig.model_json_schema(),
             }
 
+        @app.post("/admin/catalog/refresh")
+        async def admin_refresh_catalog(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            warnings = await runtime.refresh_catalog()
+            epoch = await runtime.bump_catalog_epoch()
+            return {
+                "refreshed": True,
+                "catalog_version": runtime.catalog.catalog_version,
+                "catalog_epoch": epoch,
+                "warnings": warnings,
+            }
+
+        @app.post("/admin/audit/prune")
+        async def admin_prune_audit_runs(
+            retention_days: int | None = Query(default=None, ge=0, le=3650),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            days = (
+                retention_days
+                if retention_days is not None
+                else runtime.settings.audit_retention_days
+            )
+            deleted = await runtime.store.prune_runs_older_than(days)
+            return {"deleted_runs": deleted, "retention_days": days}
+
+        @app.post("/admin/upstreams/ab-test")
+        async def admin_upstream_ab_test(
+            body: OnboardingAbTestRequest,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            caller = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            if body.upstream is not None and runtime.settings.ssrf_protection_enabled:
+                try:
+                    for candidate_url in (body.upstream.url, body.upstream.openapi_spec_url):
+                        validate_upstream_url(
+                            candidate_url,
+                            app_env=runtime.settings.app_env,
+                            block_private_ips_in_prod=runtime.settings.block_private_ips_in_prod,
+                            allowed_hosts=runtime.settings.allowed_upstream_hosts,
+                        )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            eval_id = caller or runtime._dev_discovery_identity() or CallerIdentity(
+                sub="admin-ab-evaluator",
+                tenant_id=(
+                    runtime.settings.allowed_tenants[0]
+                    if runtime.settings.allowed_tenants
+                    else "tenant-acme-dev"
+                ),
+                roles=["gateway_admin", "finance_analyst", "ops_engineer"],
+                groups=["platform"],
+            )
+            try:
+                return await run_onboarding_ab_test(runtime, eval_id, body)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         @app.post("/admin/upstreams/inspect")
         async def inspect_admin_upstream(
             cfg: UpstreamConfig,
             authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
-            await _authorize_control_plane(authorization, require_admin_role=True)
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
             inspection, audit = await _inspect_candidate(cfg, authorization)
             return {"inspection": inspection, "onboarding_audit": audit}
 
@@ -1577,6 +1974,7 @@ def create_gateway_app(
         async def add_admin_upstream(
             cfg: UpstreamConfig,
             authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
             if not runtime.settings.dynamic_upstreams_permitted:
                 raise HTTPException(
@@ -1588,13 +1986,16 @@ def create_gateway_app(
                 raise HTTPException(
                     status_code=403, detail="mcp_stdio upstreams are blocked in prod"
                 )
-            await _authorize_control_plane(authorization, require_admin_role=True)
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
 
             inspection, audit = await _inspect_candidate(cfg, authorization)
             await runtime.store.save_dynamic_upstream(
                 cfg.name, cfg.model_dump(exclude_none=True)
             )
             await runtime.refresh_catalog()
+            await runtime.bump_catalog_epoch()
             return {
                 "registered": True,
                 "upstream": cfg.model_dump(exclude_none=True, exclude={"openapi_spec"}),
@@ -1607,19 +2008,23 @@ def create_gateway_app(
         async def delete_admin_upstream(
             name: str,
             authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
             if not runtime.settings.dynamic_upstreams_permitted:
                 raise HTTPException(
                     status_code=403,
                     detail="Dynamic upstream deletion is locked in read-only/prod.",
                 )
-            await _authorize_control_plane(authorization, require_admin_role=True)
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
             deleted = await runtime.store.delete_dynamic_upstream(name)
             if not deleted:
                 raise HTTPException(
                     status_code=404, detail=f"Dynamic upstream '{name}' not found"
                 )
             await runtime.refresh_catalog()
+            await runtime.bump_catalog_epoch()
             return {
                 "deleted": True,
                 "name": name,
@@ -1696,10 +2101,39 @@ def create_gateway_app(
 
     if features.dashboard_ui:
 
-        @app.get("/dashboard", response_class=HTMLResponse)
-        async def dashboard() -> HTMLResponse:
+        def _find_spa_dir() -> Path | None:
+            for candidate in (
+                Path(__file__).parent / "static" / "spa",
+                Path("web/.output/public"),
+            ):
+                if (candidate / "index.html").is_file():
+                    return candidate
+            return None
+
+        @app.get("/dashboard", response_model=None)
+        async def dashboard() -> FileResponse | HTMLResponse:
+            spa_dir = _find_spa_dir()
+            if spa_dir is not None:
+                return FileResponse(spa_dir / "index.html")
             html_path = Path(__file__).parent / "static" / "dashboard.html"
             return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+        @app.get("/dashboard/legacy", response_class=HTMLResponse)
+        async def dashboard_legacy() -> HTMLResponse:
+            html_path = Path(__file__).parent / "static" / "dashboard.html"
+            return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+        @app.get("/dashboard/{subpath:path}", response_model=None)
+        async def dashboard_spa(subpath: str) -> FileResponse | HTMLResponse:
+            spa_dir = _find_spa_dir()
+            if spa_dir is None:
+                html_path = Path(__file__).parent / "static" / "dashboard.html"
+                return HTMLResponse(html_path.read_text(encoding="utf-8"))
+            root = spa_dir.resolve()
+            target = (root / subpath).resolve()
+            if target.is_relative_to(root) and target.is_file():
+                return FileResponse(target)
+            return FileResponse(spa_dir / "index.html")
 
     return app
 

@@ -6,7 +6,7 @@ import hashlib
 import ipaddress
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
@@ -16,6 +16,9 @@ from opentelemetry import propagate
 from pydantic import BaseModel, Field
 
 from gateway.config import UpstreamConfig
+
+if TYPE_CHECKING:
+    from gateway.state import CacheBackend
 
 _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 _CLOUD_METADATA_HOSTS = {
@@ -230,10 +233,36 @@ def _extract_mcp_call_result(result: dict[str, Any]) -> Any:
 class UpstreamClientManager:
     """Handles discovery and invocation across MCP HTTP, MCP stdio, and OpenAPI backends."""
 
-    def __init__(self, http_client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient | None = None,
+        *,
+        cache: CacheBackend | None = None,
+        session_ttl_seconds: int = 1800,
+    ) -> None:
         self._http_client = http_client
         self._owned_client: httpx.AsyncClient | None = None
+        self._cache = cache
+        self._session_ttl_seconds = max(30, session_ttl_seconds)
         self._session_ids: dict[str, str] = {}
+
+    async def _get_session_id(self, skey: str) -> str | None:
+        if self._cache is not None:
+            return await self._cache.get(f"mcp_sess:{skey}")
+        return self._session_ids.get(skey)
+
+    async def _set_session_id(self, skey: str, sid: str) -> None:
+        if self._cache is not None:
+            await self._cache.set(
+                f"mcp_sess:{skey}", sid, ttl_seconds=self._session_ttl_seconds
+            )
+        else:
+            self._session_ids[skey] = sid
+
+    async def _delete_session_id(self, skey: str) -> None:
+        if self._cache is not None:
+            await self._cache.delete(f"mcp_sess:{skey}")
+        self._session_ids.pop(skey, None)
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is not None:
@@ -357,11 +386,11 @@ class UpstreamClientManager:
         }
         if upstream.stateful_session:
             skey = f"{upstream.name}:discovery"
-            sid = self._session_ids.get(skey)
+            sid = await self._get_session_id(skey)
             if not sid:
                 sid = await self._initialize_mcp_http_session(upstream, auth_headers)
                 if sid:
-                    self._session_ids[skey] = sid
+                    await self._set_session_id(skey, sid)
             if sid:
                 headers["Mcp-Session-Id"] = sid
         resp = await self._request(
@@ -397,11 +426,11 @@ class UpstreamClientManager:
         skey = f"{upstream.name}:{session_scope or 'default'}"
         active_sid = mcp_session_id
         if not active_sid and upstream.stateful_session:
-            active_sid = self._session_ids.get(skey)
+            active_sid = await self._get_session_id(skey)
             if not active_sid:
                 active_sid = await self._initialize_mcp_http_session(upstream, auth_headers)
                 if active_sid:
-                    self._session_ids[skey] = active_sid
+                    await self._set_session_id(skey, active_sid)
         if active_sid:
             headers["Mcp-Session-Id"] = active_sid
 
@@ -417,16 +446,17 @@ class UpstreamClientManager:
             and upstream.stateful_session
             and not mcp_session_id
         ):
+            await self._delete_session_id(skey)
             new_sid = await self._initialize_mcp_http_session(upstream, auth_headers)
             if new_sid:
-                self._session_ids[skey] = new_sid
+                await self._set_session_id(skey, new_sid)
                 headers["Mcp-Session-Id"] = new_sid
                 resp = await self._request("POST", upstream.url, headers=headers, json=payload)
 
         resp.raise_for_status()
         resp_sid = resp.headers.get("mcp-session-id")
         if resp_sid and upstream.stateful_session and not mcp_session_id:
-            self._session_ids[skey] = resp_sid
+            await self._set_session_id(skey, resp_sid)
         body = _parse_mcp_jsonrpc_response(resp)
         if "error" in body:
             raise RuntimeError(f"Upstream tool error ({tool.qualified_name}): {body['error']}")

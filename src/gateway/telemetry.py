@@ -93,6 +93,11 @@ class TelemetryRecorder:
         provenance: dict[str, Any] | None = None,
         classic_schema_tokens: int | None = None,
         grounding_blocked: bool = False,
+        mode_decision_reason: str | None = None,
+        mode_decision_score: float | None = None,
+        experiment_id: str | None = None,
+        ab_variant: str | None = None,
+        model_name: str | None = None,
     ) -> dict[str, Any]:
         raw_upstream_bytes = sum(sc.raw_bytes for sc in subcalls)
         returned_bytes = len(json.dumps(returned_payload, default=str).encode("utf-8"))
@@ -132,6 +137,8 @@ class TelemetryRecorder:
             "user_sub": identity.sub,
             "user_email": identity.email,
             "user_roles": identity.roles,
+            "user_groups": list(identity.groups),
+            "user_client_groups": list(identity.client_groups),
             "client_id": identity.client_id,
             "catalog_version": catalog_version,
             "tool_name": tool_name,
@@ -148,6 +155,11 @@ class TelemetryRecorder:
             "abac_rows_filtered": abac_rows_filtered,
             "redactions_count": redactions_count,
             "grounding_blocked": grounding_blocked,
+            "mode_decision_reason": mode_decision_reason,
+            "mode_decision_score": mode_decision_score,
+            "experiment_id": experiment_id,
+            "ab_variant": ab_variant,
+            "model_name": model_name,
             "raw_upstream_bytes": raw_upstream_bytes,
             "returned_bytes": returned_bytes,
             "returned_tokens": returned_tokens,
@@ -344,4 +356,288 @@ class TelemetryRecorder:
             },
             "by_upstream": by_upstream,
             "recommendations": recommendations,
+        }
+
+    async def analytics_report(
+        self,
+        *,
+        limit: int = 1000,
+        tenant_id: str | None = None,
+        group_filter: str | None = None,
+        user_filter: str | None = None,
+        upstream_filter: str | None = None,
+        model_name: str = "default",
+        model_pricing: dict[str, dict[str, float]] | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate usage, USD cost, mode decisions, and A/B experiments by group & user."""
+        pricing_table = model_pricing or {"default": {"input": 3.0, "output": 15.0}}
+        active_price = pricing_table.get(model_name) or pricing_table.get("default") or {
+            "input": 3.0,
+            "output": 15.0,
+        }
+        in_rate = float(active_price.get("input", 3.0))
+        out_rate = float(active_price.get("output", 15.0))
+
+        all_runs = await self.store.list_runs(limit=limit, tenant_id=tenant_id)
+        runs: list[dict[str, Any]] = []
+        for run in all_runs:
+            groups = [str(g) for g in (run.get("user_groups") or [])] or ["unassigned"]
+            user_sub = str(run.get("user_sub") or "unknown")
+            subcalls = run.get("subcalls") or []
+            servers = {str(sc.get("server") or "unknown") for sc in subcalls}
+            if group_filter and group_filter not in groups:
+                continue
+            if user_filter and user_filter not in {user_sub, str(run.get("user_email") or "")}:
+                continue
+            if upstream_filter and upstream_filter not in servers:
+                continue
+            runs.append(run)
+
+        group_buckets: dict[str, dict[str, Any]] = {}
+        client_group_buckets: dict[str, dict[str, Any]] = {}
+        user_buckets: dict[str, dict[str, Any]] = {}
+        decision_buckets: dict[tuple[str, str], dict[str, Any]] = {}
+        exp_buckets: dict[str, dict[str, dict[str, Any]]] = {}
+
+        total_classic = 0
+        total_codemode = 0
+        total_tokens_saved = 0
+        total_cost_usd = 0.0
+        total_cost_saved_usd = 0.0
+
+        for run in runs:
+            mode = str(run.get("mode") or "unknown")
+            is_cm = mode.startswith("codemode") or mode == "hybrid"
+            if is_cm:
+                total_codemode += 1
+            else:
+                total_classic += 1
+
+            schema_tok = int(run.get("schema_tokens", 0))
+            ret_tok = int(run.get("returned_tokens") or _approx_tokens(run.get("returned_bytes")))
+            raw_b = int(run.get("raw_upstream_bytes", 0))
+            in_tok = schema_tok + (
+                ret_tok if is_cm else (max(1, math.ceil(raw_b / 4)) if raw_b else ret_tok)
+            )
+            out_tok = ret_tok if not is_cm else max(60, ret_tok // 2)
+            tok_saved = int(run.get("estimated_tokens_saved", 0)) + int(
+                run.get("schema_tokens_saved", 0)
+            )
+            run_cost = ((in_tok / 1_000_000.0) * in_rate) + ((out_tok / 1_000_000.0) * out_rate)
+            run_saved_usd = (tok_saved / 1_000_000.0) * in_rate
+            total_tokens_saved += tok_saved
+            total_cost_usd += run_cost
+            total_cost_saved_usd += run_saved_usd
+
+            subcalls = run.get("subcalls") or []
+            subcall_count = int(run.get("subcall_count", 0))
+            abac_n = int(run.get("abac_rows_filtered", 0))
+            red_n = int(run.get("redactions_count", 0))
+            dur_ms = float(run.get("duration_ms", 0.0))
+            user_sub = str(run.get("user_sub") or "unknown")
+            groups = [str(g) for g in (run.get("user_groups") or [])] or ["unassigned"]
+            cgroups = [str(g) for g in (run.get("user_client_groups") or [])] or ["default"]
+
+            for grp in groups:
+                gb = group_buckets.setdefault(
+                    grp,
+                    {
+                        "group": grp,
+                        "runs": 0,
+                        "_users": set(),
+                        "subcalls": 0,
+                        "classic_runs": 0,
+                        "codemode_runs": 0,
+                        "tokens_saved": 0,
+                        "estimated_cost_usd": 0.0,
+                        "estimated_cost_saved_usd": 0.0,
+                        "abac_rows_filtered": 0,
+                        "pii_redactions": 0,
+                    },
+                )
+                gb["runs"] += 1
+                gb["_users"].add(user_sub)
+                gb["subcalls"] += subcall_count
+                gb["codemode_runs" if is_cm else "classic_runs"] += 1
+                gb["tokens_saved"] += tok_saved
+                gb["estimated_cost_usd"] += run_cost
+                gb["estimated_cost_saved_usd"] += run_saved_usd
+                gb["abac_rows_filtered"] += abac_n
+                gb["pii_redactions"] += red_n
+
+            for cg in cgroups:
+                cb = client_group_buckets.setdefault(
+                    cg,
+                    {"client_group": cg, "runs": 0, "tokens_saved": 0, "abac_rows_filtered": 0},
+                )
+                cb["runs"] += 1
+                cb["tokens_saved"] += tok_saved
+                cb["abac_rows_filtered"] += abac_n
+
+            ub = user_buckets.setdefault(
+                user_sub,
+                {
+                    "user_sub": user_sub,
+                    "user_email": run.get("user_email"),
+                    "groups": groups,
+                    "runs": 0,
+                    "subcalls": 0,
+                    "classic_runs": 0,
+                    "codemode_runs": 0,
+                    "_upstreams": {},
+                    "tokens_saved": 0,
+                    "estimated_cost_usd": 0.0,
+                    "estimated_cost_saved_usd": 0.0,
+                },
+            )
+            ub["runs"] += 1
+            ub["subcalls"] += subcall_count
+            ub["codemode_runs" if is_cm else "classic_runs"] += 1
+            ub["tokens_saved"] += tok_saved
+            ub["estimated_cost_usd"] += run_cost
+            ub["estimated_cost_saved_usd"] += run_saved_usd
+            for sc in subcalls:
+                srv = str(sc.get("server") or "unknown")
+                ub["_upstreams"][srv] = ub["_upstreams"].get(srv, 0) + 1
+
+            reason = str(run.get("mode_decision_reason") or f"explicit:{mode}")
+            db = decision_buckets.setdefault(
+                (mode, reason),
+                {
+                    "mode": mode,
+                    "reason": reason,
+                    "runs": 0,
+                    "_score_sum": 0.0,
+                    "_score_n": 0,
+                    "_saved_sum": 0,
+                    "_dur_sum": 0.0,
+                },
+            )
+            db["runs"] += 1
+            if run.get("mode_decision_score") is not None:
+                db["_score_sum"] += float(run["mode_decision_score"])
+                db["_score_n"] += 1
+            db["_saved_sum"] += tok_saved
+            db["_dur_sum"] += dur_ms
+
+            exp_id = run.get("experiment_id")
+            if exp_id:
+                variant = str(run.get("ab_variant") or ("codemode" if is_cm else "classic"))
+                exp = exp_buckets.setdefault(str(exp_id), {})
+                arm = exp.setdefault(
+                    variant,
+                    {
+                        "runs": 0,
+                        "errors": 0,
+                        "_dur_sum": 0.0,
+                        "total_tokens_saved": 0,
+                    },
+                )
+                arm["runs"] += 1
+                if not run.get("ok"):
+                    arm["errors"] += 1
+                arm["_dur_sum"] += dur_ms
+                arm["total_tokens_saved"] += tok_saved
+
+        by_company_group: list[dict[str, Any]] = []
+        for item in group_buckets.values():
+            users_set = item.pop("_users")
+            runs_n = item["runs"]
+            by_company_group.append(
+                {
+                    **item,
+                    "unique_users": len(users_set),
+                    "codemode_share_pct": (
+                        round((item["codemode_runs"] / runs_n) * 100, 1) if runs_n else 0.0
+                    ),
+                    "estimated_cost_usd": round(item["estimated_cost_usd"], 6),
+                    "estimated_cost_saved_usd": round(item["estimated_cost_saved_usd"], 6),
+                }
+            )
+        by_company_group.sort(key=lambda x: x["runs"], reverse=True)
+
+        by_user: list[dict[str, Any]] = []
+        for item in user_buckets.values():
+            upstreams_map = item.pop("_upstreams")
+            top_srvs = sorted(upstreams_map.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            by_user.append(
+                {
+                    **item,
+                    "top_upstreams": [{"server": s, "calls": c} for s, c in top_srvs],
+                    "estimated_cost_usd": round(item["estimated_cost_usd"], 6),
+                    "estimated_cost_saved_usd": round(item["estimated_cost_saved_usd"], 6),
+                }
+            )
+        by_user.sort(key=lambda x: x["runs"], reverse=True)
+
+        mode_decisions: list[dict[str, Any]] = []
+        for item in decision_buckets.values():
+            n = item["runs"]
+            score_n = item.pop("_score_n")
+            score_sum = item.pop("_score_sum")
+            saved_sum = item.pop("_saved_sum")
+            dur_sum = item.pop("_dur_sum")
+            mode_decisions.append(
+                {
+                    **item,
+                    "avg_score": round(score_sum / score_n, 1) if score_n else None,
+                    "avg_tokens_saved": round(saved_sum / n, 1) if n else 0.0,
+                    "avg_duration_ms": round(dur_sum / n, 2) if n else 0.0,
+                }
+            )
+        mode_decisions.sort(key=lambda x: x["runs"], reverse=True)
+
+        ab_experiments: dict[str, Any] = {}
+        for exp_id, arms in exp_buckets.items():
+            formatted_arms: dict[str, Any] = {}
+            for variant, stats in arms.items():
+                n = stats["runs"]
+                formatted_arms[variant] = {
+                    "runs": n,
+                    "error_rate_pct": round((stats["errors"] / n) * 100, 1) if n else 0.0,
+                    "avg_duration_ms": round(stats["_dur_sum"] / n, 2) if n else 0.0,
+                    "avg_tokens_saved": round(stats["total_tokens_saved"] / n, 1) if n else 0.0,
+                    "total_tokens_saved": stats["total_tokens_saved"],
+                }
+            cm_arm = formatted_arms.get("codemode")
+            cl_arm = formatted_arms.get("classic")
+            if cm_arm and cl_arm:
+                winner = (
+                    "codemode"
+                    if cm_arm["total_tokens_saved"] >= cl_arm["total_tokens_saved"]
+                    and cm_arm["error_rate_pct"] <= cl_arm["error_rate_pct"] + 5.0
+                    else "classic"
+                )
+            else:
+                winner = "codemode" if cm_arm else "classic"
+            ab_experiments[exp_id] = {"arms": formatted_arms, "recommended_winner": winner}
+
+        total_n = len(runs)
+        return {
+            "window_runs": total_n,
+            "tenant_scope": tenant_id or "all_tenants",
+            "pricing": {
+                "model": model_name,
+                "input_per_1m_usd": in_rate,
+                "output_per_1m_usd": out_rate,
+                "available_models": sorted(pricing_table),
+            },
+            "summary": {
+                "total_runs": total_n,
+                "classic_runs": total_classic,
+                "codemode_runs": total_codemode,
+                "codemode_share_pct": (
+                    round((total_codemode / total_n) * 100, 1) if total_n else 0.0
+                ),
+                "total_tokens_saved": total_tokens_saved,
+                "estimated_cost_usd": round(total_cost_usd, 6),
+                "estimated_cost_saved_usd": round(total_cost_saved_usd, 6),
+            },
+            "by_company_group": by_company_group,
+            "by_client_group": sorted(
+                client_group_buckets.values(), key=lambda x: x["runs"], reverse=True
+            ),
+            "by_user": by_user,
+            "mode_decisions": mode_decisions,
+            "ab_experiments": ab_experiments,
         }

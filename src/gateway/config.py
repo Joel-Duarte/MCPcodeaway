@@ -16,10 +16,10 @@ from gateway.state import AuditStore
 AppEnv = Literal["sandbox", "uat", "prod"]
 AuthMode = Literal["dev", "oidc"]
 TokenExchangeDialect = Literal["dev_local", "rfc8693", "entra_v2_obo"]
-ExecutionMode = Literal["classic", "codemode", "hybrid"]
+ExecutionMode = Literal["classic", "codemode", "hybrid", "auto"]
 DiscoveryMode = Literal["upfront", "deferred", "x_intent"]
 GatewayMode = Literal[
-    "codemode", "codemode_upfront", "traditional", "traditional_discover", "hybrid"
+    "codemode", "codemode_upfront", "traditional", "traditional_discover", "hybrid", "auto"
 ]
 DiscoveryBackendMode = Literal["keyword", "bm25", "embedding", "system1", "hybrid_system1"]
 UpstreamType = Literal["mcp_http", "mcp_stdio", "openapi"]
@@ -52,6 +52,15 @@ class AbacRuleConfig(BaseModel):
     filter_response_rows: bool = True
 
 
+class AbExperimentConfig(BaseModel):
+    """Live per-upstream Classic vs. Code Mode A/B traffic experiment settings."""
+
+    enabled: bool = False
+    experiment_id: str = ""
+    codemode_traffic_pct: int = Field(default=50, ge=0, le=100)
+    read_only_only: bool = True
+
+
 class UpstreamConfig(BaseModel):
     """Declarative configuration for a downstream MCP server or OpenAPI service."""
 
@@ -79,6 +88,7 @@ class UpstreamConfig(BaseModel):
     abac_rules: list[AbacRuleConfig] = Field(default_factory=list)
     pinned_schema_digest: str | None = None
     stateful_session: bool = False
+    ab_experiment: AbExperimentConfig | None = None
     enabled: bool = True
 
     @field_validator("name")
@@ -156,8 +166,27 @@ class GatewaySettings(BaseSettings):
     log_format: Literal["json", "text"] = "json"
     log_level: str = "INFO"
     cost_per_1m_input_tokens_usd: float = 3.0
+    cost_per_1m_output_tokens_usd: float = 15.0
     context_overflow_threshold_tokens: int = 32768
     metrics_require_auth: bool = False
+
+    mcp_session_ttl_seconds: int = 1800
+    audit_retention_days: int = 90
+    admin_session_secret: str = "dev-admin-session-secret"
+    admin_session_ttl_seconds: int = 28800
+    admin_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
+    admin_oidc_authorization_endpoint: str | None = None
+    admin_oidc_redirect_uri: str | None = None
+    admin_oidc_scopes: str = "openid profile email"
+    cors_allowed_origins: list[str] = Field(default_factory=list)
+    model_pricing: dict[str, dict[str, float]] = Field(
+        default_factory=lambda: {
+            "default": {"input": 3.0, "output": 15.0},
+            "gpt-4o": {"input": 2.5, "output": 10.0},
+            "claude-sonnet": {"input": 3.0, "output": 15.0},
+            "qwen3.5-9b": {"input": 0.2, "output": 0.6},
+        }
+    )
 
     _effective_profile_name: str = PrivateAttr(default="demo")
     _resolved_features: ProfileFeatures = PrivateAttr(default_factory=ProfileFeatures)
@@ -212,6 +241,23 @@ class GatewaySettings(BaseSettings):
         if self.require_admin_auth is not None:
             return self.require_admin_auth
         return self.auth_mode == "oidc"
+
+    @property
+    def sandbox_worker_secrets(self) -> list[str]:
+        """Parse active + previous sandbox worker secrets for zero-downtime key rotation."""
+        return [s.strip() for s in self.sandbox_worker_secret.split(",") if s.strip()]
+
+    @property
+    def provenance_signing_secrets(self) -> list[str]:
+        """Parse active + previous HMAC provenance keys for zero-downtime rotation."""
+        keys = [s.strip() for s in self.provenance_signing_secret.split(",") if s.strip()]
+        return keys or ["dev-provenance-secret"]
+
+    @property
+    def admin_session_secrets(self) -> list[str]:
+        """Parse active + previous admin session cookie HMAC signing keys."""
+        keys = [s.strip() for s in self.admin_session_secret.split(",") if s.strip()]
+        return keys or ["dev-admin-session-secret"]
 
 
 class UpstreamRegistry:
