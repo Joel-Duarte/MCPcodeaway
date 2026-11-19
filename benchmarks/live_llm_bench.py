@@ -46,6 +46,20 @@ RBAC_BOUNDARY_PROMPT = (
     "Query the Snowflake debt ledger and tell me the overdue ledger balance for CUST-1003."
 )
 
+TRIAL_BALANCE_PROMPT = (
+    "Using snowflake_ledger__get_trial_balance_lines(only_variances=True), find all trial balance "
+    "lines with a variance, then look up each customer's contact_email from "
+    "billing_legacy_eu__get_eu_customer (if '-EU-' is in account_code) or "
+    "billing_legacy_us__get_us_customer (otherwise). Return each customer_id, variance, and "
+    "contact_email."
+)
+
+SINGLE_LOOKUP_PROMPT = (
+    "Look up the Snowflake debt ledger balance for customer_id='CUST-1003' using "
+    "snowflake_ledger__get_customer_balance and report their customer_id, region, and exact "
+    "ledger_balance."
+)
+
 _TRADITIONAL_SYSTEM = (
     "You are an enterprise finance assistant. Use the provided MCP tools to answer "
     "accurately and concisely. Include exact customer IDs and numeric deltas "
@@ -101,6 +115,28 @@ def score_bulk_200_answer(text: str) -> bool:
         and "CUST-2199" in cleaned
         and "1250" in cleaned
     )
+
+
+def score_trial_balance_answer(text: str) -> bool:
+    """Verify final answer reports the 3 trial balance variance customers and contact emails."""
+    cleaned = _strip_think(text)
+    return (
+        "CUST-1003" in cleaned
+        and "450" in cleaned
+        and "merchant3.example" in cleaned
+        and "CUST-1011" in cleaned
+        and "1200" in cleaned
+        and "merchant11.example" in cleaned
+        and "CUST-1024" in cleaned
+        and "-320" in cleaned
+        and "merchant24.example" in cleaned
+    )
+
+
+def score_single_lookup_answer(text: str) -> bool:
+    """Verify final answer reports CUST-1003 balance 1825."""
+    cleaned = _strip_think(text)
+    return "CUST-1003" in cleaned and "1825" in cleaned
 
 
 def _parse_mode_spec(mode_spec: str) -> tuple[str, str, str, str]:
@@ -273,7 +309,14 @@ async def _call_openai_loop(
 ) -> dict[str, Any]:
     mode_label, _, exec_axis, disc_axis = _parse_mode_spec(mode)
     if scorer is None:
-        scorer = score_bulk_200_answer if task_name == "bulk_200" else score_reconciliation_answer
+        if task_name in {"bulk_200", "reconcile_bulk_200"}:
+            scorer = score_bulk_200_answer
+        elif task_name == "trial_balance_audit":
+            scorer = score_trial_balance_answer
+        elif task_name == "single_lookup":
+            scorer = score_single_lookup_answer
+        else:
+            scorer = score_reconciliation_answer
     mcp_tools = await _list_mcp_tools(
         gw, gw_token, mode_label, discovery_backend=discovery_backend, x_intent=x_intent
     )
@@ -661,15 +704,24 @@ async def run_openai_compatible_suite(
     discovery_backend: str = "bm25",
     use_x_intent: bool = False,
     reasoning_effort: str | None = None,
+    concurrency: int = 3,
     output_path: Path | None = Path("benchmarks/live_llm_results.json"),
 ) -> dict[str, Any]:
     """Run AuthN/RBAC verification and decoupled 2x2 Execution x Discovery benchmarks."""
     chosen_modes = modes or ["traditional", "traditional_discover", "codemode_upfront", "codemode"]
     chosen_tasks = tasks or ["standard"]
-    task_prompts = {"standard": TASK_PROMPT, "bulk_200": BULK_200_PROMPT}
+    task_prompts = {
+        "standard": TASK_PROMPT,
+        "reconcile_overdue": TASK_PROMPT,
+        "bulk_200": BULK_200_PROMPT,
+        "reconcile_bulk_200": BULK_200_PROMPT,
+        "trial_balance_audit": TRIAL_BALANCE_PROMPT,
+        "single_lookup": SINGLE_LOOKUP_PROMPT,
+    }
     runs: list[dict[str, Any]] = []
     rbac_checks: list[dict[str, Any]] = []
     auth_preflight: dict[str, Any] = {}
+    sem = asyncio.Semaphore(max(1, concurrency))
 
     with tempfile.TemporaryDirectory() as tmpdir:
         dev_keys = LocalDevKeyManager(issuer="http://127.0.0.1:8000/dev/oidc")
@@ -717,6 +769,7 @@ async def run_openai_compatible_suite(
                         async with httpx.AsyncClient(
                             transport=httpx.ASGITransport(app=app), base_url="http://gw"
                         ) as gw:
+                            jobs: list[tuple[str, str, str, str | None]] = []
                             for task_name in chosen_tasks:
                                 prompt_text = task_prompts.get(task_name, TASK_PROMPT)
                                 for mode in chosen_modes:
@@ -726,21 +779,37 @@ async def run_openai_compatible_suite(
                                         if (use_x_intent and mode not in upfront_modes)
                                         else None
                                     )
+                                    jobs.append((task_name, prompt_text, mode, intent_str))
+
+                            async def _run_job(
+                                t_name: str,
+                                p_text: str,
+                                m_name: str,
+                                i_str: str | None,
+                                cur_model: str = model,
+                                cur_syn: int = syn,
+                            ) -> dict[str, Any]:
+                                async with sem:
                                     res = await _call_openai_loop(
                                         gw,
                                         fin_token,
                                         api_key,
-                                        mode,
-                                        model,
+                                        m_name,
+                                        cur_model,
                                         base_url=base_url,
                                         discovery_backend=discovery_backend,
-                                        x_intent=intent_str,
-                                        prompt=prompt_text,
-                                        task_name=task_name,
+                                        x_intent=i_str,
+                                        prompt=p_text,
+                                        task_name=t_name,
                                         reasoning_effort=reasoning_effort,
                                     )
-                                    res["extra_synthetic_tools"] = syn
-                                    runs.append(res)
+                                    res["extra_synthetic_tools"] = cur_syn
+                                    return res
+
+                            batch_results = await asyncio.gather(
+                                *(_run_job(tn, pt, md, it) for tn, pt, md, it in jobs)
+                            )
+                            runs.extend(batch_results)
 
                 app0 = apps_by_syn[synthetic_counts[0]]
                 async with app0.router.lifespan_context(app0):
@@ -780,6 +849,7 @@ async def run_openai_compatible_suite(
         "discovery_backend": discovery_backend,
         "x_intent_enabled": use_x_intent,
         "reasoning_effort": reasoning_effort,
+        "concurrency": concurrency,
         "auth_preflight": auth_preflight,
         "rbac_live_boundary": rbac_checks,
         "runs": runs,
@@ -802,6 +872,7 @@ async def run_live_bench(
     discovery_backend: str = "bm25",
     use_x_intent: bool = False,
     reasoning_effort: str | None = None,
+    concurrency: int = 3,
     synthetic_counts: list[int] | None = None,
     output_path: Path | None = Path("benchmarks/live_llm_results.json"),
 ) -> dict[str, Any]:
@@ -821,7 +892,7 @@ async def run_live_bench(
     prov_name, api_key = detected
     if prov_name == "openai_compatible":
         resolved_base = base_url or os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1")
-        resolved_models = models or ([model] if model else ["qwen3.5-4b", "qwen/qwen3.5-9b"])
+        resolved_models = models or ([model] if model else ["qwen/qwen3.5-9b"])
         return await run_openai_compatible_suite(
             base_url=resolved_base,
             api_key=api_key,
@@ -831,6 +902,7 @@ async def run_live_bench(
             discovery_backend=discovery_backend,
             use_x_intent=use_x_intent,
             reasoning_effort=reasoning_effort,
+            concurrency=concurrency,
             synthetic_counts=synthetic_counts or [0, 50],
             output_path=output_path,
         )
@@ -924,6 +996,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         choices=["none", "minimal", "low", "medium", "high"],
     )
+    parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--synthetic-tools", default="0,50")
     parser.add_argument("--output", default="benchmarks/live_llm_results.json")
     parser.add_argument("--dry-run", action="store_true")
@@ -944,6 +1017,7 @@ def main(argv: list[str] | None = None) -> int:
             discovery_backend=args.discovery,
             use_x_intent=args.x_intent,
             reasoning_effort=args.reasoning_effort,
+            concurrency=args.concurrency,
             synthetic_counts=syn_counts,
             output_path=Path(args.output),
         )

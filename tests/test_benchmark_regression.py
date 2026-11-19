@@ -18,9 +18,9 @@ async def test_locked_benchmark_thresholds_hold(tmp_path: Path) -> None:
     assert failures == [], f"Benchmark threshold regressions: {failures}"
 
 
-def test_threshold_verifier_catches_synthetic_regression() -> None:
+async def test_threshold_verifier_catches_synthetic_regression() -> None:
     thresholds = json.loads(_THRESHOLDS_PATH.read_text(encoding="utf-8"))
-    baseline = json.loads(Path("benchmarks/results.json").read_text(encoding="utf-8"))
+    baseline = await run_offline_benchmark(output_path=None)
     broken = copy.deepcopy(baseline)
     broken["scaling"][-1]["reduction_pct"] = 10.0
     broken["scenarios"][0]["deltas"]["context_token_savings_pct"] = 5.0
