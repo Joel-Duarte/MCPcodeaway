@@ -9,6 +9,7 @@ import sqlite3
 import time
 import uuid
 from collections import deque
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -33,6 +34,7 @@ class InMemoryCacheBackend:
         self._lock = asyncio.Lock()
         self._entries: dict[str, tuple[str, float]] = {}
         self._windows: dict[str, deque[float]] = {}
+        self._subscribers: dict[str, set[asyncio.Queue[str]]] = {}
 
     async def get(self, key: str) -> str | None:
         async with self._lock:
@@ -63,6 +65,29 @@ class InMemoryCacheBackend:
                 bucket.popleft()
             bucket.append(now)
             return len(bucket)
+
+    async def publish_event(self, channel: str, message: str) -> None:
+        for queue in list(self._subscribers.get(channel, ())):
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                queue.put_nowait(message)
+            except asyncio.QueueFull:
+                pass
+
+    async def subscribe_events(self, channel: str) -> AsyncIterator[str]:
+        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+        self._subscribers.setdefault(channel, set()).add(queue)
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            subs = self._subscribers.get(channel)
+            if subs is not None:
+                subs.discard(queue)
 
 
 class RedisCacheBackend:
@@ -103,6 +128,27 @@ class RedisCacheBackend:
     async def close(self) -> None:
         if self._client is not None and hasattr(self._client, "aclose"):
             await self._client.aclose()
+
+    async def publish_event(self, channel: str, message: str) -> None:
+        client = self._get_client()
+        if hasattr(client, "publish"):
+            await client.publish(channel, message)
+
+    async def subscribe_events(self, channel: str) -> AsyncIterator[str]:
+        client = self._get_client()
+        if not hasattr(client, "pubsub"):
+            return
+        pubsub = client.pubsub()
+        await pubsub.subscribe(channel)
+        try:
+            async for raw in pubsub.listen():
+                if raw and raw.get("type") == "message":
+                    data = raw.get("data")
+                    yield data.decode("utf-8") if isinstance(data, bytes) else str(data)
+        finally:
+            await pubsub.unsubscribe(channel)
+            if hasattr(pubsub, "aclose"):
+                await pubsub.aclose()
 
 
 class AuditStore(Protocol):
@@ -173,6 +219,16 @@ class SQLiteAuditStore:
             CREATE TABLE IF NOT EXISTS dynamic_upstreams (
                 name TEXT PRIMARY KEY,
                 config_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_pricing (
+                model_name TEXT PRIMARY KEY,
+                input_per_1m_usd REAL NOT NULL,
+                output_per_1m_usd REAL NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
@@ -285,6 +341,49 @@ class SQLiteAuditStore:
             conn.commit()
             return cursor.rowcount
 
+    async def list_model_pricing(self) -> dict[str, dict[str, float]]:
+        async with self._lock:
+            conn = self._ensure_conn()
+            rows = conn.execute(
+                "SELECT model_name, input_per_1m_usd, output_per_1m_usd "
+                "FROM model_pricing ORDER BY model_name ASC"
+            ).fetchall()
+        return {
+            str(r["model_name"]): {
+                "input": float(r["input_per_1m_usd"]),
+                "output": float(r["output_per_1m_usd"]),
+            }
+            for r in rows
+        }
+
+    async def save_model_pricing(
+        self, model_name: str, input_per_1m_usd: float, output_per_1m_usd: float
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute(
+                """
+                INSERT INTO model_pricing (
+                    model_name, input_per_1m_usd, output_per_1m_usd, updated_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(model_name) DO UPDATE SET
+                    input_per_1m_usd=excluded.input_per_1m_usd,
+                    output_per_1m_usd=excluded.output_per_1m_usd,
+                    updated_at=excluded.updated_at
+                """,
+                (model_name, float(input_per_1m_usd), float(output_per_1m_usd), now),
+            )
+            conn.commit()
+
+    async def delete_model_pricing(self, model_name: str) -> bool:
+        async with self._lock:
+            conn = self._ensure_conn()
+            cursor = conn.execute("DELETE FROM model_pricing WHERE model_name = ?", (model_name,))
+            conn.commit()
+            return cursor.rowcount > 0
+
 
 class PostgresAuditStore:
     """Postgres-backed AuditStore for multi-replica production deployments."""
@@ -335,6 +434,16 @@ class PostgresAuditStore:
             CREATE TABLE IF NOT EXISTS dynamic_upstreams (
                 name TEXT PRIMARY KEY,
                 config_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_pricing (
+                model_name TEXT PRIMARY KEY,
+                input_per_1m_usd DOUBLE PRECISION NOT NULL,
+                output_per_1m_usd DOUBLE PRECISION NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
@@ -441,6 +550,53 @@ class PostgresAuditStore:
             return int(str(status).split()[-1])
         except (IndexError, ValueError):
             return 0
+
+    async def list_model_pricing(self) -> dict[str, dict[str, float]]:
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            "SELECT model_name, input_per_1m_usd, output_per_1m_usd "
+            "FROM model_pricing ORDER BY model_name ASC"
+        )
+        return {
+            str(r["model_name"]): {
+                "input": float(r["input_per_1m_usd"]),
+                "output": float(r["output_per_1m_usd"]),
+            }
+            for r in rows
+        }
+
+    async def save_model_pricing(
+        self, model_name: str, input_per_1m_usd: float, output_per_1m_usd: float
+    ) -> None:
+        pool = await self._get_pool()
+        now = datetime.now(UTC).isoformat()
+        await pool.execute(
+            """
+            INSERT INTO model_pricing (
+                model_name, input_per_1m_usd, output_per_1m_usd, updated_at
+            )
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (model_name) DO UPDATE SET
+                input_per_1m_usd = EXCLUDED.input_per_1m_usd,
+                output_per_1m_usd = EXCLUDED.output_per_1m_usd,
+                updated_at = EXCLUDED.updated_at
+            """,
+            model_name,
+            float(input_per_1m_usd),
+            float(output_per_1m_usd),
+            now,
+        )
+
+    async def delete_model_pricing(self, model_name: str) -> bool:
+        pool = await self._get_pool()
+        status = await pool.execute(
+            "DELETE FROM model_pricing WHERE model_name = $1",
+            model_name,
+        )
+        try:
+            return int(str(status).split()[-1]) > 0
+        except (IndexError, ValueError):
+            return bool(status)
 
     async def close(self) -> None:
         if self._pool is not None and hasattr(self._pool, "close"):

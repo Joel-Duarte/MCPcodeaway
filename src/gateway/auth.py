@@ -129,6 +129,33 @@ DEV_PERSONAS: dict[str, dict[str, Any]] = {
         "scopes": ["mcp.tools", "mcp.admin", "mcp.audit"],
         "client_groups": ["ALL"],
     },
+    "platform_engineer": {
+        "sub": "user-eng-01",
+        "tenant_id": "tenant-acme-dev",
+        "email": "devon.eng@acme.example",
+        "client_id": "eng-reliability-agent",
+        "roles": ["ops_engineer", "finance_analyst", "snowflake_reader"],
+        "groups": ["engineering", "platform"],
+        "scopes": ["mcp.tools", "ops.read", "finance.read"],
+    },
+    "sales_ops_analyst": {
+        "sub": "user-sales-01",
+        "tenant_id": "tenant-acme-dev",
+        "email": "hannah.sales@acme.example",
+        "client_id": "sales-revops-copilot",
+        "roles": ["finance_analyst", "billing_reader", "snowflake_reader"],
+        "groups": ["sales_ops"],
+        "scopes": ["mcp.tools", "finance.read"],
+    },
+    "legal_counsel": {
+        "sub": "user-legal-01",
+        "tenant_id": "tenant-acme-dev",
+        "email": "ivan.legal@acme.example",
+        "client_id": "legal-compliance-agent",
+        "roles": ["readonly_auditor", "snowflake_reader", "billing_reader"],
+        "groups": ["legal", "audit"],
+        "scopes": ["mcp.tools", "finance.read"],
+    },
 }
 
 
