@@ -105,14 +105,37 @@ class AlertEvaluator:
                     }
                 )
 
-        grounding_blocks = sum(1 for r in runs if r.get("grounding_blocked"))
+        grounding_runs = [r for r in runs if r.get("grounding_blocked")]
+        grounding_blocks = len(grounding_runs)
         if grounding_blocks >= self.rules.grounding_blocks_max:
+            offending_users = sorted(
+                {str(r.get("user_email") or r.get("user_sub") or "unknown") for r in grounding_runs}
+            )[:4]
+            offending_servers = sorted(
+                {
+                    str(sc.get("server"))
+                    for r in grounding_runs
+                    for sc in (r.get("subcalls") or [])
+                    if sc.get("server")
+                }
+            )[:4]
             alerts.append(
                 {
                     "id": "grounding_violations",
                     "severity": "warning",
                     "title": f"Grounding violation spike ({grounding_blocks} blocked)",
-                    "detail": f"Threshold is {self.rules.grounding_blocks_max} in recent window.",
+                    "detail": (
+                        f"Threshold is {self.rules.grounding_blocks_max} in recent window. "
+                        "Code Mode blocked fabricated/ungrounded IDs or numbers not seen "
+                        "in upstream responses."
+                    ),
+                    "affected_users": offending_users,
+                    "affected_upstreams": offending_servers,
+                    "filter_status": "grounding_blocked",
+                    "remediation": (
+                        "Inspect blocked runs in /audit?status=grounding_blocked to see whether "
+                        "the prompt/LLM hallucinated values or an upstream schema omitted IDs."
+                    ),
                     "observed_at": now_iso,
                 }
             )

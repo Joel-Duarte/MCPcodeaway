@@ -965,6 +965,8 @@ class GatewayRuntime:
             mode_decision_score=mode_decision_score,
             experiment_id=experiment_id,
             ab_variant=ab_variant,
+            monty_spawn_ms=sandbox_res.monty_spawn_ms,
+            monty_exec_ms=sandbox_res.monty_exec_ms,
         )
         total_saved = self._record_execution_metrics(
             identity=identity,
@@ -2282,6 +2284,82 @@ def create_gateway_app(
                 "sha256": digest,
                 "s3_uri": s3_uri,
                 "jsonl_content": None if s3_uri else jsonl_payload,
+            }
+
+        @app.get("/admin/audit/retention-policy")
+        async def admin_get_retention_policy(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            saved: dict[str, Any] = {}
+            if hasattr(runtime.store, "get_setting"):
+                saved = await runtime.store.get_setting("retention_policy") or {}
+            return {
+                "retention_days": int(
+                    saved.get("retention_days", runtime.settings.audit_retention_days)
+                ),
+                "auto_interval": str(saved.get("auto_interval", "off")),
+                "s3_bucket": str(saved.get("s3_bucket", runtime.settings.audit_archive_s3_bucket)),
+                "prune_after_archive": bool(saved.get("prune_after_archive", True)),
+            }
+
+        @app.post("/admin/audit/retention-policy")
+        async def admin_save_retention_policy(
+            retention_days: int = Query(default=90, ge=0, le=3650),
+            auto_interval: str = Query(default="off"),
+            s3_bucket: str = Query(default=""),
+            prune_after_archive: bool = Query(default=True),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            if auto_interval not in {"off", "hourly", "daily"}:
+                raise HTTPException(
+                    status_code=400, detail="auto_interval must be 'off', 'hourly', or 'daily'"
+                )
+            policy = {
+                "retention_days": retention_days,
+                "auto_interval": auto_interval,
+                "s3_bucket": s3_bucket.strip(),
+                "prune_after_archive": prune_after_archive,
+            }
+            if hasattr(runtime.store, "save_setting"):
+                await runtime.store.save_setting("retention_policy", policy)
+            return {"saved": True, "policy": policy}
+
+        @app.post("/admin/upstreams/{name}/optimize-mode")
+        async def admin_optimize_upstream_mode(
+            name: str,
+            target_mode: str = Query(default="codemode"),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            if target_mode not in {"codemode", "auto", "hybrid", "traditional"}:
+                raise HTTPException(status_code=400, detail="Invalid target_mode")
+            upstream = runtime.registry.get(name)
+            if upstream is None:
+                raise HTTPException(status_code=404, detail=f"Upstream '{name}' not found")
+            updated = upstream.model_copy(update={"preferred_mode": target_mode})
+            if runtime.settings.dynamic_upstreams_permitted:
+                await runtime.store.save_dynamic_upstream(
+                    updated.name, updated.model_dump(exclude_none=True)
+                )
+                await runtime.refresh_catalog()
+                await runtime.bump_catalog_epoch()
+            else:
+                runtime.registry.upsert(updated)
+            return {
+                "updated": True,
+                "upstream": name,
+                "preferred_mode": target_mode,
             }
 
         def _ensure_demo_traffic_allowed() -> None:

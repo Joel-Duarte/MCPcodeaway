@@ -182,15 +182,17 @@ class GatewaySettings(BaseSettings):
     model_pricing: dict[str, dict[str, float]] = Field(
         default_factory=lambda: {
             "qwen3.5-9b": {"input": 0.10, "output": 0.15},
-            "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
-            "gemini-2.5-pro": {"input": 1.25, "output": 10.0},
-            "claude-haiku-4.5": {"input": 1.0, "output": 5.0},
-            "claude-sonnet-4": {"input": 3.0, "output": 15.0},
-            "claude-opus-4": {"input": 5.0, "output": 25.0},
-            "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
-            "gpt-4.1": {"input": 2.0, "output": 8.0},
-            "gpt-5-mini": {"input": 0.25, "output": 2.0},
-            "gpt-5": {"input": 1.25, "output": 10.0},
+            "openrouter-auto": {"input": 0.50, "output": 1.50},
+            "gemini-4-hydrogen": {"input": 1.50, "output": 7.50},
+            "gemini-4-argon": {"input": 2.00, "output": 10.0},
+            "gemini-4-neon": {"input": 3.00, "output": 15.0},
+            "gemini-3.8-flash": {"input": 0.75, "output": 3.75},
+            "claude-haiku-5.5": {"input": 0.10, "output": 0.50},
+            "claude-sonnet-5.5": {"input": 2.00, "output": 10.0},
+            "claude-opus-5.5": {"input": 4.00, "output": 20.0},
+            "gpt-6-luna": {"input": 0.10, "output": 0.50},
+            "gpt-6.1-sol": {"input": 2.00, "output": 10.0},
+            "gpt-6.2-astra": {"input": 10.00, "output": 50.0},
         }
     )
     audit_archive_s3_bucket: str = ""

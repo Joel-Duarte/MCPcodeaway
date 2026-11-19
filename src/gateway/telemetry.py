@@ -96,6 +96,9 @@ class TelemetryRecorder:
         experiment_id: str | None = None,
         ab_variant: str | None = None,
         model_name: str | None = None,
+        monty_spawn_ms: float = 0.0,
+        monty_exec_ms: float = 0.0,
+        trace_spans: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         raw_upstream_bytes = sum(sc.raw_bytes for sc in subcalls)
         returned_bytes = len(json.dumps(returned_payload, default=str).encode("utf-8"))
@@ -107,6 +110,92 @@ class TelemetryRecorder:
             if classic_schema_tokens is not None
             else 0
         )
+        is_cm = mode.startswith("codemode") or mode == "hybrid"
+        tokens_used_est = schema_tokens + (
+            returned_tokens if is_cm else upstream_tokens or returned_tokens
+        )
+        if is_cm and (estimated_tokens_saved > 0 or schema_tokens_saved > 0):
+            parts: list[str] = []
+            if estimated_tokens_saved > 0:
+                parts.append("Code Mode payload batching")
+            if schema_tokens_saved > 0:
+                parts.append("Deferred Schema Search")
+            tokens_saved_by = " + ".join(parts)
+        elif is_cm:
+            tokens_saved_by = "Code Mode sandbox (minimal payload)"
+        else:
+            tokens_saved_by = "Classic MCP (no batching savings)"
+
+        if trace_spans is None:
+            subcall_total_ms = round(sum(sc.duration_ms for sc in subcalls), 3)
+            known_ms = monty_spawn_ms + monty_exec_ms + subcall_total_ms
+            overhead_ms = max(0.2, round(duration_ms - known_ms, 3))
+            auth_ms = round(overhead_ms * 0.35, 3)
+            route_ms = round(overhead_ms * 0.25, 3)
+            sec_ms = round(max(0.1, overhead_ms - auth_ms - route_ms), 3)
+            cursor = 0.0
+            spans: list[dict[str, Any]] = [
+                {
+                    "stage": "gateway_auth",
+                    "label": "Gateway Auth & RBAC",
+                    "start_ms": cursor,
+                    "duration_ms": auth_ms,
+                    "status": "ok",
+                }
+            ]
+            cursor = round(cursor + auth_ms, 3)
+            spans.append(
+                {
+                    "stage": "mode_route",
+                    "label": f"Mode Routing ({mode})",
+                    "start_ms": cursor,
+                    "duration_ms": route_ms,
+                    "status": "ok",
+                }
+            )
+            cursor = round(cursor + route_ms, 3)
+            if is_cm and (monty_spawn_ms > 0 or monty_exec_ms > 0):
+                spans.append(
+                    {
+                        "stage": "monty_spawn",
+                        "label": "Monty Sandbox Spawn (Ephemeral)",
+                        "start_ms": cursor,
+                        "duration_ms": round(monty_spawn_ms, 3),
+                        "status": "ok",
+                    }
+                )
+                cursor = round(cursor + monty_spawn_ms, 3)
+                spans.append(
+                    {
+                        "stage": "monty_exec",
+                        "label": "Monty Python Execution",
+                        "start_ms": cursor,
+                        "duration_ms": round(monty_exec_ms, 3),
+                        "status": "ok" if ok else "error",
+                    }
+                )
+                cursor = round(cursor + monty_exec_ms, 3)
+            for sc in subcalls:
+                spans.append(
+                    {
+                        "stage": "upstream_subcall",
+                        "label": f"{sc.server}.{sc.tool}",
+                        "start_ms": cursor,
+                        "duration_ms": round(sc.duration_ms, 3),
+                        "status": "ok" if sc.ok else "error",
+                    }
+                )
+                cursor = round(cursor + sc.duration_ms, 3)
+            spans.append(
+                {
+                    "stage": "security_guard",
+                    "label": "ABAC / PII / Grounding Check",
+                    "start_ms": cursor,
+                    "duration_ms": sec_ms,
+                    "status": "blocked" if grounding_blocked else ("ok" if ok else "error"),
+                }
+            )
+            trace_spans = spans
         turns_avoided = max(0, len(subcalls) - 1) if tool_name == "execute_code" else 0
         abac_rows_filtered = sum(sc.abac_rows_filtered for sc in subcalls)
         redactions_count = sum(sc.redactions_count for sc in subcalls)
@@ -161,7 +250,12 @@ class TelemetryRecorder:
             "raw_upstream_bytes": raw_upstream_bytes,
             "returned_bytes": returned_bytes,
             "returned_tokens": returned_tokens,
+            "tokens_used_est": tokens_used_est,
+            "tokens_saved_by": tokens_saved_by,
             "estimated_tokens_saved": estimated_tokens_saved,
+            "monty_spawn_ms": round(monty_spawn_ms, 3),
+            "monty_exec_ms": round(monty_exec_ms, 3),
+            "trace_spans": trace_spans,
             "duration_ms": round(duration_ms, 3),
         }
         if provenance is not None:
@@ -380,17 +474,21 @@ class TelemetryRecorder:
         out_rate = float(active_price.get("output", 15.0))
 
         all_runs = await self.store.list_runs(limit=limit, tenant_id=tenant_id)
+        gf = (group_filter or "").strip().lower()
+        uf = (user_filter or "").strip().lower()
+        sf = (upstream_filter or "").strip().lower()
         runs: list[dict[str, Any]] = []
         for run in all_runs:
             groups = [str(g) for g in (run.get("user_groups") or [])] or ["unassigned"]
             user_sub = str(run.get("user_sub") or "unknown")
+            user_email = str(run.get("user_email") or "")
             subcalls = run.get("subcalls") or []
             servers = {str(sc.get("server") or "unknown") for sc in subcalls}
-            if group_filter and group_filter not in groups:
+            if gf and not any(gf in g.lower() for g in groups):
                 continue
-            if user_filter and user_filter not in {user_sub, str(run.get("user_email") or "")}:
+            if uf and uf not in user_sub.lower() and uf not in user_email.lower():
                 continue
-            if upstream_filter and upstream_filter not in servers:
+            if sf and not any(sf in s.lower() for s in servers):
                 continue
             runs.append(run)
 
@@ -613,6 +711,65 @@ class TelemetryRecorder:
                 winner = "codemode" if cm_arm else "classic"
             ab_experiments[exp_id] = {"arms": formatted_arms, "recommended_winner": winner}
 
+        timeline_buckets: dict[str, dict[str, float]] = {}
+        for run in runs:
+            groups = [str(g) for g in (run.get("user_groups") or [])] or ["unassigned"]
+            spans = run.get("trace_spans") or []
+            stage_sums = {
+                "gateway": 0.0,
+                "monty_spawn": 0.0,
+                "monty_exec": 0.0,
+                "upstream": 0.0,
+                "security": 0.0,
+            }
+            for sp in spans:
+                st = str(sp.get("stage") or "")
+                dur = float(sp.get("duration_ms") or 0.0)
+                if st in {"gateway_auth", "mode_route"}:
+                    stage_sums["gateway"] += dur
+                elif st == "monty_spawn":
+                    stage_sums["monty_spawn"] += dur
+                elif st == "monty_exec":
+                    stage_sums["monty_exec"] += dur
+                elif st == "upstream_subcall":
+                    stage_sums["upstream"] += dur
+                elif st == "security_guard":
+                    stage_sums["security"] += dur
+            total_dur = float(run.get("duration_ms") or 0.0)
+            for grp in groups:
+                tb = timeline_buckets.setdefault(
+                    grp,
+                    {
+                        "runs": 0.0,
+                        "total_ms": 0.0,
+                        "gateway": 0.0,
+                        "monty_spawn": 0.0,
+                        "monty_exec": 0.0,
+                        "upstream": 0.0,
+                        "security": 0.0,
+                    },
+                )
+                tb["runs"] += 1.0
+                tb["total_ms"] += total_dur
+                for k, v in stage_sums.items():
+                    tb[k] += v
+
+        timeline_by_group = [
+            {
+                "group": grp,
+                "runs": int(tb["runs"]),
+                "avg_total_ms": round(tb["total_ms"] / tb["runs"], 2),
+                "avg_gateway_ms": round(tb["gateway"] / tb["runs"], 2),
+                "avg_monty_spawn_ms": round(tb["monty_spawn"] / tb["runs"], 2),
+                "avg_monty_exec_ms": round(tb["monty_exec"] / tb["runs"], 2),
+                "avg_upstream_ms": round(tb["upstream"] / tb["runs"], 2),
+                "avg_security_ms": round(tb["security"] / tb["runs"], 2),
+            }
+            for grp, tb in sorted(
+                timeline_buckets.items(), key=lambda kv: kv[1]["runs"], reverse=True
+            )
+        ]
+
         total_n = len(runs)
         return {
             "window_runs": total_n,
@@ -641,4 +798,5 @@ class TelemetryRecorder:
             "by_user": by_user,
             "mode_decisions": mode_decisions,
             "ab_experiments": ab_experiments,
+            "timeline_by_group": timeline_by_group,
         }

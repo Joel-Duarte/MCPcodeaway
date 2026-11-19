@@ -26,6 +26,8 @@ class SandboxResult(BaseModel):
     error_type: str | None = None
     truncated: bool = False
     duration_ms: float = 0.0
+    monty_spawn_ms: float = 0.0
+    monty_exec_ms: float = 0.0
 
 
 class SandboxBackend(Protocol):
@@ -115,13 +117,18 @@ class LocalMontyBackend:
             "max_memory": self.max_memory_bytes,
             "max_recursion_depth": self.max_recursion_depth,
         }
+        spawn_ms = 0.0
+        exec_ms = 0.0
         try:
             async with pool.checkout(limits=limits) as session:
+                spawn_done = time.perf_counter()
+                spawn_ms = round((spawn_done - started) * 1000, 3)
                 raw_result = await session.feed_run(
                     code,
                     external_lookup=external_functions,
                     print_callback=collector,
                 )
+                exec_ms = round((time.perf_counter() - spawn_done) * 1000, 3)
             clean_res, clean_stdout, truncated = truncate_and_redact_output(
                 raw_result, collector.output, max_output_bytes
             )
@@ -131,6 +138,8 @@ class LocalMontyBackend:
                 stdout=clean_stdout,
                 truncated=truncated,
                 duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                monty_spawn_ms=spawn_ms,
+                monty_exec_ms=exec_ms,
             )
         except pydantic_monty.MontyError as exc:
             return SandboxResult(
@@ -139,6 +148,8 @@ class LocalMontyBackend:
                 error=str(exc),
                 error_type=type(exc).__name__,
                 duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                monty_spawn_ms=spawn_ms,
+                monty_exec_ms=exec_ms,
             )
         except Exception as exc:
             return SandboxResult(
@@ -147,6 +158,8 @@ class LocalMontyBackend:
                 error=str(exc),
                 error_type=type(exc).__name__,
                 duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                monty_spawn_ms=spawn_ms,
+                monty_exec_ms=exec_ms,
             )
 
 
