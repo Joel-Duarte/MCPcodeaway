@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MCPcodeaway — Code-Mode MCP Gateway Dashboard</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #131a2e;
+      --panel-2: #19223c;
+      --border: #283457;
+      --text: #e6ecf8;
+      --muted: #93a3c7;
+      --accent: #5eead4;
+      --accent-2: #60a5fa;
+      --warn: #fbbf24;
+      --danger: #f87171;
+      --ok: #34d399;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); line-height: 1.5; }
+    header {
+      padding: 18px 28px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(90deg, #10172b 0%, #15213d 100%);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    h1 { margin: 0; font-size: 1.25rem; letter-spacing: 0.02em; }
+    .subtitle { color: var(--muted); font-size: 0.85rem; }
+    .pills { display: flex; gap: 8px; flex-wrap: wrap; }
+    .pill {
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      font-size: 0.78rem;
+      color: var(--accent);
+    }
+    nav {
+      display: flex;
+      gap: 6px;
+      padding: 12px 28px;
+      border-bottom: 1px solid var(--border);
+      background: #0e1427;
+      flex-wrap: wrap;
+    }
+    nav button {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid transparent;
+      padding: 8px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.88rem;
+    }
+    nav button.active {
+      background: var(--panel-2);
+      border-color: var(--accent-2);
+      color: var(--text);
+    }
+    main { padding: 24px 28px; max-width: 1260px; margin: 0 auto; }
+    .tab { display: none; }
+    .tab.active { display: block; }
+    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+    .grid-2 { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px;
+    }
+    .card h2, .card h3 { margin: 0 0 10px 0; font-size: 1rem; color: var(--accent-2); }
+    .metric { font-size: 1.7rem; font-weight: 700; color: var(--accent); }
+    .label { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    label { display: block; font-size: 0.84rem; color: var(--muted); margin: 10px 0 4px; }
+    input, select, textarea {
+      width: 100%;
+      padding: 9px 11px;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-family: inherit;
+      font-size: 0.88rem;
+    }
+    textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; min-height: 110px; }
+    .btn {
+      margin-top: 12px;
+      padding: 9px 16px;
+      border: 0;
+      border-radius: 8px;
+      background: var(--accent-2);
+      color: #06101f;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 0.86rem;
+    }
+    .btn.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
+    .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
+    pre {
+      background: #070b16;
+      border: 1px solid var(--border);
+      padding: 12px;
+      border-radius: 8px;
+      overflow-x: auto;
+      font-size: 0.8rem;
+      color: #cfe0ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 600; }
+    .bar-wrap { background: #070b16; border-radius: 6px; height: 14px; overflow: hidden; margin-top: 4px; }
+    .bar { height: 100%; background: var(--accent-2); }
+    .bar.cm { background: var(--accent); }
+    .badge { padding: 2px 8px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; }
+    .badge.ok { background: rgba(52, 211, 153, 0.16); color: var(--ok); }
+    .badge.warning { background: rgba(251, 191, 36, 0.16); color: var(--warn); }
+    .badge.critical { background: rgba(248, 113, 113, 0.16); color: var(--danger); }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>MCPcodeaway — Universal Code-Mode MCP Gateway</h1>
+      <div class="subtitle">OIDC / RFC 8693 Delegation · Pydantic Monty Sandbox · Classic vs. Code Mode Comparator</div>
+    </div>
+    <div class="pills" id="header-pills">
+      <span class="pill">Loading gateway state...</span>
+    </div>
+  </header>
+
+  <nav>
+    <button class="active" data-tab="overview">Overview &amp; Benchmarks</button>
+    <button data-tab="onboarding">Add MCP / Swagger Wizard</button>
+    <button data-tab="playground">Side-by-Side Playground</button>
+    <button data-tab="auth">OIDC Delegation &amp; RBAC</button>
+    <button data-tab="transcripts">Code Mode Transcripts</button>
+  </nav>
+
+  <main>
+    <section id="overview" class="tab active">
+      <div class="grid" id="overview-cards"></div>
+      <div class="grid-2" style="margin-top: 16px;">
+        <div class="card">
+          <h2>Catalog Scaling: Classic MCP vs. Code Mode</h2>
+          <div id="scaling-chart">No offline benchmark saved yet. Run <code>uv run python benchmarks/run_benchmark.py</code>.</div>
+        </div>
+        <div class="card">
+          <h2>Audit Summary by Mode</h2>
+          <div id="audit-summary-box">Loading...</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="onboarding" class="tab">
+      <div class="grid-2">
+        <div class="card">
+          <h2>Add MCP Server or Swagger/OpenAPI Spec</h2>
+          <label>Upstream Slug Name</label>
+          <input id="up-name" value="custom_billing_api" />
+          <label>Transport Type</label>
+          <select id="up-type">
+            <option value="openapi">openapi (Swagger / OpenAPI 3.x Spec)</option>
+            <option value="mcp_http">mcp_http (Stateless Streamable HTTP MCP)</option>
+            <option value="mcp_stdio">mcp_stdio (Local Subprocess MCP)</option>
+          </select>
+          <label>Base URL (for mcp_http or openapi)</label>
+          <input id="up-url" value="http://127.0.0.1:8001/billing-eu" />
+          <label>OpenAPI Spec URL (optional)</label>
+          <input id="up-spec-url" value="http://127.0.0.1:8001/billing-eu/openapi.json" />
+          <label>Or Paste Inline OpenAPI / Swagger JSON</label>
+          <textarea id="up-spec-json" placeholder='{"openapi":"3.1.0","paths":{...}}'></textarea>
+          <label>Stdio Command &amp; Args (space-separated, for mcp_stdio)</label>
+          <input id="up-cmd" placeholder="uvx mcp-server-sqlite --db-path ./data.db" />
+          <label>Auth Type</label>
+          <select id="up-auth">
+            <option value="none">none</option>
+            <option value="delegated_token">delegated_token (RFC 8693 / Entra OBO)</option>
+            <option value="api_key">api_key (Secret Env Ref)</option>
+            <option value="bearer_secret">bearer_secret (Secret Env Ref)</option>
+          </select>
+          <div class="btn-row">
+            <button class="btn secondary" onclick="submitUpstream(false)">Inspect &amp; Compare</button>
+            <button class="btn" onclick="submitUpstream(true)">Register in Gateway</button>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Classic MCP vs. Code Mode Onboarding Audit</h2>
+          <div id="onboarding-result"><pre>Submit or inspect an upstream to view discovered tools, collision checks, token savings, and upstreams.yaml export.</pre></div>
+        </div>
+      </div>
+      <div class="card" style="margin-top: 16px;">
+        <h2>Registered Upstreams</h2>
+        <div id="upstreams-table">Loading...</div>
+      </div>
+    </section>
+
+    <section id="playground" class="tab">
+      <div class="card">
+        <h2>Classic MCP vs. Code Mode Side-by-Side Task Playground</h2>
+        <div class="grid-2">
+          <div>
+            <label>Caller Persona</label>
+            <select id="cmp-persona">
+              <option value="finance_analyst">finance_analyst (Snowflake + EU/US Billing)</option>
+              <option value="readonly_auditor">readonly_auditor (Read-Only Finance)</option>
+              <option value="ops_engineer">ops_engineer (Ops + Mutating Ticketing)</option>
+              <option value="support_agent">support_agent (Ops Read-Only)</option>
+            </select>
+          </div>
+          <div>
+            <label>Workload Scenario</label>
+            <select id="cmp-scenario">
+              <option value="reconcile_overdue">reconcile_overdue (Multi-System Overdue Reconciliation)</option>
+              <option value="trial_balance_audit">trial_balance_audit (Trial Balance Variances + Contacts)</option>
+              <option value="single_lookup">single_lookup (Control Case: Single Read Lookup)</option>
+            </select>
+          </div>
+        </div>
+        <button class="btn" onclick="runComparison()">Run Side-by-Side Comparison</button>
+      </div>
+      <div id="compare-output" style="margin-top: 16px;"></div>
+    </section>
+
+    <section id="auth" class="tab">
+      <div class="card">
+        <h2>OIDC Delegation &amp; Team/Agent RBAC Simulator</h2>
+        <label>Persona</label>
+        <select id="auth-persona">
+          <option value="finance_analyst">finance_analyst</option>
+          <option value="ops_engineer">ops_engineer</option>
+          <option value="readonly_auditor">readonly_auditor</option>
+          <option value="support_agent">support_agent</option>
+        </select>
+        <button class="btn" onclick="simulateAuth()">Mint OIDC JWT &amp; Inspect RBAC Tools</button>
+      </div>
+      <div class="grid-2" style="margin-top: 16px;">
+        <div class="card">
+          <h3>Verified CallerIdentity (/auth/me)</h3>
+          <pre id="auth-me-out">Click "Mint OIDC JWT" to inspect claims.</pre>
+        </div>
+        <div class="card">
+          <h3>RBAC-Filtered Tools (search_tools)</h3>
+          <pre id="auth-tools-out">Click "Mint OIDC JWT" to inspect accessible tools.</pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="transcripts" class="tab">
+      <div class="card">
+        <h2>Recent Execution Transcripts (/audit/runs)</h2>
+        <button class="btn secondary" onclick="loadRuns()">Refresh Transcripts</button>
+        <div id="runs-list" style="margin-top: 12px;">Loading...</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    document.querySelectorAll("nav button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll("nav button").forEach((b) => b.classList.remove("active"));
+        document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+        btn.classList.add("active");
+        document.getElementById(btn.dataset.tab).classList.add("active");
+      });
+    });
+
+    async function loadOverview() {
+      const [health, summary, upstreams, bench] = await Promise.all([
+        fetch("/health").then((r) => r.json()),
+        fetch("/audit/summary").then((r) => r.json()),
+        fetch("/admin/upstreams").then((r) => r.json()),
+        fetch("/benchmarks/latest").then((r) => r.json()),
+      ]);
+
+      document.getElementById("header-pills").innerHTML = `
+        <span class="pill">env: ${health.app_env}</span>
+        <span class="pill">auth: ${health.auth_mode}</span>
+        <span class="pill">default: ${health.default_mode}</span>
+        <span class="pill">catalog: ${health.catalog_version}</span>
+      `;
+
+      const audit = upstreams.comparison_audit;
+      document.getElementById("overview-cards").innerHTML = `
+        <div class="card"><div class="label">Registered Upstreams</div><div class="metric">${health.upstreams}</div></div>
+        <div class="card"><div class="label">Total Catalog Tools</div><div class="metric">${audit.total_tools}</div></div>
+        <div class="card"><div class="label">Classic vs Code Mode Schema</div><div class="metric">${audit.classic_mcp.schema_tokens} → ${audit.code_mode.gateway_surface_tokens} tok</div></div>
+        <div class="card"><div class="label">Recorded Audit Runs</div><div class="metric">${summary.total_runs}</div></div>
+      `;
+
+      document.getElementById("audit-summary-box").innerHTML = `<pre>${JSON.stringify(summary, null, 2)}</pre>`;
+      renderUpstreamsTable(upstreams);
+
+      if (bench.available && bench.offline && bench.offline.scaling) {
+        const rows = bench.offline.scaling.map((row) => {
+          const maxTok = Math.max(row.classic_schema_tokens, 1);
+          const cmPct = Math.max(2, Math.round((row.codemode_surface_tokens / maxTok) * 100));
+          return `
+            <div style="margin-bottom: 12px;">
+              <div><strong>${row.tool_count} Tools</strong> — Classic: ${row.classic_schema_tokens} tok vs Code Mode: ${row.codemode_surface_tokens} tok (${row.reduction_pct}% saved)</div>
+              <div class="bar-wrap"><div class="bar" style="width:100%"></div></div>
+              <div class="bar-wrap"><div class="bar cm" style="width:${cmPct}%"></div></div>
+            </div>
+          `;
+        }).join("");
+        document.getElementById("scaling-chart").innerHTML = rows;
+      }
+    }
+
+    function renderUpstreamsTable(data) {
+      const audit = data.comparison_audit;
+      const rows = data.upstreams.map((u) => {
+        const srvAudit = audit.per_server.find((p) => p.server === u.name) || {};
+        return `
+          <tr>
+            <td><strong>${u.name}</strong></td>
+            <td>${u.type}</td>
+            <td>${u.auth_type}</td>
+            <td>${srvAudit.tool_count ?? 0}</td>
+            <td>${srvAudit.classic_schema_tokens ?? 0} tok</td>
+            <td>${srvAudit.codemode_stub_tokens ?? 0} tok</td>
+          </tr>
+        `;
+      }).join("");
+      document.getElementById("upstreams-table").innerHTML = `
+        <p>Classic status: <span class="badge ${audit.classic_mcp.tool_limit_status}">${audit.classic_mcp.tool_limit_status}</span> — ${audit.classic_mcp.tool_limit_note}</p>
+        <table>
+          <thead><tr><th>Name</th><th>Type</th><th>Auth</th><th>Tools</th><th>Classic Schema</th><th>Code Mode Stubs</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+    }
+
+    async function submitUpstream(register) {
+      const type = document.getElementById("up-type").value;
+      const payload = {
+        name: document.getElementById("up-name").value.trim(),
+        type,
+        auth_type: document.getElementById("up-auth").value,
+      };
+      if (type === "mcp_stdio") {
+        const parts = document.getElementById("up-cmd").value.trim().split(/\s+/);
+        payload.command = parts[0];
+        payload.args = parts.slice(1);
+      } else {
+        payload.url = document.getElementById("up-url").value.trim() || null;
+        const specUrl = document.getElementById("up-spec-url").value.trim();
+        const specJson = document.getElementById("up-spec-json").value.trim();
+        if (specJson) payload.openapi_spec = JSON.parse(specJson);
+        else if (specUrl) payload.openapi_spec_url = specUrl;
+      }
+      const endpoint = register ? "/admin/upstreams" : "/admin/upstreams/inspect";
+      const resp = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      document.getElementById("onboarding-result").innerHTML = `<pre>${JSON.stringify(data, null, 2)}</pre>`;
+      if (register && resp.ok) await loadOverview();
+    }
+
+    async function runComparison() {
+      const resp = await fetch("/compare/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          persona: document.getElementById("cmp-persona").value,
+          scenario: document.getElementById("cmp-scenario").value,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        document.getElementById("compare-output").innerHTML = `<div class="card"><pre>${JSON.stringify(data, null, 2)}</pre></div>`;
+        return;
+      }
+      document.getElementById("compare-output").innerHTML = `
+        <div class="grid-2">
+          <div class="card">
+            <h3>Classic MCP</h3>
+            <table>
+              <tr><th>Total Context Tokens</th><td>${data.classic.total_context_tokens}</td></tr>
+              <tr><th>Schema Tokens / Turn</th><td>${data.classic.schema_tokens_per_turn}</td></tr>
+              <tr><th>Round Trips</th><td>${data.classic.round_trips}</td></tr>
+              <tr><th>Token Exchanges</th><td>${data.classic.token_exchanges}</td></tr>
+              <tr><th>Duration</th><td>${data.classic.duration_ms} ms</td></tr>
+            </table>
+          </div>
+          <div class="card">
+            <h3>Code Mode (Monty)</h3>
+            <table>
+              <tr><th>Total Context Tokens</th><td>${data.code_mode.total_context_tokens}</td></tr>
+              <tr><th>Schema Tokens / Turn</th><td>${data.code_mode.schema_tokens_per_turn}</td></tr>
+              <tr><th>Round Trips</th><td>${data.code_mode.round_trips}</td></tr>
+              <tr><th>Token Exchanges</th><td>${data.code_mode.token_exchanges}</td></tr>
+              <tr><th>Payload Saved</th><td>${data.deltas.payload_bytes_saved} bytes</td></tr>
+              <tr><th>Duration</th><td>${data.code_mode.duration_ms} ms</td></tr>
+            </table>
+          </div>
+        </div>
+        <div class="card" style="margin-top: 16px;">
+          <h3>Winner: ${data.winner} (${data.deltas.context_token_savings_pct}% context token savings)</h3>
+          <p>${data.tradeoff_notes}</p>
+          <pre>${JSON.stringify(data.code_mode.result, null, 2)}</pre>
+        </div>
+      `;
+      await loadRuns();
+    }
+
+    async function simulateAuth() {
+      const persona = document.getElementById("auth-persona").value;
+      const tokResp = await fetch("/dev/auth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ persona }),
+      }).then((r) => r.json());
+      const token = tokResp.access_token;
+      const [me, tools] = await Promise.all([
+        fetch("/auth/me", { headers: { Authorization: `Bearer ${token}` } }).then((r) => r.json()),
+        fetch("/mcp?mode=codemode", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "search_tools", arguments: { query: "", limit: 30 } },
+          }),
+        }).then((r) => r.json()),
+      ]);
+      document.getElementById("auth-me-out").textContent = JSON.stringify(me, null, 2);
+      document.getElementById("auth-tools-out").textContent = JSON.stringify(
+        tools.result.structuredContent,
+        null,
+        2
+      );
+    }
+
+    async function loadRuns() {
+      const data = await fetch("/audit/runs?limit=20").then((r) => r.json());
+      document.getElementById("runs-list").innerHTML = data.runs
+        .map(
+          (r) => `
+          <details style="margin-bottom: 10px; border: 1px solid var(--border); padding: 10px; border-radius: 8px;">
+            <summary><strong>${r.run_id}</strong> · mode=${r.mode} · user=${r.user_sub} · subcalls=${r.subcall_count} · saved=${r.estimated_tokens_saved} tok · ${r.duration_ms}ms</summary>
+            <pre>${JSON.stringify(r, null, 2)}</pre>
+          </details>
+        `
+        )
+        .join("");
+    }
+
+    loadOverview();
+    loadRuns();
+  </script>
+</body>
+</html>
