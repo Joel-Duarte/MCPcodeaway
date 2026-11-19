@@ -254,18 +254,36 @@ function formatUsd(n: number | undefined): string {
           v-for="al in liveAlerts"
           :key="al.id"
           role="alert"
-          class="flex flex-wrap items-center justify-between gap-2 rounded-lg border px-4 py-2.5 text-xs"
+          class="flex flex-col gap-2 rounded-lg border px-4 py-3 text-xs sm:flex-row sm:items-center sm:justify-between"
           :class="
             al.severity === 'critical'
               ? 'border-[#FECACA] bg-[#FEF2F2] text-[#DC2626]'
-              : 'border-[#FDE68A] bg-[#FFFBEB] text-[#D97706]'
+              : 'border-[#FDE68A] bg-[#FFFBEB] text-[#92400E]'
           "
         >
-          <div>
-            <strong class="font-semibold">{{ al.title }}</strong>
-            <span class="ml-2 text-[#52525B]">{{ al.detail }}</span>
+          <div class="space-y-0.5">
+            <div>
+              <strong class="font-semibold">{{ al.title }}</strong>
+              <span class="ml-2 text-[#52525B]">{{ al.detail }}</span>
+            </div>
+            <div v-if="al.affected_upstreams?.length || al.affected_users?.length" class="text-[11px] text-[#52525B]">
+              <span v-if="al.affected_upstreams?.length">Services: <code class="font-mono-data">{{ al.affected_upstreams.join(", ") }}</code></span>
+              <span v-if="al.affected_users?.length" class="ml-2">Callers: <code class="font-mono-data">{{ al.affected_users.join(", ") }}</code></span>
+            </div>
+            <div v-if="al.remediation" class="text-[11px] text-[#09090B]">
+              <strong>Action:</strong> {{ al.remediation }}
+            </div>
           </div>
-          <NuxtLink to="/settings" class="font-medium underline">Rules</NuxtLink>
+          <div class="flex shrink-0 items-center gap-3">
+            <NuxtLink
+              v-if="al.filter_status"
+              :to="`/audit?status=${encodeURIComponent(al.filter_status)}`"
+              class="font-semibold underline"
+            >
+              Inspect Offending Runs →
+            </NuxtLink>
+            <NuxtLink to="/settings" class="font-medium underline">Rules</NuxtLink>
+          </div>
         </div>
       </section>
 

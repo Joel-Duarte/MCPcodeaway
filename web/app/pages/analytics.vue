@@ -60,6 +60,16 @@ interface AnalyticsResponse {
     avg_tokens_saved: number;
     avg_duration_ms: number;
   }[];
+  timeline_by_group?: {
+    group: string;
+    runs: number;
+    avg_total_ms: number;
+    avg_gateway_ms: number;
+    avg_monty_spawn_ms: number;
+    avg_monty_exec_ms: number;
+    avg_upstream_ms: number;
+    avg_security_ms: number;
+  }[];
 }
 
 const { apiFetch } = useAdminApi();
@@ -228,13 +238,13 @@ function formatUsd(n: number | undefined): string {
         </Field>
 
         <Field>
-          <FieldLabel>Company Group</FieldLabel>
-          <Input v-model="groupFilter" placeholder="Filter by group (e.g. finance)" />
+          <FieldLabel>Company Group (fuzzy)</FieldLabel>
+          <Input v-model="groupFilter" placeholder="e.g. fin -> finance" />
         </Field>
 
         <Field>
-          <FieldLabel>User Subject / Email</FieldLabel>
-          <Input v-model="userFilter" placeholder="Filter by user email" />
+          <FieldLabel>User Subject / Email (fuzzy)</FieldLabel>
+          <Input v-model="userFilter" placeholder="e.g. alice -> alice.fin@..." />
         </Field>
 
         <Field>
@@ -568,6 +578,44 @@ function formatUsd(n: number | undefined): string {
             </div>
           </TabsPanel>
         </Tabs>
+      </section>
+
+      <!-- Aggregated Task / Group Trace Timeline -->
+      <section v-if="analytics.timeline_by_group?.length" class="rounded-lg border border-[#E4E4E7] bg-white">
+        <div class="border-b border-[#E4E4E7] px-4 py-3">
+          <h2 class="text-[15px] font-semibold text-[#09090B]">Aggregated Trace Timeline by Group</h2>
+          <p class="mt-0.5 text-xs text-[#52525B]">
+            Average stage latency per company group: Gateway Auth/Route, Monty Spawn, Monty Exec, Upstream Subcalls, and Security/Grounding.
+          </p>
+        </div>
+        <div class="overflow-x-auto table-scroll">
+          <table class="w-full border-collapse text-left text-[13px]">
+            <thead>
+              <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-xs font-medium text-[#52525B]">
+                <th class="px-4 py-2.5">Group</th>
+                <th class="px-4 py-2.5 text-right">Runs</th>
+                <th class="px-4 py-2.5 text-right">Gateway</th>
+                <th class="px-4 py-2.5 text-right">Monty Spawn</th>
+                <th class="px-4 py-2.5 text-right">Monty Exec</th>
+                <th class="px-4 py-2.5 text-right">Upstream</th>
+                <th class="px-4 py-2.5 text-right">Security</th>
+                <th class="px-4 py-2.5 text-right">Avg Total</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-[#E4E4E7]">
+              <tr v-for="tb in analytics.timeline_by_group" :key="tb.group" class="hover:bg-[#FAFAFA]">
+                <td class="px-4 py-2.5 font-medium text-[#09090B]">{{ tb.group }}</td>
+                <td class="px-4 py-2.5 text-right tabular-nums">{{ tb.runs }}</td>
+                <td class="px-4 py-2.5 text-right font-mono-data text-xs tabular-nums">{{ tb.avg_gateway_ms.toFixed(2) }} ms</td>
+                <td class="px-4 py-2.5 text-right font-mono-data text-xs text-[#0F766E] tabular-nums">{{ tb.avg_monty_spawn_ms.toFixed(2) }} ms</td>
+                <td class="px-4 py-2.5 text-right font-mono-data text-xs text-[#0F766E] tabular-nums">{{ tb.avg_monty_exec_ms.toFixed(2) }} ms</td>
+                <td class="px-4 py-2.5 text-right font-mono-data text-xs text-[#2563EB] tabular-nums">{{ tb.avg_upstream_ms.toFixed(2) }} ms</td>
+                <td class="px-4 py-2.5 text-right font-mono-data text-xs tabular-nums">{{ tb.avg_security_ms.toFixed(2) }} ms</td>
+                <td class="px-4 py-2.5 text-right font-semibold tabular-nums">{{ tb.avg_total_ms.toFixed(2) }} ms</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </section>
     </template>
   </div>

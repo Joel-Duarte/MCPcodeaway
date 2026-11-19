@@ -29,6 +29,18 @@ interface AuditRun {
   schema_tokens_saved: number;
   abac_rows_filtered: number;
   redactions_count: number;
+  grounding_blocked?: boolean;
+  tokens_used_est?: number;
+  tokens_saved_by?: string;
+  monty_spawn_ms?: number;
+  monty_exec_ms?: number;
+  trace_spans?: {
+    stage: string;
+    label: string;
+    start_ms: number;
+    duration_ms: number;
+    status: string;
+  }[];
   code?: string | null;
   stdout?: string | null;
   error?: string | null;
@@ -187,9 +199,30 @@ async function confirmPrune() {
   }
 }
 
+const route = useRoute();
+
 onMounted(() => {
+  const qStatus = String(route.query.status || "");
+  if (qStatus === "errors" || qStatus === "grounding_blocked" || qStatus === "ok") {
+    statusFilter.value = qStatus;
+  }
   void fetchRuns();
 });
+
+function spanBarStyle(span: { start_ms: number; duration_ms: number }, totalMs: number) {
+  const denom = Math.max(totalMs, 0.5);
+  const left = Math.min(96, Math.max(0, (span.start_ms / denom) * 100));
+  const width = Math.max(2, Math.min(100 - left, (span.duration_ms / denom) * 100));
+  return { left: `${left.toFixed(1)}%`, width: `${width.toFixed(1)}%` };
+}
+
+function spanBarColor(stage: string, status: string) {
+  if (status === "blocked") return "bg-[#D97706]";
+  if (status === "error") return "bg-[#DC2626]";
+  if (stage === "monty_spawn" || stage === "monty_exec") return "bg-[#0F766E]";
+  if (stage === "upstream_subcall") return "bg-[#2563EB]";
+  return "bg-[#71717A]";
+}
 </script>
 
 <template>
@@ -420,11 +453,17 @@ onMounted(() => {
 
         <div v-if="selectedRun" class="min-h-0 flex-1 space-y-4 overflow-y-auto p-5 text-xs">
           <!-- KPI Strip -->
-          <div class="grid grid-cols-3 gap-2">
+          <div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
             <div class="rounded-md border border-[#E4E4E7] bg-white p-2.5">
               <div class="text-[11px] text-[#71717A]">Duration</div>
               <div class="mt-0.5 text-sm font-semibold text-[#09090B] tabular-nums">
                 {{ selectedRun.duration_ms.toFixed(1) }} ms
+              </div>
+            </div>
+            <div class="rounded-md border border-[#E4E4E7] bg-white p-2.5">
+              <div class="text-[11px] text-[#71717A]">Tokens Used</div>
+              <div class="mt-0.5 text-sm font-semibold text-[#09090B] tabular-nums">
+                {{ (selectedRun.tokens_used_est ?? 0).toLocaleString("en-US") }}
               </div>
             </div>
             <div class="rounded-md border border-[#E4E4E7] bg-white p-2.5">
@@ -437,6 +476,43 @@ onMounted(() => {
               <div class="text-[11px] text-[#71717A]">Subcalls</div>
               <div class="mt-0.5 text-sm font-semibold text-[#09090B] tabular-nums">
                 {{ selectedRun.subcall_count }}
+              </div>
+            </div>
+          </div>
+
+          <div
+            v-if="selectedRun.tokens_saved_by"
+            class="rounded-md border border-[#99F6E4] bg-[#F0FDFA] px-3 py-2 text-[11px] text-[#0F766E]"
+          >
+            <strong>Savings Attribution:</strong> {{ selectedRun.tokens_saved_by }}
+            <span v-if="selectedRun.monty_spawn_ms || selectedRun.monty_exec_ms" class="ml-2 text-[#52525B] tabular-nums">
+              · Monty spawn {{ (selectedRun.monty_spawn_ms ?? 0).toFixed(2) }}ms · exec {{ (selectedRun.monty_exec_ms ?? 0).toFixed(2) }}ms
+            </span>
+          </div>
+
+          <!-- Linear-style Waterfall Trace Timeline -->
+          <div v-if="selectedRun.trace_spans?.length" class="space-y-2 rounded-md border border-[#E4E4E7] bg-white p-3">
+            <div class="flex items-center justify-between">
+              <div class="font-semibold text-[#09090B]">Request Trace Timeline</div>
+              <div class="text-[11px] text-[#71717A] tabular-nums">Total {{ selectedRun.duration_ms.toFixed(1) }} ms</div>
+            </div>
+            <div class="space-y-1.5">
+              <div
+                v-for="(sp, idx) in selectedRun.trace_spans"
+                :key="idx"
+                class="grid grid-cols-[11rem_1fr_4.5rem] items-center gap-2 text-[11px]"
+              >
+                <div class="truncate font-medium text-[#09090B]" :title="sp.label">{{ sp.label }}</div>
+                <div class="relative h-3 rounded bg-[#F4F4F5] overflow-hidden">
+                  <div
+                    class="absolute top-0 bottom-0 rounded"
+                    :class="spanBarColor(sp.stage, sp.status)"
+                    :style="spanBarStyle(sp, selectedRun.duration_ms)"
+                  />
+                </div>
+                <div class="text-right font-mono-data text-[#52525B] tabular-nums">
+                  {{ sp.duration_ms.toFixed(2) }} ms
+                </div>
               </div>
             </div>
           </div>

@@ -68,16 +68,21 @@ const newRuleWebhook = ref("");
 
 // Compliance Retention & S3 / JSONL Archive
 const retentionDays = ref("90");
+const autoInterval = ref("off");
 const archiveS3Bucket = ref("");
 const archiving = ref(false);
 const pruning = ref(false);
+const savingPolicy = ref(false);
 
 async function loadSettings() {
   errorMsg.value = "";
   try {
-    const [p, r] = await Promise.all([
+    const [p, r, pol] = await Promise.all([
       apiFetch<ModelPricingMap>("/admin/pricing/models"),
       apiFetch<AlertRules>("/admin/alerts/rules"),
+      apiFetch<{ retention_days: number; auto_interval: string; s3_bucket: string }>(
+        "/admin/audit/retention-policy"
+      ),
     ]);
     pricing.value = p;
     errorRateMax.value = String(r.error_rate_pct_max);
@@ -86,6 +91,9 @@ async function loadSettings() {
     webhookUrl.value = r.webhook_url || "";
     cooldownSeconds.value = String(r.webhook_cooldown_seconds ?? 60);
     customRules.value = r.custom_rules ? [...r.custom_rules] : [];
+    retentionDays.value = String(pol.retention_days ?? 90);
+    autoInterval.value = pol.auto_interval || "off";
+    archiveS3Bucket.value = pol.s3_bucket || "";
   } catch (err) {
     errorMsg.value = extractErrorMessage(err);
   } finally {
@@ -682,7 +690,7 @@ async function pruneAuditRuns() {
           </p>
         </div>
         <div class="p-4 space-y-4">
-          <div class="grid gap-3 sm:grid-cols-2">
+          <div class="grid gap-3 sm:grid-cols-3">
             <div>
               <label class="block text-xs font-medium text-[#52525B]">Active DB Retention Window (Days)</label>
               <input
@@ -692,6 +700,17 @@ async function pruneAuditRuns() {
                 max="3650"
                 class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-[13px] tabular-nums"
               />
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-[#52525B]">Auto-Archive &amp; Purge Schedule</label>
+              <select
+                v-model="autoInterval"
+                class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-[13px]"
+              >
+                <option value="off">Manual Only (Off)</option>
+                <option value="hourly">Every Hour (Auto-Archive + Purge)</option>
+                <option value="daily">Every 24 Hours (Auto-Archive + Purge)</option>
+              </select>
             </div>
             <div>
               <label class="block text-xs font-medium text-[#52525B]">S3 Archive Bucket (optional; blank = JSONL download)</label>
@@ -704,6 +723,18 @@ async function pruneAuditRuns() {
             </div>
           </div>
           <div class="flex flex-wrap gap-2">
+            <Button
+              :disabled="savingPolicy"
+              @click="
+                savingPolicy = true;
+                apiFetch(`/admin/audit/retention-policy?retention_days=${encodeURIComponent(retentionDays)}&auto_interval=${encodeURIComponent(autoInterval)}&s3_bucket=${encodeURIComponent(archiveS3Bucket)}`, { method: 'POST' })
+                  .then(() => { statusMsg = `Saved retention schedule (${autoInterval}, ${retentionDays}d).`; })
+                  .catch((e) => { errorMsg = extractErrorMessage(e); })
+                  .finally(() => { savingPolicy = false; })
+              "
+            >
+              {{ savingPolicy ? "Saving..." : "Save Schedule" }}
+            </Button>
             <Button data-variant="primary" :disabled="archiving" @click="archiveAuditRuns(true)">
               {{ archiving ? "Archiving..." : "Archive & Purge Old Runs" }}
             </Button>

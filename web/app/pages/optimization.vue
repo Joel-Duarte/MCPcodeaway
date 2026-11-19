@@ -45,24 +45,49 @@ const { totalRunsTick } = useLiveTelemetry();
 
 const loading = ref(true);
 const errorMessage = ref("");
+const statusMessage = ref("");
 const selectedModel = ref("qwen3.5-9b");
 const analytics = ref<AnalyticsResponse | null>(null);
 const experiments = ref<ExperimentsResponse | null>(null);
+const upstreamsList = ref<{ name: string; preferred_mode: string; enabled: boolean }[]>([]);
+const optimizingName = ref<string | null>(null);
 
 async function fetchOptimization() {
   errorMessage.value = "";
   try {
     const q = new URLSearchParams({ model: selectedModel.value });
-    const [a, e] = await Promise.all([
+    const [a, e, u] = await Promise.all([
       apiFetch<AnalyticsResponse>(`/audit/analytics?${q.toString()}`),
       apiFetch<ExperimentsResponse>("/admin/ab/experiments"),
+      apiFetch<{ upstreams: { name: string; preferred_mode: string; enabled: boolean }[] }>(
+        "/admin/upstreams?page_size=200"
+      ),
     ]);
     analytics.value = a;
     experiments.value = e;
+    upstreamsList.value = u.upstreams || [];
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
   } finally {
     loading.value = false;
+  }
+}
+
+async function optimizeUpstream(name: string, targetMode: "codemode" | "auto") {
+  optimizingName.value = name;
+  errorMessage.value = "";
+  statusMessage.value = "";
+  try {
+    await apiFetch(
+      `/admin/upstreams/${encodeURIComponent(name)}/optimize-mode?target_mode=${targetMode}`,
+      { method: "POST" }
+    );
+    statusMessage.value = `Switched '${name}' preferred mode to '${targetMode}'.`;
+    await fetchOptimization();
+  } catch (err) {
+    errorMessage.value = extractErrorMessage(err);
+  } finally {
+    optimizingName.value = null;
   }
 }
 
@@ -116,6 +141,14 @@ function formatInt(n: number | undefined): string {
           <span>Edit Model Prices</span>
         </NuxtLink>
       </div>
+    </div>
+
+    <div
+      v-if="statusMessage"
+      role="status"
+      class="rounded-lg border border-[#99F6E4] bg-[#F0FDFA] px-4 py-2.5 text-[13px] text-[#0F766E]"
+    >
+      {{ statusMessage }}
     </div>
 
     <div
@@ -252,6 +285,50 @@ function formatInt(n: number | undefined): string {
                 <td class="px-4 py-2.5 text-xs text-[#52525B]">{{ d.reason }}</td>
                 <td class="px-4 py-2.5 text-right tabular-nums">{{ d.runs }}</td>
                 <td class="px-4 py-2.5 text-right tabular-nums text-[#0F766E]">{{ d.avg_tokens_saved }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 1-Click Upstream Mode Optimizer -->
+      <section class="rounded-lg border border-[#E4E4E7] bg-white">
+        <div class="border-b border-[#E4E4E7] px-4 py-3">
+          <h2 class="text-[15px] font-semibold text-[#09090B]">Upstream Mode Recommendations (1-Click Apply)</h2>
+          <p class="mt-0.5 text-xs text-[#52525B]">
+            Switch any upstream between <code class="font-mono-data">traditional</code>, <code class="font-mono-data">auto</code>, and <code class="font-mono-data">codemode</code> immediately.
+          </p>
+        </div>
+        <div class="overflow-x-auto table-scroll">
+          <table class="w-full border-collapse text-left text-[13px]">
+            <thead>
+              <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-xs font-medium text-[#52525B]">
+                <th class="px-4 py-2.5">Upstream</th>
+                <th class="px-4 py-2.5">Current Mode</th>
+                <th class="px-4 py-2.5 text-right">Action</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-[#E4E4E7]">
+              <tr v-for="u in upstreamsList" :key="u.name" class="hover:bg-[#FAFAFA]">
+                <td class="px-4 py-2.5 font-mono-data text-xs font-medium text-[#09090B]">{{ u.name }}</td>
+                <td class="px-4 py-2.5 font-mono-data text-xs text-[#52525B]">{{ u.preferred_mode }}</td>
+                <td class="px-4 py-2.5 text-right space-x-2">
+                  <Button
+                    v-if="u.preferred_mode !== 'codemode'"
+                    data-variant="primary"
+                    :disabled="optimizingName === u.name"
+                    @click="optimizeUpstream(u.name, 'codemode')"
+                  >
+                    {{ optimizingName === u.name ? "Applying..." : "Switch to Code Mode" }}
+                  </Button>
+                  <Button
+                    v-if="u.preferred_mode !== 'auto'"
+                    :disabled="optimizingName === u.name"
+                    @click="optimizeUpstream(u.name, 'auto')"
+                  >
+                    Set Auto
+                  </Button>
+                </td>
               </tr>
             </tbody>
           </table>

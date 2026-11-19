@@ -864,7 +864,10 @@ async function copyPromptText() {
       </div>
 
       <div class="rounded border border-[#99F6E4] bg-[#F0FDFA] p-3 text-xs text-[#09090B] space-y-1">
-        <div><strong class="text-[#0F766E]">Session Advice:</strong> {{ sessionAdvice.statefulHint }}</div>
+        <div>
+          <strong class="text-[#0F766E]">Stateless by Default:</strong>
+          Monty sandboxes are 100% ephemeral, and MCP Streamable HTTP defaults to stateless. Legacy downstream <code class="font-mono-data">Mcp-Session-Id</code> handshakes are handled automatically if a 3rd-party server requires one.
+        </div>
         <div><strong class="text-[#0F766E]">A/B Advice:</strong> {{ sessionAdvice.abHint }}</div>
       </div>
 
