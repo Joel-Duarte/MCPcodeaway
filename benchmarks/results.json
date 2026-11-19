@@ -1,0 +1,415 @@
+{
+  "generated_at": "2026-11-19T01:09:23.215010+00:00",
+  "scaling": [
+    {
+      "tool_count": 20,
+      "classic_schema_bytes": 8117,
+      "classic_schema_tokens": 2030,
+      "codemode_surface_tokens": 265,
+      "codemode_search_top5_tokens": 190,
+      "reduction_pct": 86.95
+    },
+    {
+      "tool_count": 50,
+      "classic_schema_bytes": 20291,
+      "classic_schema_tokens": 5073,
+      "codemode_surface_tokens": 265,
+      "codemode_search_top5_tokens": 190,
+      "reduction_pct": 94.78
+    },
+    {
+      "tool_count": 150,
+      "classic_schema_bytes": 60871,
+      "classic_schema_tokens": 15218,
+      "codemode_surface_tokens": 265,
+      "codemode_search_top5_tokens": 190,
+      "reduction_pct": 98.26
+    },
+    {
+      "tool_count": 300,
+      "classic_schema_bytes": 121741,
+      "classic_schema_tokens": 30436,
+      "codemode_surface_tokens": 265,
+      "codemode_search_top5_tokens": 190,
+      "reduction_pct": 99.13
+    },
+    {
+      "tool_count": 500,
+      "classic_schema_bytes": 202901,
+      "classic_schema_tokens": 50726,
+      "codemode_surface_tokens": 265,
+      "codemode_search_top5_tokens": 190,
+      "reduction_pct": 99.48
+    }
+  ],
+  "scenarios": [
+    {
+      "scenario": "reconcile_overdue",
+      "classic": {
+        "schema_tokens_per_turn": 477,
+        "round_trips": 4,
+        "payload_bytes": 2837,
+        "payload_tokens": 648,
+        "total_context_tokens": 2556,
+        "token_exchanges": 3,
+        "duration_ms": 100.515,
+        "results": [
+          {
+            "queried_by": "user-fin-01",
+            "rows": [
+              {
+                "customer_id": "CUST-1003",
+                "region": "EU",
+                "ledger_balance": 1825.0,
+                "currency": "EUR",
+                "status": "overdue",
+                "days_past_due": 90
+              },
+              {
+                "customer_id": "CUST-1006",
+                "region": "EU",
+                "ledger_balance": 1750.0,
+                "currency": "EUR",
+                "status": "overdue",
+                "days_past_due": 60
+              },
+              {
+                "customer_id": "CUST-1009",
+                "region": "EU",
+                "ledger_balance": 2125.0,
+                "currency": "EUR",
+                "status": "overdue",
+                "days_past_due": 105
+              },
+              {
+                "customer_id": "CUST-1012",
+                "region": "EU",
+                "ledger_balance": 2500.0,
+                "currency": "EUR",
+                "status": "overdue",
+                "days_past_due": 75
+              },
+              {
+                "customer_id": "CUST-1015",
+                "region": "EU",
+                "ledger_balance": 2875.0,
+                "currency": "EUR",
+                "status": "overdue",
+                "days_past_due": 45
+              },
+              {
+                "customer_id": "CUST-1018",
+                "region": "US",
+                "ledger_balance": 3250.0,
+                "currency": "USD",
+                "status": "overdue",
+                "days_past_due": 90
+              },
+              {
+                "customer_id": "CUST-1021",
+                "region": "US",
+                "ledger_balance": 3625.0,
+                "currency": "USD",
+                "status": "overdue",
+                "days_past_due": 60
+              },
+              {
+                "customer_id": "CUST-1024",
+                "region": "US",
+                "ledger_balance": 3680.0,
+                "currency": "USD",
+                "status": "overdue",
+                "days_past_due": 105
+              },
+              {
+                "customer_id": "CUST-1027",
+                "region": "US",
+                "ledger_balance": 4375.0,
+                "currency": "USD",
+                "status": "overdue",
+                "days_past_due": 75
+              },
+              {
+                "customer_id": "CUST-1030",
+                "region": "US",
+                "ledger_balance": 4750.0,
+                "currency": "USD",
+                "status": "overdue",
+                "days_past_due": 45
+              }
+            ]
+          },
+          {
+            "region": "EU",
+            "count": 5,
+            "invoices": [
+              {
+                "invoice_id": "INV-EU-2003",
+                "customer_id": "CUST-1003",
+                "amount": 1375.0,
+                "currency": "EUR",
+                "status": "overdue",
+                "days_past_due": 90
+              },
+              {
+                "invoice_id": "INV-EU-2006",
+                "customer_id": "CUST-1006",
+                "amount": 1750.0,
+                "currency": "EUR",
+                "status": "overdue",
+                "days_past_due": 60
+              },
+              {
+                "invoice_id": "INV-EU-2009",
+                "customer_id": "CUST-1009",
+                "amount": 2125.0,
+                "currency": "EUR",
+                "status": "overdue",
+                "days_past_due": 105
+              },
+              {
+                "invoice_id": "INV-EU-2012",
+                "customer_id": "CUST-1012",
+                "amount": 2500.0,
+                "currency": "EUR",
+                "status": "overdue",
+                "days_past_due": 75
+              },
+              {
+                "invoice_id": "INV-EU-2015",
+                "customer_id": "CUST-1015",
+                "amount": 2875.0,
+                "currency": "EUR",
+                "status": "overdue",
+                "days_past_due": 45
+              }
+            ]
+          },
+          {
+            "region": "US",
+            "count": 5,
+            "invoices": [
+              {
+                "invoice_id": "INV-US-2018",
+                "customer_id": "CUST-1018",
+                "amount": 3250.0,
+                "currency": "USD",
+                "status": "overdue",
+                "days_past_due": 90
+              },
+              {
+                "invoice_id": "INV-US-2021",
+                "customer_id": "CUST-1021",
+                "amount": 3625.0,
+                "currency": "USD",
+                "status": "overdue",
+                "days_past_due": 60
+              },
+              {
+                "invoice_id": "INV-US-2024",
+                "customer_id": "CUST-1024",
+                "amount": 4000.0,
+                "currency": "USD",
+                "status": "overdue",
+                "days_past_due": 105
+              },
+              {
+                "invoice_id": "INV-US-2027",
+                "customer_id": "CUST-1027",
+                "amount": 4375.0,
+                "currency": "USD",
+                "status": "overdue",
+                "days_past_due": 75
+              },
+              {
+                "invoice_id": "INV-US-2030",
+                "customer_id": "CUST-1030",
+                "amount": 4750.0,
+                "currency": "USD",
+                "status": "overdue",
+                "days_past_due": 45
+              }
+            ]
+          }
+        ]
+      },
+      "code_mode": {
+        "schema_tokens_per_turn": 265,
+        "round_trips": 2,
+        "raw_upstream_bytes": 2837,
+        "payload_bytes": 193,
+        "payload_tokens": 616,
+        "total_context_tokens": 1146,
+        "token_exchanges": 0,
+        "duration_ms": 9.854,
+        "ok": true,
+        "error": null,
+        "result": [
+          {
+            "customer_id": "CUST-1003",
+            "delta": 450.0
+          },
+          {
+            "customer_id": "CUST-1024",
+            "delta": -320.0
+          }
+        ],
+        "run_id": "run_1077e3fde899"
+      },
+      "deltas": {
+        "context_token_savings_pct": 55.16,
+        "round_trips_saved": 2,
+        "payload_bytes_saved": 2644
+      },
+      "winner": "code_mode",
+      "tradeoff_notes": "Code Mode batches multi-system calls in Monty via asyncio.gather and filters intermediate payloads before returning to LLM context."
+    },
+    {
+      "scenario": "trial_balance_audit",
+      "classic": {
+        "schema_tokens_per_turn": 477,
+        "round_trips": 5,
+        "payload_bytes": 750,
+        "payload_tokens": 175,
+        "total_context_tokens": 2560,
+        "token_exchanges": 0,
+        "duration_ms": 6.934,
+        "results": [
+          {
+            "lines": [
+              {
+                "account_code": "AR-EU-103",
+                "customer_id": "CUST-1003",
+                "debit": 1825.0,
+                "credit": 1375.0,
+                "variance": 450.0
+              },
+              {
+                "account_code": "AR-EU-111",
+                "customer_id": "CUST-1011",
+                "debit": 3575.0,
+                "credit": 2375.0,
+                "variance": 1200.0
+              },
+              {
+                "account_code": "AR-US-124",
+                "customer_id": "CUST-1024",
+                "debit": 3680.0,
+                "credit": 4000.0,
+                "variance": -320.0
+              }
+            ]
+          },
+          {
+            "customer_id": "CUST-1003",
+            "name": "Merchant 3 (EU)",
+            "region": "EU",
+            "contact_email": "ap@merchant3.example",
+            "tier": "growth"
+          },
+          {
+            "customer_id": "CUST-1011",
+            "name": "Merchant 11 (EU)",
+            "region": "EU",
+            "contact_email": "ap@merchant11.example",
+            "tier": "growth"
+          },
+          {
+            "customer_id": "CUST-1024",
+            "name": "Merchant 24 (US)",
+            "region": "US",
+            "contact_email": "ap@merchant24.example",
+            "tier": "enterprise"
+          }
+        ]
+      },
+      "code_mode": {
+        "schema_tokens_per_turn": 265,
+        "round_trips": 2,
+        "raw_upstream_bytes": 750,
+        "payload_bytes": 356,
+        "payload_tokens": 654,
+        "total_context_tokens": 1184,
+        "token_exchanges": 0,
+        "duration_ms": 8.218,
+        "ok": true,
+        "error": null,
+        "result": [
+          {
+            "customer_id": "CUST-1003",
+            "variance": 450.0,
+            "contact": "ap@merchant3.example"
+          },
+          {
+            "customer_id": "CUST-1011",
+            "variance": 1200.0,
+            "contact": "ap@merchant11.example"
+          },
+          {
+            "customer_id": "CUST-1024",
+            "variance": -320.0,
+            "contact": "ap@merchant24.example"
+          }
+        ],
+        "run_id": "run_1302353d2bc5"
+      },
+      "deltas": {
+        "context_token_savings_pct": 53.75,
+        "round_trips_saved": 3,
+        "payload_bytes_saved": 394
+      },
+      "winner": "code_mode",
+      "tradeoff_notes": "Code Mode batches multi-system calls in Monty via asyncio.gather and filters intermediate payloads before returning to LLM context."
+    },
+    {
+      "scenario": "single_lookup",
+      "classic": {
+        "schema_tokens_per_turn": 477,
+        "round_trips": 2,
+        "payload_bytes": 131,
+        "payload_tokens": 31,
+        "total_context_tokens": 985,
+        "token_exchanges": 0,
+        "duration_ms": 2.24,
+        "results": [
+          {
+            "customer_id": "CUST-1003",
+            "region": "EU",
+            "ledger_balance": 1825.0,
+            "currency": "EUR",
+            "status": "overdue",
+            "days_past_due": 90
+          }
+        ]
+      },
+      "code_mode": {
+        "schema_tokens_per_turn": 265,
+        "round_trips": 2,
+        "raw_upstream_bytes": 131,
+        "payload_bytes": 231,
+        "payload_tokens": 624,
+        "total_context_tokens": 1154,
+        "token_exchanges": 0,
+        "duration_ms": 2.421,
+        "ok": true,
+        "error": null,
+        "result": {
+          "customer_id": "CUST-1003",
+          "region": "EU",
+          "ledger_balance": 1825.0,
+          "currency": "EUR",
+          "status": "overdue",
+          "days_past_due": 90
+        },
+        "run_id": "run_c569b75914e2"
+      },
+      "deltas": {
+        "context_token_savings_pct": -17.16,
+        "round_trips_saved": 0,
+        "payload_bytes_saved": 0
+      },
+      "winner": "classic_or_tie",
+      "tradeoff_notes": "For a single small read call with a modest catalog, Classic MCP takes 1 turn without writing Python; Code Mode still saves repeated schema tokens at scale."
+    }
+  ]
+}
