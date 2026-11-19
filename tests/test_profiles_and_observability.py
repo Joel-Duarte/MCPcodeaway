@@ -262,8 +262,7 @@ async def test_postgres_audit_store_crud_and_optional_dep(
                 return [{"payload_json": json.dumps(r)} for r in items[:limit]]
             if "FROM dynamic_upstreams" in norm:
                 return [
-                    {"config_json": json.dumps(self.upstreams[k])}
-                    for k in sorted(self.upstreams)
+                    {"config_json": json.dumps(self.upstreams[k])} for k in sorted(self.upstreams)
                 ]
             raise AssertionError(f"Unexpected fetch SQL: {norm}")
 

@@ -67,8 +67,10 @@ def validate_upstream_url(
             ip_obj = ip_obj.ipv4_mapped
         if ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified:
             raise ValueError(f"Blocked link-local or unspecified IP '{host}' in upstream URL")
-        if app_env == "prod" and block_private_ips_in_prod and (
-            ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved
+        if (
+            app_env == "prod"
+            and block_private_ips_in_prod
+            and (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved)
         ):
             raise ValueError(
                 f"Blocked private/loopback IP '{host}' in prod; add host to allowed_upstream_hosts"
@@ -79,6 +81,8 @@ def validate_upstream_url(
                 f"Blocked local/internal hostname '{host}' in prod; "
                 "add host to allowed_upstream_hosts"
             )
+
+
 _MUTATING_PREFIXES = (
     "create_",
     "delete_",
@@ -164,9 +168,7 @@ def _sanitize_identifier(raw: str) -> str:
     return cleaned
 
 
-def _resolve_refs(
-    node: Any, root: dict[str, Any], seen: set[str] | None = None
-) -> Any:
+def _resolve_refs(node: Any, root: dict[str, Any], seen: set[str] | None = None) -> Any:
     seen_refs = seen or set()
     if isinstance(node, list):
         return [_resolve_refs(item, root, seen_refs) for item in node]
@@ -253,9 +255,7 @@ class UpstreamClientManager:
 
     async def _set_session_id(self, skey: str, sid: str) -> None:
         if self._cache is not None:
-            await self._cache.set(
-                f"mcp_sess:{skey}", sid, ttl_seconds=self._session_ttl_seconds
-            )
+            await self._cache.set(f"mcp_sess:{skey}", sid, ttl_seconds=self._session_ttl_seconds)
         else:
             self._session_ids[skey] = sid
 
@@ -281,17 +281,13 @@ class UpstreamClientManager:
             self._owned_client = None
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        headers = {
-            str(k): str(v) for k, v in (kwargs.pop("headers", None) or {}).items()
-        }
+        headers = {str(k): str(v) for k, v in (kwargs.pop("headers", None) or {}).items()}
         propagate.inject(headers)
         client = self._get_client()
         return await client.request(method, url, headers=headers, **kwargs)
 
     @staticmethod
-    def filter_tools(
-        upstream: UpstreamConfig, tools: list[DiscoveredTool]
-    ) -> list[DiscoveredTool]:
+    def filter_tools(upstream: UpstreamConfig, tools: list[DiscoveredTool]) -> list[DiscoveredTool]:
         """Apply optional allowed_operations / excluded_operations curation lists."""
         filtered = list(tools)
         if upstream.allowed_operations:
@@ -441,11 +437,7 @@ class UpstreamClientManager:
             "params": {"name": tool.name, "arguments": arguments},
         }
         resp = await self._request("POST", upstream.url, headers=headers, json=payload)
-        if (
-            resp.status_code in {400, 404}
-            and upstream.stateful_session
-            and not mcp_session_id
-        ):
+        if resp.status_code in {400, 404} and upstream.stateful_session and not mcp_session_id:
             await self._delete_session_id(skey)
             new_sid = await self._initialize_mcp_http_session(upstream, auth_headers)
             if new_sid:
@@ -538,9 +530,7 @@ class UpstreamClientManager:
         if upstream.openapi_spec is not None:
             spec = upstream.openapi_spec
         elif upstream.openapi_spec_url:
-            resp = await self._request(
-                "GET", upstream.openapi_spec_url, headers=auth_headers or {}
-            )
+            resp = await self._request("GET", upstream.openapi_spec_url, headers=auth_headers or {})
             resp.raise_for_status()
             spec = yaml.safe_load(resp.text)
         else:
@@ -764,13 +754,9 @@ def build_agent_onboarding_prompt(
             f"url={upstream.url or upstream.command or 'inline'}"
         )
     if security_schemes:
-        context_lines.append(
-            f"- Detected OpenAPI securitySchemes: {json.dumps(security_schemes)}"
-        )
+        context_lines.append(f"- Detected OpenAPI securitySchemes: {json.dumps(security_schemes)}")
     if tools:
-        ops_preview = ", ".join(
-            f"{t.name}{'[MUTATING]' if t.mutating else ''}" for t in tools[:25]
-        )
+        ops_preview = ", ".join(f"{t.name}{'[MUTATING]' if t.mutating else ''}" for t in tools[:25])
         suffix = f" (+{len(tools) - 25} more)" if len(tools) > 25 else ""
         context_lines.append(f"- Discovered operations ({len(tools)}): {ops_preview}{suffix}")
     if checklist:

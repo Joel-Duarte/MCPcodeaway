@@ -132,8 +132,7 @@ async def test_oauth_discovery_and_dev_token_endpoints() -> None:
         assert asm.status_code == 200
         assert asm.json()["jwks_uri"] == "http://127.0.0.1:8000/dev/oidc/jwks"
         assert (
-            "urn:ietf:params:oauth:grant-type:token-exchange"
-            in asm.json()["grant_types_supported"]
+            "urn:ietf:params:oauth:grant-type:token-exchange" in asm.json()["grant_types_supported"]
         )
 
         minted = await client.post("/dev/auth/token", json={"persona": "support_agent"})
@@ -203,8 +202,9 @@ async def test_policy_evaluator_and_prod_restrictions(tmp_path) -> None:
     await store.init()
     await store.save_dynamic_upstream(
         "local_stdio",
-        UpstreamConfig(name="local_stdio", type="mcp_stdio", command="uvx", args=["mcp-server"])
-        .model_dump(),
+        UpstreamConfig(
+            name="local_stdio", type="mcp_stdio", command="uvx", args=["mcp-server"]
+        ).model_dump(),
     )
     prod_registry = UpstreamRegistry(prod_settings, store=store)
     await prod_registry.refresh()
@@ -226,9 +226,7 @@ async def test_delegated_token_exchanger_dev_cache_isolation_and_dialects() -> N
     fin_id = await validator.validate_token(dev_keys.issue_user_token(persona="finance_analyst"))
     aud_id = await validator.validate_token(dev_keys.issue_user_token(persona="readonly_auditor"))
     beta_id = await validator.validate_token(
-        dev_keys.issue_user_token(
-            persona="finance_analyst", overrides={"tenant_id": "tenant-beta"}
-        )
+        dev_keys.issue_user_token(persona="finance_analyst", overrides={"tenant_id": "tenant-beta"})
     )
 
     first = await exchanger.exchange(
@@ -324,9 +322,7 @@ async def test_mock_backends_enforce_delegated_audience_and_roles() -> None:
         await exchanger.exchange(fin_id, "api://snowflake-ledger", "snowflake.read")
     ).access_token
     eu_tok = (await exchanger.exchange(fin_id, "api://billing-eu", "billing.read")).access_token
-    sup_ops_tok = (
-        await exchanger.exchange(sup_id, "api://ops-ticketing", "ops.read")
-    ).access_token
+    sup_ops_tok = (await exchanger.exchange(sup_id, "api://ops-ticketing", "ops.read")).access_token
     eng_ops_tok = (
         await exchanger.exchange(ops_id, "api://ops-ticketing", "ops.write")
     ).access_token

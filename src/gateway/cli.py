@@ -126,9 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_p = sub.add_parser("add-mcp", help="Inspect or register a new MCP or OpenAPI upstream")
     add_p.add_argument("--name", required=True, help="Lowercase slug name (e.g. github_mcp)")
-    add_p.add_argument(
-        "--type", required=True, choices=["mcp_http", "mcp_stdio", "openapi"]
-    )
+    add_p.add_argument("--type", required=True, choices=["mcp_http", "mcp_stdio", "openapi"])
     add_p.add_argument("--url", default=None)
     add_p.add_argument("--openapi-spec-url", default=None)
     add_p.add_argument("--openapi-spec-file", default=None)

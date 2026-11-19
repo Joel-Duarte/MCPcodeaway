@@ -286,11 +286,7 @@ def test_cli_add_mcp_exports_yaml(tmp_path, capsys) -> None:
         json.dumps(
             {
                 "openapi": "3.1.0",
-                "paths": {
-                    "/ping": {
-                        "get": {"operationId": "ping_service", "summary": "Ping"}
-                    }
-                },
+                "paths": {"/ping": {"get": {"operationId": "ping_service", "summary": "Ping"}}},
             }
         ),
         encoding="utf-8",

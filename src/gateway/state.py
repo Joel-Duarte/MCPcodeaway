@@ -416,9 +416,7 @@ class PostgresAuditStore:
 
     async def list_dynamic_upstreams(self) -> list[dict[str, Any]]:
         pool = await self._get_pool()
-        rows = await pool.fetch(
-            "SELECT config_json FROM dynamic_upstreams ORDER BY name ASC"
-        )
+        rows = await pool.fetch("SELECT config_json FROM dynamic_upstreams ORDER BY name ASC")
         return [self._decode_json(row["config_json"]) for row in rows]
 
     async def delete_dynamic_upstream(self, name: str) -> bool:

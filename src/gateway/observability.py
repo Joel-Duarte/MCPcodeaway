@@ -242,9 +242,7 @@ class MetricsRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._counters: dict[str, dict[tuple[tuple[str, str], ...], float]] = {}
-        self._histograms: dict[
-            str, dict[tuple[tuple[str, str], ...], dict[str, Any]]
-        ] = {}
+        self._histograms: dict[str, dict[tuple[tuple[str, str], ...], dict[str, Any]]] = {}
 
     @staticmethod
     def _normalize_labels(labels: dict[str, Any] | None) -> tuple[tuple[str, str], ...]:

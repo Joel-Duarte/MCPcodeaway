@@ -27,9 +27,7 @@ _TRACER = trace.get_tracer("mcpcodeaway.auth")
 class AuthError(Exception):
     """Authentication or authorization error mapped cleanly to HTTP responses."""
 
-    def __init__(
-        self, status_code: int, detail: str, www_authenticate: str | None = None
-    ) -> None:
+    def __init__(self, status_code: int, detail: str, www_authenticate: str | None = None) -> None:
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
@@ -434,9 +432,7 @@ class PolicyEvaluator:
         if self.settings.app_env == "prod" and self.settings.read_only_prod:
             return False, "Mutating tools are blocked in read-only prod environment"
 
-        has_write_role = any(
-            role == "admin" or role.endswith("_writer") for role in identity.roles
-        )
+        has_write_role = any(role == "admin" or role.endswith("_writer") for role in identity.roles)
         has_write_scope = any(
             scope == "mcp.write" or scope.endswith(".write") for scope in identity.scopes
         )

@@ -86,10 +86,7 @@ def score_reconciliation_answer(text: str) -> bool:
     """Verify final answer reports both expected variance pairs (CUST-1003/+450, CUST-1024/-320)."""
     cleaned = _strip_think(text)
     return (
-        "CUST-1003" in cleaned
-        and "450" in cleaned
-        and "CUST-1024" in cleaned
-        and "-320" in cleaned
+        "CUST-1003" in cleaned and "450" in cleaned and "CUST-1024" in cleaned and "-320" in cleaned
     )
 
 
@@ -888,9 +885,7 @@ def _print_report(result: dict[str, Any]) -> None:
         "| Model | Task | Extra | Mode | Init->Final | Turns | "
         "Total Tok | Time (ms) | Retries | Grounded | Correct |"
     )
-    print(
-        "| :--- | :--- | ---: | :--- | :---: | ---: | ---: | ---: | ---: | :---: | :---: |"
-    )
+    print("| :--- | :--- | ---: | :--- | :---: | ---: | ---: | ---: | ---: | :---: | :---: |")
     for r in result["runs"]:
         init_cnt = r["exposed_tool_count"]
         final_cnt = r.get("final_tool_count", init_cnt)

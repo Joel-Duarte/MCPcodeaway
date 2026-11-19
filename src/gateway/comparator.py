@@ -36,9 +36,7 @@ def audit_catalog_comparison(
     if candidate_name is not None and candidate_tools is not None:
         by_server[candidate_name] = list(candidate_tools)
 
-    all_tools: list[DiscoveredTool] = [
-        tool for tools in by_server.values() for tool in tools
-    ]
+    all_tools: list[DiscoveredTool] = [tool for tools in by_server.values() for tool in tools]
 
     classic_defs = [to_mcp_tool_definition(tool) for tool in all_tools]
     classic_json = json.dumps(classic_defs, separators=(",", ":"))
@@ -73,9 +71,7 @@ def audit_catalog_comparison(
     stubs_text = "\n".join(render_python_stub(tool) for tool in all_tools)
     all_stubs_tokens = estimate_tokens(stubs_text) if all_tools else 0
     typical_search_tokens = (
-        estimate_tokens("\n".join(render_python_stub(t) for t in all_tools[:5]))
-        if all_tools
-        else 0
+        estimate_tokens("\n".join(render_python_stub(t) for t in all_tools[:5])) if all_tools else 0
     )
 
     reduction_pct = (
@@ -292,9 +288,7 @@ async def run_side_by_side_comparison(
                     classic_exchanges += 1
 
     classic_round_trips = len(classic_calls) + 1  # N tool calls + final LLM synthesis turn
-    classic_payload_tokens = estimate_tokens(
-        [r.get("result") for r in classic_runs]
-    )
+    classic_payload_tokens = estimate_tokens([r.get("result") for r in classic_runs])
     classic_total_tokens = classic_schema_tokens * classic_round_trips + classic_payload_tokens
 
     search_res = runtime.catalog.search_tools(
@@ -311,9 +305,7 @@ async def run_side_by_side_comparison(
 
     codemode_round_trips = 2  # search_tools + execute_code
     codemode_payload_tokens = search_tokens + estimate_tokens(cm_exec.get("result"))
-    codemode_total_tokens = (
-        codemode_schema_tokens * codemode_round_trips + codemode_payload_tokens
-    )
+    codemode_total_tokens = codemode_schema_tokens * codemode_round_trips + codemode_payload_tokens
 
     token_savings_pct = (
         round((1.0 - (codemode_total_tokens / classic_total_tokens)) * 100.0, 2)

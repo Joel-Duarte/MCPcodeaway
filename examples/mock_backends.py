@@ -225,9 +225,7 @@ class _DownstreamTokenVerifier:
     async def _resolve_key(self, token: str) -> Any:
         if self._public_key_pem is not None:
             return (
-                self._public_key_pem()
-                if callable(self._public_key_pem)
-                else self._public_key_pem
+                self._public_key_pem() if callable(self._public_key_pem) else self._public_key_pem
             )
         header = jwt.get_unverified_header(token)
         kid = header.get("kid")

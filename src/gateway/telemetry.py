@@ -54,9 +54,7 @@ def configure_telemetry(
         and id(exporter) not in _ATTACHED_EXPORTERS
     ):
         processor = (
-            SimpleSpanProcessor(exporter)
-            if use_simple_processor
-            else BatchSpanProcessor(exporter)
+            SimpleSpanProcessor(exporter) if use_simple_processor else BatchSpanProcessor(exporter)
         )
         active_provider.add_span_processor(processor)
         _ATTACHED_EXPORTERS.add(id(exporter))
@@ -234,8 +232,7 @@ class TelemetryRecorder:
             raw_b = int(run.get("raw_upstream_bytes", 0))
             ret_b = int(run.get("returned_bytes", 0))
             ret_tok = int(
-                run.get("returned_tokens")
-                or (max(1, math.ceil(ret_b / 4)) if ret_b else 0)
+                run.get("returned_tokens") or (max(1, math.ceil(ret_b / 4)) if ret_b else 0)
             )
             raw_tok = max(1, math.ceil(raw_b / 4)) if raw_b else 0
 
@@ -371,10 +368,14 @@ class TelemetryRecorder:
     ) -> dict[str, Any]:
         """Aggregate usage, USD cost, mode decisions, and A/B experiments by group & user."""
         pricing_table = model_pricing or {"default": {"input": 3.0, "output": 15.0}}
-        active_price = pricing_table.get(model_name) or pricing_table.get("default") or {
-            "input": 3.0,
-            "output": 15.0,
-        }
+        active_price = (
+            pricing_table.get(model_name)
+            or pricing_table.get("default")
+            or {
+                "input": 3.0,
+                "output": 15.0,
+            }
+        )
         in_rate = float(active_price.get("input", 3.0))
         out_rate = float(active_price.get("output", 15.0))
 

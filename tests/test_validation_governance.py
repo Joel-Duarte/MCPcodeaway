@@ -62,9 +62,7 @@ async def test_validation_hints_redaction_and_tenant_isolation(tmp_path) -> None
                     "method": "tools/call",
                     "params": {
                         "name": "execute_code",
-                        "arguments": {
-                            "code": "await snowflake_ledger__get_customer_balance()"
-                        },
+                        "arguments": {"code": "await snowflake_ledger__get_customer_balance()"},
                     },
                 },
             )

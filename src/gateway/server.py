@@ -128,6 +128,7 @@ def _execute_code_with_stubs(
     exec_copy["description"] = f"{EXECUTE_CODE_DEF['description']}\n\n{header_note}\n{stubs}{extra}"
     return exec_copy
 
+
 LIST_SERVERS_DEF: dict[str, Any] = {
     "name": "list_servers",
     "description": (
@@ -272,9 +273,7 @@ class GatewayRuntime:
         self.admin_sessions = AdminSessionManager(self.settings)
         self._local_catalog_epoch: str = "0"
         self.catalog = ToolCatalog()
-        self.discovery_engine = DiscoveryEngine(
-            self.settings, http_client=discovery_http_client
-        )
+        self.discovery_engine = DiscoveryEngine(self.settings, http_client=discovery_http_client)
         self.dispatcher = HostDispatcher(
             settings=self.settings,
             policy=self.policy,
@@ -309,9 +308,7 @@ class GatewayRuntime:
         if self.dev_keys is None:
             return None
         tenant = (
-            self.settings.allowed_tenants[0]
-            if self.settings.allowed_tenants
-            else "tenant-acme-dev"
+            self.settings.allowed_tenants[0] if self.settings.allowed_tenants else "tenant-acme-dev"
         )
         token = self.dev_keys.issue_user_token(
             overrides={
@@ -609,9 +606,7 @@ class GatewayRuntime:
                     accessible = self.catalog.list_accessible_tools(
                         identity, self.policy, self.registry, allowed_servers=effective_ceiling
                     )
-                    direct_mutating = [
-                        to_mcp_tool_definition(t) for t in accessible if t.mutating
-                    ]
+                    direct_mutating = [to_mcp_tool_definition(t) for t in accessible if t.mutating]
                     tools = (
                         [exec_copy, *direct_mutating]
                         if eff_disc == "upfront"
@@ -1051,19 +1046,22 @@ def _resolve_execution_and_discovery(
     base_mode = _resolve_mode(settings.gateway_mode, query_mode, header_mode)
     base_exec, base_disc = _MODE_TO_AXES[base_mode]
 
-    raw_exec = query_execution or header_execution or (
-        settings.execution_mode if not has_mode_override else None
+    raw_exec = (
+        query_execution
+        or header_execution
+        or (settings.execution_mode if not has_mode_override else None)
     )
     if raw_exec is not None and raw_exec not in _VALID_EXECUTION:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Invalid execution mode '{raw_exec}'. "
-                f"Expected one of: {sorted(_VALID_EXECUTION)}"
+                f"Invalid execution mode '{raw_exec}'. Expected one of: {sorted(_VALID_EXECUTION)}"
             ),
         )
-    raw_disc = query_discovery_mode or header_discovery_mode or (
-        settings.discovery_mode if not has_mode_override else None
+    raw_disc = (
+        query_discovery_mode
+        or header_discovery_mode
+        or (settings.discovery_mode if not has_mode_override else None)
     )
     if raw_disc is not None and raw_disc not in _VALID_DISCOVERY_MODES:
         raise HTTPException(
@@ -1076,8 +1074,11 @@ def _resolve_execution_and_discovery(
 
     eff_exec: ExecutionMode = raw_exec or base_exec  # type: ignore[assignment]
     eff_disc: DiscoveryMode = raw_disc or base_disc  # type: ignore[assignment]
-    if x_intent and x_intent.strip() and raw_disc != "upfront" and not (
-        base_mode == "traditional" and raw_disc is None
+    if (
+        x_intent
+        and x_intent.strip()
+        and raw_disc != "upfront"
+        and not (base_mode == "traditional" and raw_disc is None)
     ):
         eff_disc = "x_intent"
     eff_mode = (
@@ -1098,8 +1099,7 @@ def _resolve_discovery(
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Invalid discovery backend '{chosen}'. "
-                f"Expected one of: {sorted(_VALID_DISCOVERY)}"
+                f"Invalid discovery backend '{chosen}'. Expected one of: {sorted(_VALID_DISCOVERY)}"
             ),
         )
     return chosen  # type: ignore[return-value]
@@ -1542,9 +1542,7 @@ def create_gateway_app(
                         _jsonrpc_ok(
                             req_id,
                             {
-                                "content": [
-                                    {"type": "text", "text": json.dumps(res, default=str)}
-                                ],
+                                "content": [{"type": "text", "text": json.dumps(res, default=str)}],
                                 "structuredContent": res,
                                 "isError": not res["ok"],
                             },
@@ -1709,9 +1707,7 @@ def create_gateway_app(
                     "gateway_auth_denials_total",
                     labels={"surface": "audit", "status_code": 403},
                 )
-                raise HTTPException(
-                    status_code=403, detail="Cross-tenant audit run access denied."
-                )
+                raise HTTPException(status_code=403, detail="Cross-tenant audit run access denied.")
             return run
 
         @app.get("/audit/summary")
@@ -1943,15 +1939,19 @@ def create_gateway_app(
                         )
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
-            eval_id = caller or runtime._dev_discovery_identity() or CallerIdentity(
-                sub="admin-ab-evaluator",
-                tenant_id=(
-                    runtime.settings.allowed_tenants[0]
-                    if runtime.settings.allowed_tenants
-                    else "tenant-acme-dev"
-                ),
-                roles=["gateway_admin", "finance_analyst", "ops_engineer"],
-                groups=["platform"],
+            eval_id = (
+                caller
+                or runtime._dev_discovery_identity()
+                or CallerIdentity(
+                    sub="admin-ab-evaluator",
+                    tenant_id=(
+                        runtime.settings.allowed_tenants[0]
+                        if runtime.settings.allowed_tenants
+                        else "tenant-acme-dev"
+                    ),
+                    roles=["gateway_admin", "finance_analyst", "ops_engineer"],
+                    groups=["platform"],
+                )
             )
             try:
                 return await run_onboarding_ab_test(runtime, eval_id, body)
@@ -1991,9 +1991,7 @@ def create_gateway_app(
             )
 
             inspection, audit = await _inspect_candidate(cfg, authorization)
-            await runtime.store.save_dynamic_upstream(
-                cfg.name, cfg.model_dump(exclude_none=True)
-            )
+            await runtime.store.save_dynamic_upstream(cfg.name, cfg.model_dump(exclude_none=True))
             await runtime.refresh_catalog()
             await runtime.bump_catalog_epoch()
             return {
@@ -2020,9 +2018,7 @@ def create_gateway_app(
             )
             deleted = await runtime.store.delete_dynamic_upstream(name)
             if not deleted:
-                raise HTTPException(
-                    status_code=404, detail=f"Dynamic upstream '{name}' not found"
-                )
+                raise HTTPException(status_code=404, detail=f"Dynamic upstream '{name}' not found")
             await runtime.refresh_catalog()
             await runtime.bump_catalog_epoch()
             return {
@@ -2045,9 +2041,7 @@ def create_gateway_app(
                     raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
             elif runtime.settings.auth_mode == "dev" and runtime.dev_keys is not None:
                 if body.persona not in DEV_PERSONAS:
-                    raise HTTPException(
-                        status_code=400, detail=f"Unknown persona '{body.persona}'"
-                    )
+                    raise HTTPException(status_code=400, detail=f"Unknown persona '{body.persona}'")
                 token = runtime.dev_keys.issue_user_token(persona=body.persona)
                 identity = await runtime.validator.validate_token(token)
             else:

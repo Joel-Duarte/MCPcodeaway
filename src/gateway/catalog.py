@@ -117,7 +117,7 @@ def render_python_stub(tool: DiscoveredTool) -> str:
     if tool.output_schema:
         shape = _format_schema_shape(tool.output_schema)
         return (
-            f'async def {tool.qualified_name}({sig}) -> {ret_type}:\n'
+            f"async def {tool.qualified_name}({sig}) -> {ret_type}:\n"
             f'    """{doc}{tag}\n'
             f'    Returns: {shape}"""'
         )
@@ -167,9 +167,7 @@ class ToolCatalog:
         digest = compute_schema_digest(tools)
         self._tools_by_server[upstream.name] = list(tools)
         self._digests_by_server[upstream.name] = digest
-        self._drift_warnings = [
-            w for w in self._drift_warnings if w["server"] != upstream.name
-        ]
+        self._drift_warnings = [w for w in self._drift_warnings if w["server"] != upstream.name]
         if upstream.pinned_schema_digest and upstream.pinned_schema_digest != digest:
             self._drift_warnings.append(
                 {
@@ -259,9 +257,7 @@ class ToolCatalog:
                     "tool_count": len(permitted_tools),
                     "mutating_count": sum(1 for t in permitted_tools if t.mutating),
                     "sample_tools": [t.name for t in permitted_tools[:5]],
-                    "summary": (
-                        f"{upstream.name} ({upstream.type}, {len(permitted_tools)} tools)"
-                    ),
+                    "summary": (f"{upstream.name} ({upstream.type}, {len(permitted_tools)} tools)"),
                 }
             )
         return servers
@@ -370,9 +366,7 @@ class ToolCatalog:
                     f"{tool.qualified_name} {tool.server} {tool.name} {tool.description}".lower()
                 )
                 score = sum(
-                    (3 if term in tool.name.lower() else 1)
-                    for term in terms
-                    if term in haystack
+                    (3 if term in tool.name.lower() else 1) for term in terms if term in haystack
                 )
                 if score > 0:
                     scored.append((score, tool))

@@ -155,7 +155,7 @@ async def test_list_servers_ceiling_and_execute_code_scoping(tmp_path) -> None:
                     "arguments": {
                         "servers": ["snowflake_ledger"],
                         "code": (
-                            'bal = await snowflake_ledger__get_customer_balance('
+                            "bal = await snowflake_ledger__get_customer_balance("
                             'customer_id="CUST-1003")\n'
                             "return bal"
                         ),
@@ -261,9 +261,7 @@ async def test_bm25_embedding_cache_system1_and_fallback(tmp_path) -> None:
             if system1_fail_mode["fail"]:
                 return httpx.Response(
                     400,
-                    json={
-                        "error": {"code": "jitLoadFailed", "message": "Failed to load model"}
-                    },
+                    json={"error": {"code": "jitLoadFailed", "message": "Failed to load model"}},
                 )
             questions = body["questions"]
             answers: dict[str, Any] = {}

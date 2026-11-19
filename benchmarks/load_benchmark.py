@@ -149,9 +149,7 @@ async def run_load_benchmark(
                 "success_rate_pct": round(((num_users - errors) / num_users) * 100.0, 2),
                 "delegated_subcalls": subcall_total,
                 "token_cache_hits": cache_hits,
-                "token_cache_hit_rate_pct": round(
-                    (cache_hits / subcall_total) * 100.0, 2
-                )
+                "token_cache_hit_rate_pct": round((cache_hits / subcall_total) * 100.0, 2)
                 if subcall_total
                 else 0.0,
             }

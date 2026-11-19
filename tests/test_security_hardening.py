@@ -118,9 +118,7 @@ async def test_control_plane_admin_rbac_enforced(tmp_path: Path) -> None:
         assert prompt_res.status_code == 200
         assert "prompt" in prompt_res.json()
 
-        inspected = await gw.post(
-            "/admin/upstreams/inspect", headers=admin_headers, json=candidate
-        )
+        inspected = await gw.post("/admin/upstreams/inspect", headers=admin_headers, json=candidate)
         assert inspected.status_code == 200
         added = await gw.post("/admin/upstreams", headers=admin_headers, json=candidate)
         assert added.status_code == 200
@@ -237,9 +235,7 @@ async def test_inspect_upstream_blocks_ssrf_before_outbound_http(tmp_path: Path)
         return httpx.Response(200, json={})
 
     spy_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    dev_keys, _, transport = _make_app(
-        tmp_path, require_admin_auth=True, http_client=spy_client
-    )
+    dev_keys, _, transport = _make_app(tmp_path, require_admin_auth=True, http_client=spy_client)
     admin_tok = dev_keys.issue_user_token(persona="gateway_admin")
 
     async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as gw:
@@ -340,7 +336,7 @@ def test_docker_compose_scaled_profile_wires_shared_secrets() -> None:
 
     assert "GATEWAY_SANDBOX_WORKER_SECRET" in worker_env
     assert "GATEWAY_SANDBOX_WORKER_SECRET" in scaled_env
-    assert worker_env["GATEWAY_SANDBOX_WORKER_SECRET"] == scaled_env[
-        "GATEWAY_SANDBOX_WORKER_SECRET"
-    ]
+    assert (
+        worker_env["GATEWAY_SANDBOX_WORKER_SECRET"] == scaled_env["GATEWAY_SANDBOX_WORKER_SECRET"]
+    )
     assert "GATEWAY_PROVENANCE_SIGNING_SECRET" in scaled_env

@@ -208,6 +208,7 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(tmp_path) ->
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://gw"
         ) as gw:
+
             async def _run_user(idx: int) -> tuple[str, str, dict[str, Any]]:
                 tenant = "tenant-alpha" if idx % 2 == 0 else "tenant-beta"
                 sub = f"concurrent-user-{idx:02d}"
@@ -250,10 +251,7 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(tmp_path) ->
                     "params": {
                         "name": "execute_code",
                         "arguments": {
-                            "code": (
-                                "for _ in range(25):\n"
-                                "    await whoami_srv__whoami()\n"
-                            )
+                            "code": ("for _ in range(25):\n    await whoami_srv__whoami()\n")
                         },
                     },
                 },
@@ -284,9 +282,7 @@ async def test_redis_cache_backend_with_fake_client() -> None:
 
         async def zremrangebyscore(self, key: str, min_score: float, max_score: float) -> None:
             bucket = self.zsets.get(key, {})
-            self.zsets[key] = {
-                m: s for m, s in bucket.items() if not (min_score <= s <= max_score)
-            }
+            self.zsets[key] = {m: s for m, s in bucket.items() if not (min_score <= s <= max_score)}
 
         async def zadd(self, key: str, mapping: dict[str, float]) -> None:
             self.zsets.setdefault(key, {}).update(mapping)

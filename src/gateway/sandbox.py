@@ -156,9 +156,7 @@ class RemoteMontyWorkerBackend:
     def __init__(self, worker_ws_url: str, *, worker_secret: str = "") -> None:
         self.worker_ws_url = worker_ws_url
         self.worker_secret = worker_secret
-        self._primary_secret = next(
-            (s.strip() for s in worker_secret.split(",") if s.strip()), ""
-        )
+        self._primary_secret = next((s.strip() for s in worker_secret.split(",") if s.strip()), "")
 
     async def close(self) -> None:
         return None

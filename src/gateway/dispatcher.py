@@ -165,8 +165,7 @@ def summarize_value_shape(value: Any, *, depth: int = 0) -> Any:
         return type(value).__name__
     if isinstance(value, dict):
         return {
-            str(k): summarize_value_shape(v, depth=depth + 1)
-            for k, v in list(value.items())[:15]
+            str(k): summarize_value_shape(v, depth=depth + 1) for k, v in list(value.items())[:15]
         }
     if isinstance(value, list | tuple):
         return [summarize_value_shape(value[0], depth=depth + 1)] if value else []
@@ -217,9 +216,7 @@ def build_provenance_envelope(
     return body
 
 
-def verify_provenance_envelope(
-    envelope: dict[str, Any], signing_secrets: str | list[str]
-) -> bool:
+def verify_provenance_envelope(envelope: dict[str, Any], signing_secrets: str | list[str]) -> bool:
     """Verify a provenance envelope HMAC against one or more rotated keys."""
     presented = str(envelope.get("provenance_hmac") or "")
     if not presented:
@@ -354,8 +351,7 @@ def _apply_post_call_abac_with_count(
         elif isinstance(current, dict) and field in current:
             if str(current[field]) not in allowed_vals:
                 raise PermissionError(
-                    f"ABAC row policy denied access to record with "
-                    f"{field}='{current[field]}'"
+                    f"ABAC row policy denied access to record with {field}='{current[field]}'"
                 )
     return current, dropped
 
@@ -408,9 +404,7 @@ class HostDispatcher:
         secret_env = upstream.secret_env_var or ""
         secret_val = os.getenv(secret_env, "") if secret_env else ""
         if not secret_val:
-            raise RuntimeError(
-                f"Upstream '{upstream.name}' requires secret env var '{secret_env}'"
-            )
+            raise RuntimeError(f"Upstream '{upstream.name}' requires secret env var '{secret_env}'")
         if upstream.auth_type == "bearer_secret":
             return {"Authorization": f"Bearer {secret_val}"}, False, None
         if upstream.auth_type == "api_key":

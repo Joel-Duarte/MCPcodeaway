@@ -388,8 +388,7 @@ async def run_discovery_benchmark(
 def _print_table(report: dict[str, Any]) -> None:
     print("\n=== Discovery Accuracy & Latency: Regular vs. Embedding vs. System 1 ===")
     print(
-        "| Tools | Backend | Recall@5 | Direct | Semantic | MRR | Srv Acc | "
-        "Fallback % | Mean ms |"
+        "| Tools | Backend | Recall@5 | Direct | Semantic | MRR | Srv Acc | Fallback % | Mean ms |"
     )
     print("| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for r in report["results"]:

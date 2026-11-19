@@ -451,9 +451,7 @@ async def test_typed_output_schemas_and_keyerror_shape_hints(tmp_path) -> None:
                 "content": [
                     {
                         "type": "text",
-                        "text": json.dumps(
-                            {"widget_records": [{"sku": "SKU-1", "stock_qty": 9}]}
-                        ),
+                        "text": json.dumps({"widget_records": [{"sku": "SKU-1", "stock_qty": 9}]}),
                     }
                 ]
             },
@@ -522,10 +520,7 @@ async def test_typed_output_schemas_and_keyerror_shape_hints(tmp_path) -> None:
                     {
                         "name": "execute_code",
                         "arguments": {
-                            "code": (
-                                "w = await widget_api__fetch_widget()\n"
-                                "w['wrong_key']"
-                            )
+                            "code": ("w = await widget_api__fetch_widget()\nw['wrong_key']")
                         },
                     },
                     query="mode=codemode",
@@ -542,4 +537,3 @@ async def test_typed_output_schemas_and_keyerror_shape_hints(tmp_path) -> None:
                 assert "Observed return shapes from tools called in this run" in err_sc["error"]
     finally:
         await backend_client.aclose()
-

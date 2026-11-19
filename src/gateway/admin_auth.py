@@ -244,9 +244,7 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
         _require_admin(identity)
 
         session_tok = runtime.admin_sessions.create_session_token(identity)
-        redirect = RedirectResponse(
-            url=_safe_next_url(pkce_data.get("next_url")), status_code=302
-        )
+        redirect = RedirectResponse(url=_safe_next_url(pkce_data.get("next_url")), status_code=302)
         _set_cookie(redirect, session_tok)
         return redirect
 
@@ -274,9 +272,7 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
             if runtime.dev_keys is None:
                 raise HTTPException(status_code=500, detail="Dev key manager unavailable")
             if body.persona not in DEV_PERSONAS:
-                raise HTTPException(
-                    status_code=400, detail=f"Unknown persona '{body.persona}'"
-                )
+                raise HTTPException(status_code=400, detail=f"Unknown persona '{body.persona}'")
             token = runtime.dev_keys.issue_user_token(persona=body.persona)
             try:
                 identity = await runtime.validator.validate_token(token)

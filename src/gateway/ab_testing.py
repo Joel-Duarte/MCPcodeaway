@@ -378,20 +378,14 @@ def _auto_readonly_replay_plan(
     upstream: UpstreamConfig, tools: list[DiscoveredTool]
 ) -> tuple[list[dict[str, Any]], str]:
     """Pick safe read-only no-required-arg tools for zero-config onboarding replay."""
-    safe_tools = [
-        t
-        for t in tools
-        if not t.mutating and not (t.input_schema or {}).get("required")
-    ]
+    safe_tools = [t for t in tools if not t.mutating and not (t.input_schema or {}).get("required")]
     chosen = safe_tools[:2] if safe_tools else tools[:1]
     classic_calls = [{"tool": t.qualified_name, "arguments": {}} for t in chosen]
     if not chosen:
         return [], "{'empty': True}"
     lines = ["import asyncio"]
     lines.append(
-        "res = await asyncio.gather("
-        + ", ".join(f"{t.qualified_name}()" for t in chosen)
-        + ")"
+        "res = await asyncio.gather(" + ", ".join(f"{t.qualified_name}()" for t in chosen) + ")"
     )
     lines.append("{'calls': len(res)}")
     return classic_calls, "\n".join(lines)
@@ -479,18 +473,14 @@ async def run_onboarding_ab_test(
         if body.dry_run:
             est_payload = max(body.sample_payload_bytes, max(1, tool_count) * 512)
             avg_bytes = float(est_payload)
-            cm_stub_tok = estimate_tokens(
-                "\n".join(render_python_stub(t) for t in tools[:5])
-            )
+            cm_stub_tok = estimate_tokens("\n".join(render_python_stub(t) for t in tools[:5]))
             cl_tot = max(classic_schema_tokens * 2 + round(est_payload / 4), 1)
             cm_tot = 360 * 2 + cm_stub_tok + 120
             replay_ab = {
                 "mode": "dry_run_estimate",
                 "classic": {"total_context_tokens": cl_tot, "payload_bytes": est_payload},
                 "code_mode": {"total_context_tokens": cm_tot, "payload_bytes": 480},
-                "deltas": {
-                    "context_token_savings_pct": round((1 - cm_tot / cl_tot) * 100, 2)
-                },
+                "deltas": {"context_token_savings_pct": round((1 - cm_tot / cl_tot) * 100, 2)},
                 "winner": "code_mode" if cm_tot <= cl_tot else "classic_or_tie",
             }
         elif classic_calls and codemode_code:
