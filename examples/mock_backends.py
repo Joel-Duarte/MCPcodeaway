@@ -742,9 +742,24 @@ def create_mock_backends_app(
             op_id="list_crm_accounts",
             path="/accounts",
             rows=[
-                {"account_id": "ACC-101", "name": "Acme Retail EU", "arr_usd": 148000, "tier": "enterprise"},
-                {"account_id": "ACC-102", "name": "Northwind Logistics", "arr_usd": 92000, "tier": "growth"},
-                {"account_id": "ACC-103", "name": "Contoso FinTech", "arr_usd": 215000, "tier": "enterprise"},
+                {
+                    "account_id": "ACC-101",
+                    "name": "Acme Retail EU",
+                    "arr_usd": 148000,
+                    "tier": "enterprise",
+                },
+                {
+                    "account_id": "ACC-102",
+                    "name": "Northwind Logistics",
+                    "arr_usd": 92000,
+                    "tier": "growth",
+                },
+                {
+                    "account_id": "ACC-103",
+                    "name": "Contoso FinTech",
+                    "arr_usd": 215000,
+                    "tier": "enterprise",
+                },
             ],
         ),
     )
@@ -770,8 +785,18 @@ def create_mock_backends_app(
             op_id="list_ci_deployments",
             path="/deployments",
             rows=[
-                {"deploy_id": "DEP-901", "service": "gateway-prod", "status": "healthy", "sha": "ca43384"},
-                {"deploy_id": "DEP-902", "service": "billing-eu", "status": "healthy", "sha": "9b4c734"},
+                {
+                    "deploy_id": "DEP-901",
+                    "service": "gateway-prod",
+                    "status": "healthy",
+                    "sha": "ca43384",
+                },
+                {
+                    "deploy_id": "DEP-902",
+                    "service": "billing-eu",
+                    "status": "healthy",
+                    "sha": "9b4c734",
+                },
             ],
         ),
     )
