@@ -42,14 +42,15 @@ async function fetchOptimization() {
   errorMessage.value = "";
   try {
     const q = new URLSearchParams({ model: selectedModel.value });
-    const [a, u] = await Promise.all([
-      apiFetch<AnalyticsResponse>(`/audit/analytics?${q.toString()}`),
-      apiFetch<{ upstreams: { name: string; preferred_mode: string; enabled: boolean }[] }>(
-        "/admin/upstreams?page_size=200"
-      ),
-    ]);
-    analytics.value = a;
-    upstreamsList.value = u.upstreams || [];
+    analytics.value = await apiFetch<AnalyticsResponse>(`/audit/analytics?${q.toString()}`);
+    try {
+      const u = await apiFetch<{
+        upstreams: { name: string; preferred_mode: string; enabled: boolean }[];
+      }>("/admin/upstreams?page_size=200", {}, true);
+      upstreamsList.value = u.upstreams || [];
+    } catch {
+      upstreamsList.value = [];
+    }
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
   } finally {

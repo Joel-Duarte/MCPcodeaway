@@ -372,13 +372,13 @@ async function pruneAuditRuns() {
               {{ pricing?.billing_note }} Edit any default or custom model rate inline.
             </p>
           </div>
-          <div class="flex items-center gap-2">
+          <div class="flex flex-wrap items-center gap-2">
             <input
               v-model="modelSearch"
               type="search"
               placeholder="Search models..."
               aria-label="Search model pricing catalog"
-              class="w-56 rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-xs text-[#09090B]"
+              class="w-full sm:w-56 rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-xs text-[#09090B]"
             />
             <span class="text-xs text-[#71717A] tabular-nums">{{ allModelEntries.length }} models</span>
           </div>

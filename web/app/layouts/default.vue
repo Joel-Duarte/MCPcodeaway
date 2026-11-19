@@ -167,9 +167,35 @@ const adminRoleText = computed(() => {
                     <span>{{ item.label }}</span>
                   </NuxtLink>
                 </nav>
-                <div class="border-t border-[#E4E4E7] p-4 text-xs text-[#52525B]">
+                <div class="border-t border-[#E4E4E7] p-4 text-xs text-[#52525B] space-y-2">
                   <div>Profile: <span class="font-medium text-[#09090B]">{{ runtimeMeta.profile }}</span></div>
-                  <div class="mt-1">Catalog: <span class="font-mono-data text-[#09090B]">{{ runtimeMeta.catalog_version }}</span></div>
+                  <div>Catalog: <span class="font-mono-data text-[#09090B]">{{ runtimeMeta.catalog_version }}</span></div>
+                  <div v-if="demoStatus.enabled" class="pt-1 flex flex-wrap items-center gap-1.5">
+                    <Button
+                      v-if="!demoStatus.running"
+                      class="px-2 py-1 text-xs"
+                      :disabled="demoBusy"
+                      @click="startTraffic()"
+                    >
+                      Start Demo Traffic
+                    </Button>
+                    <Button
+                      v-else
+                      data-variant="danger"
+                      class="px-2 py-1 text-xs"
+                      :disabled="demoBusy"
+                      @click="stopTraffic"
+                    >
+                      Stop Demo Traffic
+                    </Button>
+                    <Button
+                      class="px-2 py-1 text-xs"
+                      :disabled="demoBusy"
+                      @click="runBurst(8)"
+                    >
+                      Burst +8
+                    </Button>
+                  </div>
                 </div>
               </DrawerContent>
             </Drawer>

@@ -102,19 +102,23 @@ let refreshDebounce: ReturnType<typeof setTimeout> | null = null;
 async function fetchOverview() {
   errorMessage.value = "";
   try {
-    const [rt, val, ana] = await Promise.all([
-      apiFetch<RuntimeTelemetryResponse>("/admin/telemetry/runtime"),
+    const [val, ana] = await Promise.all([
       apiFetch<AuditValueResponse>("/audit/value"),
       apiFetch<AnalyticsSummary>("/audit/analytics"),
     ]);
-    runtimeData.value = rt;
     valueData.value = val;
     analyticsData.value = ana;
-    setRuntimeMeta({
-      profile: rt.gateway.profile,
-      app_env: rt.gateway.app_env,
-      catalog_version: rt.gateway.catalog_version,
-    });
+    try {
+      const rt = await apiFetch<RuntimeTelemetryResponse>("/admin/telemetry/runtime", {}, true);
+      runtimeData.value = rt;
+      setRuntimeMeta({
+        profile: rt.gateway.profile,
+        app_env: rt.gateway.app_env,
+        catalog_version: rt.gateway.catalog_version,
+      });
+    } catch {
+      // Keep audit/value & analytics rendered when /admin/telemetry/runtime is disabled
+    }
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
   } finally {

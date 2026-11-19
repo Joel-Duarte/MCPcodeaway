@@ -57,10 +57,9 @@ async function fetchTraces() {
     const gq = groupFilter.value.trim()
       ? `?group=${encodeURIComponent(groupFilter.value.trim())}`
       : "";
-    const [r, a, rt] = await Promise.all([
+    const [r, a] = await Promise.all([
       apiFetch<{ runs: TraceRun[] }>("/audit/runs?limit=50"),
       apiFetch<{ timeline_by_group?: TimelineGroup[] }>(`/audit/analytics${gq}`),
-      apiFetch<RuntimeTelemetry>("/admin/telemetry/runtime"),
     ]);
     const allRuns = r.runs || [];
     const gf = groupFilter.value.trim().toLowerCase();
@@ -68,7 +67,11 @@ async function fetchTraces() {
       ? allRuns.filter((x) => (x.user_groups || []).some((g) => g.toLowerCase().includes(gf)))
       : allRuns;
     timelineGroups.value = a.timeline_by_group || [];
-    runtime.value = rt;
+    try {
+      runtime.value = await apiFetch<RuntimeTelemetry>("/admin/telemetry/runtime", {}, true);
+    } catch {
+      runtime.value = null;
+    }
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
   } finally {
@@ -125,7 +128,7 @@ function pct(part: number, total: number): string {
           type="search"
           placeholder="Filter group (e.g. finance)..."
           aria-label="Filter traces by group"
-          class="w-48 rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-xs text-[#09090B]"
+          class="w-full sm:w-48 rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-xs text-[#09090B]"
           @input="fetchTraces()"
         />
         <label class="flex items-center gap-2 rounded-md border border-[#E4E4E7] bg-white px-2.5 py-1.5 text-xs font-medium text-[#09090B] cursor-pointer">

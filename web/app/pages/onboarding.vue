@@ -46,7 +46,8 @@ interface AbTestResult {
 
 interface InspectResponse {
   inspection: {
-    upstream: string;
+    name?: string;
+    upstream?: string;
     type: string;
     tool_count: number;
     tools: {
@@ -76,7 +77,12 @@ const draftType = ref("openapi");
 const draftUrl = ref("http://localhost:8001");
 const draftSpecUrl = ref("http://localhost:8001/openapi.json");
 const draftAuthType = ref("none");
+const draftAudience = ref("");
+const draftScope = ref("");
+const draftSecretEnv = ref("");
+const draftApiKeyHeader = ref("X-API-Key");
 const draftRoles = ref("finance_analyst, ops_engineer, gateway_admin");
+const draftGroups = ref("");
 const draftStateful = ref(false);
 const draftPreferredMode = ref("auto");
 const draftAbEnabled = ref(false);
@@ -289,6 +295,10 @@ function buildUpstreamPayload() {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+  const groups = draftGroups.value
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
   const splitNum = Math.min(100, Math.max(0, Number.parseInt(draftAbSplitPct.value || "50", 10) || 50));
 
   let resolvedType = draftType.value;
@@ -315,7 +325,12 @@ function buildUpstreamPayload() {
     openapi_spec_url: specUrl,
     openapi_spec: inlineSpec,
     auth_type: draftAuthType.value,
+    downstream_audience: draftAudience.value.trim() || undefined,
+    downstream_scope: draftScope.value.trim() || undefined,
+    secret_env_var: draftSecretEnv.value.trim() || undefined,
+    api_key_header: draftApiKeyHeader.value.trim() || "X-API-Key",
     allowed_roles: roles,
+    allowed_groups: groups,
     stateful_session: draftStateful.value,
     preferred_mode: draftPreferredMode.value,
     enabled: true,
@@ -387,7 +402,11 @@ async function handleInspect() {
       body: buildUpstreamPayload(),
     });
     schemaVerified.value = true;
-    statusMessage.value = `Inspected '${inspectResult.value.inspection.upstream}' (${inspectResult.value.inspection.tool_count} tools). Step 2 unlocked.`;
+    const inspectedName =
+      inspectResult.value.inspection.name ||
+      inspectResult.value.inspection.upstream ||
+      draftName.value.trim();
+    statusMessage.value = `Inspected '${inspectedName}' (${inspectResult.value.inspection.tool_count} tools). Step 2 unlocked.`;
   } catch (err) {
     schemaVerified.value = false;
     errorMessage.value = extractErrorMessage(err);
@@ -463,10 +482,22 @@ function applyImportedJson() {
     if (typeof parsed.url === "string") draftUrl.value = parsed.url;
     if (typeof parsed.openapi_spec_url === "string") draftSpecUrl.value = parsed.openapi_spec_url;
     if (typeof parsed.auth_type === "string") draftAuthType.value = parsed.auth_type;
+    if (typeof parsed.downstream_audience === "string")
+      draftAudience.value = parsed.downstream_audience;
+    if (typeof parsed.downstream_scope === "string") draftScope.value = parsed.downstream_scope;
+    if (typeof parsed.secret_env_var === "string") draftSecretEnv.value = parsed.secret_env_var;
+    if (typeof parsed.api_key_header === "string") draftApiKeyHeader.value = parsed.api_key_header;
     if (typeof parsed.stateful_session === "boolean") draftStateful.value = parsed.stateful_session;
     if (typeof parsed.preferred_mode === "string") draftPreferredMode.value = parsed.preferred_mode;
     if (Array.isArray(parsed.allowed_roles)) {
       draftRoles.value = parsed.allowed_roles.map((r) => String(r)).join(", ");
+    }
+    if (Array.isArray(parsed.allowed_groups)) {
+      draftGroups.value = parsed.allowed_groups.map((g) => String(g)).join(", ");
+    }
+    if (parsed.openapi_spec && typeof parsed.openapi_spec === "object") {
+      sourceKind.value = "openapi_inline";
+      inlineSpecText.value = JSON.stringify(parsed.openapi_spec, null, 2);
     }
     importDialogOpen.value = false;
     statusMessage.value = "Imported JSON into draft form.";
@@ -810,6 +841,27 @@ async function copyPromptText() {
           </Select>
           <FieldDescription>{{ authHelpText }}</FieldDescription>
           <pre class="mt-2 overflow-x-auto rounded border border-[#E4E4E7] bg-[#FAFAFA] p-2 font-mono-data text-[11px] text-[#52525B]">{{ authRequestPreview }}</pre>
+
+          <div v-if="draftAuthType === 'delegated_token'" class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field>
+              <FieldLabel>Downstream Audience</FieldLabel>
+              <Input v-model="draftAudience" placeholder="api://partner-service" class="font-mono-data text-xs" />
+            </Field>
+            <Field>
+              <FieldLabel>Downstream Scope</FieldLabel>
+              <Input v-model="draftScope" placeholder="mcp.tools" class="font-mono-data text-xs" />
+            </Field>
+          </div>
+          <div v-else-if="draftAuthType === 'api_key' || draftAuthType === 'bearer_secret'" class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field>
+              <FieldLabel>Secret Env Variable</FieldLabel>
+              <Input v-model="draftSecretEnv" placeholder="PARTNER_API_KEY" class="font-mono-data text-xs" />
+            </Field>
+            <Field v-if="draftAuthType === 'api_key'">
+              <FieldLabel>API Key Header</FieldLabel>
+              <Input v-model="draftApiKeyHeader" placeholder="X-API-Key" class="font-mono-data text-xs" />
+            </Field>
+          </div>
         </Field>
 
         <Field>
@@ -856,10 +908,16 @@ async function copyPromptText() {
               {{ role }}
             </button>
           </div>
-          <Field>
-            <FieldLabel>Custom / Selected Roles</FieldLabel>
-            <Input v-model="draftRoles" class="font-mono-data text-xs" />
-          </Field>
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field>
+              <FieldLabel>Custom / Selected Roles</FieldLabel>
+              <Input v-model="draftRoles" class="font-mono-data text-xs" />
+            </Field>
+            <Field>
+              <FieldLabel>Allowed Groups (comma-separated)</FieldLabel>
+              <Input v-model="draftGroups" placeholder="finance, platform" class="font-mono-data text-xs" />
+            </Field>
+          </div>
         </div>
       </div>
 

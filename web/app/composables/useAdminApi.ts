@@ -81,6 +81,7 @@ export function useAdminApi() {
     try {
       return await $fetch<T>(url, {
         baseURL: apiBase ? undefined : "/",
+        timeout: 25000,
         ...opts,
         headers,
         credentials: "include",

@@ -97,6 +97,18 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
   expect(inspectStep.ok, inspectStep.error?.message).toBe(true);
   await Promise.resolve();
 
+  // Advance to Step 2 and verify auth-specific fields mount when delegated_token is selected
+  const navStep2 = await agent.act({
+    steps: [{ ref: "2. Policy & Mode", action: "press" }],
+  });
+  expect(navStep2.ok, navStep2.error?.message).toBe(true);
+  const step2Labels = agent
+    .snapshot()
+    .filter((entry) => !entry.offPage && entry.component !== "more")
+    .map((entry) => entry.label);
+  expect(step2Labels).toContain("Custom / Selected Roles");
+  expect(step2Labels).toContain("Allowed Groups (comma-separated)");
+
   // Advance to Step 3 so Register Upstream mounts cleanly
   const navStep3 = await agent.act({
     steps: [{ ref: "3. A/B Test & Save", action: "press" }],

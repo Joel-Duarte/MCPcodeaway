@@ -50,6 +50,7 @@ interface AuditRun {
   ab_variant?: string | null;
   provenance?: {
     grounded?: boolean;
+    provenance_hmac?: string;
     hmac_sha256?: string;
     unverified_identifiers?: string[];
   } | null;
@@ -83,6 +84,15 @@ const limitOptions = [
   { value: "25", label: "25 per page" },
   { value: "50", label: "50 per page" },
   { value: "100", label: "100 per page" },
+];
+
+const modeFilterOptions = [
+  { value: "all", label: "All Modes" },
+  { value: "codemode", label: "Code Mode (Deferred)" },
+  { value: "codemode_upfront", label: "Code Mode (Upfront)" },
+  { value: "traditional", label: "Classic (Upfront)" },
+  { value: "traditional_discover", label: "Classic (Discover)" },
+  { value: "hybrid", label: "Hybrid" },
 ];
 
 async function fetchRuns(resetOffset = false) {
@@ -129,15 +139,17 @@ watch(wsEvents, (list) => {
     mode: latest.mode,
     ok: latest.ok,
     duration_ms: latest.duration_ms,
-    tenant_id: "",
+    tenant_id: latest.tenant_id || "",
     user_sub: latest.user_sub,
-    subcall_count: 0,
-    raw_upstream_bytes: 0,
-    returned_bytes: 0,
-    estimated_tokens_saved: latest.tokens_saved,
-    schema_tokens_saved: 0,
-    abac_rows_filtered: 0,
-    redactions_count: 0,
+    user_email: latest.user_email ?? null,
+    user_groups: latest.user_groups || [],
+    subcall_count: latest.subcall_count ?? 0,
+    raw_upstream_bytes: latest.raw_upstream_bytes ?? 0,
+    returned_bytes: latest.returned_bytes ?? 0,
+    estimated_tokens_saved: latest.estimated_tokens_saved ?? latest.tokens_saved,
+    schema_tokens_saved: latest.schema_tokens_saved ?? 0,
+    abac_rows_filtered: latest.abac_rows_filtered ?? 0,
+    redactions_count: latest.redactions_count ?? 0,
     mode_decision_reason: latest.mode_decision_reason,
     provenance: { grounded: !latest.grounding_blocked },
   };
@@ -287,10 +299,30 @@ function spanBarColor(stage: string, status: string) {
         </Button>
       </div>
 
-      <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Field>
           <FieldLabel>Search Run / User / Error</FieldLabel>
           <Input v-model="searchQuery" placeholder="run_id, user, or error text..." />
+        </Field>
+
+        <Field>
+          <FieldLabel>Execution Mode</FieldLabel>
+          <Select
+            :items="modeFilterOptions"
+            :value="modeFilter"
+            @value-change="(v) => { if (v) { modeFilter = String(v); void fetchRuns(true); } }"
+          >
+            <SelectTrigger>
+              <SelectValue />
+              <AppIcon name="chevron-down" :size="14" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem v-for="opt in modeFilterOptions" :key="opt.value" :value="opt.value">
+                {{ opt.label }}
+                <SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator>
+              </SelectItem>
+            </SelectContent>
+          </Select>
         </Field>
 
         <Field>
@@ -521,7 +553,7 @@ function spanBarColor(stage: string, status: string) {
               <div
                 v-for="(sp, idx) in selectedRun.trace_spans"
                 :key="idx"
-                class="grid grid-cols-[11rem_1fr_4.5rem] items-center gap-2 rounded px-1 py-0.5 text-[11px] cursor-pointer hover:bg-[#FAFAFA]"
+                class="grid grid-cols-[7.5rem_1fr_4rem] sm:grid-cols-[11rem_1fr_4.5rem] items-center gap-2 rounded px-1 py-0.5 text-[11px] cursor-pointer hover:bg-[#FAFAFA]"
                 @mouseenter="inspectedSpan = sp"
                 @click="inspectedSpan = sp"
               >
@@ -573,7 +605,7 @@ function spanBarColor(stage: string, status: string) {
             <div>
               <div class="text-[#71717A]">Security Filters</div>
               <div class="mt-0.5 text-[#09090B] tabular-nums">
-                ABAC: {{ selectedRun.abac_rows_filtered }} · PII: {{ selectedRun.pii_redactions }}
+                ABAC: {{ selectedRun.abac_rows_filtered }} · PII: {{ selectedRun.redactions_count }}
               </div>
             </div>
           </div>
