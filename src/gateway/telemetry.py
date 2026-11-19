@@ -115,16 +115,14 @@ class TelemetryRecorder:
             returned_tokens if is_cm else upstream_tokens or returned_tokens
         )
         if is_cm and (estimated_tokens_saved > 0 or schema_tokens_saved > 0):
-            parts: list[str] = []
-            if estimated_tokens_saved > 0:
-                parts.append("Code Mode payload batching")
+            parts: list[str] = ["Saved vs. Traditional MCP via Code Mode"]
             if schema_tokens_saved > 0:
                 parts.append("Deferred Schema Search")
             tokens_saved_by = " + ".join(parts)
         elif is_cm:
-            tokens_saved_by = "Code Mode sandbox (minimal payload)"
+            tokens_saved_by = "Saved vs. Traditional MCP via Code Mode (minimal payload)"
         else:
-            tokens_saved_by = "Classic MCP (no batching savings)"
+            tokens_saved_by = "Traditional MCP (no Code Mode batching savings)"
 
         if trace_spans is None:
             subcall_total_ms = round(sum(sc.duration_ms for sc in subcalls), 3)

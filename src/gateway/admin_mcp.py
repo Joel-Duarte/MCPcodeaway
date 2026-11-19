@@ -58,6 +58,30 @@ _ADMIN_MCP_TOOLS: list[dict[str, Any]] = [
         "annotations": {"readOnlyHint": False, "destructiveHint": False},
     },
     {
+        "name": "get_gateway_metrics",
+        "description": "Return live gateway runtime, Monty sandbox spawn/exec p50/p95, and ROI savings.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"model": {"type": "string"}},
+        },
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+    },
+    {
+        "name": "get_optimization_recommendations",
+        "description": "List upstreams not yet in codemode/auto and their mode routing stats.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+    },
+    {
+        "name": "get_trace_timeline",
+        "description": "Return recent execution trace waterfalls with Monty spawn/exec spans.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+        },
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+    },
+    {
         "name": "admin_get_runtime_telemetry",
         "description": "Read gateway CPU, RSS, active executions, worker health, and store state.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -247,6 +271,39 @@ async def _dispatch_admin_tool(
 
     if name == "admin_get_analytics":
         return await analytics_fn(args.get("model"), None)
+
+    if name == "get_gateway_metrics":
+        rt = await telemetry_fn()
+        an = await analytics_fn(args.get("model") or "qwen3.5-9b", None)
+        return {"runtime": rt, "summary": an.get("summary"), "pricing": an.get("pricing")}
+
+    if name == "get_optimization_recommendations":
+        unoptimized = [
+            {"name": u.name, "preferred_mode": u.preferred_mode, "recommended": "codemode"}
+            for u in runtime.registry.list_upstreams()
+            if u.preferred_mode not in {"codemode", "auto"}
+        ]
+        return {"unoptimized_upstreams": unoptimized, "count": len(unoptimized)}
+
+    if name == "get_trace_timeline":
+        limit = min(50, max(1, int(args.get("limit", 10))))
+        runs = await runtime.store.list_runs(limit=limit)
+        return {
+            "runs": [
+                {
+                    "run_id": r.get("run_id"),
+                    "mode": r.get("mode"),
+                    "ok": r.get("ok"),
+                    "duration_ms": r.get("duration_ms"),
+                    "monty_spawn_ms": r.get("monty_spawn_ms", 0.0),
+                    "monty_exec_ms": r.get("monty_exec_ms", 0.0),
+                    "tokens_used_est": r.get("tokens_used_est", 0),
+                    "tokens_saved_by": r.get("tokens_saved_by"),
+                    "trace_spans": r.get("trace_spans", []),
+                }
+                for r in runs
+            ]
+        }
 
     if name == "admin_demo_traffic_burst":
         if (

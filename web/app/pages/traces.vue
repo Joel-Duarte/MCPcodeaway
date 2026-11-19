@@ -59,7 +59,16 @@ const errorMessage = ref("");
 const runs = ref<TraceRun[]>([]);
 const runtime = ref<RuntimeTelemetry | null>(null);
 const expandedId = ref<string | null>(null);
+const inspectedSpan = ref<{ runId: string; span: TraceSpan } | null>(null);
 const liveUpdates = ref(true);
+
+function bottleneckSpan(run: TraceRun): { span: TraceSpan; pct: number } | null {
+  const spans = synthesizedSpans(run);
+  if (!spans.length) return null;
+  const slowest = spans.reduce((a, b) => (b.duration_ms > a.duration_ms ? b : a), spans[0]);
+  const pct = run.duration_ms > 0 ? Math.round((slowest.duration_ms / run.duration_ms) * 100) : 0;
+  return { span: slowest, pct };
+}
 
 async function fetchTraces() {
   errorMessage.value = "";
@@ -252,21 +261,54 @@ function spanBarColor(stage: string, status: string) {
           </div>
 
           <div class="space-y-1.5 rounded-md border border-[#E4E4E7] bg-white p-3">
+            <!-- Timeline Analyzer Bottleneck Callout -->
+            <div
+              v-if="bottleneckSpan(r)"
+              class="mb-2 flex flex-wrap items-center justify-between gap-2 rounded border border-[#E4E4E7] bg-[#FAFAFA] px-2.5 py-1.5 text-[11px] text-[#52525B]"
+            >
+              <span>
+                <strong class="text-[#09090B]">Timeline Analyzer:</strong>
+                Bottleneck is <strong class="text-[#09090B]">{{ bottleneckSpan(r)!.span.label }}</strong>
+                ({{ bottleneckSpan(r)!.span.duration_ms.toFixed(2) }} ms · {{ bottleneckSpan(r)!.pct }}% of total)
+              </span>
+              <span class="text-[#71717A]">Hover or click any stage bar to inspect</span>
+            </div>
+
             <div
               v-for="(sp, idx) in synthesizedSpans(r)"
               :key="idx"
-              class="grid grid-cols-[12rem_1fr_4.5rem] items-center gap-2 text-[11px]"
+              class="grid grid-cols-[12rem_1fr_4.5rem] items-center gap-2 rounded px-1 py-0.5 text-[11px] cursor-pointer hover:bg-[#FAFAFA]"
+              @mouseenter="inspectedSpan = { runId: r.run_id, span: sp }"
+              @click.stop="inspectedSpan = { runId: r.run_id, span: sp }"
             >
               <div class="truncate font-medium text-[#09090B]" :title="sp.label">{{ sp.label }}</div>
               <div class="relative h-3 rounded bg-[#F4F4F5] overflow-hidden">
                 <div
-                  class="absolute top-0 bottom-0 rounded"
+                  class="absolute top-0 bottom-0 rounded transition-opacity"
                   :class="spanBarColor(sp.stage, sp.status)"
                   :style="spanBarStyle(sp, r.duration_ms)"
                 />
               </div>
               <div class="text-right font-mono-data text-[#52525B] tabular-nums">
                 {{ sp.duration_ms.toFixed(2) }} ms
+              </div>
+            </div>
+
+            <!-- Interactive Stage Inspector -->
+            <div
+              v-if="inspectedSpan?.runId === r.run_id"
+              class="mt-2 rounded border border-[#99F6E4] bg-[#F0FDFA] px-3 py-2 text-[11px] text-[#09090B]"
+            >
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <span class="font-semibold text-[#0F766E]">
+                  Stage: {{ inspectedSpan.span.label }} ({{ inspectedSpan.span.stage }})
+                </span>
+                <span class="font-mono-data tabular-nums text-[#52525B]">
+                  start +{{ inspectedSpan.span.start_ms.toFixed(2) }}ms ·
+                  duration {{ inspectedSpan.span.duration_ms.toFixed(2) }}ms ·
+                  {{ r.duration_ms > 0 ? ((inspectedSpan.span.duration_ms / r.duration_ms) * 100).toFixed(1) : "0.0" }}% of total ·
+                  status: {{ inspectedSpan.span.status }}
+                </span>
               </div>
             </div>
           </div>

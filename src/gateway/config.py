@@ -159,6 +159,7 @@ class GatewaySettings(BaseSettings):
 
     require_admin_auth: bool | None = None
     admin_roles: list[str] = Field(default_factory=lambda: ["gateway_admin", "platform_admin"])
+    viewer_roles: list[str] = Field(default_factory=lambda: ["operator_viewer"])
     ssrf_protection_enabled: bool = True
     block_private_ips_in_prod: bool = True
     allowed_upstream_hosts: list[str] = Field(default_factory=list)

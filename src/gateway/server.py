@@ -1651,6 +1651,7 @@ def create_gateway_app(
         admin_cookie: str | None = None,
         *,
         require_admin_role: bool = True,
+        allow_viewer: bool = False,
     ) -> CallerIdentity | None:
         if authorization:
             try:
@@ -1673,7 +1674,10 @@ def create_gateway_app(
                 raise HTTPException(
                     status_code=exc.status_code, detail=exc.detail, headers=headers
                 ) from exc
-            if require_admin_role and not (set(identity.roles) & set(runtime.settings.admin_roles)):
+            allowed_roles = set(runtime.settings.admin_roles)
+            if allow_viewer:
+                allowed_roles |= set(runtime.settings.viewer_roles)
+            if require_admin_role and not (set(identity.roles) & allowed_roles):
                 runtime.metrics.inc_counter(
                     "gateway_auth_denials_total",
                     labels={"surface": "control_plane", "status_code": 403},
