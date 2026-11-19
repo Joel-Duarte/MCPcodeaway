@@ -2039,7 +2039,7 @@ def create_gateway_app(
             all_upstreams = runtime.registry.list_upstreams(include_disabled=True)
             facets_groups = sorted({g for u in all_upstreams for g in u.allowed_groups})
             facets_auth = sorted({u.auth_type for u in all_upstreams})
-            facets_modes = sorted({u.preferred_mode for u in all_upstreams})
+            facets_modes = sorted({u.preferred_mode or "codemode" for u in all_upstreams})
 
             filtered = all_upstreams
             if q:

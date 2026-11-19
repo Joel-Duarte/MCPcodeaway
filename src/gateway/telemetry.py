@@ -182,7 +182,7 @@ class TelemetryRecorder:
                         "label": f"{sc.server}.{sc.tool}",
                         "start_ms": cursor,
                         "duration_ms": round(sc.duration_ms, 3),
-                        "status": "ok" if sc.ok else "error",
+                        "status": "ok" if sc.status == "ok" else "error",
                     }
                 )
                 cursor = round(cursor + sc.duration_ms, 3)
