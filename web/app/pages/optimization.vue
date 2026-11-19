@@ -54,7 +54,7 @@ async function fetchOptimization() {
   try {
     const q = new URLSearchParams({ model: selectedModel.value });
     const [a, e] = await Promise.all([
-      apiFetch<AnalyticsResponse>(`/admin/analytics/groups?${q.toString()}`),
+      apiFetch<AnalyticsResponse>(`/audit/analytics?${q.toString()}`),
       apiFetch<ExperimentsResponse>("/admin/ab/experiments"),
     ]);
     analytics.value = a;
