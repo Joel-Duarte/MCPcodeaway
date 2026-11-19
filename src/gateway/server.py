@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -303,6 +304,7 @@ class GatewayRuntime:
         self.telemetry = TelemetryRecorder(self.store)
         self.preloaded_tools = preloaded_tools or {}
         self.startup_warnings: list[str] = []
+        self._startup_retry_task: asyncio.Task[None] | None = None
 
     def _dev_discovery_identity(self) -> CallerIdentity | None:
         if self.dev_keys is None:
@@ -493,14 +495,33 @@ class GatewayRuntime:
                 headers, _, _ = await self.dispatcher.resolve_upstream_headers(identity, upstream)
                 tools = await self.client_manager.discover_tools(upstream, auth_headers=headers)
                 self.catalog.set_server_tools(upstream, tools)
+                self.startup_warnings = [
+                    w for w in self.startup_warnings if f"'{upstream.name}'" not in w
+                ]
             except Exception:
                 continue
+
+    async def _retry_failed_startup_upstreams(self) -> None:
+        """Retry failed startup upstreams once HTTP listeners/peers finish binding."""
+        for delay in (0.5, 1.5, 3.0):
+            await asyncio.sleep(delay)
+            if not self.startup_warnings:
+                return
+            await self.refresh_catalog()
+            if not self.startup_warnings:
+                return
 
     async def startup(self) -> None:
         await self.store.init()
         await self.refresh_catalog()
+        if self.startup_warnings:
+            self._startup_retry_task = asyncio.create_task(self._retry_failed_startup_upstreams())
 
     async def shutdown(self) -> None:
+        if self._startup_retry_task is not None and not self._startup_retry_task.done():
+            self._startup_retry_task.cancel()
+            await asyncio.gather(self._startup_retry_task, return_exceptions=True)
+        self._startup_retry_task = None
         await self.sandbox.close()
         await self.client_manager.close()
         if hasattr(self.cache, "close"):
