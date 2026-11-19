@@ -790,8 +790,6 @@ async def run_openai_compatible_suite(
                     auth_mode="dev",
                     rate_limit_per_minute=2000,
                     discovery_backend=discovery_backend,  # type: ignore[arg-type]
-                    embedding_url=f"{base_url.rstrip('/')}/embeddings",
-                    system1_url=f"{base_url.rstrip('/')}/systemone",
                     sqlite_path=f"{tmpdir}/live_{syn}.db",
                     upstreams_config_path=cfg_path,
                 )
@@ -1043,7 +1041,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--discovery",
         default="bm25",
-        choices=["keyword", "bm25", "embedding", "system1", "hybrid_system1"],
+        choices=["keyword", "bm25"],
     )
     parser.add_argument("--x-intent", action="store_true")
     parser.add_argument(

@@ -117,7 +117,7 @@ _VALID_MODES: set[str] = {
 }
 _VALID_EXECUTION: set[str] = {"classic", "codemode", "hybrid", "auto"}
 _VALID_DISCOVERY_MODES: set[str] = {"upfront", "deferred", "x_intent"}
-_VALID_DISCOVERY: set[str] = {"keyword", "bm25", "embedding", "system1", "hybrid_system1"}
+_VALID_DISCOVERY: set[str] = {"keyword", "bm25"}
 
 _MODE_TO_AXES: dict[GatewayMode, tuple[ExecutionMode, DiscoveryMode]] = {
     "traditional": ("classic", "upfront"),

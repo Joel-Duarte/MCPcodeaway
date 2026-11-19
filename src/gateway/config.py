@@ -21,7 +21,7 @@ DiscoveryMode = Literal["upfront", "deferred", "x_intent"]
 GatewayMode = Literal[
     "codemode", "codemode_upfront", "traditional", "traditional_discover", "hybrid", "auto"
 ]
-DiscoveryBackendMode = Literal["keyword", "bm25", "embedding", "system1", "hybrid_system1"]
+DiscoveryBackendMode = Literal["keyword", "bm25"]
 UpstreamType = Literal["mcp_http", "mcp_stdio", "openapi"]
 UpstreamAuthType = Literal["delegated_token", "bearer_secret", "api_key", "none"]
 
@@ -148,13 +148,6 @@ class GatewaySettings(BaseSettings):
     redis_url: str | None = None
 
     discovery_backend: DiscoveryBackendMode = "bm25"
-    system1_url: str | None = None
-    system1_model: str = "laya"
-    system1_api_key: str = ""
-    system1_threshold: float = 0.35
-    embedding_url: str | None = None
-    embedding_model: str = "text-embedding-qwen3-embedding-0.6b"
-    embedding_api_key: str = ""
 
     sqlite_path: str = "data/gateway.db"
     postgres_dsn: str | None = None

@@ -1,8 +1,7 @@
-"""Phase 6 tests: Classic discoverability, multi-MCP scoping, System 1, and X-Intent."""
+"""Phase 6 tests: Classic discoverability, multi-MCP scoping, BM25, and X-Intent."""
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import httpx
@@ -234,181 +233,11 @@ async def test_traditional_discover_server_discover_and_pagination(tmp_path) -> 
             assert set(p1_names).isdisjoint(set(p2_names))
 
 
-async def test_bm25_embedding_cache_system1_and_fallback(tmp_path) -> None:
-    embed_calls: list[list[str]] = []
-    system1_calls: list[dict[str, Any]] = []
-    system1_fail_mode = {"fail": False}
-
-    def _mock_handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode("utf-8"))
-        if request.url.path == "/v1/embeddings":
-            inputs = list(body["input"])
-            embed_calls.append(inputs)
-            data = []
-            for idx, text in enumerate(inputs):
-                low = text.lower()
-                # Orthogonal signal: [eu_invoice_dim, debt_ledger_dim, noise_dim]
-                vec = [
-                    1.0 if ("eu_invoice" in low or "european" in low) else 0.0,
-                    1.0 if ("debt_ledger" in low or "debt" in low) else 0.0,
-                    0.05,
-                ]
-                data.append({"index": idx, "embedding": vec})
-            return httpx.Response(200, json={"data": data})
-
-        if request.url.path == "/v1/systemone":
-            system1_calls.append(body)
-            if system1_fail_mode["fail"]:
-                return httpx.Response(
-                    400,
-                    json={"error": {"code": "jitLoadFailed", "message": "Failed to load model"}},
-                )
-            questions = body["questions"]
-            answers: dict[str, Any] = {}
-            for qid, qspec in questions.items():
-                instr = qspec["instructions"].lower()
-                if qid.startswith("srv_"):
-                    answers[qid] = {
-                        "type": "noul",
-                        "noul": 0.94 if "snowflake_ledger" in instr else 0.06,
-                    }
-                else:
-                    answers[qid] = {"probability": 0.91 if "query_debt_ledger" in instr else 0.15}
-            return httpx.Response(200, json={"answers": answers})
-
-        return httpx.Response(404, json={"error": "not found"})
-
-    mock_disc_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(_mock_handler), base_url="http://mock.discovery"
-    )
-    app, dev_keys = _setup_gateway(
-        tmp_path,
-        discovery_client=mock_disc_client,
-        settings_overrides={
-            "embedding_url": "http://mock.discovery/v1/embeddings",
-            "system1_url": "http://mock.discovery/v1/systemone",
-            "system1_model": "laya",
-            "system1_threshold": 0.35,
-        },
-    )
-    fin_token = dev_keys.issue_user_token(persona="finance_analyst")
-    ops_token = dev_keys.issue_user_token(persona="ops_engineer")
-
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
-        ) as client:
-            # 1. BM25 semantic ranking
-            bm25_res = await _mcp_post(
-                client,
-                fin_token,
-                "tools/call",
-                {"name": "search_tools", "arguments": {"query": "past due debt ledger balance"}},
-                query="mode=codemode&discovery=bm25",
-            )
-            bm25_sc = bm25_res["result"]["structuredContent"]
-            assert bm25_sc["backend_used"] == "bm25"
-            assert bm25_sc["tools"][0]["qualified_name"].startswith("snowflake_ledger__")
-
-            # 2. Embedding backend embeds catalog once, then caches vectors by catalog_version
-            emb1 = await _mcp_post(
-                client,
-                fin_token,
-                "tools/call",
-                {"name": "search_tools", "arguments": {"query": "european merchant invoices"}},
-                query="mode=codemode&discovery=embedding",
-            )
-            emb1_sc = emb1["result"]["structuredContent"]
-            assert emb1_sc["backend_used"] == "embedding"
-            assert emb1_sc["tools"][0]["server"] == "billing_legacy_eu"
-            assert len(embed_calls[0]) > 1  # query + tool cards
-
-            emb2 = await _mcp_post(
-                client,
-                fin_token,
-                "tools/call",
-                {"name": "search_tools", "arguments": {"query": "debt balance lookup"}},
-                query="mode=codemode&discovery=embedding",
-            )
-            assert emb2["result"]["structuredContent"]["tools"][0]["server"] == "snowflake_ledger"
-            assert len(embed_calls[1]) == 1  # ONLY the new query was embedded!
-
-            # 3. System 1 enforces RBAC BEFORE Stage 1: ops_engineer only sends ops_ticketing
-            system1_calls.clear()
-            await _mcp_post(
-                client,
-                ops_token,
-                "tools/call",
-                {"name": "search_tools", "arguments": {"query": "customer debt ledger"}},
-                query="mode=codemode&discovery=system1",
-            )
-            assert len(system1_calls) == 2
-            stage1_qkeys = set(system1_calls[0]["questions"].keys())
-            assert stage1_qkeys == {"srv_ops_ticketing"}
-
-            # 4. System 1 Stage 1 prunes billing servers -> Stage 2 scores only snowflake
-            system1_calls.clear()
-            s1_fin = await _mcp_post(
-                client,
-                fin_token,
-                "tools/call",
-                {"name": "search_tools", "arguments": {"query": "overdue balances"}},
-                query="mode=codemode&discovery=system1",
-            )
-            s1_sc = s1_fin["result"]["structuredContent"]
-            assert s1_sc["backend_used"] == "system1"
-            assert s1_sc["fallback_triggered"] is False
-            assert s1_sc["tools"][0]["qualified_name"] == "snowflake_ledger__query_debt_ledger"
-            assert s1_sc["tools"][0]["stage1_server_score"] == 0.94
-            assert len(system1_calls) == 2
-            stage2_instrs = " ".join(
-                q["instructions"] for q in system1_calls[1]["questions"].values()
-            )
-            assert "billing_legacy_eu__" not in stage2_instrs
-
-            # 5. BM25 fallback when /v1/systemone returns HTTP 400 jitLoadFailed
-            system1_fail_mode["fail"] = True
-            fb_res = await _mcp_post(
-                client,
-                fin_token,
-                "tools/call",
-                {"name": "search_tools", "arguments": {"query": "debt ledger"}},
-                query="mode=codemode&discovery=system1",
-            )
-            fb_sc = fb_res["result"]["structuredContent"]
-            assert fb_sc["backend_requested"] == "system1"
-            assert fb_sc["backend_used"] == "bm25"
-            assert fb_sc["fallback_triggered"] is True
-            assert "400" in (fb_sc["fallback_reason"] or "")
-            assert len(fb_sc["tools"]) > 0
-
-
-async def test_hybrid_system1_prefilter_and_x_intent_header(tmp_path) -> None:
-    stage2_counts: list[int] = []
-
-    def _s1_handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode("utf-8"))
-        qkeys = list(body["questions"].keys())
-        if any(k.startswith("tool_") for k in qkeys):
-            stage2_counts.append(len(qkeys))
-        answers = {
-            k: {"probability": 0.9 if "snowflake" in v["instructions"].lower() else 0.7}
-            for k, v in body["questions"].items()
-        }
-        return httpx.Response(200, json={"answers": answers})
-
-    mock_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(_s1_handler), base_url="http://mock.s1"
-    )
-    app, dev_keys = _setup_gateway(
-        tmp_path,
-        discovery_client=mock_client,
-        settings_overrides={"system1_url": "http://mock.s1/v1/systemone"},
-    )
+async def test_bm25_and_x_intent_header_discovery(tmp_path) -> None:
+    app, dev_keys = _setup_gateway(tmp_path)
     fin_token = dev_keys.issue_user_token(persona="finance_analyst")
 
     async with app.router.lifespan_context(app):
-        # Add 50 synthetic tools directly to billing_legacy_us for <=25 prefilter test
         syn_tools = [
             DiscoveredTool(
                 server="billing_legacy_us",
@@ -432,17 +261,19 @@ async def test_hybrid_system1_prefilter_and_x_intent_header(tmp_path) -> None:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"
         ) as client:
-            # hybrid_system1 caps Stage 2 tool questions to <= 25 even across >50 accessible tools
-            await _mcp_post(
+            # 1. BM25 semantic ranking
+            bm25_res = await _mcp_post(
                 client,
                 fin_token,
                 "tools/call",
-                {"name": "search_tools", "arguments": {"query": "invoice reconciliation"}},
-                query="mode=codemode&discovery=hybrid_system1",
+                {"name": "search_tools", "arguments": {"query": "past due debt ledger balance"}},
+                query="mode=codemode&discovery=bm25",
             )
-            assert stage2_counts and stage2_counts[-1] <= 25
+            bm25_sc = bm25_res["result"]["structuredContent"]
+            assert bm25_sc["backend_used"] == "bm25"
+            assert bm25_sc["tools"][0]["qualified_name"].startswith("snowflake_ledger__")
 
-            # X-Intent in traditional_discover pre-hydrates matching tools with full JSON schemas
+            # 2. X-Intent in traditional_discover pre-hydrates matching tools with full JSON schemas
             td_intent = await _mcp_post(
                 client,
                 fin_token,
@@ -455,7 +286,7 @@ async def test_hybrid_system1_prefilter_and_x_intent_header(tmp_path) -> None:
             assert "search_tools" in td_tool_names
             assert "billing_legacy_eu__list_eu_invoices" in td_tool_names
 
-            # X-Intent in codemode keeps 3-tool surface & inlines Python stub in execute_code
+            # 3. X-Intent in codemode keeps 3-tool surface & inlines Python stub in execute_code
             cm_intent = await _mcp_post(
                 client,
                 fin_token,

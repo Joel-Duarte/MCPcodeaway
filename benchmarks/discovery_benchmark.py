@@ -283,20 +283,11 @@ async def run_discovery_benchmark(
     *,
     backends: list[DiscoveryBackendMode] | None = None,
     extra_counts: tuple[int, ...] = (0, 50, 150),
-    embedding_url: str | None = None,
-    embedding_model: str = "text-embedding-qwen3-embedding-0.6b",
-    system1_url: str | None = None,
-    system1_model: str = "laya",
     output_path: Path | None = Path("benchmarks/discovery_results.json"),
 ) -> dict[str, Any]:
     """Evaluate Recall@5, Precision@5, MRR, server routing accuracy, and latency."""
     chosen_backends: list[DiscoveryBackendMode] = backends or ["keyword", "bm25"]
-    settings = GatewaySettings(
-        embedding_url=embedding_url,
-        embedding_model=embedding_model,
-        system1_url=system1_url,
-        system1_model=system1_model,
-    )
+    settings = GatewaySettings()
     engine = DiscoveryEngine(settings)
     rows: list[dict[str, Any]] = []
 
@@ -402,28 +393,13 @@ def _print_table(report: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Benchmark tool discovery backends")
-    parser.add_argument("--live-lmstudio", action="store_true")
-    parser.add_argument("--lmstudio-base", default="http://127.0.0.1:1234/v1")
-    parser.add_argument("--embedding-model", default="text-embedding-qwen3-embedding-0.6b")
-    parser.add_argument("--system1-model", default="laya")
     parser.add_argument("--output", default="benchmarks/discovery_results.json")
     args = parser.parse_args(argv)
 
     backends: list[DiscoveryBackendMode] = ["keyword", "bm25"]
-    emb_url: str | None = None
-    s1_url: str | None = None
-    if args.live_lmstudio:
-        backends.extend(["embedding", "system1", "hybrid_system1"])
-        emb_url = f"{args.lmstudio_base.rstrip('/')}/embeddings"
-        s1_url = f"{args.lmstudio_base.rstrip('/')}/systemone"
-
     report = asyncio.run(
         run_discovery_benchmark(
             backends=backends,
-            embedding_url=emb_url,
-            embedding_model=args.embedding_model,
-            system1_url=s1_url,
-            system1_model=args.system1_model,
             output_path=Path(args.output),
         )
     )
