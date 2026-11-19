@@ -12,3 +12,11 @@ All admin console and frontend edits in `web/` **must** conform to:
 - [.agents/rules/ui-craft.md](.agents/rules/ui-craft.md) — Workspace rule enforcing these standards on every UI task.
 
 Do **not** bundle `web/` static assets into the barebones `production` gateway Docker target (`Dockerfile` target `gateway`), and do **not** bypass or modify npm release-age policies.
+
+## Code Navigation & Pre-CI Standards
+
+- **Two-Tier Navigation (`Graphify` + `Ripwire`):** Prefer `ripwire . --for="<symbol>"`, `--callers`, `--uses`, `--impact`, and post-edit `ripwire . --situ` for deterministic AST symbol/blast-radius checks (`<100ms`), and `graphify query` / `graphify path` (`graphify-out/` kept untracked) for macro cross-module queries; fall back to `rg` only for exact literals, configs, or Vue templates.
+- **Pre-CI Gates & Working Conditions:**
+  - Run `./scripts/pre-ci.sh --fast` during iteration and `./scripts/pre-ci.sh --full` before commits/PRs (`scripts/agent_preflight.py`, `ruff format --check`, `ruff check`, `pytest`, `web/` `npm run generate`, and `benchmarks/run_benchmark.py --verify-thresholds`).
+  - Never add bare `# noqa`, bare `# type: ignore`, unjustified `eslint-disable`, or `src/` imports of `tests`. Keep `.agents/` local-only (never commit new `.agents/` additions).
+  - Keep `tests/golden/flows.json` and `benchmarks/thresholds.json` strictly additive; stop and escalate after 3 consecutive identical failures or 2 failed identical approaches.

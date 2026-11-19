@@ -15,3 +15,5 @@ build/
 web/node_modules/
 web/.nuxt/
 web/.output/
+graphify-out/
+.agents/

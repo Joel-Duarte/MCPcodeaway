@@ -120,15 +120,33 @@ From [benchmarks/load_results.json](benchmarks/load_results.json):
 | `traditional` | 1.107 s | 27.1 rps | 7.568 / 100.692 ms | 100.0% | 90 subcalls / 66.67% (`60` hits) |
 | `codemode` | 1.127 s | 26.63 rps | 475.03 / 1019.045 ms | 100.0% | 90 subcalls / 66.67% (`60` hits) |
 
+### 6. Live External MCP Client Trial (`POST /mcp` over HTTP)
+
+Measured by an external HTTP subagent client ([benchmarks/subagent_mcp_trial.json](benchmarks/subagent_mcp_trial.json)) against live `examples.mock_backends` (`:8001`) + `gateway.server` (`:8000`, `startup_warnings=[]`):
+
+- **Bulk Join (`reconcile_bulk_200`, 200 rows):** Classic `4` RT (`199,817 B`, `49,954` est. tokens, `38.55 ms`) vs Code Mode `3` RT (`11,622 B`, `2,906` est. tokens, `32.52 ms`, HMAC `provenance_verified=true`) -> **94.18% byte & token reduction**.
+- **Overdue Reconciliation (`reconcile_overdue`):** `14,193 B` -> `11,336 B` (**20.13%** byte / **20.12%** token savings; `4` -> `3` RT).
+- **Small Single-Call Audit (`trial_balance_audit`):** `6,925 B` -> `6,799 B` (**1.82%** byte / **1.79%** token savings).
+- **Routing & Policy Enforcement:** `execution=auto` emitted `X-Gateway-Mode-Decision: auto->codemode (score=100.0): Avg payload 17020 bytes risks prompt overflow`; EU/US OBO RLS returned `0` cross-region leaks (`5` rows each); `support_agent` RBAC denied `snowflake_ledger` (`-32003`); `require_grounding=true` blocked fabricated `CUST-9999` (`UngroundedResultError`).
+
 ## Vendor-Agnostic Integrations & Scaling
 
 - **Enterprise IdP & MCP Client Examples**: See [examples/integrations/](examples/integrations/) (`entra_copilot_studio`, `keycloak_oidc`, `mcp_clients`).
 - **Horizontal Scaling & Barebones Production**: Build the barebones `gateway` image target (`docker build --target gateway .`) or run `docker compose --profile prod up` / `--profile scaled up` (using [docker-compose.yml](docker-compose.yml)) for multi-replica stateless gateways, Postgres audit persistence (`GATEWAY_POSTGRES_DSN`), Redis caching (`GATEWAY_REDIS_URL`), and egress-isolated `sandbox-worker` pods authenticated with `GATEWAY_SANDBOX_WORKER_SECRET` and `GATEWAY_PROVENANCE_SIGNING_SECRET`. See [docs/cloud_scalability.md](docs/cloud_scalability.md).
 
+## CI/CD, Security QA & Pre-CI Gates
+
+- **GitHub Actions CI/CD (SHA-pinned, least-privilege):**
+  - [backend-ci.yml](.github/workflows/backend-ci.yml): `scripts/agent_preflight.py`, Ruff format & lint, full `pytest -v`, and multi-target Docker builds (`gateway`, `sandbox-worker`, `gateway-ui`).
+  - [frontend-ci.yml](.github/workflows/frontend-ci.yml): `npm ci`, `nuxt prepare`, `npm run generate`, and live `/dashboard/` + `_nuxt/` asset verification.
+  - [qa-ci.yml](.github/workflows/qa-ci.yml): Golden E2E flow suite + locked offline benchmark verification (`--verify-thresholds`).
+  - [security-ci.yml](.github/workflows/security-ci.yml) + [dependabot.yml](.github/dependabot.yml): CodeQL (`python`, `javascript-typescript`, `actions`), Dependency Review, Zizmor workflow audit, pinned Gitleaks (`.gitleaks.toml`), and scheduled `npm`/`uv` audits.
+- **Golden Flows & Locked Benchmarks:** Deterministic end-to-end policy/grounding flows live in [tests/golden/flows.json](tests/golden/flows.json) ([tests/test_golden_flows.py](tests/test_golden_flows.py)), and minimum/maximum benchmark bounds live in [benchmarks/thresholds.json](benchmarks/thresholds.json) ([tests/test_benchmark_regression.py](tests/test_benchmark_regression.py)).
+- **Agent Navigation & Local Gates:** Follow [AGENTS.md](AGENTS.md) ([CLAUDE.md](CLAUDE.md)) for two-tier `ripwire` + `graphify` navigation, install git hooks via `pre-commit` (`.pre-commit-config.yaml`) or wire `hooks/agent-post-edit.sh`, and run `./scripts/pre-ci.sh`.
+
 ## Verification
 
 ```bash
-uv run ruff check src examples benchmarks tests
-uv run pytest -v
-cd web && npm run generate
+./scripts/pre-ci.sh --fast   # agent preflight, ruff, golden flows & regression tests
+./scripts/pre-ci.sh --full   # full pytest, Nuxt generate & --verify-thresholds (add --docker for images)
 ```
