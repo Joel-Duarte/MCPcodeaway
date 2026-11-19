@@ -1,0 +1,153 @@
+{
+  "generated_at": "2026-11-19T10:05:53.736004+00:00",
+  "provider": "openai_compatible",
+  "base_url": "http://127.0.0.1:1234/v1",
+  "discovery_backend": "bm25",
+  "x_intent_enabled": false,
+  "reasoning_effort": "low",
+  "auth_preflight": {
+    "all_passed": true,
+    "checks": {
+      "oauth_protected_resource_200": true,
+      "oauth_authorization_server_200": true,
+      "unauthenticated_mcp_401": true,
+      "unapproved_tenant_403": true,
+      "dev_token_mint_200": true,
+      "support_agent_sees_ops_read_only": true,
+      "finance_analyst_sees_finance_only": true
+    },
+    "support_servers": [
+      "ops_ticketing"
+    ],
+    "finance_servers": [
+      "billing_legacy_eu",
+      "billing_legacy_us",
+      "snowflake_ledger"
+    ]
+  },
+  "rbac_live_boundary": [
+    {
+      "model": "qwen/qwen3.5-9b",
+      "persona": "support_agent",
+      "finance_subcalls": 0,
+      "leaked_finance_balance": false,
+      "blocked_cleanly": true,
+      "answer_preview": ""
+    }
+  ],
+  "runs": [
+    {
+      "model": "qwen/qwen3.5-9b",
+      "task": "standard",
+      "mode": "codemode_upfront",
+      "execution": "codemode",
+      "discovery_mode": "upfront",
+      "discovery_backend": "bm25",
+      "x_intent": false,
+      "reasoning_effort": "low",
+      "exposed_tool_count": 1,
+      "final_tool_count": 1,
+      "turns": 2,
+      "mcp_tool_calls": 1,
+      "subcalls_total": 12,
+      "delegated_token_hops": 4,
+      "self_corrections": 0,
+      "provenance_grounded": true,
+      "prompt_tokens": 3717,
+      "completion_tokens": 1427,
+      "total_tokens": 5144,
+      "duration_ms": 34152.07,
+      "correct": true,
+      "answer": "Found **2 overdue customers** whose Snowflake debt ledger balance differs from their legacy billing invoice amount:\n\n| customer_id | delta (ledger_balance - invoice_amount) |\n|-------------|------------------------------------------|\n| CUST-1003   | 450.0                                    |\n| CUST-1024   | -320.0                                   |",
+      "run_ids": [
+        "run_3cd177cff664"
+      ],
+      "extra_synthetic_tools": 0
+    },
+    {
+      "model": "qwen/qwen3.5-9b",
+      "task": "bulk_200",
+      "mode": "codemode_upfront",
+      "execution": "codemode",
+      "discovery_mode": "upfront",
+      "discovery_backend": "bm25",
+      "x_intent": false,
+      "reasoning_effort": "low",
+      "exposed_tool_count": 1,
+      "final_tool_count": 1,
+      "turns": 1,
+      "mcp_tool_calls": 0,
+      "subcalls_total": 0,
+      "delegated_token_hops": 0,
+      "self_corrections": 0,
+      "provenance_grounded": null,
+      "prompt_tokens": 1248,
+      "completion_tokens": 2048,
+      "total_tokens": 3296,
+      "duration_ms": 46236.8,
+      "correct": false,
+      "answer": "",
+      "run_ids": [],
+      "extra_synthetic_tools": 0
+    },
+    {
+      "model": "qwen/qwen3.5-9b",
+      "task": "standard",
+      "mode": "codemode_upfront",
+      "execution": "codemode",
+      "discovery_mode": "upfront",
+      "discovery_backend": "bm25",
+      "x_intent": false,
+      "reasoning_effort": "low",
+      "exposed_tool_count": 1,
+      "final_tool_count": 1,
+      "turns": 3,
+      "mcp_tool_calls": 2,
+      "subcalls_total": 6,
+      "delegated_token_hops": 6,
+      "self_corrections": 1,
+      "provenance_grounded": true,
+      "prompt_tokens": 27139,
+      "completion_tokens": 1768,
+      "total_tokens": 28907,
+      "duration_ms": 49569.41,
+      "correct": true,
+      "answer": "Based on the analysis, I found **2 overdue customers** whose Snowflake debt ledger balance differs from their legacy billing invoice amount:\n\n| customer_id | ledger_balance | invoice_amount | delta (ledger - invoice) |\n|-------------|----------------|----------------|--------------------------|\n| CUST-1003   | 1825.0 EUR     | 1375.0 EUR     | **+450.0**              |\n| CUST-1024   | 3680.0 USD     | 4000.0 USD     | **-320.0**              |\n\n**Summary:**\n- **CUST-1003** (EU): Ledger balance is **450.0 EUR higher** than the invoice amount\n- **CUST-1024** (US): Ledger balance is **320.0 USD l",
+      "run_ids": [
+        "run_c2f82eecbf0a",
+        "run_12504c39a2f8"
+      ],
+      "extra_synthetic_tools": 50
+    },
+    {
+      "model": "qwen/qwen3.5-9b",
+      "task": "bulk_200",
+      "mode": "codemode_upfront",
+      "execution": "codemode",
+      "discovery_mode": "upfront",
+      "discovery_backend": "bm25",
+      "x_intent": false,
+      "reasoning_effort": "low",
+      "exposed_tool_count": 1,
+      "final_tool_count": 1,
+      "turns": 4,
+      "mcp_tool_calls": 3,
+      "subcalls_total": 6,
+      "delegated_token_hops": 6,
+      "self_corrections": 1,
+      "provenance_grounded": true,
+      "prompt_tokens": 30754,
+      "completion_tokens": 2599,
+      "total_tokens": 33353,
+      "duration_ms": 67296.63,
+      "correct": true,
+      "answer": "```json\n[{\"customer_id\": \"CUST-2041\", \"delta\": 615.0}, {\"customer_id\": \"CUST-2118\", \"delta\": -480.0}, {\"customer_id\": \"CUST-2199\", \"delta\": 1250.0}]\n```",
+      "run_ids": [
+        "run_8aca9c4dec28",
+        "run_0df543ede934",
+        "run_35be4a19af32"
+      ],
+      "extra_synthetic_tools": 50
+    }
+  ]
+}
