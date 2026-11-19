@@ -48,3 +48,33 @@ upstreams:
     allowed_scopes: [mcp.tools, ops.read, ops.write]
     mutating_tools: [create_collection_case]
     enabled: true
+
+  - name: crm_accounts
+    type: openapi
+    url: http://mock-backends:8001/crm
+    openapi_spec_url: http://mock-backends:8001/crm/openapi.json
+    auth_type: none
+    preferred_mode: traditional
+    allowed_roles: [sales_ops, finance_analyst, gateway_admin, admin]
+    allowed_groups: [sales, finance, platform]
+    enabled: true
+
+  - name: hr_directory
+    type: openapi
+    url: http://mock-backends:8001/hr
+    openapi_spec_url: http://mock-backends:8001/hr/openapi.json
+    auth_type: none
+    preferred_mode: traditional
+    allowed_roles: [hr_ops, gateway_admin, admin]
+    allowed_groups: [hr, platform]
+    enabled: true
+
+  - name: devops_ci
+    type: openapi
+    url: http://mock-backends:8001/devops
+    openapi_spec_url: http://mock-backends:8001/devops/openapi.json
+    auth_type: none
+    preferred_mode: auto
+    allowed_roles: [platform_eng, sre_oncall, gateway_admin, admin]
+    allowed_groups: [engineering, platform]
+    enabled: true

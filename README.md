@@ -1,6 +1,13 @@
 # MCPcodeaway — Vendor-Agnostic Code-Mode Universal MCP Gateway
 
-**MCPcodeaway** is a stateless, vendor-agnostic MCP gateway that bridges enterprise Identity Providers (Entra ID, Okta, Keycloak, or local dev RS256 OIDC) to heterogeneous backends (`mcp_http`, `mcp_stdio`, and `openapi` / Swagger) while executing multi-step workflows inside a networkless **Monty (`pydantic-monty`)** Python sandbox.
+**MCPcodeaway** is a stateless, vendor-agnostic MCP gateway that bridges enterprise Identity Providers (Entra ID, Okta, Keycloak, or local dev RS256 OIDC) to heterogeneous backends (`mcp_http`, `mcp_stdio`, and `openapi` / Swagger) while executing multi-step workflows inside an ephemeral, networkless **Monty (`pydantic-monty`)** Python sandbox.
+
+## Why MCPcodeaway? (Platform Value Proposition)
+
+- **Up to 99% Catalog Surface Reduction & 71–93% Multi-Step Token Savings:** Exposes a constant ~463-token deferred discovery + `execute_code` surface instead of stuffing 50–500 tool schemas into every prompt, and executes joins/filters inside Monty before returning compact grounded results. See [BENCHMARKS.md](BENCHMARKS.md) for live `qwen/qwen3.5-9b` A/B results, wins, and honest single-lookup tradeoffs.
+- **Zero-Trust Enterprise Security:** Per-user OIDC JWT validation, RFC 8693 / OBO delegated token exchange, host-side ABAC row filtering, PII/secret redaction, SSRF guards, and HMAC provenance grounding verification.
+- **Stateless-First Cloud-Native Design:** Built around stateless Streamable HTTP MCP and ephemeral Monty sandboxes—no sticky sessions required for horizontal scaling—while transparently handling legacy `Mcp-Session-Id` upstreams when needed.
+- **Full Operate Control Plane (`/dashboard`):** Nuxt 4 + `@ui-sdk/vue` console with real-time WebSocket telemetry, Linear-style Request Traces (`/traces`), Gateway Usage & Group Timeline Aggregation (`/analytics`), 1-click Mode Optimization (`/optimization`), 3-step HITL Onboarding + A/B Lab (`/onboarding`), Audit & S3/JSONL Compliance Archival (`/audit`), and Custom Alert Rules (`/settings`).
 
 ## Architecture
 

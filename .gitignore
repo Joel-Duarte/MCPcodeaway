@@ -19,3 +19,6 @@ web/test-results/
 web/playwright-report/
 graphify-out/
 .agents/
+benchmarks/*_results.json
+benchmarks/results.json
+benchmarks/subagent_mcp_trial.json

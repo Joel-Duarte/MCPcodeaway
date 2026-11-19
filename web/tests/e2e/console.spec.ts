@@ -34,10 +34,15 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     await expect(page.getByRole("heading", { name: /Gateway Usage, Groups & Cost Attribution/i })).toBeVisible();
     await expect(page.getByText(/Code Mode vs\. Classic Volume/i)).toBeVisible();
 
-    // 2b. Dedicated Optimization & ROI page
+    // 2b. Dedicated Optimization & Cost Savings page
     await page.getByRole("link", { name: /Optimization & ROI/i }).click();
-    await expect(page.getByRole("heading", { name: /Optimization, Cost Savings & A\/B Splits/i })).toBeVisible();
-    await expect(page.getByText(/Empirical 9B Baseline/i)).toBeVisible();
+    await expect(page.getByRole("heading", { name: /Optimization & Cost Savings/i })).toBeVisible();
+    await expect(page.getByText(/Upstreams Needing Optimization/i)).toBeVisible();
+
+    // 2c. Dedicated Traces & Timeline page
+    await page.getByRole("link", { name: /Traces & Timeline/i }).click();
+    await expect(page.getByRole("heading", { name: /Request Traces & Monty Sandbox Timeline/i })).toBeVisible();
+    await expect(page.getByText(/Monty Sandbox Mode/i)).toBeVisible();
 
     // 3. Upstreams Catalog renders live servers + 500-server search
     await page.getByRole("link", { name: /Upstreams Catalog/i }).click();
@@ -82,7 +87,7 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     page,
   }) => {
     await page.setViewportSize({ width: 375, height: 812 });
-    for (const path of ["/dashboard/", "/dashboard/analytics", "/dashboard/optimization", "/dashboard/onboarding", "/dashboard/upstreams", "/dashboard/audit", "/dashboard/settings"]) {
+    for (const path of ["/dashboard/", "/dashboard/traces", "/dashboard/analytics", "/dashboard/optimization", "/dashboard/onboarding", "/dashboard/upstreams", "/dashboard/audit", "/dashboard/settings"]) {
       await page.goto(`${BASE}${path}`, { waitUntil: "networkidle" });
       const overflow = await page.evaluate(
         () => document.documentElement.scrollWidth - document.documentElement.clientWidth

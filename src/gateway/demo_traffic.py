@@ -22,7 +22,15 @@ _TIER_TIMING: dict[str, tuple[float, float]] = {
 }
 
 _BUILTIN_SERVERS = frozenset(
-    {"billing_legacy_eu", "billing_legacy_us", "ops_ticketing", "snowflake_ledger"}
+    {
+        "billing_legacy_eu",
+        "billing_legacy_us",
+        "ops_ticketing",
+        "snowflake_ledger",
+        "crm_accounts",
+        "hr_directory",
+        "devops_ci",
+    }
 )
 
 
@@ -207,6 +215,16 @@ class DemoTrafficRunner:
                 {
                     "name": "ops_ticketing__escalate_incident",
                     "arguments": {"incident_id": "INC-404", "priority": "sev1"},
+                },
+                None,
+            ),
+            (
+                "sales_ops_analyst",
+                "mode=codemode&require_grounding=true",
+                "crm:grounding_block_probe",
+                {
+                    "name": "execute_code",
+                    "arguments": {"code": "{'account_id': 'ACC-9999', 'arr_usd': 999999}"},
                 },
                 None,
             ),

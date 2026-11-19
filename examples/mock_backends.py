@@ -718,6 +718,64 @@ def create_mock_backends_app(
         ),
     )
 
+    def _build_simple_enterprise_subapp(
+        *,
+        title: str,
+        mount_prefix: str,
+        op_id: str,
+        path: str,
+        rows: list[dict[str, Any]],
+    ) -> FastAPI:
+        sub = FastAPI(title=title, version="1.0.0", servers=[{"url": mount_prefix}])
+
+        @sub.get(path, operation_id=op_id)
+        async def list_items(limit: int = Query(default=25, ge=1, le=100)) -> dict[str, Any]:
+            return {"items": rows[:limit], "count": len(rows[:limit])}
+
+        return sub
+
+    app.mount(
+        "/crm",
+        _build_simple_enterprise_subapp(
+            title="Enterprise CRM Accounts API",
+            mount_prefix="/crm",
+            op_id="list_crm_accounts",
+            path="/accounts",
+            rows=[
+                {"account_id": "ACC-101", "name": "Acme Retail EU", "arr_usd": 148000, "tier": "enterprise"},
+                {"account_id": "ACC-102", "name": "Northwind Logistics", "arr_usd": 92000, "tier": "growth"},
+                {"account_id": "ACC-103", "name": "Contoso FinTech", "arr_usd": 215000, "tier": "enterprise"},
+            ],
+        ),
+    )
+    app.mount(
+        "/hr",
+        _build_simple_enterprise_subapp(
+            title="HR Directory API",
+            mount_prefix="/hr",
+            op_id="list_hr_employees",
+            path="/employees",
+            rows=[
+                {"emp_id": "EMP-01", "department": "finance", "role": "controller", "region": "EU"},
+                {"emp_id": "EMP-02", "department": "engineering", "role": "sre", "region": "US"},
+                {"emp_id": "EMP-03", "department": "sales_ops", "role": "analyst", "region": "EU"},
+            ],
+        ),
+    )
+    app.mount(
+        "/devops",
+        _build_simple_enterprise_subapp(
+            title="DevOps CI/CD Pipelines API",
+            mount_prefix="/devops",
+            op_id="list_ci_deployments",
+            path="/deployments",
+            rows=[
+                {"deploy_id": "DEP-901", "service": "gateway-prod", "status": "healthy", "sha": "ca43384"},
+                {"deploy_id": "DEP-902", "service": "billing-eu", "status": "healthy", "sha": "9b4c734"},
+            ],
+        ),
+    )
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}

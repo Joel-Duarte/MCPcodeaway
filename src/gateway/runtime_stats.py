@@ -96,6 +96,36 @@ async def collect_runtime_telemetry(runtime: GatewayRuntime) -> dict[str, Any]:
         worker_info["status"] = "in_process"
         worker_info["stats"] = gw_stats
 
+    recent_runs = await runtime.store.list_runs(limit=100)
+    spawns = sorted(
+        float(r.get("monty_spawn_ms") or 0.0)
+        for r in recent_runs
+        if float(r.get("monty_spawn_ms") or 0.0) > 0
+    )
+    execs = sorted(
+        float(r.get("monty_exec_ms") or 0.0)
+        for r in recent_runs
+        if float(r.get("monty_exec_ms") or 0.0) > 0
+    )
+
+    def _pct(vals: list[float], q: float) -> float:
+        if not vals:
+            return 0.0
+        idx = min(len(vals) - 1, max(0, int(q * len(vals)) - 1))
+        return round(vals[idx], 3)
+
+    monty_telemetry = {
+        "ephemeral": True,
+        "codemode_runs": sum(
+            1 for r in recent_runs if str(r.get("mode", "")).startswith("codemode")
+        ),
+        "grounding_blocked_runs": sum(1 for r in recent_runs if r.get("grounding_blocked")),
+        "spawn_p50_ms": _pct(spawns, 0.50),
+        "spawn_p95_ms": _pct(spawns, 0.95),
+        "exec_p50_ms": _pct(execs, 0.50),
+        "exec_p95_ms": _pct(execs, 0.95),
+    }
+
     return {
         "gateway": {
             "profile": runtime.settings.effective_profile_name,
@@ -108,4 +138,5 @@ async def collect_runtime_telemetry(runtime: GatewayRuntime) -> dict[str, Any]:
             **gw_stats,
         },
         "sandbox_worker": worker_info,
+        "monty_telemetry": monty_telemetry,
     }
