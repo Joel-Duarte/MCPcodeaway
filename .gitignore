@@ -15,5 +15,7 @@ build/
 web/node_modules/
 web/.nuxt/
 web/.output/
+web/test-results/
+web/playwright-report/
 graphify-out/
 .agents/

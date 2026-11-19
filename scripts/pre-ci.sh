@@ -44,8 +44,8 @@ fi
 echo ">> [4/6] Full backend pytest suite (incl. Golden flows & Phase 11)..."
 uv run pytest -v
 
-echo ">> [5/6] Frontend Nuxt 4 + @ui-sdk/vue static build check..."
-(cd "$REPO_ROOT/web" && NUXT_TELEMETRY_DISABLED=1 npm run generate)
+echo ">> [5/6] Frontend Vitest agent checks & Nuxt 4 + @ui-sdk/vue static build..."
+(cd "$REPO_ROOT/web" && npm run test:unit && NUXT_TELEMETRY_DISABLED=1 npm run generate)
 
 echo ">> [6/6] Locked offline benchmark threshold verification..."
 uv run python benchmarks/run_benchmark.py --output /tmp/mcp_pre_ci_bench.json --verify-thresholds
