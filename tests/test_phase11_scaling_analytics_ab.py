@@ -460,12 +460,12 @@ async def test_runtime_telemetry_analytics_cors_and_cross_tenant_isolation(
             # Analytics across groups/users/client_groups/model pricing.
             ana = (
                 await gw.get(
-                    "/audit/analytics?group=finance&model=gpt-4o",
+                    "/audit/analytics?group=finance&model=gpt-4.1",
                     headers={"Authorization": f"Bearer {adm_tok}"},
                 )
             ).json()
             assert ana["summary"]["total_runs"] == 1
-            assert ana["pricing"]["model"] == "gpt-4o"
+            assert ana["pricing"]["model"] == "gpt-4.1"
             assert ana["by_company_group"][0]["group"] == "finance"
             assert ana["by_client_group"][0]["client_group"] == "eu_accountant"
             assert ana["by_user"][0]["user_email"] == "alice@acme.test"

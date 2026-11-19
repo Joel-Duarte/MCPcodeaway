@@ -1,0 +1,31 @@
+groups:
+  - name: mcpcodeaway_gateway_alerts
+    rules:
+      - alert: GatewayHighErrorRate
+        expr: |
+          sum(rate(mcpcodeaway_requests_total{status="error"}[5m]))
+          / clamp_min(sum(rate(mcpcodeaway_requests_total[5m])), 0.001) > 0.15
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MCPcodeaway error rate above 15%"
+
+      - alert: GatewayHighP95Latency
+        expr: |
+          histogram_quantile(0.95, sum(rate(mcpcodeaway_request_duration_ms_bucket[5m])) by (le)) > 1500
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCPcodeaway p95 latency exceeded 1500ms"
+
+      - alert: GatewayOBOCacheHitDrop
+        expr: |
+          sum(rate(mcpcodeaway_obo_cache_hits_total[10m]))
+          / clamp_min(sum(rate(mcpcodeaway_obo_exchanges_total[10m])), 0.001) < 0.3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Delegated OBO token cache hit ratio dropped below 30%"

@@ -233,6 +233,15 @@ class SQLiteAuditStore:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gateway_settings (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
         self._conn = conn
         return conn
@@ -294,6 +303,54 @@ class SQLiteAuditStore:
                     (limit,),
                 ).fetchall()
         return [json.loads(row["payload_json"]) for row in rows]
+
+    async def query_runs(
+        self,
+        *,
+        limit: int = 25,
+        offset: int = 0,
+        tenant_id: str | None = None,
+        status: str = "all",
+        mode: str | None = None,
+        q: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        if mode and mode != "all":
+            clauses.append("mode = ?")
+            params.append(mode)
+        if status == "errors":
+            clauses.append("json_extract(payload_json, '$.ok') = 0")
+        elif status == "grounding_blocked":
+            clauses.append("json_extract(payload_json, '$.grounding_blocked') = 1")
+        elif status == "ok":
+            clauses.append("json_extract(payload_json, '$.ok') = 1")
+        if q and q.strip():
+            needle = f"%{q.strip()}%"
+            clauses.append("(run_id LIKE ? OR user_sub LIKE ? OR payload_json LIKE ?)")
+            params.extend([needle, needle, needle])
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        async with self._lock:
+            conn = self._ensure_conn()
+            total_row = conn.execute(
+                f"SELECT COUNT(*) AS cnt FROM audit_runs {where_sql}",
+                tuple(params),
+            ).fetchone()
+            total = int(total_row["cnt"]) if total_row is not None else 0
+            rows = conn.execute(
+                f"""
+                SELECT payload_json FROM audit_runs
+                {where_sql}
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*params, max(1, min(limit, 200)), max(0, offset)),
+            ).fetchall()
+        return [json.loads(row["payload_json"]) for row in rows], total
 
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
         async with self._lock:
@@ -383,6 +440,32 @@ class SQLiteAuditStore:
             cursor = conn.execute("DELETE FROM model_pricing WHERE model_name = ?", (model_name,))
             conn.commit()
             return cursor.rowcount > 0
+
+    async def get_setting(self, key: str) -> dict[str, Any] | None:
+        async with self._lock:
+            conn = self._ensure_conn()
+            row = conn.execute(
+                "SELECT value_json FROM gateway_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return json.loads(row["value_json"]) if row is not None else None
+
+    async def save_setting(self, key: str, value: dict[str, Any]) -> None:
+        now = datetime.now(UTC).isoformat()
+        payload = json.dumps(value, default=str)
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute(
+                """
+                INSERT INTO gateway_settings (key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json=excluded.value_json,
+                    updated_at=excluded.updated_at
+                """,
+                (key, payload, now),
+            )
+            conn.commit()
 
 
 class PostgresAuditStore:
@@ -498,6 +581,60 @@ class PostgresAuditStore:
             )
         return [self._decode_json(row["payload_json"]) for row in rows]
 
+    async def query_runs(
+        self,
+        *,
+        limit: int = 25,
+        offset: int = 0,
+        tenant_id: str | None = None,
+        status: str = "all",
+        mode: str | None = None,
+        q: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        pool = await self._get_pool()
+        clauses: list[str] = []
+        args: list[Any] = []
+        idx = 1
+        if tenant_id is not None:
+            clauses.append(f"tenant_id = ${idx}")
+            args.append(tenant_id)
+            idx += 1
+        if mode and mode != "all":
+            clauses.append(f"mode = ${idx}")
+            args.append(mode)
+            idx += 1
+        if status == "errors":
+            clauses.append("(payload_json::jsonb->>'ok') = 'false'")
+        elif status == "grounding_blocked":
+            clauses.append("(payload_json::jsonb->>'grounding_blocked') = 'true'")
+        elif status == "ok":
+            clauses.append("(payload_json::jsonb->>'ok') = 'true'")
+        if q and q.strip():
+            clauses.append(
+                f"(run_id ILIKE ${idx} OR user_sub ILIKE ${idx} OR payload_json ILIKE ${idx})"
+            )
+            args.append(f"%{q.strip()}%")
+            idx += 1
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        cnt_row = await pool.fetchrow(
+            f"SELECT COUNT(*) AS cnt FROM audit_runs {where_sql}",
+            *args,
+        )
+        total = int(cnt_row["cnt"]) if cnt_row is not None else 0
+        rows = await pool.fetch(
+            f"""
+            SELECT payload_json FROM audit_runs
+            {where_sql}
+            ORDER BY created_at DESC
+            LIMIT ${idx} OFFSET ${idx + 1}
+            """,
+            *args,
+            max(1, min(limit, 200)),
+            max(0, offset),
+        )
+        return [self._decode_json(row["payload_json"]) for row in rows], total
+
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
         pool = await self._get_pool()
         row = await pool.fetchrow(
@@ -597,6 +734,41 @@ class PostgresAuditStore:
             return int(str(status).split()[-1]) > 0
         except (IndexError, ValueError):
             return bool(status)
+
+    async def _ensure_settings_table(self, pool: Any) -> None:
+        await pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gateway_settings (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    async def get_setting(self, key: str) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        await self._ensure_settings_table(pool)
+        row = await pool.fetchrow("SELECT value_json FROM gateway_settings WHERE key = $1", key)
+        return self._decode_json(row["value_json"]) if row is not None else None
+
+    async def save_setting(self, key: str, value: dict[str, Any]) -> None:
+        pool = await self._get_pool()
+        await self._ensure_settings_table(pool)
+        now = datetime.now(UTC).isoformat()
+        payload = json.dumps(value, default=str)
+        await pool.execute(
+            """
+            INSERT INTO gateway_settings (key, value_json, updated_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (key) DO UPDATE SET
+                value_json = EXCLUDED.value_json,
+                updated_at = EXCLUDED.updated_at
+            """,
+            key,
+            payload,
+            now,
+        )
 
     async def close(self) -> None:
         if self._pool is not None and hasattr(self._pool, "close"):

@@ -181,10 +181,12 @@ class GatewaySettings(BaseSettings):
     cors_allowed_origins: list[str] = Field(default_factory=list)
     model_pricing: dict[str, dict[str, float]] = Field(
         default_factory=lambda: {
-            "default": {"input": 3.0, "output": 15.0},
-            "gpt-4o": {"input": 2.5, "output": 10.0},
-            "claude-sonnet": {"input": 3.0, "output": 15.0},
             "qwen3.5-9b": {"input": 0.2, "output": 0.6},
+            "gemini-2.5-flash": {"input": 0.15, "output": 0.6},
+            "gemini-2.5-pro": {"input": 1.25, "output": 10.0},
+            "claude-sonnet-4": {"input": 3.0, "output": 15.0},
+            "gpt-4.1": {"input": 2.0, "output": 8.0},
+            "gpt-5": {"input": 1.25, "output": 10.0},
         }
     )
 
