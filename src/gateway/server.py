@@ -13,11 +13,20 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import Cookie, FastAPI, Header, HTTPException, Query, Request
+from fastapi import (
+    Cookie,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from opentelemetry import trace
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from gateway import __version__
 from gateway.ab_testing import (
@@ -53,7 +62,7 @@ from gateway.config import (
     UpstreamConfig,
     UpstreamRegistry,
 )
-from gateway.demo_traffic import DemoTrafficRunner
+from gateway.demo_traffic import DemoTier, DemoTrafficRunner
 from gateway.discovery import DiscoveryEngine
 from gateway.dispatcher import (
     ExecutionBudget,
@@ -533,6 +542,36 @@ class GatewayRuntime:
         if hasattr(self.store, "close"):
             await self.store.close()  # type: ignore[attr-defined]
 
+    async def _publish_live_summary(self, run: dict[str, Any], identity: CallerIdentity) -> None:
+        if not hasattr(self.cache, "publish_event"):
+            return
+        event = {
+            "type": "run_recorded",
+            "run_id": run.get("run_id"),
+            "created_at": run.get("created_at"),
+            "mode": run.get("mode"),
+            "tool_name": run.get("tool_name"),
+            "company_group": (identity.groups[0] if identity.groups else "ungrouped"),
+            "user_sub": identity.sub,
+            "ok": bool(run.get("ok")),
+            "grounding_blocked": bool(run.get("grounding_blocked", False)),
+            "duration_ms": run.get("duration_ms"),
+            "tokens_saved": run.get("tokens_saved", 0),
+            "mode_decision_reason": run.get("mode_decision_reason"),
+        }
+        try:
+            await self.cache.publish_event("mcpcodeaway:telemetry", json.dumps(event, default=str))
+        except Exception:
+            pass
+
+    async def merged_model_pricing(self) -> dict[str, dict[str, float]]:
+        merged = {k: dict(v) for k, v in self.settings.model_pricing.items()}
+        if hasattr(self.store, "list_model_pricing"):
+            custom = await self.store.list_model_pricing()
+            for k, v in custom.items():
+                merged[k] = dict(v)
+        return merged
+
     def tools_for_mode(
         self,
         identity: CallerIdentity,
@@ -926,6 +965,7 @@ class GatewayRuntime:
             duration_ms=duration_ms,
             run=run,
         )
+        await self._publish_live_summary(run, identity)
         log_event(
             "sandbox.executed",
             mode=mode,
@@ -1019,6 +1059,7 @@ class GatewayRuntime:
                 duration_ms=duration_ms,
                 run=run,
             )
+            await self._publish_live_summary(run, identity)
             return {
                 "ok": ok,
                 "result": result,
@@ -1153,6 +1194,12 @@ class CompareRequest(BaseModel):
     persona: str = "finance_analyst"
     custom_classic_calls: list[dict[str, Any]] | None = None
     custom_code: str | None = None
+
+
+class ModelPriceBody(BaseModel):
+    model_name: str = Field(..., min_length=1, max_length=64)
+    input_per_1m_usd: float = Field(..., ge=0.0, le=1000.0)
+    output_per_1m_usd: float = Field(..., ge=0.0, le=1000.0)
 
 
 def create_gateway_app(
@@ -1790,10 +1837,86 @@ def create_gateway_app(
                 user_filter=user,
                 upstream_filter=upstream,
                 model_name=model,
-                model_pricing=runtime.settings.model_pricing,
+                model_pricing=await runtime.merged_model_pricing(),
             )
 
     if features.admin_read:
+
+        @app.get("/admin/pricing/models")
+        async def admin_list_model_pricing(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            custom: dict[str, dict[str, float]] = {}
+            if hasattr(runtime.store, "list_model_pricing"):
+                custom = await runtime.store.list_model_pricing()
+            return {
+                "models": await runtime.merged_model_pricing(),
+                "custom_models": sorted(custom),
+                "defaults": sorted(runtime.settings.model_pricing),
+                "billing_note": (
+                    "Models per-token API pricing ($/1M in & out); "
+                    "subscription plans are not exposed by MCP."
+                ),
+            }
+
+        @app.websocket("/admin/ws/telemetry")
+        async def admin_ws_telemetry(
+            websocket: WebSocket,
+            token: str | None = Query(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> None:
+            auth_hdr = f"Bearer {token}" if token else websocket.headers.get("authorization")
+            try:
+                await _authorize_control_plane(
+                    auth_hdr, mcpcodeaway_admin_session, require_admin_role=True
+                )
+            except HTTPException:
+                await websocket.close(code=4403)
+                return
+
+            await websocket.accept()
+            initial_rt = await collect_runtime_telemetry(runtime)
+            await websocket.send_json(
+                {
+                    "type": "snapshot",
+                    "runtime": initial_rt,
+                    "demo_traffic": runtime.demo_traffic.status(),
+                }
+            )
+
+            async def _forward_pubsub() -> None:
+                if not hasattr(runtime.cache, "subscribe_events"):
+                    return
+                async for raw_msg in runtime.cache.subscribe_events("mcpcodeaway:telemetry"):
+                    await websocket.send_text(raw_msg)
+
+            async def _runtime_ticks() -> None:
+                while True:
+                    await asyncio.sleep(2.0)
+                    rt_snap = await collect_runtime_telemetry(runtime)
+                    await websocket.send_json(
+                        {
+                            "type": "runtime_tick",
+                            "runtime": rt_snap,
+                            "demo_traffic": runtime.demo_traffic.status(),
+                        }
+                    )
+
+            pub_task = asyncio.create_task(_forward_pubsub())
+            tick_task = asyncio.create_task(_runtime_ticks())
+            try:
+                while True:
+                    await websocket.receive_text()
+            except WebSocketDisconnect:
+                pass
+            finally:
+                pub_task.cancel()
+                tick_task.cancel()
+                await asyncio.gather(pub_task, tick_task, return_exceptions=True)
 
         @app.get("/admin/upstreams")
         async def list_admin_upstreams(
@@ -1836,7 +1959,7 @@ def create_gateway_app(
             )
             analytics = await runtime.telemetry.analytics_report(
                 limit=1000,
-                model_pricing=runtime.settings.model_pricing,
+                model_pricing=await runtime.merged_model_pricing(),
             )
             configured = [
                 {
@@ -1964,9 +2087,41 @@ def create_gateway_app(
             )
             return runtime.demo_traffic.status()
 
+        @app.post("/admin/pricing/models")
+        async def admin_save_model_pricing(
+            body: ModelPriceBody,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            if not hasattr(runtime.store, "save_model_pricing"):
+                raise HTTPException(
+                    status_code=501, detail="Active AuditStore lacks pricing storage"
+                )
+            await runtime.store.save_model_pricing(
+                body.model_name.strip(), body.input_per_1m_usd, body.output_per_1m_usd
+            )
+            return {"saved": True, "models": await runtime.merged_model_pricing()}
+
+        @app.delete("/admin/pricing/models/{model_name}")
+        async def admin_delete_model_pricing(
+            model_name: str,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            deleted = False
+            if hasattr(runtime.store, "delete_model_pricing"):
+                deleted = await runtime.store.delete_model_pricing(model_name)
+            return {"deleted": deleted, "models": await runtime.merged_model_pricing()}
+
         @app.post("/admin/demo/traffic/start")
         async def admin_demo_traffic_start(
-            interval_seconds: float = Query(default=2.0, ge=0.5, le=10.0),
+            tier: DemoTier = "enterprise",
             authorization: str | None = Header(default=None),
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
@@ -1974,7 +2129,19 @@ def create_gateway_app(
                 authorization, mcpcodeaway_admin_session, require_admin_role=True
             )
             _ensure_demo_traffic_allowed()
-            return await runtime.demo_traffic.start(interval_seconds=interval_seconds)
+            return await runtime.demo_traffic.start(tier=tier)
+
+        @app.post("/admin/demo/traffic/tier")
+        async def admin_demo_traffic_tier(
+            tier: DemoTier = "enterprise",
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _ensure_demo_traffic_allowed()
+            return await runtime.demo_traffic.set_tier(tier=tier)
 
         @app.post("/admin/demo/traffic/stop")
         async def admin_demo_traffic_stop(

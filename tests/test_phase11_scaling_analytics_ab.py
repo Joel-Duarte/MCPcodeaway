@@ -787,7 +787,89 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
             )
             assert burst.status_code == 200
             assert burst.json()["sent"] == 2
+
+            # Custom model pricing CRUD + analytics model selector merge
+            saved_p = await gw.post(
+                "/admin/pricing/models",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+                json={
+                    "model_name": "custom-haiku",
+                    "input_per_1m_usd": 0.8,
+                    "output_per_1m_usd": 4.0,
+                },
+            )
+            assert saved_p.status_code == 200
+            assert "custom-haiku" in saved_p.json()["models"]
+            listed_p = await gw.get(
+                "/admin/pricing/models",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+            )
+            assert listed_p.status_code == 200
+            assert "qwen3.5-9b" in listed_p.json()["models"]
+            ana_p = await gw.get(
+                "/audit/analytics?model=custom-haiku",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+            )
+            assert ana_p.status_code == 200
+            assert ana_p.json()["pricing"]["model"] == "custom-haiku"
+            assert ana_p.json()["pricing"]["input_per_1m_usd"] == 0.8
+            del_p = await gw.delete(
+                "/admin/pricing/models/custom-haiku",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+            )
+            assert del_p.status_code == 200
+            assert del_p.json()["deleted"] is True
+
+            # Tiered demo traffic start/tier/stop
+            t_start = await gw.post(
+                "/admin/demo/traffic/start?tier=stress",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+            )
+            assert t_start.status_code == 200
+            assert t_start.json()["tier"] == "stress"
+            assert t_start.json()["running"] is True
+            t_swap = await gw.post(
+                "/admin/demo/traffic/tier?tier=light",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+            )
+            assert t_swap.status_code == 200
+            assert t_swap.json()["tier"] == "light"
+            t_stop = await gw.post(
+                "/admin/demo/traffic/stop",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+            )
+            assert t_stop.status_code == 200
+            assert t_stop.json()["running"] is False
     finally:
         await rt.shutdown()
 
     assert sys.version_info >= (3, 12)
+
+
+def test_live_websocket_telemetry_stream_and_summary_only_payload(tmp_path: Path) -> None:
+    from starlette.testclient import TestClient
+
+    dev_keys = LocalDevKeyManager()
+    settings = GatewaySettings(
+        auth_mode="dev",
+        profile="demo",
+        sqlite_path=str(tmp_path / "ws.db"),
+        upstreams_config_path=str(tmp_path / "none.yaml"),
+    )
+    app = create_gateway_app(settings=settings, dev_keys=dev_keys, preloaded_tools={})
+    adm_tok = dev_keys.issue_user_token(persona="gateway_admin")
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/admin/ws/telemetry?token={adm_tok}") as ws:
+            snap = ws.receive_json()
+            assert snap["type"] == "snapshot"
+            assert "gateway" in snap["runtime"]
+            burst_r = client.post(
+                "/admin/demo/traffic/burst?count=1",
+                headers={"Authorization": f"Bearer {adm_tok}"},
+            )
+            assert burst_r.status_code == 200
+            evt = ws.receive_json()
+            assert evt["type"] == "run_recorded"
+            assert "run_id" in evt
+            assert "raw_payload" not in evt
+            assert "code" not in evt
