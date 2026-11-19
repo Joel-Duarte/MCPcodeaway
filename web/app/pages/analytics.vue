@@ -305,28 +305,6 @@ function formatUsd(n: number | undefined): string {
         </Button>
       </section>
 
-      <!-- Empirical Code Mode vs. Classic Proof Banner -->
-      <section aria-label="Empirical Code Mode value proof" class="rounded-lg border border-[#99F6E4] bg-[#F0FDFA] p-4">
-        <div class="flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <h2 class="text-[15px] font-semibold text-[#0F766E]">
-              Empirical Proof: Why Code Mode Saves Money ({{ analytics.pricing.model }})
-            </h2>
-            <p class="mt-0.5 text-xs text-[#52525B]">
-              Code Mode executes multi-tool joins inside the Monty sandbox instead of streaming raw JSON through LLM context. Per-token API pricing is modeled ($/1M in &amp; out); subscription plans are not exposed by MCP.
-            </p>
-          </div>
-          <div class="flex flex-wrap items-center gap-4 text-xs tabular-nums">
-            <span class="font-semibold text-[#09090B]">
-              {{ formatInt(analytics.summary.total_tokens_saved) }} tokens saved
-            </span>
-            <span class="font-semibold text-[#059669]">
-              {{ formatUsd(analytics.summary.estimated_cost_saved_usd) }} avoided
-            </span>
-          </div>
-        </div>
-      </section>
-
       <!-- Summary KPI Strip -->
       <section class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">

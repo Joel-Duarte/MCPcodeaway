@@ -200,6 +200,15 @@ async function confirmPrune() {
 }
 
 const route = useRoute();
+const inspectedSpan = ref<AuditRun["trace_spans"] extends (infer T)[] | undefined ? T | null : null>(null);
+
+function bottleneckSpan(run: AuditRun) {
+  const spans = run.trace_spans || [];
+  if (!spans.length) return null;
+  const slowest = spans.reduce((a, b) => (b.duration_ms > a.duration_ms ? b : a), spans[0]);
+  const pct = run.duration_ms > 0 ? Math.round((slowest.duration_ms / run.duration_ms) * 100) : 0;
+  return { span: slowest, pct };
+}
 
 onMounted(() => {
   const qStatus = String(route.query.status || "");
@@ -207,6 +216,10 @@ onMounted(() => {
     statusFilter.value = qStatus;
   }
   void fetchRuns();
+  const qRunId = String(route.query.run_id || "");
+  if (qRunId) {
+    void inspectRun(qRunId);
+  }
 });
 
 function spanBarStyle(span: { start_ms: number; duration_ms: number }, totalMs: number) {
@@ -496,11 +509,21 @@ function spanBarColor(stage: string, status: string) {
               <div class="font-semibold text-[#09090B]">Request Trace Timeline</div>
               <div class="text-[11px] text-[#71717A] tabular-nums">Total {{ selectedRun.duration_ms.toFixed(1) }} ms</div>
             </div>
+            <div
+              v-if="bottleneckSpan(selectedRun)"
+              class="rounded border border-[#E4E4E7] bg-[#FAFAFA] px-2.5 py-1.5 text-[11px] text-[#52525B]"
+            >
+              <strong class="text-[#09090B]">Timeline Analyzer:</strong>
+              Bottleneck is <strong class="text-[#09090B]">{{ bottleneckSpan(selectedRun)!.span.label }}</strong>
+              ({{ bottleneckSpan(selectedRun)!.span.duration_ms.toFixed(2) }} ms · {{ bottleneckSpan(selectedRun)!.pct }}% of total). Hover or click a bar to inspect.
+            </div>
             <div class="space-y-1.5">
               <div
                 v-for="(sp, idx) in selectedRun.trace_spans"
                 :key="idx"
-                class="grid grid-cols-[11rem_1fr_4.5rem] items-center gap-2 text-[11px]"
+                class="grid grid-cols-[11rem_1fr_4.5rem] items-center gap-2 rounded px-1 py-0.5 text-[11px] cursor-pointer hover:bg-[#FAFAFA]"
+                @mouseenter="inspectedSpan = sp"
+                @click="inspectedSpan = sp"
               >
                 <div class="truncate font-medium text-[#09090B]" :title="sp.label">{{ sp.label }}</div>
                 <div class="relative h-3 rounded bg-[#F4F4F5] overflow-hidden">
@@ -514,6 +537,16 @@ function spanBarColor(stage: string, status: string) {
                   {{ sp.duration_ms.toFixed(2) }} ms
                 </div>
               </div>
+            </div>
+            <div
+              v-if="inspectedSpan"
+              class="rounded border border-[#99F6E4] bg-[#F0FDFA] px-2.5 py-1.5 text-[11px] text-[#09090B]"
+            >
+              <strong class="text-[#0F766E]">{{ inspectedSpan.label }}</strong> ({{ inspectedSpan.stage }}) ·
+              start +{{ inspectedSpan.start_ms.toFixed(2) }}ms ·
+              duration {{ inspectedSpan.duration_ms.toFixed(2) }}ms ·
+              {{ selectedRun.duration_ms > 0 ? ((inspectedSpan.duration_ms / selectedRun.duration_ms) * 100).toFixed(1) : "0.0" }}% of total ·
+              status: {{ inspectedSpan.status }}
             </div>
           </div>
 

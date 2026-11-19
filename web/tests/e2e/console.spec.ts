@@ -39,10 +39,10 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     await expect(page.getByRole("heading", { name: /Optimization & Cost Savings/i })).toBeVisible();
     await expect(page.getByText(/Upstreams Needing Optimization/i)).toBeVisible();
 
-    // 2c. Dedicated Traces & Timeline page
+    // 2c. Dedicated Traces & Latency Timeline page
     await page.getByRole("link", { name: /Traces & Timeline/i }).click();
-    await expect(page.getByRole("heading", { name: /Request Traces & Monty Sandbox Timeline/i })).toBeVisible();
-    await expect(page.getByText(/Monty Sandbox Mode/i)).toBeVisible();
+    await expect(page.getByRole("heading", { name: /Traces & Latency Timeline/i })).toBeVisible();
+    await expect(page.getByText(/Where Time Is Spent by Group/i)).toBeVisible();
 
     // 3. Upstreams Catalog renders live servers + 500-server search
     await page.getByRole("link", { name: /Upstreams Catalog/i }).click();
