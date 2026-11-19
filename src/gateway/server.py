@@ -770,15 +770,19 @@ def create_gateway_app(
     async def latest_benchmarks() -> dict[str, Any]:
         results_path = Path("benchmarks/results.json")
         load_path = Path("benchmarks/load_results.json")
+        live_path = Path("benchmarks/live_llm_results.json")
         payload: dict[str, Any] = {
-            "available": results_path.exists() or load_path.exists(),
+            "available": results_path.exists() or load_path.exists() or live_path.exists(),
             "offline": None,
             "load": None,
+            "live_llm": None,
         }
         if results_path.exists():
             payload["offline"] = json.loads(results_path.read_text(encoding="utf-8"))
         if load_path.exists():
             payload["load"] = json.loads(load_path.read_text(encoding="utf-8"))
+        if live_path.exists():
+            payload["live_llm"] = json.loads(live_path.read_text(encoding="utf-8"))
         return payload
 
     @app.get("/dashboard", response_class=HTMLResponse)
