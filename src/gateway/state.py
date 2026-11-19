@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sqlite3
 import time
@@ -273,3 +274,156 @@ class SQLiteAuditStore:
             cursor = conn.execute("DELETE FROM dynamic_upstreams WHERE name = ?", (name,))
             conn.commit()
             return cursor.rowcount > 0
+
+
+class PostgresAuditStore:
+    """Postgres-backed AuditStore for multi-replica production deployments."""
+
+    def __init__(self, dsn: str = "", *, pool: Any = None) -> None:
+        self.dsn = dsn
+        self._pool = pool
+
+    async def _get_pool(self) -> Any:
+        if self._pool is None:
+            try:
+                import asyncpg
+            except ImportError as exc:
+                raise RuntimeError(
+                    "postgres_dsn requires optional dependency 'mcpcodeaway[postgres]' (asyncpg)."
+                ) from exc
+            self._pool = await asyncpg.create_pool(self.dsn)
+        return self._pool
+
+    @staticmethod
+    def _decode_json(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        return dict(json.loads(str(value)))
+
+    async def init(self) -> None:
+        pool = await self._get_pool()
+        await pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_runs (
+                run_id TEXT PRIMARY KEY,
+                tenant_id TEXT,
+                user_sub TEXT,
+                mode TEXT,
+                created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        await pool.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_audit_runs_tenant_created
+            ON audit_runs(tenant_id, created_at DESC)
+            """
+        )
+        await pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dynamic_upstreams (
+                name TEXT PRIMARY KEY,
+                config_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    async def record_run(self, run: dict[str, Any]) -> None:
+        pool = await self._get_pool()
+        created_at = str(run.get("created_at") or datetime.now(UTC).isoformat())
+        payload = json.dumps(run, default=str)
+        await pool.execute(
+            """
+            INSERT INTO audit_runs (run_id, tenant_id, user_sub, mode, created_at, payload_json)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (run_id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
+                user_sub = EXCLUDED.user_sub,
+                mode = EXCLUDED.mode,
+                created_at = EXCLUDED.created_at,
+                payload_json = EXCLUDED.payload_json
+            """,
+            str(run["run_id"]),
+            run.get("tenant_id"),
+            run.get("user_sub"),
+            run.get("mode"),
+            created_at,
+            payload,
+        )
+
+    async def list_runs(
+        self, limit: int = 50, tenant_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        if tenant_id is not None:
+            rows = await pool.fetch(
+                """
+                SELECT payload_json FROM audit_runs
+                WHERE tenant_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                tenant_id,
+                limit,
+            )
+        else:
+            rows = await pool.fetch(
+                """
+                SELECT payload_json FROM audit_runs
+                ORDER BY created_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [self._decode_json(row["payload_json"]) for row in rows]
+
+    async def get_run(self, run_id: str) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        row = await pool.fetchrow(
+            "SELECT payload_json FROM audit_runs WHERE run_id = $1",
+            run_id,
+        )
+        return self._decode_json(row["payload_json"]) if row is not None else None
+
+    async def save_dynamic_upstream(self, name: str, config: dict[str, Any]) -> None:
+        pool = await self._get_pool()
+        now = datetime.now(UTC).isoformat()
+        payload = json.dumps(config, default=str)
+        await pool.execute(
+            """
+            INSERT INTO dynamic_upstreams (name, config_json, updated_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (name) DO UPDATE SET
+                config_json = EXCLUDED.config_json,
+                updated_at = EXCLUDED.updated_at
+            """,
+            name,
+            payload,
+            now,
+        )
+
+    async def list_dynamic_upstreams(self) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            "SELECT config_json FROM dynamic_upstreams ORDER BY name ASC"
+        )
+        return [self._decode_json(row["config_json"]) for row in rows]
+
+    async def delete_dynamic_upstream(self, name: str) -> bool:
+        pool = await self._get_pool()
+        status = await pool.execute(
+            "DELETE FROM dynamic_upstreams WHERE name = $1",
+            name,
+        )
+        try:
+            return int(str(status).split()[-1]) > 0
+        except (IndexError, ValueError):
+            return bool(status)
+
+    async def close(self) -> None:
+        if self._pool is not None and hasattr(self._pool, "close"):
+            res = self._pool.close()
+            if inspect.isawaitable(res):
+                await res

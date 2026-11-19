@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import httpx
 import yaml
 from mcp import ClientSession, StdioServerParameters, stdio_client
+from opentelemetry import propagate
 from pydantic import BaseModel, Field
 
 from gateway.config import UpstreamConfig
@@ -231,12 +232,32 @@ class UpstreamClientManager:
 
     def __init__(self, http_client: httpx.AsyncClient | None = None) -> None:
         self._http_client = http_client
+        self._owned_client: httpx.AsyncClient | None = None
+        self._session_ids: dict[str, str] = {}
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._http_client is not None:
+            return self._http_client
+        if self._owned_client is None:
+            self._owned_client = httpx.AsyncClient(
+                timeout=15.0,
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            )
+        return self._owned_client
+
+    async def close(self) -> None:
+        """Close the gateway-owned pooled HTTP client if initialized."""
+        if self._owned_client is not None:
+            await self._owned_client.aclose()
+            self._owned_client = None
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        if self._http_client is not None:
-            return await self._http_client.request(method, url, **kwargs)
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            return await client.request(method, url, **kwargs)
+        headers = {
+            str(k): str(v) for k, v in (kwargs.pop("headers", None) or {}).items()
+        }
+        propagate.inject(headers)
+        client = self._get_client()
+        return await client.request(method, url, headers=headers, **kwargs)
 
     @staticmethod
     def filter_tools(
@@ -275,14 +296,54 @@ class UpstreamClientManager:
         tool: DiscoveredTool,
         arguments: dict[str, Any],
         auth_headers: dict[str, str] | None = None,
+        *,
+        mcp_session_id: str | None = None,
+        session_scope: str | None = None,
     ) -> Any:
         if upstream.type == "mcp_http":
-            return await self._call_mcp_http(upstream, tool, arguments, auth_headers)
+            return await self._call_mcp_http(
+                upstream,
+                tool,
+                arguments,
+                auth_headers,
+                mcp_session_id=mcp_session_id,
+                session_scope=session_scope,
+            )
         if upstream.type == "mcp_stdio":
             return await self._call_mcp_stdio(upstream, tool, arguments)
         if upstream.type == "openapi":
             return await self._call_openapi(upstream, tool, arguments, auth_headers)
         raise ValueError(f"Unsupported upstream type '{upstream.type}'")
+
+    async def _initialize_mcp_http_session(
+        self, upstream: UpstreamConfig, auth_headers: dict[str, str] | None
+    ) -> str | None:
+        if not upstream.url:
+            return None
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            **(auth_headers or {}),
+        }
+        resp = await self._request(
+            "POST",
+            upstream.url,
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "mcpcodeaway-gateway", "version": "0.1.0"},
+                },
+            },
+        )
+        if resp.status_code >= 400:
+            return None
+        sid = resp.headers.get("mcp-session-id")
+        return sid.strip() if sid else None
 
     async def _discover_mcp_http(
         self, upstream: UpstreamConfig, auth_headers: dict[str, str] | None
@@ -294,6 +355,15 @@ class UpstreamClientManager:
             "Accept": "application/json, text/event-stream",
             **(auth_headers or {}),
         }
+        if upstream.stateful_session:
+            skey = f"{upstream.name}:discovery"
+            sid = self._session_ids.get(skey)
+            if not sid:
+                sid = await self._initialize_mcp_http_session(upstream, auth_headers)
+                if sid:
+                    self._session_ids[skey] = sid
+            if sid:
+                headers["Mcp-Session-Id"] = sid
         resp = await self._request(
             "POST",
             upstream.url,
@@ -313,6 +383,9 @@ class UpstreamClientManager:
         tool: DiscoveredTool,
         arguments: dict[str, Any],
         auth_headers: dict[str, str] | None,
+        *,
+        mcp_session_id: str | None = None,
+        session_scope: str | None = None,
     ) -> Any:
         if not upstream.url:
             raise ValueError(f"mcp_http upstream '{upstream.name}' missing url")
@@ -321,18 +394,39 @@ class UpstreamClientManager:
             "Accept": "application/json, text/event-stream",
             **(auth_headers or {}),
         }
-        resp = await self._request(
-            "POST",
-            upstream.url,
-            headers=headers,
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {"name": tool.name, "arguments": arguments},
-            },
-        )
+        skey = f"{upstream.name}:{session_scope or 'default'}"
+        active_sid = mcp_session_id
+        if not active_sid and upstream.stateful_session:
+            active_sid = self._session_ids.get(skey)
+            if not active_sid:
+                active_sid = await self._initialize_mcp_http_session(upstream, auth_headers)
+                if active_sid:
+                    self._session_ids[skey] = active_sid
+        if active_sid:
+            headers["Mcp-Session-Id"] = active_sid
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": tool.name, "arguments": arguments},
+        }
+        resp = await self._request("POST", upstream.url, headers=headers, json=payload)
+        if (
+            resp.status_code in {400, 404}
+            and upstream.stateful_session
+            and not mcp_session_id
+        ):
+            new_sid = await self._initialize_mcp_http_session(upstream, auth_headers)
+            if new_sid:
+                self._session_ids[skey] = new_sid
+                headers["Mcp-Session-Id"] = new_sid
+                resp = await self._request("POST", upstream.url, headers=headers, json=payload)
+
         resp.raise_for_status()
+        resp_sid = resp.headers.get("mcp-session-id")
+        if resp_sid and upstream.stateful_session and not mcp_session_id:
+            self._session_ids[skey] = resp_sid
         body = _parse_mcp_jsonrpc_response(resp)
         if "error" in body:
             raise RuntimeError(f"Upstream tool error ({tool.qualified_name}): {body['error']}")

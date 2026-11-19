@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 import uuid
 from typing import Any
@@ -13,10 +14,14 @@ import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt.algorithms import RSAAlgorithm
+from opentelemetry import trace
 from pydantic import BaseModel, Field
 
 from gateway.config import ClaimMappingConfig, GatewaySettings, UpstreamConfig
+from gateway.observability import log_event
 from gateway.state import CacheBackend
+
+_TRACER = trace.get_tracer("mcpcodeaway.auth")
 
 
 class AuthError(Exception):
@@ -472,49 +477,72 @@ class DelegatedTokenExchanger:
         audience: str,
         scope: str,
     ) -> TokenExchangeResult:
-        dialect = self.settings.token_exchange_dialect
-        cache_key = f"delegated:{identity.tenant_id}:{identity.sub}:{audience}:{scope}"
-        cached = await self.cache.get(cache_key)
-        if cached is not None:
+        with _TRACER.start_as_current_span("gateway.auth.obo_exchange") as span:
+            started = time.perf_counter()
+            dialect = self.settings.token_exchange_dialect
+            span.set_attribute("auth.dialect", dialect)
+            span.set_attribute("auth.audience", audience)
+            span.set_attribute("tenant.id", identity.tenant_id)
+
+            cache_key = f"delegated:{identity.tenant_id}:{identity.sub}:{audience}:{scope}"
+            cached = await self.cache.get(cache_key)
+            if cached is not None:
+                span.set_attribute("auth.cache_hit", True)
+                log_event(
+                    "auth.obo.exchanged",
+                    level=logging.DEBUG,
+                    audience=audience,
+                    dialect=dialect,
+                    cache_hit=True,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                )
+                return TokenExchangeResult(
+                    access_token=cached,
+                    audience=audience,
+                    scope=scope,
+                    dialect=dialect,
+                    cache_hit=True,
+                    expires_in=self.settings.token_cache_ttl_seconds,
+                )
+
+            span.set_attribute("auth.cache_hit", False)
+            if dialect == "dev_local":
+                if self.dev_keys is None:
+                    raise AuthError(500, "Dev key manager required for dev_local token exchange")
+                ttl = self.settings.token_cache_ttl_seconds
+                access_token = self.dev_keys.issue_delegated_token(
+                    identity=identity,
+                    audience=audience,
+                    scope=scope,
+                    actor_client_id=self.settings.oidc_client_id,
+                    ttl_seconds=ttl,
+                )
+                expires_in = ttl
+            else:
+                access_token, expires_in = await self._exchange_http(
+                    dialect=dialect,
+                    identity=identity,
+                    audience=audience,
+                    scope=scope,
+                )
+
+            cache_ttl = min(max(expires_in - 30, 1), self.settings.token_cache_ttl_seconds)
+            await self.cache.set(cache_key, access_token, ttl_seconds=cache_ttl)
+            log_event(
+                "auth.obo.exchanged",
+                audience=audience,
+                dialect=dialect,
+                cache_hit=False,
+                duration_ms=round((time.perf_counter() - started) * 1000, 3),
+            )
             return TokenExchangeResult(
-                access_token=cached,
+                access_token=access_token,
                 audience=audience,
                 scope=scope,
                 dialect=dialect,
-                cache_hit=True,
-                expires_in=self.settings.token_cache_ttl_seconds,
+                cache_hit=False,
+                expires_in=expires_in,
             )
-
-        if dialect == "dev_local":
-            if self.dev_keys is None:
-                raise AuthError(500, "Dev key manager required for dev_local token exchange")
-            ttl = self.settings.token_cache_ttl_seconds
-            access_token = self.dev_keys.issue_delegated_token(
-                identity=identity,
-                audience=audience,
-                scope=scope,
-                actor_client_id=self.settings.oidc_client_id,
-                ttl_seconds=ttl,
-            )
-            expires_in = ttl
-        else:
-            access_token, expires_in = await self._exchange_http(
-                dialect=dialect,
-                identity=identity,
-                audience=audience,
-                scope=scope,
-            )
-
-        cache_ttl = min(max(expires_in - 30, 1), self.settings.token_cache_ttl_seconds)
-        await self.cache.set(cache_key, access_token, ttl_seconds=cache_ttl)
-        return TokenExchangeResult(
-            access_token=access_token,
-            audience=audience,
-            scope=scope,
-            dialect=dialect,
-            cache_hit=False,
-            expires_in=expires_in,
-        )
 
     async def _exchange_http(
         self,

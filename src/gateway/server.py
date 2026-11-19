@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,7 +13,8 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from opentelemetry import trace
 from pydantic import BaseModel
 
 from gateway import __version__
@@ -50,11 +53,20 @@ from gateway.dispatcher import (
     summarize_value_shape,
 )
 from gateway.oauth_discovery import create_oauth_discovery_router
+from gateway.observability import (
+    MetricsRegistry,
+    clear_request_context,
+    configure_logging,
+    log_event,
+    set_request_context,
+    update_request_context,
+)
 from gateway.sandbox import LocalMontyBackend, RemoteMontyWorkerBackend, SandboxBackend
 from gateway.state import (
     AuditStore,
     CacheBackend,
     InMemoryCacheBackend,
+    PostgresAuditStore,
     RedisCacheBackend,
     SQLiteAuditStore,
 )
@@ -66,6 +78,8 @@ from gateway.upstream_clients import (
     inspect_upstream,
     validate_upstream_url,
 )
+
+_TRACER = trace.get_tracer("mcpcodeaway.server")
 
 _VALID_MODES: set[str] = {
     "codemode",
@@ -209,14 +223,21 @@ class GatewayRuntime:
         preloaded_tools: dict[str, list[DiscoveredTool]] | None = None,
     ) -> None:
         self.settings = settings or GatewaySettings()
+        configure_logging(self.settings.log_format, self.settings.log_level)
         configure_telemetry(otlp_endpoint=self.settings.otlp_endpoint)
+        self.metrics = MetricsRegistry()
         if cache is not None:
             self.cache: CacheBackend = cache
         elif self.settings.redis_url:
             self.cache = RedisCacheBackend(self.settings.redis_url)
         else:
             self.cache = InMemoryCacheBackend()
-        self.store = store or SQLiteAuditStore(self.settings.sqlite_path)
+        if store is not None:
+            self.store: AuditStore = store
+        elif self.settings.postgres_dsn:
+            self.store = PostgresAuditStore(self.settings.postgres_dsn)
+        else:
+            self.store = SQLiteAuditStore(self.settings.sqlite_path)
         self.dev_keys = dev_keys
         if self.dev_keys is None and self.settings.auth_mode == "dev":
             self.dev_keys = LocalDevKeyManager(issuer=self.settings.oidc_issuer)
@@ -243,6 +264,7 @@ class GatewayRuntime:
             cache=self.cache,
             client_manager=self.client_manager,
             catalog=self.catalog,
+            metrics=self.metrics,
         )
         if sandbox_backend is not None:
             self.sandbox: SandboxBackend = sandbox_backend
@@ -369,6 +391,7 @@ class GatewayRuntime:
 
     async def shutdown(self) -> None:
         await self.sandbox.close()
+        await self.client_manager.close()
         if hasattr(self.cache, "close"):
             await self.cache.close()  # type: ignore[attr-defined]
         if hasattr(self.store, "close"):
@@ -499,6 +522,43 @@ class GatewayRuntime:
             return out
         return {"tools": tools}
 
+    def _record_execution_metrics(
+        self,
+        *,
+        identity: CallerIdentity,
+        mode: str,
+        ok: bool,
+        duration_ms: float,
+        run: dict[str, Any],
+    ) -> int:
+        total_saved = int(run["estimated_tokens_saved"]) + int(run["schema_tokens_saved"])
+        metric_labels = {"tenant": identity.tenant_id, "mode": mode}
+        self.metrics.inc_counter(
+            "gateway_tokens_saved_total", amount=total_saved, labels=metric_labels
+        )
+        self.metrics.inc_counter(
+            "gateway_payload_bytes_in_total",
+            amount=run["raw_upstream_bytes"],
+            labels=metric_labels,
+        )
+        self.metrics.inc_counter(
+            "gateway_payload_bytes_out_total",
+            amount=run["returned_bytes"],
+            labels=metric_labels,
+        )
+        if run["turns_avoided"] > 0:
+            self.metrics.inc_counter(
+                "gateway_turns_avoided_total",
+                amount=run["turns_avoided"],
+                labels=metric_labels,
+            )
+        self.metrics.observe_histogram(
+            "gateway_execution_duration_seconds",
+            duration_ms / 1000.0,
+            labels={"mode": mode, "ok": str(ok).lower()},
+        )
+        return total_saved
+
     async def execute_code_for_identity(
         self,
         identity: CallerIdentity,
@@ -511,6 +571,7 @@ class GatewayRuntime:
         allowed_servers: set[str] | None = None,
         timeout_ms: int = 10000,
         require_grounding: bool = False,
+        mcp_session_id: str | None = None,
     ) -> dict[str, Any]:
         """Run Code Mode Python script in SandboxBackend and record audit telemetry."""
         started = time.perf_counter()
@@ -537,6 +598,9 @@ class GatewayRuntime:
                 discovery_mode=discovery_mode,
             )
         )
+        classic_schema_tokens = estimate_tokens(
+            self.tools_for_mode(identity, "traditional", allowed_servers=allowed_servers)
+        )
 
         budget = ExecutionBudget(self.settings.max_calls_per_execution)
         subcalls: list[SubcallRecord] = []
@@ -561,6 +625,7 @@ class GatewayRuntime:
                         bound,
                         budget=budget,
                         code_mode_hints=True,
+                        mcp_session_id=mcp_session_id,
                     )
                     subcalls.append(rec)
                     if isinstance(res, dict) and "_dispatch_error" in res:
@@ -574,11 +639,16 @@ class GatewayRuntime:
             external_functions[tool.qualified_name] = _make_wrapper(tool, upstream)
 
         timeout_seconds = min(timeout_ms / 1000.0, self.settings.monty_timeout_seconds)
-        sandbox_res = await self.sandbox.execute(
-            code,
-            external_functions=external_functions,
-            timeout_seconds=timeout_seconds,
-        )
+        with _TRACER.start_as_current_span("gateway.sandbox.execute") as span:
+            span.set_attribute("mcp.mode", mode)
+            span.set_attribute("mcp.accessible_tools", len(external_functions))
+            sandbox_res = await self.sandbox.execute(
+                code,
+                external_functions=external_functions,
+                timeout_seconds=timeout_seconds,
+            )
+            span.set_attribute("sandbox.ok", sandbox_res.ok)
+            span.set_attribute("sandbox.subcalls", len(subcalls))
         duration_ms = round((time.perf_counter() - started) * 1000, 3)
 
         provenance = build_provenance_envelope(
@@ -592,6 +662,7 @@ class GatewayRuntime:
         effective_result = sandbox_res.result
         effective_error = sandbox_res.error
         effective_error_type = sandbox_res.error_type
+        grounding_blocked = False
         if (self.settings.require_tool_grounding or require_grounding) and effective_ok:
             if provenance["subcall_count"] == 0 and effective_result is not None:
                 effective_ok = False
@@ -601,6 +672,7 @@ class GatewayRuntime:
                     "Policy require_tool_grounding blocked result returned "
                     "with 0 allowed tool calls."
                 )
+                grounding_blocked = True
             elif provenance["unverified_identifiers"]:
                 effective_ok = False
                 effective_result = None
@@ -609,6 +681,19 @@ class GatewayRuntime:
                     "Policy require_tool_grounding blocked unverified identifiers not "
                     f"returned by allowed tools: {provenance['unverified_identifiers']}"
                 )
+                grounding_blocked = True
+
+        if grounding_blocked:
+            self.metrics.inc_counter(
+                "gateway_grounding_rejections_total",
+                labels={"reason": str(effective_error_type)},
+            )
+            log_event(
+                "grounding.blocked",
+                level=logging.WARNING,
+                reason=effective_error_type,
+                mode=mode,
+            )
 
         payload: dict[str, Any] = {
             "ok": effective_ok,
@@ -647,7 +732,28 @@ class GatewayRuntime:
             error=effective_error,
             tool_name="execute_code",
             provenance=provenance,
+            classic_schema_tokens=classic_schema_tokens,
+            grounding_blocked=grounding_blocked,
         )
+        total_saved = self._record_execution_metrics(
+            identity=identity,
+            mode=mode,
+            ok=effective_ok,
+            duration_ms=duration_ms,
+            run=run,
+        )
+        log_event(
+            "sandbox.executed",
+            mode=mode,
+            ok=effective_ok,
+            subcalls=len(subcalls),
+            raw_bytes=run["raw_upstream_bytes"],
+            returned_bytes=run["returned_bytes"],
+            tokens_saved=total_saved,
+            turns_avoided=run["turns_avoided"],
+            duration_ms=duration_ms,
+        )
+
         payload["run_id"] = run["run_id"]
         payload["raw_upstream_bytes"] = run["raw_upstream_bytes"]
         payload["returned_bytes"] = run["returned_bytes"]
@@ -662,6 +768,7 @@ class GatewayRuntime:
         *,
         mode: GatewayMode = "traditional",
         allowed_servers: set[str] | None = None,
+        mcp_session_id: str | None = None,
     ) -> dict[str, Any]:
         """Invoke a single upstream tool directly (traditional / traditional_discover / hybrid)."""
         started = time.perf_counter()
@@ -684,8 +791,16 @@ class GatewayRuntime:
         schema_tokens = estimate_tokens(
             self.tools_for_mode(identity, mode, allowed_servers=allowed_servers)
         )
+        classic_schema_tokens = estimate_tokens(
+            self.tools_for_mode(identity, "traditional", allowed_servers=allowed_servers)
+        )
         result, rec = await self.dispatcher.invoke_tool(
-            identity, tool, upstream, arguments, code_mode_hints=False
+            identity,
+            tool,
+            upstream,
+            arguments,
+            code_mode_hints=False,
+            mcp_session_id=mcp_session_id,
         )
         duration_ms = round((time.perf_counter() - started) * 1000, 3)
         ok = rec.status == "ok"
@@ -700,6 +815,14 @@ class GatewayRuntime:
             ok=ok,
             error=rec.error,
             tool_name=tool.qualified_name,
+            classic_schema_tokens=classic_schema_tokens,
+        )
+        self._record_execution_metrics(
+            identity=identity,
+            mode=mode,
+            ok=ok,
+            duration_ms=duration_ms,
+            run=run,
         )
         return {
             "ok": ok,
@@ -874,6 +997,8 @@ def create_gateway_app(
         return {
             "status": "ok",
             "version": __version__,
+            "profile": runtime.settings.effective_profile_name,
+            "features": runtime.settings.active_features.model_dump(),
             "app_env": runtime.settings.app_env,
             "auth_mode": runtime.settings.auth_mode,
             "default_mode": runtime.settings.gateway_mode,
@@ -881,6 +1006,14 @@ def create_gateway_app(
             "upstreams": len(runtime.registry.list_upstreams()),
             "drift_warnings": runtime.catalog.drift_warnings,
             "startup_warnings": runtime.startup_warnings,
+        }
+
+    @app.get("/ready")
+    async def ready() -> dict[str, Any]:
+        return {
+            "ready": True,
+            "profile": runtime.settings.effective_profile_name,
+            "upstreams": len(runtime.registry.list_upstreams()),
         }
 
     @app.post("/mcp")
@@ -899,201 +1032,302 @@ def create_gateway_app(
         x_mcp_servers: str | None = Header(default=None),
         x_intent: str | None = Header(default=None),
         x_require_grounding: str | None = Header(default=None),
+        x_request_id: str | None = Header(default=None),
+        mcp_session_id: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ) -> JSONResponse:
-        try:
-            identity = await runtime.validator.validate_authorization_header(authorization)
-        except AuthError as exc:
-            headers = {"WWW-Authenticate": exc.www_authenticate} if exc.www_authenticate else None
-            raise HTTPException(
-                status_code=exc.status_code, detail=exc.detail, headers=headers
-            ) from exc
-
-        eff_exec, eff_disc_mode, effective_mode = _resolve_execution_and_discovery(
-            runtime.settings,
-            query_mode=mode,
-            header_mode=x_gateway_mode,
-            query_execution=execution,
-            header_execution=x_execution_mode,
-            query_discovery_mode=discovery_mode,
-            header_discovery_mode=x_discovery_mode,
-            x_intent=x_intent,
+        req_corr_id = x_request_id or f"req_{uuid.uuid4().hex[:12]}"
+        req_started = time.perf_counter()
+        set_request_context(
+            request_id=req_corr_id,
+            profile=runtime.settings.effective_profile_name,
         )
-        effective_discovery = _resolve_discovery(
-            runtime.settings.discovery_backend, discovery, x_discovery_backend
-        )
-        allowed_servers = _parse_servers_ceiling(servers, x_mcp_servers)
-        enforce_grounding = bool(
-            require_grounding
-            or (x_require_grounding and x_require_grounding.strip().lower() in {"1", "true", "yes"})
-        )
-        payload = await request.json()
-        req_id = payload.get("id")
-        method = payload.get("method")
-        params = payload.get("params") or {}
-
-        if method == "initialize":
-            return _jsonrpc_ok(
-                req_id,
-                {
-                    "protocolVersion": "2025-03-26",
-                    "capabilities": {"tools": {"listChanged": True}},
-                    "serverInfo": {"name": "mcpcodeaway", "version": __version__},
-                },
-            )
-        if method == "server/discover":
-            return _jsonrpc_ok(
-                req_id,
-                {
-                    "supportedVersions": ["2025-03-26"],
-                    "capabilities": {"tools": {"listChanged": True}},
-                    "ttlMs": 30000,
-                    "cacheScope": "private",
-                    "instructions": (
-                        "Stateless multi-MCP gateway. Call list_servers then search_tools "
-                        "(or pass X-Intent / ?servers=...) before calling execute_code or "
-                        "hydrated tools."
-                    ),
-                },
-            )
-        if method == "notifications/initialized":
-            return JSONResponse({}, status_code=202)
-
-        await runtime.ensure_catalog_for_identity(identity)
-
-        if method == "tools/list":
-            req_srvs = params.get("servers")
-            if not req_srvs and params.get("server"):
-                req_srvs = [str(params["server"])]
-            listed = await runtime.list_tools_for_request(
-                identity,
-                effective_mode,
-                allowed_servers=allowed_servers,
-                discovery_backend=effective_discovery,
-                execution=eff_exec,
-                discovery_mode=eff_disc_mode,
-                intent=x_intent,
-                query=params.get("query"),
-                requested_servers=req_srvs,
-                limit=params.get("limit"),
-                cursor=params.get("cursor"),
-            )
-            return _jsonrpc_ok(req_id, listed)
-
-        if method == "tools/call":
-            tool_name = str(params.get("name") or "")
-            arguments = dict(params.get("arguments") or {})
-
-            if tool_name == "list_servers":
-                srv_rows = runtime.catalog.list_accessible_servers(
-                    identity,
-                    runtime.policy,
-                    runtime.registry,
-                    allowed_servers=allowed_servers,
-                    query=str(arguments.get("query", "")),
-                )
-                srv_payload = {
-                    "catalog_version": runtime.catalog.catalog_version,
-                    "server_count": len(srv_rows),
-                    "servers": srv_rows,
-                }
-                return _jsonrpc_ok(
-                    req_id,
-                    {
-                        "content": [{"type": "text", "text": json.dumps(srv_payload)}],
-                        "structuredContent": srv_payload,
-                    },
-                )
-
-            if tool_name == "search_tools":
-                if eff_exec == "classic" and eff_disc_mode == "upfront":
-                    return _jsonrpc_err(
-                        req_id, -32601, "search_tools is disabled in traditional upfront mode"
-                    )
-                req_srvs = arguments.get("servers")
-                if not req_srvs and arguments.get("server"):
-                    req_srvs = [str(arguments["server"])]
-                res = await runtime.catalog.discover_tools_for_caller(
-                    identity,
-                    runtime.policy,
-                    runtime.registry,
-                    runtime.discovery_engine,
-                    query=str(arguments.get("query", "")),
-                    servers=req_srvs,
-                    allowed_servers=allowed_servers,
-                    backend=effective_discovery,
-                    limit=int(arguments.get("limit", 15)),
-                    include_schemas=(eff_exec == "classic"),
-                )
-                return _jsonrpc_ok(
-                    req_id,
-                    {
-                        "content": [{"type": "text", "text": json.dumps(res)}],
-                        "structuredContent": res,
-                    },
-                )
-
-            if tool_name == "execute_code":
-                if eff_exec == "classic":
-                    return _jsonrpc_err(
-                        req_id, -32601, f"execute_code is disabled in {effective_mode} mode"
-                    )
-                code = str(arguments.get("code") or "")
-                if not code.strip():
-                    return _jsonrpc_err(req_id, -32602, "execute_code requires non-empty 'code'")
-                res = await runtime.execute_code_for_identity(
-                    identity,
-                    code,
-                    mode=effective_mode,
-                    execution=eff_exec,
-                    discovery_mode=eff_disc_mode,
-                    servers=arguments.get("servers"),
-                    allowed_servers=allowed_servers,
-                    timeout_ms=int(arguments.get("timeout_ms", 10000)),
-                    require_grounding=enforce_grounding,
-                )
-                return _jsonrpc_ok(
-                    req_id,
-                    {
-                        "content": [{"type": "text", "text": json.dumps(res, default=str)}],
-                        "structuredContent": res,
-                        "isError": not res["ok"],
-                    },
-                )
-
-            if eff_exec == "codemode":
-                return _jsonrpc_err(
-                    req_id,
-                    -32601,
-                    f"Direct tool '{tool_name}' is not exposed in codemode; "
-                    "invoke authorized tools inside execute_code.",
-                )
-
+        with _TRACER.start_as_current_span("gateway.mcp.request") as mcp_span:
+            mcp_span.set_attribute("gateway.profile", runtime.settings.effective_profile_name)
             try:
-                res = await runtime.call_direct_tool_for_identity(
-                    identity,
-                    tool_name,
-                    arguments,
-                    mode=effective_mode,
-                    allowed_servers=allowed_servers,
+                try:
+                    identity = await runtime.validator.validate_authorization_header(authorization)
+                except AuthError as exc:
+                    runtime.metrics.inc_counter(
+                        "gateway_auth_denials_total",
+                        labels={"surface": "mcp", "status_code": exc.status_code},
+                    )
+                    log_event(
+                        "auth.denied",
+                        level=logging.WARNING,
+                        surface="mcp",
+                        status_code=exc.status_code,
+                        reason=exc.detail,
+                    )
+                    headers = (
+                        {"WWW-Authenticate": exc.www_authenticate} if exc.www_authenticate else None
+                    )
+                    raise HTTPException(
+                        status_code=exc.status_code, detail=exc.detail, headers=headers
+                    ) from exc
+
+                update_request_context(tenant_id=identity.tenant_id, user_sub=identity.sub)
+                mcp_span.set_attribute("tenant.id", identity.tenant_id)
+
+                eff_exec, eff_disc_mode, effective_mode = _resolve_execution_and_discovery(
+                    runtime.settings,
+                    query_mode=mode,
+                    header_mode=x_gateway_mode,
+                    query_execution=execution,
+                    header_execution=x_execution_mode,
+                    query_discovery_mode=discovery_mode,
+                    header_discovery_mode=x_discovery_mode,
+                    x_intent=x_intent,
                 )
-            except KeyError as exc:
-                return _jsonrpc_err(req_id, -32601, str(exc))
-            except PermissionError as exc:
-                return _jsonrpc_err(req_id, -32003, str(exc))
-            except (ValueError, RuntimeError) as exc:
-                return _jsonrpc_err(req_id, -32602, str(exc))
+                effective_discovery = _resolve_discovery(
+                    runtime.settings.discovery_backend, discovery, x_discovery_backend
+                )
+                allowed_servers = _parse_servers_ceiling(servers, x_mcp_servers)
+                enforce_grounding = bool(
+                    require_grounding
+                    or (
+                        x_require_grounding
+                        and x_require_grounding.strip().lower() in {"1", "true", "yes"}
+                    )
+                )
+                payload = await request.json()
+                req_id = payload.get("id")
+                method = payload.get("method")
+                params = payload.get("params") or {}
+                mcp_span.set_attribute("mcp.method", str(method))
+                mcp_span.set_attribute("mcp.mode", effective_mode)
 
-            return _jsonrpc_ok(
-                req_id,
-                {
-                    "content": [{"type": "text", "text": json.dumps(res, default=str)}],
-                    "structuredContent": res,
-                    "isError": not res["ok"],
-                },
-            )
+                def _finish(resp: JSONResponse, status_label: str = "ok") -> JSONResponse:
+                    dur_ms = round((time.perf_counter() - req_started) * 1000, 3)
+                    runtime.metrics.inc_counter(
+                        "gateway_mcp_requests_total",
+                        labels={
+                            "method": str(method),
+                            "mode": effective_mode,
+                            "status": status_label,
+                        },
+                    )
+                    log_event(
+                        "mcp.request.completed",
+                        method=str(method),
+                        mode=effective_mode,
+                        discovery=effective_discovery,
+                        status=status_label,
+                        duration_ms=dur_ms,
+                    )
+                    resp.headers["X-Request-Id"] = req_corr_id
+                    return resp
 
-        return _jsonrpc_err(req_id, -32601, f"Unsupported MCP method '{method}'")
+                if method == "initialize":
+                    return _finish(
+                        _jsonrpc_ok(
+                            req_id,
+                            {
+                                "protocolVersion": "2025-03-26",
+                                "capabilities": {"tools": {"listChanged": True}},
+                                "serverInfo": {"name": "mcpcodeaway", "version": __version__},
+                            },
+                        )
+                    )
+                if method == "server/discover":
+                    return _finish(
+                        _jsonrpc_ok(
+                            req_id,
+                            {
+                                "supportedVersions": ["2025-03-26"],
+                                "capabilities": {"tools": {"listChanged": True}},
+                                "ttlMs": 30000,
+                                "cacheScope": "private",
+                                "instructions": (
+                                    "Stateless multi-MCP gateway. Call list_servers then "
+                                    "search_tools (or pass X-Intent / ?servers=...) before "
+                                    "calling execute_code or hydrated tools."
+                                ),
+                            },
+                        )
+                    )
+                if method == "notifications/initialized":
+                    return _finish(JSONResponse({}, status_code=202))
+
+                await runtime.ensure_catalog_for_identity(identity)
+
+                if method == "tools/list":
+                    req_srvs = params.get("servers")
+                    if not req_srvs and params.get("server"):
+                        req_srvs = [str(params["server"])]
+                    listed = await runtime.list_tools_for_request(
+                        identity,
+                        effective_mode,
+                        allowed_servers=allowed_servers,
+                        discovery_backend=effective_discovery,
+                        execution=eff_exec,
+                        discovery_mode=eff_disc_mode,
+                        intent=x_intent,
+                        query=params.get("query"),
+                        requested_servers=req_srvs,
+                        limit=params.get("limit"),
+                        cursor=params.get("cursor"),
+                    )
+                    return _finish(_jsonrpc_ok(req_id, listed))
+
+                if method == "tools/call":
+                    tool_name = str(params.get("name") or "")
+                    arguments = dict(params.get("arguments") or {})
+
+                    if tool_name == "list_servers":
+                        srv_rows = runtime.catalog.list_accessible_servers(
+                            identity,
+                            runtime.policy,
+                            runtime.registry,
+                            allowed_servers=allowed_servers,
+                            query=str(arguments.get("query", "")),
+                        )
+                        srv_payload = {
+                            "catalog_version": runtime.catalog.catalog_version,
+                            "server_count": len(srv_rows),
+                            "servers": srv_rows,
+                        }
+                        return _finish(
+                            _jsonrpc_ok(
+                                req_id,
+                                {
+                                    "content": [{"type": "text", "text": json.dumps(srv_payload)}],
+                                    "structuredContent": srv_payload,
+                                },
+                            )
+                        )
+
+                    if tool_name == "search_tools":
+                        if eff_exec == "classic" and eff_disc_mode == "upfront":
+                            return _finish(
+                                _jsonrpc_err(
+                                    req_id,
+                                    -32601,
+                                    "search_tools is disabled in traditional upfront mode",
+                                ),
+                                status_label="error",
+                            )
+                        req_srvs = arguments.get("servers")
+                        if not req_srvs and arguments.get("server"):
+                            req_srvs = [str(arguments["server"])]
+                        with _TRACER.start_as_current_span("gateway.discovery.search") as dspan:
+                            dspan.set_attribute("discovery.backend", effective_discovery)
+                            dspan.set_attribute("discovery.query", str(arguments.get("query", "")))
+                            res = await runtime.catalog.discover_tools_for_caller(
+                                identity,
+                                runtime.policy,
+                                runtime.registry,
+                                runtime.discovery_engine,
+                                query=str(arguments.get("query", "")),
+                                servers=req_srvs,
+                                allowed_servers=allowed_servers,
+                                backend=effective_discovery,
+                                limit=int(arguments.get("limit", 15)),
+                                include_schemas=(eff_exec == "classic"),
+                            )
+                        return _finish(
+                            _jsonrpc_ok(
+                                req_id,
+                                {
+                                    "content": [{"type": "text", "text": json.dumps(res)}],
+                                    "structuredContent": res,
+                                },
+                            )
+                        )
+
+                    if tool_name == "execute_code":
+                        if eff_exec == "classic":
+                            return _finish(
+                                _jsonrpc_err(
+                                    req_id,
+                                    -32601,
+                                    f"execute_code is disabled in {effective_mode} mode",
+                                ),
+                                status_label="error",
+                            )
+                        code = str(arguments.get("code") or "")
+                        if not code.strip():
+                            return _finish(
+                                _jsonrpc_err(
+                                    req_id, -32602, "execute_code requires non-empty 'code'"
+                                ),
+                                status_label="error",
+                            )
+                        res = await runtime.execute_code_for_identity(
+                            identity,
+                            code,
+                            mode=effective_mode,
+                            execution=eff_exec,
+                            discovery_mode=eff_disc_mode,
+                            servers=arguments.get("servers"),
+                            allowed_servers=allowed_servers,
+                            timeout_ms=int(arguments.get("timeout_ms", 10000)),
+                            require_grounding=enforce_grounding,
+                            mcp_session_id=mcp_session_id,
+                        )
+                        return _finish(
+                            _jsonrpc_ok(
+                                req_id,
+                                {
+                                    "content": [
+                                        {"type": "text", "text": json.dumps(res, default=str)}
+                                    ],
+                                    "structuredContent": res,
+                                    "isError": not res["ok"],
+                                },
+                            ),
+                            status_label="ok" if res["ok"] else "error",
+                        )
+
+                    if eff_exec == "codemode":
+                        return _finish(
+                            _jsonrpc_err(
+                                req_id,
+                                -32601,
+                                f"Direct tool '{tool_name}' is not exposed in codemode; "
+                                "invoke authorized tools inside execute_code.",
+                            ),
+                            status_label="error",
+                        )
+
+                    try:
+                        res = await runtime.call_direct_tool_for_identity(
+                            identity,
+                            tool_name,
+                            arguments,
+                            mode=effective_mode,
+                            allowed_servers=allowed_servers,
+                            mcp_session_id=mcp_session_id,
+                        )
+                    except KeyError as exc:
+                        return _finish(_jsonrpc_err(req_id, -32601, str(exc)), status_label="error")
+                    except PermissionError as exc:
+                        return _finish(_jsonrpc_err(req_id, -32003, str(exc)), status_label="error")
+                    except (ValueError, RuntimeError) as exc:
+                        return _finish(_jsonrpc_err(req_id, -32602, str(exc)), status_label="error")
+
+                    return _finish(
+                        _jsonrpc_ok(
+                            req_id,
+                            {
+                                "content": [
+                                    {"type": "text", "text": json.dumps(res, default=str)}
+                                ],
+                                "structuredContent": res,
+                                "isError": not res["ok"],
+                            },
+                        ),
+                        status_label="ok" if res["ok"] else "error",
+                    )
+
+                return _finish(
+                    _jsonrpc_err(req_id, -32601, f"Unsupported MCP method '{method}'"),
+                    status_label="error",
+                )
+            finally:
+                clear_request_context()
+
+    features = runtime.settings.active_features
 
     async def _authorize_control_plane(
         authorization: str | None,
@@ -1104,6 +1338,17 @@ def create_gateway_app(
             try:
                 identity = await runtime.validator.validate_authorization_header(authorization)
             except AuthError as exc:
+                runtime.metrics.inc_counter(
+                    "gateway_auth_denials_total",
+                    labels={"surface": "control_plane", "status_code": exc.status_code},
+                )
+                log_event(
+                    "auth.denied",
+                    level=logging.WARNING,
+                    surface="control_plane",
+                    status_code=exc.status_code,
+                    reason=exc.detail,
+                )
                 headers = (
                     {"WWW-Authenticate": exc.www_authenticate} if exc.www_authenticate else None
                 )
@@ -1111,12 +1356,34 @@ def create_gateway_app(
                     status_code=exc.status_code, detail=exc.detail, headers=headers
                 ) from exc
             if require_admin_role and not (set(identity.roles) & set(runtime.settings.admin_roles)):
+                runtime.metrics.inc_counter(
+                    "gateway_auth_denials_total",
+                    labels={"surface": "control_plane", "status_code": 403},
+                )
+                log_event(
+                    "auth.denied",
+                    level=logging.WARNING,
+                    surface="control_plane",
+                    status_code=403,
+                    reason="missing_admin_role",
+                )
                 raise HTTPException(
                     status_code=403,
                     detail="Admin role required for control-plane access.",
                 )
             return identity
         if runtime.settings.admin_auth_required:
+            runtime.metrics.inc_counter(
+                "gateway_auth_denials_total",
+                labels={"surface": "control_plane", "status_code": 401},
+            )
+            log_event(
+                "auth.denied",
+                level=logging.WARNING,
+                surface="control_plane",
+                status_code=401,
+                reason="missing_bearer_token",
+            )
             raise HTTPException(
                 status_code=401,
                 detail="Authorization Bearer token required for control-plane access.",
@@ -1133,61 +1400,113 @@ def create_gateway_app(
         if set(identity.roles) & set(runtime.settings.admin_roles):
             return requested_tenant
         if requested_tenant is not None and requested_tenant != identity.tenant_id:
+            runtime.metrics.inc_counter(
+                "gateway_auth_denials_total",
+                labels={"surface": "audit", "status_code": 403},
+            )
+            log_event(
+                "auth.denied",
+                level=logging.WARNING,
+                surface="audit",
+                status_code=403,
+                reason="cross_tenant_denied",
+            )
             raise HTTPException(status_code=403, detail="Cross-tenant audit access denied.")
         return identity.tenant_id
 
-    @app.get("/audit/runs")
-    async def audit_runs(
-        limit: int = Query(default=50, ge=1, le=200),
-        tenant_id: str | None = Query(default=None),
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        identity = await _authorize_control_plane(authorization, require_admin_role=False)
-        effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
-        runs = await runtime.store.list_runs(limit=limit, tenant_id=effective_tenant)
-        return {"count": len(runs), "runs": runs}
+    if features.metrics:
 
-    @app.get("/audit/runs/{run_id}")
-    async def audit_run_detail(
-        run_id: str,
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        identity = await _authorize_control_plane(authorization, require_admin_role=False)
-        run = await runtime.store.get_run(run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
-        if (
-            identity is not None
-            and not (set(identity.roles) & set(runtime.settings.admin_roles))
-            and run.get("tenant_id") != identity.tenant_id
-        ):
-            raise HTTPException(status_code=403, detail="Cross-tenant audit run access denied.")
-        return run
+        @app.get("/metrics", response_class=PlainTextResponse)
+        async def prometheus_metrics(
+            authorization: str | None = Header(default=None),
+        ) -> PlainTextResponse:
+            if runtime.settings.metrics_require_auth:
+                await _authorize_control_plane(authorization, require_admin_role=False)
+            return PlainTextResponse(
+                runtime.metrics.render_prometheus(),
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
 
-    @app.get("/audit/summary")
-    async def audit_summary(
-        tenant_id: str | None = Query(default=None),
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        identity = await _authorize_control_plane(authorization, require_admin_role=False)
-        effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
-        return await runtime.telemetry.summary(tenant_id=effective_tenant)
+    if features.audit_api:
 
-    @app.get("/admin/upstreams")
-    async def list_admin_upstreams(
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        await _authorize_control_plane(authorization, require_admin_role=True)
-        upstreams = runtime.registry.list_upstreams(include_disabled=True)
-        return {
-            "app_env": runtime.settings.app_env,
-            "dynamic_upstreams_permitted": runtime.settings.dynamic_upstreams_permitted,
-            "catalog_version": runtime.catalog.catalog_version,
-            "digests_by_server": runtime.catalog.digests_by_server,
-            "drift_warnings": runtime.catalog.drift_warnings,
-            "upstreams": [u.model_dump(exclude={"openapi_spec"}) for u in upstreams],
-            "comparison_audit": audit_catalog_comparison(runtime.catalog, runtime.registry),
-        }
+        @app.get("/audit/runs")
+        async def audit_runs(
+            limit: int = Query(default=50, ge=1, le=200),
+            tenant_id: str | None = Query(default=None),
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(authorization, require_admin_role=False)
+            effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
+            runs = await runtime.store.list_runs(limit=limit, tenant_id=effective_tenant)
+            return {"count": len(runs), "runs": runs}
+
+        @app.get("/audit/runs/{run_id}")
+        async def audit_run_detail(
+            run_id: str,
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(authorization, require_admin_role=False)
+            run = await runtime.store.get_run(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+            if (
+                identity is not None
+                and not (set(identity.roles) & set(runtime.settings.admin_roles))
+                and run.get("tenant_id") != identity.tenant_id
+            ):
+                runtime.metrics.inc_counter(
+                    "gateway_auth_denials_total",
+                    labels={"surface": "audit", "status_code": 403},
+                )
+                raise HTTPException(
+                    status_code=403, detail="Cross-tenant audit run access denied."
+                )
+            return run
+
+        @app.get("/audit/summary")
+        async def audit_summary(
+            tenant_id: str | None = Query(default=None),
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(authorization, require_admin_role=False)
+            effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
+            return await runtime.telemetry.summary(tenant_id=effective_tenant)
+
+        @app.get("/audit/value")
+        async def audit_value(
+            limit: int = Query(default=500, ge=1, le=2000),
+            tenant_id: str | None = Query(default=None),
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(authorization, require_admin_role=False)
+            effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
+            return await runtime.telemetry.value_report(
+                limit=limit,
+                tenant_id=effective_tenant,
+                cost_per_1m_input_tokens_usd=runtime.settings.cost_per_1m_input_tokens_usd,
+                context_overflow_threshold_tokens=(
+                    runtime.settings.context_overflow_threshold_tokens
+                ),
+            )
+
+    if features.admin_read:
+
+        @app.get("/admin/upstreams")
+        async def list_admin_upstreams(
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(authorization, require_admin_role=True)
+            upstreams = runtime.registry.list_upstreams(include_disabled=True)
+            return {
+                "app_env": runtime.settings.app_env,
+                "profile": runtime.settings.effective_profile_name,
+                "dynamic_upstreams_permitted": runtime.settings.dynamic_upstreams_permitted,
+                "catalog_version": runtime.catalog.catalog_version,
+                "digests_by_server": runtime.catalog.digests_by_server,
+                "drift_warnings": runtime.catalog.drift_warnings,
+                "upstreams": [u.model_dump(exclude={"openapi_spec"}) for u in upstreams],
+                "comparison_audit": audit_catalog_comparison(runtime.catalog, runtime.registry),
+            }
 
     async def _inspect_candidate(
         cfg: UpstreamConfig, authorization: str | None
@@ -1233,140 +1552,154 @@ def create_gateway_app(
         )
         return inspection, audit
 
-    @app.get("/admin/upstreams/agent-prompt")
-    async def admin_agent_onboarding_prompt(
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        await _authorize_control_plane(authorization, require_admin_role=True)
-        return {
-            "prompt": build_agent_onboarding_prompt(),
-            "schema": UpstreamConfig.model_json_schema(),
-        }
+    if features.admin_write:
 
-    @app.post("/admin/upstreams/inspect")
-    async def inspect_admin_upstream(
-        cfg: UpstreamConfig,
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        await _authorize_control_plane(authorization, require_admin_role=True)
-        inspection, audit = await _inspect_candidate(cfg, authorization)
-        return {"inspection": inspection, "onboarding_audit": audit}
+        @app.get("/admin/upstreams/agent-prompt")
+        async def admin_agent_onboarding_prompt(
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(authorization, require_admin_role=True)
+            return {
+                "prompt": build_agent_onboarding_prompt(),
+                "schema": UpstreamConfig.model_json_schema(),
+            }
 
-    @app.post("/admin/upstreams")
-    async def add_admin_upstream(
-        cfg: UpstreamConfig,
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        if not runtime.settings.dynamic_upstreams_permitted:
-            raise HTTPException(
-                status_code=403,
-                detail="Dynamic upstream registration is locked in read-only/prod; "
-                "promote changes via config/upstreams.yaml PR.",
+        @app.post("/admin/upstreams/inspect")
+        async def inspect_admin_upstream(
+            cfg: UpstreamConfig,
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(authorization, require_admin_role=True)
+            inspection, audit = await _inspect_candidate(cfg, authorization)
+            return {"inspection": inspection, "onboarding_audit": audit}
+
+        @app.post("/admin/upstreams")
+        async def add_admin_upstream(
+            cfg: UpstreamConfig,
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            if not runtime.settings.dynamic_upstreams_permitted:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Dynamic upstream registration is locked in read-only/prod; "
+                    "promote changes via config/upstreams.yaml PR.",
+                )
+            if runtime.settings.app_env == "prod" and cfg.type == "mcp_stdio":
+                raise HTTPException(
+                    status_code=403, detail="mcp_stdio upstreams are blocked in prod"
+                )
+            await _authorize_control_plane(authorization, require_admin_role=True)
+
+            inspection, audit = await _inspect_candidate(cfg, authorization)
+            await runtime.store.save_dynamic_upstream(
+                cfg.name, cfg.model_dump(exclude_none=True)
             )
-        if runtime.settings.app_env == "prod" and cfg.type == "mcp_stdio":
-            raise HTTPException(status_code=403, detail="mcp_stdio upstreams are blocked in prod")
-        await _authorize_control_plane(authorization, require_admin_role=True)
+            await runtime.refresh_catalog()
+            return {
+                "registered": True,
+                "upstream": cfg.model_dump(exclude_none=True, exclude={"openapi_spec"}),
+                "inspection": inspection,
+                "onboarding_audit": audit,
+                "catalog_version": runtime.catalog.catalog_version,
+            }
 
-        inspection, audit = await _inspect_candidate(cfg, authorization)
-        await runtime.store.save_dynamic_upstream(cfg.name, cfg.model_dump(exclude_none=True))
-        await runtime.refresh_catalog()
-        return {
-            "registered": True,
-            "upstream": cfg.model_dump(exclude_none=True, exclude={"openapi_spec"}),
-            "inspection": inspection,
-            "onboarding_audit": audit,
-            "catalog_version": runtime.catalog.catalog_version,
-        }
+        @app.delete("/admin/upstreams/{name}")
+        async def delete_admin_upstream(
+            name: str,
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            if not runtime.settings.dynamic_upstreams_permitted:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Dynamic upstream deletion is locked in read-only/prod.",
+                )
+            await _authorize_control_plane(authorization, require_admin_role=True)
+            deleted = await runtime.store.delete_dynamic_upstream(name)
+            if not deleted:
+                raise HTTPException(
+                    status_code=404, detail=f"Dynamic upstream '{name}' not found"
+                )
+            await runtime.refresh_catalog()
+            return {
+                "deleted": True,
+                "name": name,
+                "catalog_version": runtime.catalog.catalog_version,
+            }
 
-    @app.delete("/admin/upstreams/{name}")
-    async def delete_admin_upstream(
-        name: str,
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        if not runtime.settings.dynamic_upstreams_permitted:
-            raise HTTPException(
-                status_code=403,
-                detail="Dynamic upstream deletion is locked in read-only/prod.",
-            )
-        await _authorize_control_plane(authorization, require_admin_role=True)
-        deleted = await runtime.store.delete_dynamic_upstream(name)
-        if not deleted:
-            raise HTTPException(
-                status_code=404, detail=f"Dynamic upstream '{name}' not found"
-            )
-        await runtime.refresh_catalog()
-        return {
-            "deleted": True,
-            "name": name,
-            "catalog_version": runtime.catalog.catalog_version,
-        }
+    if features.comparator:
 
-    @app.post("/compare/run")
-    async def compare_run(
-        body: CompareRequest,
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        if authorization:
+        @app.post("/compare/run")
+        async def compare_run(
+            body: CompareRequest,
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            if authorization:
+                try:
+                    identity = await runtime.validator.validate_authorization_header(authorization)
+                except AuthError as exc:
+                    raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+            elif runtime.settings.auth_mode == "dev" and runtime.dev_keys is not None:
+                if body.persona not in DEV_PERSONAS:
+                    raise HTTPException(
+                        status_code=400, detail=f"Unknown persona '{body.persona}'"
+                    )
+                token = runtime.dev_keys.issue_user_token(persona=body.persona)
+                identity = await runtime.validator.validate_token(token)
+            else:
+                raise HTTPException(status_code=401, detail="Authorization Bearer token required")
+
             try:
-                identity = await runtime.validator.validate_authorization_header(authorization)
-            except AuthError as exc:
-                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-        elif runtime.settings.auth_mode == "dev" and runtime.dev_keys is not None:
-            if body.persona not in DEV_PERSONAS:
-                raise HTTPException(status_code=400, detail=f"Unknown persona '{body.persona}'")
-            token = runtime.dev_keys.issue_user_token(persona=body.persona)
-            identity = await runtime.validator.validate_token(token)
-        else:
-            raise HTTPException(status_code=401, detail="Authorization Bearer token required")
+                return await run_side_by_side_comparison(
+                    runtime,
+                    identity,
+                    scenario=body.scenario,
+                    custom_classic_calls=body.custom_classic_calls,
+                    custom_code=body.custom_code,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        try:
-            return await run_side_by_side_comparison(
-                runtime,
-                identity,
-                scenario=body.scenario,
-                custom_classic_calls=body.custom_classic_calls,
-                custom_code=body.custom_code,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if features.benchmarks_api:
 
-    @app.get("/benchmarks/latest")
-    async def latest_benchmarks() -> dict[str, Any]:
-        results_path = Path("benchmarks/results.json")
-        load_path = Path("benchmarks/load_results.json")
-        live_path = Path("benchmarks/live_llm_results.json")
-        discovery_path = Path("benchmarks/discovery_results.json")
-        matrix_path = Path("benchmarks/matrix_2x2_results.json")
-        payload: dict[str, Any] = {
-            "available": (
-                results_path.exists()
-                or load_path.exists()
-                or live_path.exists()
-                or discovery_path.exists()
-                or matrix_path.exists()
-            ),
-            "offline": None,
-            "load": None,
-            "live_llm": None,
-            "discovery": None,
-            "matrix_2x2": None,
-        }
-        if results_path.exists():
-            payload["offline"] = json.loads(results_path.read_text(encoding="utf-8"))
-        if load_path.exists():
-            payload["load"] = json.loads(load_path.read_text(encoding="utf-8"))
-        if live_path.exists():
-            payload["live_llm"] = json.loads(live_path.read_text(encoding="utf-8"))
-        if discovery_path.exists():
-            payload["discovery"] = json.loads(discovery_path.read_text(encoding="utf-8"))
-        if matrix_path.exists():
-            payload["matrix_2x2"] = json.loads(matrix_path.read_text(encoding="utf-8"))
-        return payload
+        @app.get("/benchmarks/latest")
+        async def latest_benchmarks() -> dict[str, Any]:
+            results_path = Path("benchmarks/results.json")
+            load_path = Path("benchmarks/load_results.json")
+            live_path = Path("benchmarks/live_llm_results.json")
+            discovery_path = Path("benchmarks/discovery_results.json")
+            matrix_path = Path("benchmarks/matrix_2x2_results.json")
+            payload: dict[str, Any] = {
+                "available": (
+                    results_path.exists()
+                    or load_path.exists()
+                    or live_path.exists()
+                    or discovery_path.exists()
+                    or matrix_path.exists()
+                ),
+                "offline": None,
+                "load": None,
+                "live_llm": None,
+                "discovery": None,
+                "matrix_2x2": None,
+            }
+            if results_path.exists():
+                payload["offline"] = json.loads(results_path.read_text(encoding="utf-8"))
+            if load_path.exists():
+                payload["load"] = json.loads(load_path.read_text(encoding="utf-8"))
+            if live_path.exists():
+                payload["live_llm"] = json.loads(live_path.read_text(encoding="utf-8"))
+            if discovery_path.exists():
+                payload["discovery"] = json.loads(discovery_path.read_text(encoding="utf-8"))
+            if matrix_path.exists():
+                payload["matrix_2x2"] = json.loads(matrix_path.read_text(encoding="utf-8"))
+            return payload
 
-    @app.get("/dashboard", response_class=HTMLResponse)
-    async def dashboard() -> HTMLResponse:
-        html_path = Path(__file__).parent / "static" / "dashboard.html"
-        return HTMLResponse(html_path.read_text(encoding="utf-8"))
+    if features.dashboard_ui:
+
+        @app.get("/dashboard", response_class=HTMLResponse)
+        async def dashboard() -> HTMLResponse:
+            html_path = Path(__file__).parent / "static" / "dashboard.html"
+            return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
     return app
 

@@ -1,6 +1,8 @@
 services:
   mock-backends:
-    build: .
+    build:
+      context: .
+      target: gateway-demo
     command: ["uvicorn", "examples.mock_backends:app", "--host", "0.0.0.0", "--port", "8001"]
     environment:
       GATEWAY_JWKS_URL: http://gateway:8000/dev/oidc/jwks
@@ -8,12 +10,16 @@ services:
       - "8001:8001"
     networks:
       - control_plane
+    profiles: ["", "default", "demo", "scaled"]
 
   gateway:
-    build: .
+    build:
+      context: .
+      target: gateway-demo
     depends_on:
       - mock-backends
     environment:
+      GATEWAY_PROFILE: demo
       GATEWAY_APP_ENV: sandbox
       GATEWAY_AUTH_MODE: dev
       GATEWAY_UPSTREAMS_CONFIG_PATH: config/upstreams.docker.yaml
@@ -22,16 +28,28 @@ services:
       - "8000:8000"
     networks:
       - control_plane
-    profiles: ["", "default"]
+    profiles: ["", "default", "demo"]
 
   redis:
     image: redis:7-alpine
     networks:
       - control_plane
-    profiles: ["scaled"]
+    profiles: ["prod", "scaled"]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: mcpcodeaway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev-postgres-password}
+    networks:
+      - control_plane
+    profiles: ["prod", "scaled"]
 
   sandbox-worker:
-    build: .
+    build:
+      context: .
+      target: sandbox-worker
     command: ["uvicorn", "gateway.sandbox_worker:app", "--host", "0.0.0.0", "--port", "8002"]
     environment:
       GATEWAY_SANDBOX_WORKER_SECRET: ${GATEWAY_SANDBOX_WORKER_SECRET:-dev-sandbox-worker-secret}
@@ -39,10 +57,12 @@ services:
       replicas: 2
     networks:
       - sandbox_isolated
-    profiles: ["scaled"]
+    profiles: ["prod", "scaled"]
 
   gateway-scaled:
-    build: .
+    build:
+      context: .
+      target: gateway-demo
     depends_on:
       - mock-backends
       - redis
@@ -50,6 +70,7 @@ services:
     deploy:
       replicas: 2
     environment:
+      GATEWAY_PROFILE: staging
       GATEWAY_APP_ENV: uat
       GATEWAY_AUTH_MODE: dev
       GATEWAY_UPSTREAMS_CONFIG_PATH: config/upstreams.docker.yaml
@@ -64,6 +85,36 @@ services:
       - control_plane
       - sandbox_isolated
     profiles: ["scaled"]
+
+  gateway-prod:
+    build:
+      context: .
+      target: gateway
+    depends_on:
+      - redis
+      - postgres
+      - sandbox-worker
+    deploy:
+      replicas: 2
+    environment:
+      GATEWAY_PROFILE: production
+      GATEWAY_APP_ENV: prod
+      GATEWAY_AUTH_MODE: oidc
+      GATEWAY_OIDC_ISSUER: ${GATEWAY_OIDC_ISSUER:-https://idp.example/oauth2}
+      GATEWAY_OIDC_AUDIENCE: ${GATEWAY_OIDC_AUDIENCE:-api://mcp-code-gateway}
+      GATEWAY_UPSTREAMS_CONFIG_PATH: config/upstreams.yaml
+      GATEWAY_POSTGRES_DSN: ${GATEWAY_POSTGRES_DSN:-postgresql://gateway:dev-postgres-password@postgres:5432/mcpcodeaway}
+      GATEWAY_REDIS_URL: redis://redis:6379/0
+      GATEWAY_SANDBOX_BACKEND: remote
+      GATEWAY_SANDBOX_WORKER_URL: ws://sandbox-worker:8002/ws/execute
+      GATEWAY_SANDBOX_WORKER_SECRET: ${GATEWAY_SANDBOX_WORKER_SECRET:-dev-sandbox-worker-secret}
+      GATEWAY_PROVENANCE_SIGNING_SECRET: ${GATEWAY_PROVENANCE_SIGNING_SECRET:-dev-provenance-secret}
+    ports:
+      - "8000:8000"
+    networks:
+      - control_plane
+      - sandbox_isolated
+    profiles: ["prod"]
 
 networks:
   control_plane:

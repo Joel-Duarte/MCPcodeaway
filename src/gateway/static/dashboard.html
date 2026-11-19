@@ -159,6 +159,10 @@
           <div id="audit-summary-box">Loading...</div>
         </div>
       </div>
+      <div class="card" style="margin-top: 16px;">
+        <h2>Gateway Value &amp; ROI Proof</h2>
+        <div id="value-roi-box">Loading ROI metrics...</div>
+      </div>
     </section>
 
     <section id="onboarding" class="tab">
@@ -363,11 +367,37 @@
       ]);
 
       document.getElementById("header-pills").innerHTML = `
+        <span class="pill">profile: ${health.profile || "demo"}</span>
         <span class="pill">env: ${health.app_env}</span>
         <span class="pill">auth: ${health.auth_mode}</span>
         <span class="pill">default: ${health.default_mode}</span>
         <span class="pill">catalog: ${health.catalog_version}</span>
       `;
+
+      try {
+        const valRes = await fetch("/audit/value");
+        if (valRes.ok) {
+          const val = await valRes.json();
+          const eff = val.efficiency || {};
+          const sec = val.security_and_governance || {};
+          document.getElementById("value-roi-box").innerHTML = `
+            <p>
+              <strong>Tokens Saved:</strong> ${eff.total_tokens_saved ?? 0}
+              (&approx; $${(eff.estimated_llm_cost_saved_usd ?? 0).toFixed(4)} saved) &middot;
+              <strong>Turns Avoided:</strong> ${eff.llm_turns_avoided ?? 0} &middot;
+              <strong>Overflows Prevented:</strong> ${eff.context_overflows_prevented ?? 0} &middot;
+              <strong>ABAC Rows Filtered:</strong> ${sec.abac_rows_filtered ?? 0} &middot;
+              <strong>Redactions:</strong> ${sec.pii_secrets_redacted ?? 0}
+            </p>
+            <pre>${JSON.stringify(val, null, 2)}</pre>
+          `;
+        } else {
+          document.getElementById("value-roi-box").textContent =
+            "ROI metrics require authorization or audit_api feature.";
+        }
+      } catch (_err) {
+        document.getElementById("value-roi-box").textContent = "Unable to load /audit/value.";
+      }
 
       const audit = upstreams.comparison_audit;
       document.getElementById("overview-cards").innerHTML = `

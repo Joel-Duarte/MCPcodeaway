@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import time
@@ -17,6 +18,7 @@ from pydantic import BaseModel
 from gateway.auth import CallerIdentity, DelegatedTokenExchanger, PolicyEvaluator
 from gateway.catalog import ToolCatalog, render_python_stub
 from gateway.config import GatewaySettings, UpstreamConfig
+from gateway.observability import MetricsRegistry, log_event
 from gateway.state import CacheBackend
 from gateway.upstream_clients import DiscoveredTool, UpstreamClientManager
 
@@ -41,37 +43,72 @@ def _luhn_valid(digits: str) -> bool:
     return total % 10 == 0
 
 
-def _mask_cards(text: str) -> str:
+def _mask_cards_with_count(text: str) -> tuple[str, int]:
+    count = 0
+
     def _replace(match: re.Match[str]) -> str:
+        nonlocal count
         digits = re.sub(r"\D", "", match.group(0))
         if 13 <= len(digits) <= 19 and _luhn_valid(digits):
+            count += 1
             return "[REDACTED_CARD]"
         return match.group(0)
 
-    return _CARD_CANDIDATE_RE.sub(_replace, text)
+    return _CARD_CANDIDATE_RE.sub(_replace, text), count
 
 
 class OutputRedactor:
     """Redacts leaked bearer JWTs, API keys, SSNs, and Luhn-valid card numbers."""
 
     @classmethod
+    def redact_text_with_count(cls, text: str) -> tuple[str, int]:
+        total = 0
+        masked, n_jwt = _JWT_RE.subn("[REDACTED_JWT]", text)
+        total += n_jwt
+        masked, n_key = _API_KEY_RE.subn("[REDACTED_SECRET]", masked)
+        total += n_key
+        masked, n_ssn = _SSN_RE.subn("[REDACTED_SSN]", masked)
+        total += n_ssn
+        masked, n_card = _mask_cards_with_count(masked)
+        return masked, total + n_card
+
+    @classmethod
     def redact_text(cls, text: str) -> str:
-        masked = _JWT_RE.sub("[REDACTED_JWT]", text)
-        masked = _API_KEY_RE.sub("[REDACTED_SECRET]", masked)
-        masked = _SSN_RE.sub("[REDACTED_SSN]", masked)
-        return _mask_cards(masked)
+        return cls.redact_text_with_count(text)[0]
+
+    @classmethod
+    def redact_with_count(cls, value: Any) -> tuple[Any, int]:
+        if isinstance(value, str):
+            return cls.redact_text_with_count(value)
+        if isinstance(value, list):
+            items: list[Any] = []
+            total = 0
+            for item in value:
+                redacted_item, n = cls.redact_with_count(item)
+                items.append(redacted_item)
+                total += n
+            return items, total
+        if isinstance(value, tuple):
+            items_t: list[Any] = []
+            total = 0
+            for item in value:
+                redacted_item, n = cls.redact_with_count(item)
+                items_t.append(redacted_item)
+                total += n
+            return items_t, total
+        if isinstance(value, dict):
+            out: dict[Any, Any] = {}
+            total = 0
+            for k, v in value.items():
+                redacted_val, n = cls.redact_with_count(v)
+                out[k] = redacted_val
+                total += n
+            return out, total
+        return value, 0
 
     @classmethod
     def redact(cls, value: Any) -> Any:
-        if isinstance(value, str):
-            return cls.redact_text(value)
-        if isinstance(value, list):
-            return [cls.redact(item) for item in value]
-        if isinstance(value, tuple):
-            return [cls.redact(item) for item in value]
-        if isinstance(value, dict):
-            return {k: cls.redact(v) for k, v in value.items()}
-        return value
+        return cls.redact_with_count(value)[0]
 
 
 class SubcallRecord(BaseModel):
@@ -86,6 +123,8 @@ class SubcallRecord(BaseModel):
     token_cache_hit: bool = False
     downstream_audience: str | None = None
     output_sha256: str | None = None
+    abac_rows_filtered: int = 0
+    redactions_count: int = 0
     error: str | None = None
 
 
@@ -250,12 +289,13 @@ def _apply_pre_call_abac(
     return updated
 
 
-def _apply_post_call_abac(
+def _apply_post_call_abac_with_count(
     identity: CallerIdentity,
     upstream: UpstreamConfig,
     result: Any,
-) -> Any:
+) -> tuple[Any, int]:
     current = result
+    dropped = 0
     for rule in upstream.abac_rules:
         if not rule.filter_response_rows or not rule.row_field:
             continue
@@ -268,27 +308,39 @@ def _apply_post_call_abac(
             and isinstance(current, dict)
             and isinstance(current.get(rule.response_list_key), list)
         ):
+            orig = current[rule.response_list_key]
             filtered = [
                 row
-                for row in current[rule.response_list_key]
+                for row in orig
                 if not isinstance(row, dict) or str(row.get(field)) in allowed_vals
             ]
+            dropped += len(orig) - len(filtered)
             current = {**current, rule.response_list_key: filtered}
             if "count" in current:
                 current["count"] = len(filtered)
         elif isinstance(current, list):
+            orig_list = current
             current = [
                 row
-                for row in current
+                for row in orig_list
                 if not isinstance(row, dict) or str(row.get(field)) in allowed_vals
             ]
+            dropped += len(orig_list) - len(current)
         elif isinstance(current, dict) and field in current:
             if str(current[field]) not in allowed_vals:
                 raise PermissionError(
                     f"ABAC row policy denied access to record with "
                     f"{field}='{current[field]}'"
                 )
-    return current
+    return current, dropped
+
+
+def _apply_post_call_abac(
+    identity: CallerIdentity,
+    upstream: UpstreamConfig,
+    result: Any,
+) -> Any:
+    return _apply_post_call_abac_with_count(identity, upstream, result)[0]
 
 
 class HostDispatcher:
@@ -303,6 +355,7 @@ class HostDispatcher:
         cache: CacheBackend,
         client_manager: UpstreamClientManager,
         catalog: ToolCatalog,
+        metrics: MetricsRegistry | None = None,
     ) -> None:
         self.settings = settings
         self.policy = policy
@@ -310,6 +363,7 @@ class HostDispatcher:
         self.cache = cache
         self.client_manager = client_manager
         self.catalog = catalog
+        self.metrics = metrics
 
     async def resolve_upstream_headers(
         self, identity: CallerIdentity, upstream: UpstreamConfig
@@ -347,6 +401,7 @@ class HostDispatcher:
         *,
         budget: ExecutionBudget | None = None,
         code_mode_hints: bool = False,
+        mcp_session_id: str | None = None,
     ) -> tuple[Any, SubcallRecord]:
         started = time.perf_counter()
         with _TRACER.start_as_current_span("gateway.downstream.call") as span:
@@ -360,11 +415,30 @@ class HostDispatcher:
                 identity, upstream, tool.name, tool.mutating
             )
             if not allowed:
+                if self.metrics is not None:
+                    self.metrics.inc_counter(
+                        "gateway_policy_denials_total",
+                        labels={"server": upstream.name, "tool": tool.qualified_name},
+                    )
+                log_event(
+                    "policy.denied",
+                    level=logging.WARNING,
+                    server=upstream.name,
+                    tool=tool.qualified_name,
+                    reason=reason,
+                )
                 raise PermissionError(reason)
 
             rl_key = f"rl:{identity.tenant_id}:{identity.sub}"
             count = await self.cache.increment_window(rl_key, window_seconds=60)
             if count > self.settings.rate_limit_per_minute:
+                log_event(
+                    "policy.denied",
+                    level=logging.WARNING,
+                    server=upstream.name,
+                    tool=tool.qualified_name,
+                    reason="rate_limit_exceeded",
+                )
                 raise RuntimeError(
                     f"Rate limit exceeded ({self.settings.rate_limit_per_minute}/min)"
                 )
@@ -372,7 +446,22 @@ class HostDispatcher:
             if budget is not None:
                 budget.consume()
 
-            scoped_args = _apply_pre_call_abac(identity, tool, upstream, arguments)
+            try:
+                scoped_args = _apply_pre_call_abac(identity, tool, upstream, arguments)
+            except PermissionError as exc:
+                if self.metrics is not None:
+                    self.metrics.inc_counter(
+                        "gateway_policy_denials_total",
+                        labels={"server": upstream.name, "tool": tool.qualified_name},
+                    )
+                log_event(
+                    "policy.denied",
+                    level=logging.WARNING,
+                    server=upstream.name,
+                    tool=tool.qualified_name,
+                    reason=str(exc),
+                )
+                raise
 
             try:
                 jsonschema.validate(instance=scoped_args, schema=tool.input_schema)
@@ -389,8 +478,21 @@ class HostDispatcher:
                     identity, upstream
                 )
                 span.set_attribute("auth.token_cache_hit", cache_hit)
+                if upstream.auth_type == "delegated_token" and self.metrics is not None:
+                    self.metrics.inc_counter(
+                        "gateway_obo_token_cache_total",
+                        labels={
+                            "outcome": "hit" if cache_hit else "miss",
+                            "server": upstream.name,
+                        },
+                    )
                 raw_result = await self.client_manager.call_tool(
-                    upstream, tool, scoped_args, auth_headers=auth_headers
+                    upstream,
+                    tool,
+                    scoped_args,
+                    auth_headers=auth_headers,
+                    mcp_session_id=mcp_session_id,
+                    session_scope=f"{identity.tenant_id}:{identity.sub}",
                 )
             except Exception as exc:
                 duration_ms = round((time.perf_counter() - started) * 1000, 3)
@@ -405,13 +507,88 @@ class HostDispatcher:
                     downstream_audience=audience,
                     error=str(exc),
                 )
+                if self.metrics is not None:
+                    self.metrics.inc_counter(
+                        "gateway_upstream_calls_total",
+                        labels={
+                            "server": upstream.name,
+                            "tool": tool.qualified_name,
+                            "status": "error",
+                        },
+                    )
+                log_event(
+                    "upstream.failed",
+                    level=logging.WARNING,
+                    server=upstream.name,
+                    tool=tool.qualified_name,
+                    duration_ms=duration_ms,
+                    error=str(exc),
+                )
                 span.record_exception(exc)
                 return {"_dispatch_error": str(exc)}, record
 
             raw_encoded = json.dumps(raw_result, default=str).encode("utf-8")
             raw_bytes = len(raw_encoded)
             output_sha256 = hashlib.sha256(raw_encoded).hexdigest()[:16]
-            redacted = _apply_post_call_abac(identity, upstream, OutputRedactor.redact(raw_result))
+            redacted_raw, redactions_count = OutputRedactor.redact_with_count(raw_result)
+            try:
+                filtered, abac_rows_filtered = _apply_post_call_abac_with_count(
+                    identity, upstream, redacted_raw
+                )
+            except PermissionError as exc:
+                if self.metrics is not None:
+                    self.metrics.inc_counter(
+                        "gateway_policy_denials_total",
+                        labels={"server": upstream.name, "tool": tool.qualified_name},
+                    )
+                log_event(
+                    "policy.denied",
+                    level=logging.WARNING,
+                    server=upstream.name,
+                    tool=tool.qualified_name,
+                    reason=str(exc),
+                )
+                raise
+
+            span.set_attribute("upstream.raw_bytes", raw_bytes)
+            span.set_attribute("abac.rows_filtered", abac_rows_filtered)
+            span.set_attribute("redaction.count", redactions_count)
+            if self.metrics is not None:
+                self.metrics.inc_counter(
+                    "gateway_upstream_calls_total",
+                    labels={
+                        "server": upstream.name,
+                        "tool": tool.qualified_name,
+                        "status": "ok",
+                    },
+                )
+                if abac_rows_filtered > 0:
+                    self.metrics.inc_counter(
+                        "gateway_abac_rows_filtered_total",
+                        amount=abac_rows_filtered,
+                        labels={"server": upstream.name},
+                    )
+                if redactions_count > 0:
+                    self.metrics.inc_counter(
+                        "gateway_redactions_total",
+                        amount=redactions_count,
+                        labels={"server": upstream.name},
+                    )
+            if abac_rows_filtered > 0:
+                log_event(
+                    "abac.filtered",
+                    server=upstream.name,
+                    tool=tool.qualified_name,
+                    rows_filtered=abac_rows_filtered,
+                )
+            if redactions_count > 0:
+                log_event(
+                    "redaction.applied",
+                    server=upstream.name,
+                    tool=tool.qualified_name,
+                    redactions_count=redactions_count,
+                )
+
             duration_ms = round((time.perf_counter() - started) * 1000, 3)
             record = SubcallRecord(
                 tool=tool.qualified_name,
@@ -423,5 +600,7 @@ class HostDispatcher:
                 token_cache_hit=cache_hit,
                 downstream_audience=audience,
                 output_sha256=output_sha256,
+                abac_rows_filtered=abac_rows_filtered,
+                redactions_count=redactions_count,
             )
-            return redacted, record
+            return filtered, record

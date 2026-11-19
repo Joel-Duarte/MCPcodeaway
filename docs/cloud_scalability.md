@@ -6,7 +6,9 @@
 
 - **Stateless Streamable HTTP (`/mcp`)**: Every request carries its OIDC Bearer JWT and completes in a single stateless HTTP round-trip—no sticky sessions, no in-memory session pin across pods.
 - **Externalized Cache & Rate Limiting (`GATEWAY_REDIS_URL`)**: Switching from `InMemoryCacheBackend` to `RedisCacheBackend` shares `(tenant_id, sub, audience, scope)` delegated token caches and sliding-window rate-limit counters across all gateway replicas.
-- **Audit Persistence**: Local dev uses zero-dependency SQLite WAL (`SQLiteAuditStore`); multi-replica production clusters implement the same `AuditStore` protocol against Postgres or DynamoDB, while exporting OpenTelemetry spans via OTLP.
+- **Pooled Upstream Connections & Stateful `Mcp-Session-Id`**: `UpstreamClientManager` maintains a pooled HTTP keep-alive client (`max_connections=100`, `max_keepalive_connections=20`) closed cleanly on shutdown, injects W3C `traceparent` headers on outbound calls, and negotiates/forwards `Mcp-Session-Id` for stateful Streamable HTTP MCP upstreams (`stateful_session: true`).
+- **Audit Persistence**: Local dev uses zero-dependency SQLite WAL (`SQLiteAuditStore`); multi-replica production clusters use `PostgresAuditStore` (`mcpcodeaway[postgres]`, `GATEWAY_POSTGRES_DSN`) implementing the same `AuditStore` protocol while exporting OpenTelemetry spans via OTLP (`mcpcodeaway[otlp]`, `GATEWAY_OTLP_ENDPOINT`) and Prometheus metrics on `/metrics`.
+- **Barebones-First Composable Profiles (`GATEWAY_PROFILE`)**: `config/profiles.yaml` defaults custom profiles onto barebones `production` (real MCP + OIDC/OBO + Prometheus `/metrics` + tenant-isolated `/audit/*` + `/audit/value`, with zero demo routes, dev tokens, comparator, or `examples/` in the `gateway` Docker target). `staging` and `demo` extend `production` declaratively, and users can define custom profiles via `extends:`.
 
 ## 2. Where Code Mode Sandboxes Run (`SandboxBackend`)
 

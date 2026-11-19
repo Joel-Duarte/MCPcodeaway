@@ -80,40 +80,50 @@ def create_oauth_discovery_router(
             "token_endpoint_auth_methods_supported": ["client_secret_post"],
         }
 
-    @router.get("/dev/oidc/jwks")
-    async def dev_oidc_jwks() -> dict[str, Any]:
-        if settings.auth_mode != "dev" or dev_keys is None:
-            raise HTTPException(status_code=404, detail="Dev OIDC endpoints disabled")
-        return dev_keys.jwks()
+    if settings.auth_mode == "dev" and settings.active_features.dev_auth:
 
-    @router.post("/dev/auth/token")
-    async def dev_issue_token(body: DevTokenRequest) -> dict[str, Any]:
-        if settings.auth_mode != "dev" or dev_keys is None:
-            raise HTTPException(status_code=404, detail="Dev OIDC endpoints disabled")
-        if body.persona and body.persona not in DEV_PERSONAS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown dev persona '{body.persona}'. "
-                f"Choose one of: {', '.join(sorted(DEV_PERSONAS))}",
+        @router.get("/dev/oidc/jwks")
+        async def dev_oidc_jwks() -> dict[str, Any]:
+            if dev_keys is None:
+                raise HTTPException(status_code=404, detail="Dev OIDC endpoints disabled")
+            return dev_keys.jwks()
+
+        @router.post("/dev/auth/token")
+        async def dev_issue_token(body: DevTokenRequest) -> dict[str, Any]:
+            if dev_keys is None:
+                raise HTTPException(status_code=404, detail="Dev OIDC endpoints disabled")
+            if body.persona and body.persona not in DEV_PERSONAS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown dev persona '{body.persona}'. "
+                    f"Choose one of: {', '.join(sorted(DEV_PERSONAS))}",
+                )
+            overrides: dict[str, Any] = {}
+            for field_name in (
+                "sub",
+                "tenant_id",
+                "email",
+                "client_id",
+                "roles",
+                "groups",
+                "scopes",
+            ):
+                val = getattr(body, field_name)
+                if val is not None:
+                    overrides[field_name] = val
+
+            token = dev_keys.issue_user_token(
+                persona=body.persona,
+                audience=body.audience or settings.oidc_audience,
+                ttl_seconds=body.ttl_seconds,
+                overrides=overrides or None,
             )
-        overrides: dict[str, Any] = {}
-        for field_name in ("sub", "tenant_id", "email", "client_id", "roles", "groups", "scopes"):
-            val = getattr(body, field_name)
-            if val is not None:
-                overrides[field_name] = val
-
-        token = dev_keys.issue_user_token(
-            persona=body.persona,
-            audience=body.audience or settings.oidc_audience,
-            ttl_seconds=body.ttl_seconds,
-            overrides=overrides or None,
-        )
-        return {
-            "access_token": token,
-            "token_type": "Bearer",
-            "expires_in": body.ttl_seconds,
-            "persona": body.persona,
-        }
+            return {
+                "access_token": token,
+                "token_type": "Bearer",
+                "expires_in": body.ttl_seconds,
+                "persona": body.persona,
+            }
 
     @router.get("/auth/me")
     async def auth_me(

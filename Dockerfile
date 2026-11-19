@@ -4,10 +4,9 @@ WORKDIR /app
 COPY pyproject.toml .python-version ./
 COPY src ./src
 COPY config ./config
-COPY examples ./examples
-RUN uv sync --no-dev --extra redis
+RUN uv sync --no-dev --extra redis --extra postgres --extra otlp
 
-FROM python:3.13-slim-bookworm
+FROM python:3.13-slim-bookworm AS base-runtime
 
 RUN useradd --create-home --uid 10001 appuser
 WORKDIR /app
@@ -15,14 +14,29 @@ WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/src /app/src
 COPY --from=builder /app/config /app/config
-COPY --from=builder /app/examples /app/examples
 COPY --from=builder /app/pyproject.toml /app/pyproject.toml
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     GATEWAY_SQLITE_PATH=/tmp/gateway.db
 
+# Target 1: Barebones production gateway (zero examples or benchmark fixtures)
+FROM base-runtime AS gateway
+ENV GATEWAY_PROFILE=production
 USER appuser
 EXPOSE 8000
+CMD ["uvicorn", "gateway.server:app", "--host", "0.0.0.0", "--port", "8000"]
 
+# Target 2: Egress-isolated Monty sandbox worker (WebSocket reverse-RPC)
+FROM base-runtime AS sandbox-worker
+USER appuser
+EXPOSE 8002
+CMD ["uvicorn", "gateway.sandbox_worker:app", "--host", "0.0.0.0", "--port", "8002"]
+
+# Target 3: Full local demo workbench (includes examples/ mock servers)
+FROM base-runtime AS gateway-demo
+COPY --chown=appuser:appuser examples ./examples
+ENV GATEWAY_PROFILE=demo
+USER appuser
+EXPOSE 8000
 CMD ["uvicorn", "gateway.server:app", "--host", "0.0.0.0", "--port", "8000"]

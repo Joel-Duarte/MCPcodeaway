@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from gateway.profiles import PROFILE_SETTING_FIELDS, ProfileFeatures, resolve_profile
 from gateway.state import AuditStore
 
 AppEnv = Literal["sandbox", "uat", "prod"]
@@ -77,6 +78,7 @@ class UpstreamConfig(BaseModel):
     preferred_mode: GatewayMode | None = None
     abac_rules: list[AbacRuleConfig] = Field(default_factory=list)
     pinned_schema_digest: str | None = None
+    stateful_session: bool = False
     enabled: bool = True
 
     @field_validator("name")
@@ -97,6 +99,9 @@ class GatewaySettings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    profile: str | None = None
+    profiles_config_path: str = "config/profiles.yaml"
 
     app_env: AppEnv = "sandbox"
     auth_mode: AuthMode = "dev"
@@ -139,6 +144,7 @@ class GatewaySettings(BaseSettings):
     embedding_api_key: str = ""
 
     sqlite_path: str = "data/gateway.db"
+    postgres_dsn: str | None = None
     upstreams_config_path: str = "config/upstreams.yaml"
 
     require_admin_auth: bool | None = None
@@ -147,6 +153,53 @@ class GatewaySettings(BaseSettings):
     block_private_ips_in_prod: bool = True
     allowed_upstream_hosts: list[str] = Field(default_factory=list)
     otlp_endpoint: str | None = None
+    log_format: Literal["json", "text"] = "json"
+    log_level: str = "INFO"
+    cost_per_1m_input_tokens_usd: float = 3.0
+    context_overflow_threshold_tokens: int = 32768
+    metrics_require_auth: bool = False
+
+    _effective_profile_name: str = PrivateAttr(default="demo")
+    _resolved_features: ProfileFeatures = PrivateAttr(default_factory=ProfileFeatures)
+
+    @model_validator(mode="after")
+    def _apply_profile_defaults(self) -> GatewaySettings:
+        if self.profile:
+            resolved = resolve_profile(self.profile, self.profiles_config_path)
+            for field_name in PROFILE_SETTING_FIELDS:
+                val = getattr(resolved, field_name)
+                if val is not None and field_name not in self.model_fields_set:
+                    setattr(self, field_name, val)
+            self._effective_profile_name = resolved.name
+            self._resolved_features = resolved.features
+            return self
+
+        if self.app_env == "prod" and self.auth_mode == "oidc":
+            self._effective_profile_name = "production"
+            self._resolved_features = ProfileFeatures()
+        else:
+            self._effective_profile_name = "demo" if self.auth_mode == "dev" else "custom"
+            self._resolved_features = ProfileFeatures(
+                audit_api=True,
+                metrics=True,
+                admin_read=True,
+                admin_write=True,
+                dashboard_ui=True,
+                comparator=True,
+                benchmarks_api=True,
+                dev_auth=(self.auth_mode == "dev"),
+            )
+        return self
+
+    @property
+    def effective_profile_name(self) -> str:
+        """Resolved active profile name."""
+        return self._effective_profile_name
+
+    @property
+    def active_features(self) -> ProfileFeatures:
+        """Resolved feature flags controlling which control-plane/demo surfaces mount."""
+        return self._resolved_features
 
     @property
     def dynamic_upstreams_permitted(self) -> bool:

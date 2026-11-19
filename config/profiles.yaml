@@ -1,0 +1,53 @@
+profiles:
+  # Barebones production profile: real MCP + OIDC/OBO + Prometheus/OTLP metrics + read-only audit.
+  # No dashboard, no demo personas, no comparator, no benchmark fixtures, no dynamic writes.
+  production:
+    description: "Barebones production gateway: MCP, OIDC/OBO, metrics, read-only GitOps."
+    app_env: prod
+    auth_mode: oidc
+    require_admin_auth: true
+    allow_dynamic_upstreams: false
+    features:
+      audit_api: true
+      metrics: true
+      admin_read: true
+      admin_write: false
+      dashboard_ui: false
+      comparator: false
+      benchmarks_api: false
+      dev_auth: false
+
+  # Staging / onboarding workbench built cleanly on top of production.
+  staging:
+    description: "Staging/onboarding gateway extending production with HITL wizard."
+    extends: production
+    app_env: uat
+    auth_mode: oidc
+    require_admin_auth: true
+    allow_dynamic_upstreams: true
+    features:
+      admin_write: true
+      dashboard_ui: true
+
+  # Full local demo & evaluation profile built on top of staging.
+  demo:
+    description: "Local demo gateway with zero-dep dev JWTs, mock personas, and comparator."
+    extends: staging
+    app_env: sandbox
+    auth_mode: dev
+    token_exchange_dialect: dev_local
+    require_admin_auth: false
+    allow_dynamic_upstreams: true
+    features:
+      dev_auth: true
+      comparator: true
+      benchmarks_api: true
+
+  # Example custom profile extending barebones production for high-assurance finance deployments.
+  finance_strict:
+    description: "Strict finance production profile: Code Mode + grounding, hidden /admin/*."
+    extends: production
+    execution_mode: codemode
+    require_tool_grounding: true
+    features:
+      admin_read: false
