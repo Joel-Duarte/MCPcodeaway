@@ -108,6 +108,32 @@ def extract_entity_identifiers(value: Any) -> set[str]:
     return found
 
 
+def summarize_value_shape(value: Any, *, depth: int = 0) -> Any:
+    """Return a compact schema-only sketch (keys + scalar type names, zero raw data)."""
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int | float):
+        return type(value).__name__
+    if isinstance(value, str):
+        return "str"
+    if depth >= 3:
+        if isinstance(value, dict):
+            return "dict"
+        if isinstance(value, list | tuple):
+            return "list"
+        return type(value).__name__
+    if isinstance(value, dict):
+        return {
+            str(k): summarize_value_shape(v, depth=depth + 1)
+            for k, v in list(value.items())[:15]
+        }
+    if isinstance(value, list | tuple):
+        return [summarize_value_shape(value[0], depth=depth + 1)] if value else []
+    return type(value).__name__
+
+
 def build_provenance_envelope(
     *,
     allowed_servers: set[str] | None,

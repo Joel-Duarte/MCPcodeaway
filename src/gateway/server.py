@@ -47,6 +47,7 @@ from gateway.dispatcher import (
     SubcallRecord,
     bind_positional_arguments,
     build_provenance_envelope,
+    summarize_value_shape,
 )
 from gateway.oauth_discovery import create_oauth_discovery_router
 from gateway.sandbox import LocalMontyBackend, RemoteMontyWorkerBackend, SandboxBackend
@@ -534,6 +535,7 @@ class GatewayRuntime:
         budget = ExecutionBudget(self.settings.max_calls_per_execution)
         subcalls: list[SubcallRecord] = []
         observed_tool_outputs: list[Any] = []
+        observed_tool_shapes: dict[str, Any] = {}
         external_functions: dict[str, Callable[..., Any]] = {}
 
         for tool in accessible:
@@ -558,6 +560,7 @@ class GatewayRuntime:
                     if isinstance(res, dict) and "_dispatch_error" in res:
                         raise RuntimeError(res["_dispatch_error"])
                     observed_tool_outputs.append(res)
+                    observed_tool_shapes[t.qualified_name] = summarize_value_shape(res)
                     return res
 
                 return _wrapper
@@ -611,6 +614,16 @@ class GatewayRuntime:
             "_provenance": provenance,
         }
         if not effective_ok:
+            if observed_tool_shapes and any(
+                k in f"{effective_error_type or ''} {effective_error or ''}"
+                for k in ("KeyError", "TypeError", "AttributeError")
+            ):
+                payload["observed_output_shapes"] = observed_tool_shapes
+                hint = json.dumps(observed_tool_shapes)
+                effective_error = (
+                    f"{effective_error or 'Execution error'}\n"
+                    f"Observed return shapes from tools called in this run: {hint}"
+                )
             payload["error"] = effective_error
             payload["error_type"] = effective_error_type
 

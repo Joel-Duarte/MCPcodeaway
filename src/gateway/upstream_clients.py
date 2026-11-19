@@ -39,6 +39,7 @@ class DiscoveredTool(BaseModel):
     input_schema: dict[str, Any] = Field(
         default_factory=lambda: {"type": "object", "properties": {}}
     )
+    output_schema: dict[str, Any] | None = None
     mutating: bool = False
     http_method: str | None = None
     http_path: str | None = None
@@ -81,6 +82,7 @@ def compute_schema_digest(tools: list[DiscoveredTool]) -> str:
             "name": t.name,
             "description": t.description,
             "input_schema": t.input_schema,
+            "output_schema": t.output_schema,
             "mutating": t.mutating,
         }
         for t in sorted(tools, key=lambda item: item.name)
@@ -274,6 +276,7 @@ class UpstreamClientManager:
         for item in listed.tools:
             annotations = item.annotations.model_dump() if item.annotations else {}
             schema = getattr(item, "input_schema", None) or getattr(item, "inputSchema", None)
+            out_schema = getattr(item, "output_schema", None) or getattr(item, "outputSchema", None)
             tools.append(
                 self._normalize_mcp_tool(
                     upstream,
@@ -281,6 +284,7 @@ class UpstreamClientManager:
                         "name": item.name,
                         "description": item.description or "",
                         "inputSchema": schema or {"type": "object", "properties": {}},
+                        "outputSchema": out_schema,
                         "annotations": annotations,
                     },
                 )
@@ -309,12 +313,15 @@ class UpstreamClientManager:
     def _normalize_mcp_tool(self, upstream: UpstreamConfig, raw: dict[str, Any]) -> DiscoveredTool:
         name = str(raw["name"])
         annotations = dict(raw.get("annotations") or {})
+        raw_out = raw.get("outputSchema") or raw.get("output_schema")
+        out_schema = dict(raw_out) if isinstance(raw_out, dict) else None
         return DiscoveredTool(
             server=upstream.name,
             name=name,
             qualified_name=f"{upstream.name}__{name}",
             description=str(raw.get("description") or ""),
             input_schema=dict(raw.get("inputSchema") or {"type": "object", "properties": {}}),
+            output_schema=out_schema,
             mutating=infer_mutating(
                 name,
                 annotations=annotations,
@@ -405,6 +412,28 @@ class UpstreamClientManager:
                 if required:
                     input_schema["required"] = required
 
+                output_schema: dict[str, Any] | None = None
+                responses = op.get("responses")
+                if isinstance(responses, dict):
+                    for code_key in ("200", "201", "202", "default"):
+                        raw_resp = responses.get(code_key) or (
+                            responses.get(int(code_key)) if code_key.isdigit() else None
+                        )
+                        if not isinstance(raw_resp, dict):
+                            continue
+                        resolved_resp = _resolve_refs(raw_resp, spec)
+                        json_resp = (resolved_resp.get("content") or {}).get("application/json")
+                        schema_obj = (
+                            json_resp.get("schema") if isinstance(json_resp, dict) else None
+                        )
+                        if isinstance(schema_obj, dict):
+                            cand = _resolve_refs(schema_obj, spec)
+                            if cand and not (
+                                cand.get("type") == "object" and not cand.get("properties")
+                            ):
+                                output_schema = cand
+                                break
+
                 tools.append(
                     DiscoveredTool(
                         server=upstream.name,
@@ -412,6 +441,7 @@ class UpstreamClientManager:
                         qualified_name=f"{upstream.name}__{tool_name}",
                         description=desc,
                         input_schema=input_schema,
+                        output_schema=output_schema,
                         mutating=infer_mutating(
                             tool_name,
                             http_method=http_method,

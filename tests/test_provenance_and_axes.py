@@ -12,9 +12,11 @@ from typing import Any
 import httpx
 import pytest
 import uvicorn
+from fastapi import FastAPI
 
 from examples.mock_backends import create_mock_backends_app
 from gateway.auth import LocalDevKeyManager
+from gateway.catalog import render_python_stub, to_mcp_tool_definition
 from gateway.comparator import run_side_by_side_comparison
 from gateway.config import GatewaySettings
 from gateway.sandbox_worker import create_sandbox_worker_app
@@ -412,3 +414,132 @@ async def test_bulk_200_dataset_and_offline_savings(tmp_path) -> None:
     finally:
         await runtime.shutdown()
         await backend_client.aclose()
+
+
+async def test_typed_output_schemas_and_keyerror_shape_hints(tmp_path) -> None:
+    settings = GatewaySettings(
+        app_env="sandbox",
+        auth_mode="dev",
+        sqlite_path=str(tmp_path / "typed.db"),
+    )
+    dev_keys = LocalDevKeyManager(issuer=settings.oidc_issuer)
+    backends_app = create_mock_backends_app(
+        public_key_pem=dev_keys.public_pem, expected_issuer=settings.oidc_issuer
+    )
+    schemaless = FastAPI()
+
+    @schemaless.post("/mcp")
+    async def schemaless_mcp(request: dict[str, Any]):
+        if request.get("method") == "tools/list":
+            return {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {
+                    "tools": [
+                        {
+                            "name": "fetch_widget",
+                            "description": "Fetch widget without outputSchema",
+                            "inputSchema": {"type": "object", "properties": {}},
+                        }
+                    ]
+                },
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {"widget_records": [{"sku": "SKU-1", "stock_qty": 9}]}
+                        ),
+                    }
+                ]
+            },
+        }
+
+    combined = FastAPI()
+    combined.mount("/schemaless", schemaless)
+    combined.mount("/", backends_app)
+
+    backend_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=combined), base_url="http://127.0.0.1:8001"
+    )
+    app = create_gateway_app(
+        settings=settings,
+        store=SQLiteAuditStore(settings.sqlite_path),
+        dev_keys=dev_keys,
+        http_client=backend_client,
+    )
+    fin_token = dev_keys.issue_user_token(persona="finance_analyst")
+
+    try:
+        async with app.router.lifespan_context(app):
+            rt: GatewayRuntime = app.state.runtime
+            # 1. OpenAPI + MCP tools populate output_schema, to_mcp_tool_definition, and stubs
+            sf_tool = rt.catalog.get_tool("snowflake_ledger__query_debt_ledger")
+            eu_tool = rt.catalog.get_tool("billing_legacy_eu__list_eu_invoices")
+            assert sf_tool is not None and sf_tool.output_schema is not None
+            assert eu_tool is not None and eu_tool.output_schema is not None
+            assert "outputSchema" in to_mcp_tool_definition(sf_tool)
+            assert "outputSchema" in to_mcp_tool_definition(eu_tool)
+
+            sf_stub = render_python_stub(sf_tool)
+            eu_stub = render_python_stub(eu_tool)
+            assert "-> dict[str, Any]:" in sf_stub
+            assert "rows" in sf_stub and "ledger_balance" in sf_stub
+            assert "invoices" in eu_stub and "amount" in eu_stub
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://gw"
+            ) as gw:
+                up = await _post_mcp(gw, fin_token, "tools/list", query="mode=codemode_upfront")
+                up_desc = up["result"]["tools"][0]["description"]
+                assert "Returns: {'queried_by': str, 'rows':" in up_desc
+                assert "ledger_balance" in up_desc and "invoices" in up_desc
+
+                # Register schema-less upstream dynamically (output_schema=None)
+                reg = await gw.post(
+                    "/admin/upstreams",
+                    json={
+                        "name": "widget_api",
+                        "type": "mcp_http",
+                        "url": "http://127.0.0.1:8001/schemaless/mcp",
+                        "auth_type": "none",
+                        "allowed_roles": ["finance_analyst"],
+                    },
+                )
+                assert reg.status_code == 200, reg.text
+                w_tool = rt.catalog.get_tool("widget_api__fetch_widget")
+                assert w_tool is not None and w_tool.output_schema is None
+
+                # 2. KeyError after calling widget_api__fetch_widget returns structural shape hint
+                err_resp = await _post_mcp(
+                    gw,
+                    fin_token,
+                    "tools/call",
+                    {
+                        "name": "execute_code",
+                        "arguments": {
+                            "code": (
+                                "w = await widget_api__fetch_widget()\n"
+                                "w['wrong_key']"
+                            )
+                        },
+                    },
+                    query="mode=codemode",
+                )
+                err_sc = err_resp["result"]["structuredContent"]
+                assert err_sc["ok"] is False
+                assert err_sc["error_type"] in {"KeyError", "MontyRuntimeError"}
+                assert "KeyError" in err_sc["error"]
+                assert err_sc["observed_output_shapes"] == {
+                    "widget_api__fetch_widget": {
+                        "widget_records": [{"sku": "str", "stock_qty": "int"}]
+                    }
+                }
+                assert "Observed return shapes from tools called in this run" in err_sc["error"]
+    finally:
+        await backend_client.aclose()
+

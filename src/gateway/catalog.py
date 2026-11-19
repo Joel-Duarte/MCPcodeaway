@@ -32,8 +32,65 @@ def estimate_tokens(value: Any) -> int:
     return max(1, math.ceil(len(text) / 4))
 
 
+def _unwrap_union(schema: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    variants = schema.get("anyOf") or schema.get("oneOf")
+    if not isinstance(variants, list) or not variants:
+        return schema, False
+    nullable = any(isinstance(v, dict) and v.get("type") == "null" for v in variants)
+    non_null = [v for v in variants if isinstance(v, dict) and v.get("type") != "null"]
+    if non_null:
+        return non_null[0], nullable
+    return schema, nullable
+
+
+def _schema_return_type(schema: dict[str, Any] | None) -> str:
+    if not schema:
+        return "Any"
+    inner, nullable = _unwrap_union(schema)
+    if "properties" in inner or inner.get("type") == "object":
+        base = "dict[str, Any]"
+    elif inner.get("type") == "array":
+        base = "list[Any]"
+    else:
+        base = _PY_TYPE_MAP.get(str(inner.get("type", "any")), "Any")
+    return f"{base} | None" if nullable and base != "Any" else base
+
+
+def _format_schema_shape(schema: dict[str, Any], *, depth: int = 0) -> str:
+    inner, nullable = _unwrap_union(schema)
+    suffix = " | None" if nullable else ""
+    if depth >= 3:
+        if "properties" in inner or inner.get("type") == "object":
+            return f"dict[str, Any]{suffix}"
+        if inner.get("type") == "array":
+            return f"list[Any]{suffix}"
+    if "properties" in inner or inner.get("type") == "object":
+        props = inner.get("properties") or {}
+        if not props:
+            return f"dict[str, Any]{suffix}"
+        items = list(props.items())
+        parts = [
+            f"'{k}': {_format_schema_shape(v, depth=depth + 1)}"
+            for k, v in items[:12]
+            if isinstance(v, dict)
+        ]
+        if len(items) > 12:
+            parts.append("...")
+        return f"{{{', '.join(parts)}}}{suffix}"
+    if inner.get("type") == "array":
+        item_schema = inner.get("items")
+        inner_str = (
+            _format_schema_shape(item_schema, depth=depth + 1)
+            if isinstance(item_schema, dict)
+            else "Any"
+        )
+        return f"list[{inner_str}]{suffix}"
+    base = _PY_TYPE_MAP.get(str(inner.get("type", "any")), "Any")
+    return f"{base}{suffix}" if base != "Any" else "Any"
+
+
 def render_python_stub(tool: DiscoveredTool) -> str:
-    """Compile a compact typed async Python stub for Code Mode prompts."""
+    """Compile a compact typed async Python stub (with output shape) for Code Mode prompts."""
     props = (tool.input_schema or {}).get("properties") or {}
     required = set((tool.input_schema or {}).get("required") or [])
     params: list[str] = []
@@ -56,17 +113,28 @@ def render_python_stub(tool: DiscoveredTool) -> str:
     if len(doc) > 120:
         doc = f"{doc[:117]}..."
     tag = " [MUTATING]" if tool.mutating else ""
-    return f'async def {tool.qualified_name}({sig}) -> Any:\n    """{doc}{tag}"""'
+    ret_type = _schema_return_type(tool.output_schema)
+    if tool.output_schema:
+        shape = _format_schema_shape(tool.output_schema)
+        return (
+            f'async def {tool.qualified_name}({sig}) -> {ret_type}:\n'
+            f'    """{doc}{tag}\n'
+            f'    Returns: {shape}"""'
+        )
+    return f'async def {tool.qualified_name}({sig}) -> {ret_type}:\n    """{doc}{tag}"""'
 
 
 def to_mcp_tool_definition(tool: DiscoveredTool) -> dict[str, Any]:
     """Convert a DiscoveredTool into a Classic MCP tools/list definition."""
-    return {
+    defn: dict[str, Any] = {
         "name": tool.qualified_name,
         "description": tool.description,
         "inputSchema": tool.input_schema,
         "annotations": tool.annotations or {"readOnlyHint": not tool.mutating},
     }
+    if tool.output_schema:
+        defn["outputSchema"] = tool.output_schema
+    return defn
 
 
 class ToolCatalog:

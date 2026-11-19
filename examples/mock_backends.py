@@ -21,6 +21,32 @@ class CreateCollectionCaseRequest(BaseModel):
     priority: str = "high"
 
 
+class InvoiceItem(BaseModel):
+    invoice_id: str
+    customer_id: str
+    amount: float
+    currency: str
+    status: str
+    days_past_due: int
+    merchant_name: str | None = None
+    cost_center: str | None = None
+    payment_terms: str | None = None
+
+
+class InvoiceListResponse(BaseModel):
+    region: str
+    count: int
+    invoices: list[InvoiceItem]
+
+
+class CustomerRecord(BaseModel):
+    customer_id: str
+    name: str
+    region: str
+    contact_email: str
+    tier: str
+
+
 def _seed_enterprise_data() -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -264,29 +290,41 @@ def _build_billing_subapp(
     )
     required = {"billing_reader", "finance_analyst", "admin"}
 
-    @subapp.get("/invoices", operation_id=f"list_{region.lower()}_invoices")
+    @subapp.get(
+        "/invoices",
+        operation_id=f"list_{region.lower()}_invoices",
+        response_model=InvoiceListResponse,
+    )
     async def list_invoices(
         status: str | None = Query(default=None, description="Filter by invoice status"),
         dataset: str = Query(
             default="standard", description="Dataset size: 'standard' or 'bulk' (100 rows)"
         ),
         authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
+    ) -> InvoiceListResponse:
         await verifier.verify(authorization, expected_audience=audience, required_roles=required)
         source = bulk_invoices if dataset == "bulk" else invoices
         filtered = [inv for inv in source if status is None or inv["status"] == status]
-        return {"region": region, "count": len(filtered), "invoices": filtered}
+        return InvoiceListResponse(
+            region=region,
+            count=len(filtered),
+            invoices=[InvoiceItem(**inv) for inv in filtered],
+        )
 
-    @subapp.get("/customers/{customer_id}", operation_id=f"get_{region.lower()}_customer")
+    @subapp.get(
+        "/customers/{customer_id}",
+        operation_id=f"get_{region.lower()}_customer",
+        response_model=CustomerRecord,
+    )
     async def get_customer(
         customer_id: str,
         authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
+    ) -> CustomerRecord:
         await verifier.verify(authorization, expected_audience=audience, required_roles=required)
         customer = customers.get(customer_id)
         if customer is None:
             raise HTTPException(status_code=404, detail=f"Customer '{customer_id}' not found")
-        return customer
+        return CustomerRecord(**customer)
 
     return subapp
 
@@ -385,6 +423,26 @@ def create_mock_backends_app(
                     },
                 },
             },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "queried_by": {"type": "string"},
+                    "rows": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "customer_id": {"type": "string"},
+                                "region": {"type": "string"},
+                                "ledger_balance": {"type": "number"},
+                                "currency": {"type": "string"},
+                                "status": {"type": "string"},
+                                "days_past_due": {"type": "integer"},
+                            },
+                        },
+                    },
+                },
+            },
             "annotations": {"readOnlyHint": True, "destructiveHint": False},
         },
         {
@@ -395,6 +453,17 @@ def create_mock_backends_app(
                 "properties": {"customer_id": {"type": "string"}},
                 "required": ["customer_id"],
             },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "customer_id": {"type": "string"},
+                    "region": {"type": "string"},
+                    "ledger_balance": {"type": "number"},
+                    "currency": {"type": "string"},
+                    "status": {"type": "string"},
+                    "days_past_due": {"type": "integer"},
+                },
+            },
             "annotations": {"readOnlyHint": True, "destructiveHint": False},
         },
         {
@@ -403,6 +472,24 @@ def create_mock_backends_app(
             "inputSchema": {
                 "type": "object",
                 "properties": {"only_variances": {"type": "boolean", "default": False}},
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "lines": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "account_code": {"type": "string"},
+                                "customer_id": {"type": "string"},
+                                "debit": {"type": "number"},
+                                "credit": {"type": "number"},
+                                "variance": {"type": "number"},
+                            },
+                        },
+                    }
+                },
             },
             "annotations": {"readOnlyHint": True, "destructiveHint": False},
         },
@@ -416,6 +503,25 @@ def create_mock_backends_app(
                 "type": "object",
                 "properties": {"status": {"type": "string"}},
             },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "incidents": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "incident_id": {"type": "string"},
+                                "terminal_id": {"type": "string"},
+                                "customer_id": {"type": "string"},
+                                "severity": {"type": "string"},
+                                "issue": {"type": "string"},
+                                "status": {"type": "string"},
+                            },
+                        },
+                    }
+                },
+            },
             "annotations": {"readOnlyHint": True, "destructiveHint": False},
         },
         {
@@ -425,6 +531,14 @@ def create_mock_backends_app(
                 "type": "object",
                 "properties": {"terminal_id": {"type": "string"}},
                 "required": ["terminal_id"],
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "terminal_id": {"type": "string"},
+                    "online": {"type": "boolean"},
+                    "active_incident": {"type": "object"},
+                },
             },
             "annotations": {"readOnlyHint": True, "destructiveHint": False},
         },
@@ -439,6 +553,16 @@ def create_mock_backends_app(
                     "priority": {"type": "string", "default": "high"},
                 },
                 "required": ["customer_id", "reason"],
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "case_id": {"type": "string"},
+                    "customer_id": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "priority": {"type": "string"},
+                    "created_by": {"type": "string"},
+                },
             },
             "annotations": {"readOnlyHint": False, "destructiveHint": False},
         },
