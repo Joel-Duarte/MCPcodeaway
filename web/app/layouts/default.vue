@@ -38,10 +38,11 @@ const isLoginPage = computed(() => route.path === "/login");
 
 const navItems: { to: string; label: string; icon: IconName }[] = [
   { to: "/", label: "Overview & Runtime", icon: "overview" },
-  { to: "/analytics", label: "Analytics & Cost", icon: "analytics" },
+  { to: "/analytics", label: "Gateway Usage", icon: "analytics" },
+  { to: "/optimization", label: "Optimization & ROI", icon: "upstreams" },
   { to: "/onboarding", label: "Onboarding & A/B Lab", icon: "onboarding" },
-  { to: "/upstreams", label: "Upstreams & Splits", icon: "upstreams" },
-  { to: "/audit", label: "Audit & Retention", icon: "audit" },
+  { to: "/upstreams", label: "Upstreams Catalog", icon: "upstreams" },
+  { to: "/audit", label: "Audit & Compliance", icon: "audit" },
   { to: "/settings", label: "Settings & Alerts", icon: "shield" },
 ];
 

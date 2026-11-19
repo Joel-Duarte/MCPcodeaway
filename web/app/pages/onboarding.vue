@@ -182,6 +182,20 @@ const authHelpText = computed(() => {
   return "No downstream credentials sent — suitable only for internal read-only sandboxes.";
 });
 
+const authRequestPreview = computed(() => {
+  const host = draftUrl.value.trim() || "https://api.example.com";
+  if (draftAuthType.value === "delegated_token") {
+    return `POST ${host}/...\\nAuthorization: Bearer <OBO_USER_SCOPED_JWT>\\nX-Forwarded-Sub: <caller_sub>`;
+  }
+  if (draftAuthType.value === "api_key") {
+    return `GET ${host}/...\\nX-API-Key: <HOST_ENV_SECRET_KEY>`;
+  }
+  if (draftAuthType.value === "bearer_secret") {
+    return `GET ${host}/...\\nAuthorization: Bearer <HOST_ENV_SERVICE_TOKEN>`;
+  }
+  return `GET ${host}/...\\n(No Authorization header injected)`;
+});
+
 const sessionAdvice = computed(() => {
   const count = inspectResult.value?.inspection.tool_count ?? 0;
   return {
@@ -795,6 +809,7 @@ async function copyPromptText() {
             </SelectContent>
           </Select>
           <FieldDescription>{{ authHelpText }}</FieldDescription>
+          <pre class="mt-2 overflow-x-auto rounded border border-[#E4E4E7] bg-[#FAFAFA] p-2 font-mono-data text-[11px] text-[#52525B]">{{ authRequestPreview }}</pre>
         </Field>
 
         <Field>
@@ -815,6 +830,12 @@ async function copyPromptText() {
               </SelectItem>
             </SelectContent>
           </Select>
+          <div class="mt-2 space-y-1 rounded border border-[#E4E4E7] bg-[#FAFAFA] p-2.5 text-[11px] text-[#52525B]">
+            <div><strong class="text-[#09090B]">auto:</strong> Gateway picks Code Mode or Classic per request using tool count &amp; payload size.</div>
+            <div><strong class="text-[#0F766E]">codemode:</strong> Defers full schemas (<code class="font-mono-data">search_tools</code> on demand) so 100+ tools don't bloat prompts, and runs Python in Monty.</div>
+            <div><strong class="text-[#0F766E]">hybrid:</strong> Code Mode for read/aggregation + confirmed Classic MCP calls for mutating writes.</div>
+            <div><strong class="text-[#2563EB]">traditional:</strong> Classic MCP (<code class="font-mono-data">discover</code> + <code class="font-mono-data">tools/call</code>) for simple single-tool calls.</div>
+          </div>
         </Field>
 
         <div class="sm:col-span-2 space-y-2">
@@ -919,6 +940,9 @@ async function copyPromptText() {
               </SelectItem>
             </SelectContent>
           </Select>
+          <FieldDescription>
+            Select which registered service (or your current draft) receives the Classic vs. Code Mode evaluation probe.
+          </FieldDescription>
         </Field>
 
         <Tabs v-model:value="abTab">
@@ -970,6 +994,9 @@ async function copyPromptText() {
                   Ollama (:11434)
                 </Button>
               </div>
+              <p class="text-[11px] text-[#52525B]">
+                Running in Docker? Use <code class="font-mono-data">http://host.docker.internal:1234/v1</code> (LM Studio) or <code class="font-mono-data">http://host.docker.internal:11434/v1</code> (Ollama) with Local Network / CORS enabled.
+              </p>
               <Field>
                 <FieldLabel>Base URL</FieldLabel>
                 <Input v-model="llmBaseUrl" class="font-mono-data text-xs" />

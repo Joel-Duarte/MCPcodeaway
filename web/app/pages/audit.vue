@@ -208,7 +208,7 @@ onMounted(() => {
           <Switch v-model:checked="liveMode">
             <SwitchThumb />
           </Switch>
-          <span>Live Stream</span>
+          <span>Real-Time</span>
         </label>
         <Button pending-announcement="Refreshing runs" @click="fetchRuns(false)">
           <AppIcon name="refresh" :size="15" />
@@ -272,6 +272,11 @@ onMounted(() => {
           <Input v-model="tenantFilter" placeholder="Leave blank for default scope" />
         </Field>
       </div>
+      <div class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 text-xs text-[#52525B]">
+        <span class="font-medium text-[#09090B]">Detection Guide:</span>
+        <strong class="text-[#DC2626]">Errors Only</strong> shows failed upstream calls, RBAC/ABAC policy denials, or Monty syntax/runtime errors (<code class="font-mono-data">ok = false</code>).
+        <strong class="text-[#92400E]">Grounding Blocked</strong> isolates Code Mode runs where output verification caught ungrounded numbers/IDs that did not originate from any upstream subcall (<code class="font-mono-data">grounding_blocked = true</code>).
+      </div>
     </section>
 
     <div
@@ -334,12 +339,14 @@ onMounted(() => {
                 <span
                   class="rounded border px-2 py-0.5 text-xs font-medium"
                   :class="
-                    r.ok
-                      ? 'border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]'
-                      : 'border-[#FECACA] bg-[#FEF2F2] text-[#DC2626]'
+                    r.grounding_blocked
+                      ? 'border-[#FDE68A] bg-[#FFFBEB] text-[#92400E]'
+                      : r.ok
+                        ? 'border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]'
+                        : 'border-[#FECACA] bg-[#FEF2F2] text-[#DC2626]'
                   "
                 >
-                  {{ r.ok ? "ok" : "error" }}
+                  {{ r.grounding_blocked ? "grounding blocked" : r.ok ? "ok" : "error" }}
                 </span>
               </td>
               <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ r.subcall_count }}</td>
@@ -371,18 +378,38 @@ onMounted(() => {
           </Button>
         </div>
       </div>
+      <div class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 text-xs text-[#52525B]">
+        <span class="font-medium text-[#09090B]">Detection Guide:</span>
+        <strong class="text-[#DC2626]">Errors Only</strong> shows failed upstream calls, RBAC/ABAC policy denials, or Monty syntax/runtime errors (<code class="font-mono-data">ok = false</code>).
+        <strong class="text-[#92400E]">Grounding Blocked</strong> isolates Code Mode runs where output verification caught ungrounded numbers/IDs that did not originate from any upstream subcall (<code class="font-mono-data">grounding_blocked = true</code>).
+      </div>
     </section>
 
     <!-- Slide-over Audit Inspector Drawer -->
     <Drawer v-model:open="drawerOpen" side="right">
       <DrawerBackdrop />
-      <DrawerContent class="w-full max-w-[95vw] sm:w-[32rem] p-0">
-        <div class="flex items-center justify-between border-b border-[#E4E4E7] px-5 py-4">
-          <div>
-            <DrawerTitle class="text-sm font-semibold text-[#09090B]">
-              Run {{ selectedRun?.run_id.slice(0, 12) }}
-            </DrawerTitle>
-            <DrawerDescription class="text-xs text-[#52525B]">
+      <DrawerContent class="w-full max-w-[95vw] sm:w-[36rem] p-0">
+        <div class="flex items-center justify-between border-b border-[#E4E4E7] bg-[#FAFAFA] px-5 py-4">
+          <div class="min-w-0">
+            <div class="flex items-center gap-2">
+              <DrawerTitle class="font-mono-data text-sm font-semibold text-[#09090B]">
+                {{ selectedRun?.run_id.slice(0, 16) }}
+              </DrawerTitle>
+              <span
+                v-if="selectedRun"
+                class="rounded border px-2 py-0.5 text-[11px] font-medium"
+                :class="
+                  selectedRun.grounding_blocked
+                    ? 'border-[#FDE68A] bg-[#FFFBEB] text-[#92400E]'
+                    : selectedRun.ok
+                      ? 'border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]'
+                      : 'border-[#FECACA] bg-[#FEF2F2] text-[#DC2626]'
+                "
+              >
+                {{ selectedRun.grounding_blocked ? "Grounding Blocked" : selectedRun.ok ? "Succeeded" : "Error" }}
+              </span>
+            </div>
+            <DrawerDescription class="mt-0.5 truncate text-xs text-[#52525B]">
               {{ selectedRun?.mode }} · {{ selectedRun?.user_email || selectedRun?.user_sub }}
             </DrawerDescription>
           </div>
@@ -392,7 +419,30 @@ onMounted(() => {
         </div>
 
         <div v-if="selectedRun" class="min-h-0 flex-1 space-y-4 overflow-y-auto p-5 text-xs">
-          <div class="grid grid-cols-2 gap-3 rounded-md border border-[#E4E4E7] bg-[#F4F4F5] p-3">
+          <!-- KPI Strip -->
+          <div class="grid grid-cols-3 gap-2">
+            <div class="rounded-md border border-[#E4E4E7] bg-white p-2.5">
+              <div class="text-[11px] text-[#71717A]">Duration</div>
+              <div class="mt-0.5 text-sm font-semibold text-[#09090B] tabular-nums">
+                {{ selectedRun.duration_ms.toFixed(1) }} ms
+              </div>
+            </div>
+            <div class="rounded-md border border-[#E4E4E7] bg-white p-2.5">
+              <div class="text-[11px] text-[#71717A]">Tokens Saved</div>
+              <div class="mt-0.5 text-sm font-semibold text-[#0F766E] tabular-nums">
+                {{ (selectedRun.estimated_tokens_saved + selectedRun.schema_tokens_saved).toLocaleString("en-US") }}
+              </div>
+            </div>
+            <div class="rounded-md border border-[#E4E4E7] bg-white p-2.5">
+              <div class="text-[11px] text-[#71717A]">Subcalls</div>
+              <div class="mt-0.5 text-sm font-semibold text-[#09090B] tabular-nums">
+                {{ selectedRun.subcall_count }}
+              </div>
+            </div>
+          </div>
+
+          <!-- Metadata & Provenance Grid -->
+          <div class="grid grid-cols-2 gap-3 rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3">
             <div>
               <div class="text-[#71717A]">Grounded Provenance</div>
               <div class="mt-0.5 font-semibold" :class="selectedRun.provenance?.grounded ? 'text-[#059669]' : 'text-[#52525B]'">
@@ -405,16 +455,37 @@ onMounted(() => {
                 {{ selectedRun.mode_decision_reason || "explicit" }}
               </div>
             </div>
+            <div>
+              <div class="text-[#71717A]">Groups</div>
+              <div class="mt-0.5 font-mono-data text-[#09090B]">
+                {{ (selectedRun.user_groups || []).join(", ") || "—" }}
+              </div>
+            </div>
+            <div>
+              <div class="text-[#71717A]">Security Filters</div>
+              <div class="mt-0.5 text-[#09090B] tabular-nums">
+                ABAC: {{ selectedRun.abac_rows_filtered }} · PII: {{ selectedRun.pii_redactions }}
+              </div>
+            </div>
+          </div>
+
+          <div v-if="selectedRun.error" class="space-y-1.5">
+            <div class="font-semibold" :class="selectedRun.grounding_blocked ? 'text-[#92400E]' : 'text-[#DC2626]'">
+              {{ selectedRun.grounding_blocked ? "Grounding Violation Blocked" : "Execution Error" }}
+            </div>
+            <pre
+              class="overflow-x-auto rounded border p-3 font-mono-data text-xs whitespace-pre-wrap"
+              :class="
+                selectedRun.grounding_blocked
+                  ? 'border-[#FDE68A] bg-[#FFFBEB] text-[#92400E]'
+                  : 'border-[#FECACA] bg-[#FEF2F2] text-[#DC2626]'
+              "
+            >{{ selectedRun.error }}</pre>
           </div>
 
           <div v-if="selectedRun.code" class="space-y-1.5">
             <div class="font-semibold text-[#09090B]">Executed Monty Python</div>
             <pre class="overflow-x-auto rounded border border-[#E4E4E7] bg-[#FAFAFA] p-3 font-mono-data text-xs text-[#09090B]">{{ selectedRun.code }}</pre>
-          </div>
-
-          <div v-if="selectedRun.error" class="space-y-1.5">
-            <div class="font-semibold text-[#DC2626]">Error</div>
-            <pre class="overflow-x-auto rounded border border-[#FECACA] bg-[#FEF2F2] p-3 font-mono-data text-xs text-[#DC2626]">{{ selectedRun.error }}</pre>
           </div>
 
           <div v-if="selectedRun.subcalls?.length" class="space-y-1.5">
@@ -438,6 +509,11 @@ onMounted(() => {
               </table>
             </div>
           </div>
+
+          <details class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3">
+            <summary class="cursor-pointer font-medium text-[#09090B]">Raw Audit JSON</summary>
+            <pre class="mt-2 max-h-64 overflow-auto rounded border border-[#E4E4E7] bg-white p-2.5 font-mono-data text-[11px] text-[#09090B]">{{ JSON.stringify(selectedRun, null, 2) }}</pre>
+          </details>
         </div>
       </DrawerContent>
     </Drawer>

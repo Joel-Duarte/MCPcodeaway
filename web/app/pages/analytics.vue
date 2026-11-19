@@ -179,19 +179,27 @@ function formatUsd(n: number | undefined): string {
     <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div>
         <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">
-          Analytics, Groups &amp; Model Cost
+          Gateway Usage, Groups &amp; Cost Attribution
         </h1>
         <p class="mt-0.5 text-[13px] text-[#52525B]">
-          Attribute gateway token savings, LLM cost estimates, client groups, and mode selection reasons.
+          Track overall MCP gateway traffic, top company groups, active users, and ABAC/PII governance.
         </p>
       </div>
-      <NuxtLink
-        to="/settings"
-        class="no-underline inline-flex items-center gap-1.5 rounded-md border border-[#D4D4D8] bg-white px-3 py-1.5 text-xs font-medium text-[#09090B] hover:bg-[#F4F4F5]"
-      >
-        <AppIcon name="shield" :size="14" />
-        <span>Custom Model Pricing</span>
-      </NuxtLink>
+      <div class="flex flex-wrap items-center gap-2">
+        <NuxtLink
+          to="/optimization"
+          class="no-underline inline-flex items-center gap-1.5 rounded-md border border-[#99F6E4] bg-[#F0FDFA] px-3 py-1.5 text-xs font-medium text-[#0F766E] hover:bg-[#CCFBF1]"
+        >
+          <span>Optimization &amp; A/B ROI</span>
+        </NuxtLink>
+        <NuxtLink
+          to="/settings"
+          class="no-underline inline-flex items-center gap-1.5 rounded-md border border-[#D4D4D8] bg-white px-3 py-1.5 text-xs font-medium text-[#09090B] hover:bg-[#F4F4F5]"
+        >
+          <AppIcon name="shield" :size="14" />
+          <span>Model Pricing</span>
+        </NuxtLink>
+      </div>
     </div>
 
     <!-- Reactive Filters Bar (auto-applies on change) -->

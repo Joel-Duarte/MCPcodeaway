@@ -8,6 +8,7 @@ interface UpstreamEntry {
   auth_type: string;
   stateful_session?: boolean;
   preferred_mode?: string;
+  allowed_groups?: string[];
   enabled: boolean;
   ab_experiment?: {
     enabled: boolean;
@@ -24,24 +25,16 @@ interface UpstreamsResponse {
   digests_by_server: Record<string, string>;
   drift_warnings: string[];
   upstreams: UpstreamEntry[];
-}
-
-interface ExperimentsResponse {
-  configured: {
-    upstream: string;
-    preferred_mode: string;
-    ab_experiment: { enabled: boolean; experiment_id?: string | null; codemode_traffic_pct: number } | null;
-  }[];
-  results: Record<
-    string,
-    {
-      arms: Record<
-        string,
-        { runs: number; error_rate_pct: number; avg_duration_ms: number; avg_tokens_saved: number; total_tokens_saved: number }
-      >;
-      recommended_winner: string;
-    }
-  >;
+  total?: number;
+  total_registered?: number;
+  page?: number;
+  page_size?: number;
+  total_pages?: number;
+  facets?: {
+    groups: string[];
+    auth_types: string[];
+    modes: string[];
+  };
 }
 
 const { apiFetch, setRuntimeMeta } = useAdminApi();
@@ -50,19 +43,37 @@ const loading = ref(true);
 const errorMessage = ref("");
 const statusMessage = ref("");
 const upstreamsData = ref<UpstreamsResponse | null>(null);
-const experimentsData = ref<ExperimentsResponse | null>(null);
 const deleteTarget = ref<string | null>(null);
 const deleteDialogOpen = ref(false);
 
-async function fetchData() {
+// 500-server scale search, filters & pagination
+const searchQuery = ref("");
+const groupFilter = ref("");
+const authFilter = ref("");
+const statefulFilter = ref<"all" | "stateful" | "stateless">("all");
+const modeFilter = ref("");
+const page = ref(1);
+const pageSize = 25;
+
+let searchTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function fetchData(resetPage = false) {
+  if (resetPage) page.value = 1;
   errorMessage.value = "";
   try {
-    const [ups, exps] = await Promise.all([
-      apiFetch<UpstreamsResponse>("/admin/upstreams"),
-      apiFetch<ExperimentsResponse>("/admin/ab/experiments"),
-    ]);
+    const params = new URLSearchParams({
+      page: String(page.value),
+      page_size: String(pageSize),
+    });
+    if (searchQuery.value.trim()) params.set("q", searchQuery.value.trim());
+    if (groupFilter.value) params.set("group", groupFilter.value);
+    if (authFilter.value) params.set("auth_type", authFilter.value);
+    if (statefulFilter.value === "stateful") params.set("stateful", "true");
+    if (statefulFilter.value === "stateless") params.set("stateful", "false");
+    if (modeFilter.value) params.set("mode", modeFilter.value);
+
+    const ups = await apiFetch<UpstreamsResponse>(`/admin/upstreams?${params.toString()}`);
     upstreamsData.value = ups;
-    experimentsData.value = exps;
     setRuntimeMeta({
       profile: ups.profile,
       app_env: ups.app_env,
@@ -73,6 +84,26 @@ async function fetchData() {
   } finally {
     loading.value = false;
   }
+}
+
+watch(searchQuery, () => {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    void fetchData(true);
+  }, 200);
+});
+
+watch([groupFilter, authFilter, statefulFilter, modeFilter], () => {
+  void fetchData(true);
+});
+
+function clearFilters() {
+  searchQuery.value = "";
+  groupFilter.value = "";
+  authFilter.value = "";
+  statefulFilter.value = "all";
+  modeFilter.value = "";
+  void fetchData(true);
 }
 
 async function handleRefreshCatalog() {
@@ -112,11 +143,6 @@ async function confirmDelete() {
 onMounted(() => {
   void fetchData();
 });
-
-const experimentRows = computed(() => {
-  const results = experimentsData.value?.results || {};
-  return Object.entries(results).map(([id, info]) => ({ id, ...info }));
-});
 </script>
 
 <template>
@@ -124,10 +150,10 @@ const experimentRows = computed(() => {
     <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div>
         <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">
-          Upstreams Catalog &amp; Live A/B Splits
+          Upstreams Service Catalog
         </h1>
         <p class="mt-0.5 text-[13px] text-[#52525B]">
-          Registered MCP/OpenAPI services, stateful session configuration, schema digests, and live experiment arms.
+          Search, filter, and manage registered MCP/OpenAPI services, stateful session configuration, and schema digests.
         </p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
@@ -140,7 +166,7 @@ const experimentRows = computed(() => {
           class="no-underline inline-flex items-center gap-1.5 rounded-md border border-[#0F766E] bg-[#0F766E] px-3.5 py-2 text-[13px] font-medium text-white hover:bg-[#115E59]"
         >
           <AppIcon name="onboarding" :size="15" />
-          <span>Onboard &amp; A/B Test</span>
+          <span>Onboard Service</span>
         </NuxtLink>
       </div>
     </div>
@@ -173,10 +199,61 @@ const experimentRows = computed(() => {
       </ul>
     </div>
 
+    <!-- 500-Server Scale Search & Filter Bar -->
+    <section class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
+      <div class="grid gap-3 sm:grid-cols-5">
+        <div class="sm:col-span-2">
+          <label class="block text-xs font-medium text-[#52525B]">Search Service Name or URL</label>
+          <input
+            v-model="searchQuery"
+            type="search"
+            placeholder="e.g. billing, snowflake, https://..."
+            class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-xs text-[#09090B]"
+          />
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-[#52525B]">Allowed Group</label>
+          <select v-model="groupFilter" class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-2.5 py-1.5 text-xs">
+            <option value="">All Groups</option>
+            <option v-for="g in upstreamsData?.facets?.groups || []" :key="g" :value="g">{{ g }}</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-[#52525B]">Auth Type</label>
+          <select v-model="authFilter" class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-2.5 py-1.5 text-xs">
+            <option value="">All Auth</option>
+            <option v-for="a in upstreamsData?.facets?.auth_types || []" :key="a" :value="a">{{ a }}</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-[#52525B]">Session &amp; Mode</label>
+          <div class="mt-1 flex gap-1.5">
+            <select v-model="statefulFilter" class="w-1/2 rounded-md border border-[#E4E4E7] bg-white px-2 py-1.5 text-xs">
+              <option value="all">All Sessions</option>
+              <option value="stateful">Stateful</option>
+              <option value="stateless">Stateless</option>
+            </select>
+            <select v-model="modeFilter" class="w-1/2 rounded-md border border-[#E4E4E7] bg-white px-2 py-1.5 text-xs">
+              <option value="">All Modes</option>
+              <option v-for="m in upstreamsData?.facets?.modes || []" :key="m" :value="m">{{ m }}</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      <div class="flex items-center justify-between text-xs text-[#52525B]">
+        <span class="tabular-nums">
+          Matching {{ upstreamsData?.total ?? upstreamsData?.upstreams?.length ?? 0 }} of
+          {{ upstreamsData?.total_registered ?? upstreamsData?.upstreams?.length ?? 0 }} registered servers
+        </span>
+        <button type="button" class="font-medium text-[#0F766E] hover:underline" @click="clearFilters">
+          Reset Filters
+        </button>
+      </div>
+    </section>
+
     <div v-if="loading" class="h-48 animate-pulse rounded-lg border border-[#E4E4E7] bg-white" />
 
     <template v-else-if="upstreamsData">
-      <!-- Upstreams Table -->
       <section class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="flex items-center justify-between border-b border-[#E4E4E7] px-4 py-3">
           <h2 class="text-[15px] font-semibold text-[#09090B]">Registered Upstreams</h2>
@@ -186,7 +263,7 @@ const experimentRows = computed(() => {
         </div>
 
         <div v-if="upstreamsData.upstreams.length === 0" class="p-6 text-center text-[13px] text-[#71717A]">
-          No upstreams registered in this profile yet.
+          No upstreams match the active filters.
         </div>
 
         <div v-else class="overflow-x-auto table-scroll">
@@ -195,9 +272,9 @@ const experimentRows = computed(() => {
               <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-xs font-medium text-[#52525B]">
                 <th class="px-4 py-2.5 whitespace-nowrap">Name</th>
                 <th class="px-4 py-2.5 whitespace-nowrap">Type / Auth</th>
+                <th class="px-4 py-2.5 whitespace-nowrap">Groups</th>
                 <th class="px-4 py-2.5 whitespace-nowrap">Stateful MCP</th>
                 <th class="px-4 py-2.5 whitespace-nowrap">Preferred Mode</th>
-                <th class="px-4 py-2.5 whitespace-nowrap">Live A/B Split</th>
                 <th class="px-4 py-2.5 whitespace-nowrap">Digest</th>
                 <th v-if="upstreamsData.dynamic_upstreams_permitted" class="px-4 py-2.5 whitespace-nowrap text-right">
                   Actions
@@ -212,6 +289,9 @@ const experimentRows = computed(() => {
                 </td>
                 <td class="px-4 py-2.5 text-xs text-[#52525B] whitespace-nowrap">
                   {{ u.type }} · {{ u.auth_type }}
+                </td>
+                <td class="px-4 py-2.5 text-xs text-[#52525B] whitespace-nowrap">
+                  {{ (u.allowed_groups || []).join(", ") || "open" }}
                 </td>
                 <td class="px-4 py-2.5 text-xs whitespace-nowrap">
                   <span
@@ -228,12 +308,6 @@ const experimentRows = computed(() => {
                 <td class="px-4 py-2.5 font-mono-data text-xs text-[#09090B] whitespace-nowrap">
                   {{ u.preferred_mode || "codemode" }}
                 </td>
-                <td class="px-4 py-2.5 text-xs tabular-nums whitespace-nowrap">
-                  <span v-if="u.ab_experiment?.enabled" class="text-[#0F766E] font-medium">
-                    {{ u.ab_experiment.codemode_traffic_pct }}% CM / {{ 100 - u.ab_experiment.codemode_traffic_pct }}% CL
-                  </span>
-                  <span v-else class="text-[#71717A]">Off</span>
-                </td>
                 <td class="px-4 py-2.5 font-mono-data text-xs text-[#71717A] whitespace-nowrap">
                   {{ (upstreamsData.digests_by_server[u.name] || "—").slice(0, 12) }}
                 </td>
@@ -247,77 +321,42 @@ const experimentRows = computed(() => {
             </tbody>
           </table>
         </div>
-      </section>
 
-      <!-- Live A/B Experiments Table -->
-      <section class="rounded-lg border border-[#E4E4E7] bg-white">
-        <div class="border-b border-[#E4E4E7] px-4 py-3">
-          <h2 class="text-[15px] font-semibold text-[#09090B]">Live Experiment Results</h2>
-        </div>
-
-        <div v-if="experimentRows.length === 0" class="p-6 text-center text-[13px] text-[#71717A]">
-          No traffic split experiments have accumulated runs yet. Enable `ab_experiment` on an upstream in Onboarding.
-        </div>
-
-        <div v-else class="overflow-x-auto table-scroll">
-          <table class="w-full border-collapse text-left text-[13px]">
-            <thead>
-              <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-xs font-medium text-[#52525B]">
-                <th class="px-4 py-2.5 whitespace-nowrap">Experiment ID</th>
-                <th class="px-4 py-2.5 whitespace-nowrap">Code Mode Arm</th>
-                <th class="px-4 py-2.5 whitespace-nowrap">Classic Arm</th>
-                <th class="px-4 py-2.5 whitespace-nowrap">Recommended Winner</th>
-              </tr>
-            </thead>
-            <tbody class="divide-y divide-[#E4E4E7]">
-              <tr v-for="exp in experimentRows" :key="exp.id" class="hover:bg-[#FAFAFA]">
-                <td class="px-4 py-2.5 font-mono-data font-medium text-[#09090B] whitespace-nowrap">
-                  {{ exp.id }}
-                </td>
-                <td class="px-4 py-2.5 text-xs tabular-nums whitespace-nowrap">
-                  <template v-if="exp.arms.codemode">
-                    {{ exp.arms.codemode.runs }} runs · {{ exp.arms.codemode.avg_duration_ms.toFixed(1) }} ms · {{ exp.arms.codemode.total_tokens_saved }} tok saved
-                  </template>
-                  <span v-else class="text-[#71717A]">—</span>
-                </td>
-                <td class="px-4 py-2.5 text-xs tabular-nums whitespace-nowrap">
-                  <template v-if="exp.arms.classic">
-                    {{ exp.arms.classic.runs }} runs · {{ exp.arms.classic.avg_duration_ms.toFixed(1) }} ms · err {{ exp.arms.classic.error_rate_pct }}%
-                  </template>
-                  <span v-else class="text-[#71717A]">—</span>
-                </td>
-                <td class="px-4 py-2.5 whitespace-nowrap">
-                  <span
-                    class="rounded border px-2 py-0.5 text-xs font-medium"
-                    :class="
-                      exp.recommended_winner === 'codemode'
-                        ? 'border-[#99F6E4] bg-[#F0FDFA] text-[#0F766E]'
-                        : 'border-[#BFDBFE] bg-[#EFF6FF] text-[#2563EB]'
-                    "
-                  >
-                    {{ exp.recommended_winner }}
-                  </span>
-                </td>
-              </tr>
-            </tbody>
-          </table>
+        <div
+          v-if="(upstreamsData.total_pages ?? 1) > 1"
+          class="flex items-center justify-between border-t border-[#E4E4E7] bg-[#FAFAFA] px-4 py-2.5 text-xs text-[#52525B]"
+        >
+          <span class="tabular-nums">
+            Page {{ upstreamsData.page ?? 1 }} of {{ upstreamsData.total_pages ?? 1 }}
+          </span>
+          <div class="flex gap-2">
+            <Button :disabled="(upstreamsData.page ?? 1) <= 1" @click="page -= 1; void fetchData()">
+              Previous
+            </Button>
+            <Button
+              :disabled="(upstreamsData.page ?? 1) >= (upstreamsData.total_pages ?? 1)"
+              @click="page += 1; void fetchData()"
+            >
+              Next
+            </Button>
+          </div>
         </div>
       </section>
     </template>
 
-    <!-- Destructive confirmation Dialog -->
     <Dialog v-model:open="deleteDialogOpen">
       <DialogBackdrop />
       <DialogContent>
-        <DialogTitle>Remove dynamic upstream?</DialogTitle>
+        <DialogTitle>Delete dynamic upstream?</DialogTitle>
         <DialogDescription>
-          This deletes <strong class="font-mono-data text-[#09090B]">{{ deleteTarget }}</strong> from the gateway store and bumps the catalog epoch across replicas.
+          Removing <strong>{{ deleteTarget }}</strong> stops routing new MCP subcalls to it immediately.
         </DialogDescription>
         <div class="flex justify-end gap-2 pt-2">
           <DialogClose>Cancel</DialogClose>
           <Button
             data-variant="danger"
-            data-agent-confirm="Remove this dynamic upstream from the gateway?"
+            data-agent-confirm="Permanently delete dynamic upstream?"
+            pending-announcement="Deleting upstream"
             @click="confirmDelete"
           >
             Delete Upstream
