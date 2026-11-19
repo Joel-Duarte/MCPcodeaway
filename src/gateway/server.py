@@ -59,7 +59,12 @@ from gateway.state import (
     SQLiteAuditStore,
 )
 from gateway.telemetry import TelemetryRecorder, configure_telemetry
-from gateway.upstream_clients import DiscoveredTool, UpstreamClientManager, inspect_upstream
+from gateway.upstream_clients import (
+    DiscoveredTool,
+    UpstreamClientManager,
+    build_agent_onboarding_prompt,
+    inspect_upstream,
+)
 
 _VALID_MODES: set[str] = {
     "codemode",
@@ -1153,6 +1158,13 @@ def create_gateway_app(
             candidate_tools=discovered,
         )
         return inspection, audit
+
+    @app.get("/admin/upstreams/agent-prompt")
+    async def admin_agent_onboarding_prompt() -> dict[str, Any]:
+        return {
+            "prompt": build_agent_onboarding_prompt(),
+            "schema": UpstreamConfig.model_json_schema(),
+        }
 
     @app.post("/admin/upstreams/inspect")
     async def inspect_admin_upstream(

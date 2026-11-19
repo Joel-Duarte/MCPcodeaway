@@ -302,7 +302,17 @@ def _build_billing_subapp(
         ),
         authorization: str | None = Header(default=None),
     ) -> InvoiceListResponse:
-        await verifier.verify(authorization, expected_audience=audience, required_roles=required)
+        claims = await verifier.verify(
+            authorization, expected_audience=audience, required_roles=required
+        )
+        allowed_groups = {str(g) for g in (claims.get("client_groups") or []) if g}
+        if allowed_groups and region not in allowed_groups:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Caller client_groups={sorted(allowed_groups)} cannot access region {region}"
+                ),
+            )
         source = bulk_invoices if dataset == "bulk" else invoices
         filtered = [inv for inv in source if status is None or inv["status"] == status]
         return InvoiceListResponse(
@@ -320,7 +330,17 @@ def _build_billing_subapp(
         customer_id: str,
         authorization: str | None = Header(default=None),
     ) -> CustomerRecord:
-        await verifier.verify(authorization, expected_audience=audience, required_roles=required)
+        claims = await verifier.verify(
+            authorization, expected_audience=audience, required_roles=required
+        )
+        allowed_groups = {str(g) for g in (claims.get("client_groups") or []) if g}
+        if allowed_groups and region not in allowed_groups:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Caller client_groups={sorted(allowed_groups)} cannot access region {region}"
+                ),
+            )
         customer = customers.get(customer_id)
         if customer is None:
             raise HTTPException(status_code=404, detail=f"Customer '{customer_id}' not found")
@@ -579,6 +599,8 @@ def create_mock_backends_app(
         )
 
         def call_snowflake(name: str, args: dict[str, Any]) -> Any:
+            allowed_groups = {str(g) for g in (claims.get("client_groups") or []) if g}
+            customer_regions = {r["customer_id"]: r["region"] for r in debt_ledger + bulk_ledger}
             if name == "query_debt_ledger":
                 source = bulk_ledger if args.get("dataset") == "bulk" else debt_ledger
                 rows = [
@@ -586,6 +608,7 @@ def create_mock_backends_app(
                     for r in source
                     if (not args.get("status") or r["status"] == args["status"])
                     and (not args.get("region") or r["region"] == args["region"])
+                    and (not allowed_groups or r["region"] in allowed_groups)
                 ]
                 return {"queried_by": claims["sub"], "rows": rows}
             if name == "get_customer_balance":
@@ -593,12 +616,26 @@ def create_mock_backends_app(
                 row = next((r for r in debt_ledger if r["customer_id"] == cid), None)
                 if row is None:
                     raise ValueError(f"Unknown customer_id '{cid}'")
+                if allowed_groups and row["region"] not in allowed_groups:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=(
+                            f"RLS denied customer '{cid}' (region {row['region']}) "
+                            f"for client_groups={sorted(allowed_groups)}"
+                        ),
+                    )
                 return row
             if name == "get_trial_balance_lines":
                 only_var = bool(args.get("only_variances", False))
                 return {
                     "lines": [
-                        line for line in trial_balance if not only_var or line["variance"] != 0.0
+                        line
+                        for line in trial_balance
+                        if (not only_var or line["variance"] != 0.0)
+                        and (
+                            not allowed_groups
+                            or customer_regions.get(line["customer_id"]) in allowed_groups
+                        )
                     ]
                 }
             raise KeyError(f"Unknown tool '{name}'")

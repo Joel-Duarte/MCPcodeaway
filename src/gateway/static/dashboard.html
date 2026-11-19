@@ -188,14 +188,56 @@
             <option value="api_key">api_key (Secret Env Ref)</option>
             <option value="bearer_secret">bearer_secret (Secret Env Ref)</option>
           </select>
-          <div class="btn-row">
-            <button class="btn secondary" onclick="submitUpstream(false)">Inspect &amp; Compare</button>
-            <button class="btn" onclick="submitUpstream(true)">Register in Gateway</button>
+          <div class="grid-2">
+            <div>
+              <label>Downstream Audience / Env Var</label>
+              <input id="up-aud" placeholder="api://target-svc (for OBO)" />
+              <label>Secret Env Var (for api_key/bearer)</label>
+              <input id="up-secret-env" placeholder="PARTNER_API_KEY" />
+              <label>Allowed Roles (comma-separated)</label>
+              <input id="up-roles" placeholder="finance_analyst, admin" />
+            </div>
+            <div>
+              <label>Downstream Scope (for OBO)</label>
+              <input id="up-scope" placeholder="mcp.tools" />
+              <label>Preferred Gateway Mode</label>
+              <select id="up-mode">
+                <option value="codemode">codemode (Deferred Stubs)</option>
+                <option value="codemode_upfront">codemode_upfront (Inlined Stubs)</option>
+                <option value="traditional_discover">traditional_discover</option>
+                <option value="traditional">traditional</option>
+                <option value="hybrid">hybrid (Monty Reads + Direct Writes)</option>
+              </select>
+              <label>ABAC Claim / Arg / List / Field (optional)</label>
+              <input id="up-abac" placeholder="client_groups:region:rows:region" />
+            </div>
           </div>
+          <div class="btn-row">
+            <button class="btn secondary" onclick="submitUpstream(false)">Inspect &amp; Analyze</button>
+            <button class="btn" onclick="submitUpstream(true)">Register Selected Operations</button>
+          </div>
+          <hr style="border-color: var(--border); margin: 14px 0;" />
+          <label>Import Agent-Generated UpstreamConfig JSON</label>
+          <textarea id="import-agent-json" placeholder='{"name":"...", "type":"openapi", ...}'></textarea>
+          <button class="btn secondary" style="margin-top: 8px;" onclick="importAgentConfig()">Load Agent JSON into Wizard</button>
         </div>
         <div class="card">
-          <h2>Classic MCP vs. Code Mode Onboarding Audit</h2>
-          <div id="onboarding-result"><pre>Submit or inspect an upstream to view discovered tools, collision checks, token savings, and upstreams.yaml export.</pre></div>
+          <h2>HITL Onboarding Guidance, Curation &amp; Agent Prompt</h2>
+          <div id="onboarding-guidance" style="margin-bottom: 12px;">
+            <p style="color: var(--muted);">Click <strong>Inspect &amp; Analyze</strong> to detect OpenAPI security schemes, review setup checklists for Gateway / Corporate IdP / Target Backend, and curate endpoints.</p>
+          </div>
+          <div id="op-curation" style="margin-bottom: 12px;"></div>
+          <div style="margin-bottom: 12px;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <label style="margin:0;">AI Agent Interview Prompt (give to your agent to generate config JSON)</label>
+              <div style="display:flex; gap:6px;">
+                <button class="btn secondary" style="padding:4px 10px;font-size:0.8rem;" onclick="fetchGenericAgentPrompt()">Generic Prompt</button>
+                <button class="btn secondary" style="padding:4px 10px;font-size:0.8rem;" onclick="copyAgentPrompt()">Copy</button>
+              </div>
+            </div>
+            <textarea id="agent-prompt-box" style="min-height: 110px;" placeholder="Inspect an upstream or click 'Generic Prompt' to get an AI onboarding prompt..."></textarea>
+          </div>
+          <div id="onboarding-result"><pre>Inspect or register an upstream to view discovered tools, collision checks, token savings, and upstreams.yaml export.</pre></div>
         </div>
       </div>
       <div class="card" style="margin-top: 16px;">
@@ -212,6 +254,8 @@
             <label>Caller Persona</label>
             <select id="cmp-persona">
               <option value="finance_analyst">finance_analyst (Snowflake + EU/US Billing)</option>
+              <option value="eu_accountant">eu_accountant (EU Client Group Only)</option>
+              <option value="us_accountant">us_accountant (US Client Group Only)</option>
               <option value="readonly_auditor">readonly_auditor (Read-Only Finance)</option>
               <option value="ops_engineer">ops_engineer (Ops + Mutating Ticketing)</option>
               <option value="support_agent">support_agent (Ops Read-Only)</option>
@@ -239,6 +283,8 @@
             <label>Persona</label>
             <select id="auth-persona">
               <option value="finance_analyst">finance_analyst</option>
+              <option value="eu_accountant">eu_accountant (EU Client Group Only)</option>
+              <option value="us_accountant">us_accountant (US Client Group Only)</option>
               <option value="ops_engineer">ops_engineer</option>
               <option value="readonly_auditor">readonly_auditor</option>
               <option value="support_agent">support_agent</option>
@@ -374,13 +420,129 @@
       `;
     }
 
+    let loadedExtraConfig = {};
+
+    function parseAbacSpec(specStr) {
+      const parts = (specStr || "").split(":").map((s) => s.trim());
+      if (!parts[0]) return [];
+      return [{
+        claim: parts[0],
+        arg_name: parts[1] || null,
+        response_list_key: parts[2] || null,
+        row_field: parts[3] || null,
+      }];
+    }
+
+    function selectedAllowedOperations() {
+      const boxes = document.querySelectorAll(".up-op-check");
+      if (!boxes.length) return loadedExtraConfig.allowed_operations || [];
+      return Array.from(boxes).filter((b) => b.checked).map((b) => b.value);
+    }
+
+    function renderOnboardingChecklist(guidance) {
+      if (!guidance) return;
+      const items = (guidance.checklist || []).map((c) => `
+        <div style="border-left: 3px solid ${c.severity === "required" ? "var(--warn)" : "var(--accent)"}; padding: 6px 10px; margin-bottom: 6px; background: #0f141e; border-radius: 6px;">
+          <span class="pill" style="margin-right:6px;">${c.target}</span>
+          <strong>${c.title}</strong> (${c.severity})
+          <div style="color: var(--muted); font-size: 0.84rem; margin-top: 2px;">${c.detail}</div>
+        </div>
+      `).join("");
+      const schemes = (guidance.detected_security_schemes || []).map((s) => s.name + ":" + s.type).join(", ") || "none declared";
+      document.getElementById("onboarding-guidance").innerHTML = `
+        <div style="margin-bottom: 8px;">
+          <span class="badge ok">Recommended mode: ${guidance.recommended_mode}</span>
+          <span class="pill">OpenAPI auth schemes: ${schemes}</span>
+        </div>
+        ${items}
+      `;
+      if (guidance.agent_onboarding_prompt) {
+        document.getElementById("agent-prompt-box").value = guidance.agent_onboarding_prompt;
+      }
+    }
+
+    function renderOpCuration(allTools, selectedOps) {
+      if (!allTools || !allTools.length) {
+        document.getElementById("op-curation").innerHTML = "";
+        return;
+      }
+      const selectedSet = new Set(selectedOps || []);
+      const rows = allTools.map((t) => {
+        const isDelete = (t.http_method || "").toUpperCase() === "DELETE";
+        const checked = selectedSet.size ? selectedSet.has(t.name) : !isDelete;
+        const schemaTag = t.output_schema ? '<span class="badge ok">outputSchema</span>' : '<span class="badge warn">untyped</span>';
+        const mutTag = t.mutating ? '<span class="badge warn">mutating</span>' : '<span class="badge ok">read</span>';
+        return `
+          <tr>
+            <td><input type="checkbox" class="up-op-check" value="${t.name}" ${checked ? "checked" : ""} style="width:auto;" /></td>
+            <td><code>${t.name}</code></td>
+            <td>${mutTag} ${schemaTag}</td>
+            <td style="font-size:0.82rem;color:var(--muted);">${t.description || ""}</td>
+          </tr>
+        `;
+      }).join("");
+      document.getElementById("op-curation").innerHTML = `
+        <label>Curate Operations (<code>allowed_operations</code>)</label>
+        <div style="max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:6px;">
+          <table><thead><tr><th>Keep</th><th>Operation</th><th>Flags</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>
+        </div>
+      `;
+    }
+
+    async function fetchGenericAgentPrompt() {
+      const data = await fetch("/admin/upstreams/agent-prompt").then((r) => r.json());
+      document.getElementById("agent-prompt-box").value = data.prompt || "";
+    }
+
+    async function copyAgentPrompt() {
+      const txt = document.getElementById("agent-prompt-box").value;
+      if (txt && navigator.clipboard) await navigator.clipboard.writeText(txt);
+    }
+
+    function importAgentConfig() {
+      const raw = document.getElementById("import-agent-json").value.trim();
+      if (!raw) return;
+      const cfg = JSON.parse(raw);
+      if (cfg.name) document.getElementById("up-name").value = cfg.name;
+      if (cfg.type) document.getElementById("up-type").value = cfg.type;
+      if (cfg.url) document.getElementById("up-url").value = cfg.url;
+      if (cfg.openapi_spec_url) document.getElementById("up-spec-url").value = cfg.openapi_spec_url;
+      if (cfg.openapi_spec) document.getElementById("up-spec-json").value = JSON.stringify(cfg.openapi_spec, null, 2);
+      if (cfg.command) document.getElementById("up-cmd").value = [cfg.command, ...(cfg.args || [])].join(" ");
+      if (cfg.auth_type) document.getElementById("up-auth").value = cfg.auth_type;
+      if (cfg.downstream_audience) document.getElementById("up-aud").value = cfg.downstream_audience;
+      if (cfg.downstream_scope) document.getElementById("up-scope").value = cfg.downstream_scope;
+      if (cfg.secret_env_var) document.getElementById("up-secret-env").value = cfg.secret_env_var;
+      if (Array.isArray(cfg.allowed_roles)) document.getElementById("up-roles").value = cfg.allowed_roles.join(", ");
+      if (cfg.preferred_mode) document.getElementById("up-mode").value = cfg.preferred_mode;
+      if (Array.isArray(cfg.abac_rules) && cfg.abac_rules.length) {
+        const r = cfg.abac_rules[0];
+        document.getElementById("up-abac").value = [r.claim || "", r.arg_name || "", r.response_list_key || "", r.row_field || ""].join(":");
+      }
+      loadedExtraConfig = cfg;
+      submitUpstream(false);
+    }
+
     async function submitUpstream(register) {
       const type = document.getElementById("up-type").value;
+      const roles = document.getElementById("up-roles").value.split(",").map((s) => s.trim()).filter(Boolean);
+      const allowedOps = selectedAllowedOperations();
       const payload = {
+        ...loadedExtraConfig,
         name: document.getElementById("up-name").value.trim(),
         type,
         auth_type: document.getElementById("up-auth").value,
+        preferred_mode: document.getElementById("up-mode").value || null,
+        allowed_roles: roles,
+        allowed_operations: allowedOps,
+        abac_rules: parseAbacSpec(document.getElementById("up-abac").value),
       };
+      const aud = document.getElementById("up-aud").value.trim();
+      const scope = document.getElementById("up-scope").value.trim();
+      const secEnv = document.getElementById("up-secret-env").value.trim();
+      if (aud) payload.downstream_audience = aud;
+      if (scope) payload.downstream_scope = scope;
+      if (secEnv) payload.secret_env_var = secEnv;
       if (type === "mcp_stdio") {
         const parts = document.getElementById("up-cmd").value.trim().split(/\s+/);
         payload.command = parts[0];
@@ -399,6 +561,10 @@
         body: JSON.stringify(payload),
       });
       const data = await resp.json();
+      if (data.inspection) {
+        renderOnboardingChecklist(data.inspection.onboarding_guidance);
+        renderOpCuration(data.inspection.all_tools, data.inspection.selected_operations);
+      }
       document.getElementById("onboarding-result").innerHTML = `<pre>${JSON.stringify(data, null, 2)}</pre>`;
       if (register && resp.ok) await loadOverview();
     }

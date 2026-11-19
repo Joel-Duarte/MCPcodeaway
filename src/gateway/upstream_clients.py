@@ -178,18 +178,36 @@ class UpstreamClientManager:
         async with httpx.AsyncClient(timeout=15.0) as client:
             return await client.request(method, url, **kwargs)
 
+    @staticmethod
+    def filter_tools(
+        upstream: UpstreamConfig, tools: list[DiscoveredTool]
+    ) -> list[DiscoveredTool]:
+        """Apply optional allowed_operations / excluded_operations curation lists."""
+        filtered = list(tools)
+        if upstream.allowed_operations:
+            allowed = set(upstream.allowed_operations)
+            filtered = [t for t in filtered if t.name in allowed]
+        if upstream.excluded_operations:
+            excluded = set(upstream.excluded_operations)
+            filtered = [t for t in filtered if t.name not in excluded]
+        return filtered
+
     async def discover_tools(
         self,
         upstream: UpstreamConfig,
         auth_headers: dict[str, str] | None = None,
+        *,
+        apply_filters: bool = True,
     ) -> list[DiscoveredTool]:
         if upstream.type == "mcp_http":
-            return await self._discover_mcp_http(upstream, auth_headers)
-        if upstream.type == "mcp_stdio":
-            return await self._discover_mcp_stdio(upstream)
-        if upstream.type == "openapi":
-            return await self._discover_openapi(upstream, auth_headers)
-        raise ValueError(f"Unsupported upstream type '{upstream.type}'")
+            tools = await self._discover_mcp_http(upstream, auth_headers)
+        elif upstream.type == "mcp_stdio":
+            tools = await self._discover_mcp_stdio(upstream)
+        elif upstream.type == "openapi":
+            tools = await self._discover_openapi(upstream, auth_headers)
+        else:
+            raise ValueError(f"Unsupported upstream type '{upstream.type}'")
+        return self.filter_tools(upstream, tools) if apply_filters else tools
 
     async def call_tool(
         self,
@@ -330,9 +348,9 @@ class UpstreamClientManager:
             annotations=annotations,
         )
 
-    async def _discover_openapi(
+    async def _load_openapi_spec(
         self, upstream: UpstreamConfig, auth_headers: dict[str, str] | None
-    ) -> list[DiscoveredTool]:
+    ) -> dict[str, Any]:
         if upstream.openapi_spec is not None:
             spec = upstream.openapi_spec
         elif upstream.openapi_spec_url:
@@ -345,9 +363,13 @@ class UpstreamClientManager:
             raise ValueError(
                 f"openapi upstream '{upstream.name}' requires openapi_spec or openapi_spec_url"
             )
-
         if not isinstance(spec, dict):
             raise ValueError(f"Invalid OpenAPI spec for '{upstream.name}'")
+        return spec
+
+    def _discover_openapi_from_spec(
+        self, upstream: UpstreamConfig, spec: dict[str, Any]
+    ) -> list[DiscoveredTool]:
 
         tools: list[DiscoveredTool] = []
         paths = spec.get("paths") or {}
@@ -456,6 +478,12 @@ class UpstreamClientManager:
                 )
         return tools
 
+    async def _discover_openapi(
+        self, upstream: UpstreamConfig, auth_headers: dict[str, str] | None
+    ) -> list[DiscoveredTool]:
+        spec = await self._load_openapi_spec(upstream, auth_headers)
+        return self._discover_openapi_from_spec(upstream, spec)
+
     async def _call_openapi(
         self,
         upstream: UpstreamConfig,
@@ -496,25 +524,289 @@ class UpstreamClientManager:
             return resp.text
 
 
+def _extract_openapi_security_schemes(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    """Summarize OpenAPI components.securitySchemes into gateway onboarding hints."""
+    components = spec.get("components")
+    if not isinstance(components, dict):
+        return []
+    schemes = components.get("securitySchemes")
+    if not isinstance(schemes, dict):
+        return []
+    found: list[dict[str, Any]] = []
+    for name, raw in schemes.items():
+        if not isinstance(raw, dict):
+            continue
+        entry: dict[str, Any] = {
+            "name": str(name),
+            "type": str(raw.get("type", "")),
+        }
+        if raw.get("scheme"):
+            entry["scheme"] = str(raw["scheme"])
+        if raw.get("in"):
+            entry["in"] = str(raw["in"])
+        if raw.get("name"):
+            entry["header_name"] = str(raw["name"])
+        if raw.get("openIdConnectUrl"):
+            entry["openIdConnectUrl"] = str(raw["openIdConnectUrl"])
+        flows = raw.get("flows")
+        if isinstance(flows, dict):
+            flow_summary: dict[str, Any] = {}
+            for fname, fval in flows.items():
+                if isinstance(fval, dict):
+                    flow_summary[fname] = {
+                        "tokenUrl": fval.get("tokenUrl"),
+                        "authorizationUrl": fval.get("authorizationUrl"),
+                        "scopes": sorted((fval.get("scopes") or {}).keys()),
+                    }
+            if flow_summary:
+                entry["flows"] = flow_summary
+        found.append(entry)
+    return found
+
+
+def build_agent_onboarding_prompt(
+    *,
+    upstream: UpstreamConfig | None = None,
+    tools: list[DiscoveredTool] | None = None,
+    security_schemes: list[dict[str, Any]] | None = None,
+    checklist: list[dict[str, Any]] | None = None,
+    recommended_mode: str = "codemode",
+) -> str:
+    """Build a copy-paste prompt for an AI agent to interview a human and emit UpstreamConfig."""
+    context_lines: list[str] = []
+    if upstream is not None:
+        context_lines.append(
+            f"- Candidate upstream: name={upstream.name}, type={upstream.type}, "
+            f"url={upstream.url or upstream.command or 'inline'}"
+        )
+    if security_schemes:
+        context_lines.append(
+            f"- Detected OpenAPI securitySchemes: {json.dumps(security_schemes)}"
+        )
+    if tools:
+        ops_preview = ", ".join(
+            f"{t.name}{'[MUTATING]' if t.mutating else ''}" for t in tools[:25]
+        )
+        suffix = f" (+{len(tools) - 25} more)" if len(tools) > 25 else ""
+        context_lines.append(f"- Discovered operations ({len(tools)}): {ops_preview}{suffix}")
+    if checklist:
+        summary_items = "; ".join(f"[{c['target']}] {c['title']}" for c in checklist)
+        context_lines.append(f"- Setup checklist items: {summary_items}")
+
+    context_block = "\n".join(context_lines) if context_lines else "- No spec inspected yet."
+    return (
+        "You are configuring an upstream API/MCP server for MCPcodeaway.\n"
+        "Ask the human operator concise setup questions one topic at a time first:\n"
+        "1. Transport & Spec: Confirm upstream slug (`^[a-z][a-z0-9_]*$`), `type` "
+        "(`openapi` | `mcp_http` | `mcp_stdio`), `url`, and `openapi_spec_url`.\n"
+        "2. Auth & Corporate IdP Propagation:\n"
+        '   - Prefer `auth_type="delegated_token"` (RFC 8693 / Entra OBO) when target '
+        "APIs accept corporate IdP JWTs; ask for `downstream_audience` and "
+        "`downstream_scope`, and remind admin to grant OBO consent on the IdP.\n"
+        "   - Otherwise use `api_key` / `bearer_secret` and ask ONLY for `secret_env_var` "
+        "(e.g. `PARTNER_API_KEY`) + `api_key_header` (never raw secrets).\n"
+        "3. Endpoint Curation: List discovered routes and let the human pick safe ones "
+        "for `allowed_operations` or `excluded_operations` (omit unsafe writes).\n"
+        "4. Team RBAC & Record/Row ABAC: Ask for `allowed_roles`, `allowed_groups`, "
+        "`allowed_scopes`, and whether callers are restricted to subsets like "
+        "`client_groups` / `region` via `abac_rules` "
+        "(`claim`, `arg_name`, `response_list_key`, `row_field`).\n"
+        "5. Execution Mode: Confirm `preferred_mode` (`codemode`, `codemode_upfront`, "
+        "`traditional_discover`, `traditional`, or `hybrid`; "
+        f"recommended: `{recommended_mode}`).\n\n"
+        f"Discovered context:\n{context_block}\n\n"
+        "Once answered, emit ONE valid JSON object matching Gateway `UpstreamConfig` "
+        "(plus separate Corporate IdP / backend setup bullets if OBO is needed) ready "
+        "for `/dashboard` ('Import Agent JSON') or `POST /admin/upstreams`."
+    )
+
+
+def build_onboarding_guidance(
+    upstream: UpstreamConfig,
+    all_tools: list[DiscoveredTool],
+    security_schemes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Produce structured HITL auth/RBAC/ABAC setup prompts for gateway, IdP & backend."""
+    checklist: list[dict[str, Any]] = []
+    has_oauth_scheme = any(
+        s.get("type") in {"oauth2", "openIdConnect"}
+        or (s.get("type") == "http" and str(s.get("scheme", "")).lower() == "bearer")
+        for s in security_schemes
+    )
+    has_apikey_scheme = any(s.get("type") == "apiKey" for s in security_schemes)
+
+    if has_oauth_scheme or upstream.auth_type == "delegated_token":
+        checklist.append(
+            {
+                "target": "corporate_idp",
+                "severity": "required",
+                "field": "downstream_audience",
+                "title": "Grant Gateway OBO / RFC 8693 Token Exchange Consent",
+                "detail": (
+                    "Ask your corporate IdP admin (Entra ID, Okta, Keycloak) to allow the "
+                    "gateway client app to exchange user tokens for this API's audience/scopes."
+                ),
+            }
+        )
+        checklist.append(
+            {
+                "target": "gateway",
+                "severity": "required",
+                "field": "auth_type",
+                "title": "Configure Delegated User Token Propagation",
+                "detail": (
+                    "Set auth_type='delegated_token' with downstream_audience and downstream_scope "
+                    "so per-user claims (roles, client_groups) propagate cleanly in Code Mode."
+                ),
+            }
+        )
+        checklist.append(
+            {
+                "target": "target_backend",
+                "severity": "recommended",
+                "field": "abac_rules",
+                "title": "Confirm Backend JWT & Row-Level Security (or Add Gateway ABAC)",
+                "detail": (
+                    "No backend code changes needed if this service already enforces user/group "
+                    "RLS on OIDC JWTs; otherwise attach gateway abac_rules for record isolation."
+                ),
+            }
+        )
+
+    if has_apikey_scheme or upstream.auth_type in {"api_key", "bearer_secret"}:
+        header_hint = next(
+            (s.get("header_name") for s in security_schemes if s.get("header_name")),
+            upstream.api_key_header,
+        )
+        checklist.append(
+            {
+                "target": "gateway",
+                "severity": "required",
+                "field": "secret_env_var",
+                "title": "Bind Secret Env Reference & Header Name",
+                "detail": (
+                    f"Set secret_env_var (never hardcode secrets in YAML) and confirm "
+                    f"api_key_header='{header_hint}'."
+                ),
+            }
+        )
+        checklist.append(
+            {
+                "target": "gateway",
+                "severity": "recommended",
+                "field": "abac_rules",
+                "title": "Enforce Host-Side RBAC & Row-Level ABAC on Shared-Key Upstream",
+                "detail": (
+                    "Shared API keys carry no caller identity; configure allowed_roles plus "
+                    "abac_rules (e.g. client_groups -> region) so HostDispatcher filters rows."
+                ),
+            }
+        )
+
+    if not upstream.allowed_roles and not upstream.allowed_groups:
+        checklist.append(
+            {
+                "target": "gateway",
+                "severity": "recommended",
+                "field": "allowed_roles",
+                "title": "Restrict Least-Privilege Team Roles / Groups",
+                "detail": (
+                    "Set allowed_roles / allowed_groups before production promotion so "
+                    "unrelated agent personas cannot discover or invoke this upstream."
+                ),
+            }
+        )
+
+    missing_out = [t.name for t in all_tools if not t.output_schema]
+    if missing_out:
+        checklist.append(
+            {
+                "target": "target_backend",
+                "severity": "warning",
+                "field": "outputSchema",
+                "title": f"{len(missing_out)} Operation(s) Missing Typed outputSchema",
+                "detail": (
+                    "Adding response models/outputSchema avoids runtime key guesses and lets "
+                    "Code Mode complete in 2-3 turns instead of retrying KeyErrors."
+                ),
+            }
+        )
+
+    mutating = [t.name for t in all_tools if t.mutating]
+    if mutating:
+        checklist.append(
+            {
+                "target": "gateway",
+                "severity": "recommended",
+                "field": "allowed_operations",
+                "title": f"Review {len(mutating)} Mutating Operation(s)",
+                "detail": (
+                    "Exclude unsafe admin routes via allowed_operations / excluded_operations, "
+                    "or use preferred_mode='hybrid' so writes require direct MCP confirmation."
+                ),
+            }
+        )
+
+    read_only_count = len(all_tools) - len(mutating)
+    if mutating and read_only_count > 0 and len(all_tools) > 3:
+        rec_mode = "hybrid"
+    elif len(all_tools) <= 10 and not mutating:
+        rec_mode = "traditional"
+    elif len(all_tools) <= 25:
+        rec_mode = "codemode_upfront"
+    else:
+        rec_mode = "codemode"
+
+    prompt = build_agent_onboarding_prompt(
+        upstream=upstream,
+        tools=all_tools,
+        security_schemes=security_schemes,
+        checklist=checklist,
+        recommended_mode=rec_mode,
+    )
+    return {
+        "recommended_mode": rec_mode,
+        "detected_security_schemes": security_schemes,
+        "missing_output_schema_tools": missing_out,
+        "checklist": checklist,
+        "agent_onboarding_prompt": prompt,
+    }
+
+
 async def inspect_upstream(
     upstream: UpstreamConfig,
     client_manager: UpstreamClientManager,
     auth_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Discover tools, compute schema digest, and build a safe YAML snippet without secrets."""
-    tools = await client_manager.discover_tools(upstream, auth_headers=auth_headers)
+    """Discover tools, build HITL onboarding guidance, and emit a safe YAML snippet."""
+    security_schemes: list[dict[str, Any]] = []
+    if upstream.type == "openapi":
+        spec = await client_manager._load_openapi_spec(upstream, auth_headers)
+        all_tools = client_manager._discover_openapi_from_spec(upstream, spec)
+        security_schemes = _extract_openapi_security_schemes(spec)
+    else:
+        all_tools = await client_manager.discover_tools(
+            upstream, auth_headers=auth_headers, apply_filters=False
+        )
+
+    tools = client_manager.filter_tools(upstream, all_tools)
     digest = compute_schema_digest(tools)
     export_dict = upstream.model_dump(exclude_none=True, exclude={"openapi_spec"})
     export_dict["pinned_schema_digest"] = digest
     if export_dict.get("env"):
         export_dict["env"] = {k: "<SET_VIA_ENV>" for k in export_dict["env"]}
     yaml_snippet = yaml.safe_dump({"upstreams": [export_dict]}, sort_keys=False)
+    guidance = build_onboarding_guidance(upstream, all_tools, security_schemes)
     return {
         "name": upstream.name,
         "type": upstream.type,
         "tool_count": len(tools),
+        "total_discovered_count": len(all_tools),
+        "selected_operations": [t.name for t in tools],
         "schema_digest": digest,
         "mutating_tools": [t.name for t in tools if t.mutating],
         "tools": [t.model_dump() for t in tools],
+        "all_tools": [t.model_dump() for t in all_tools],
+        "onboarding_guidance": guidance,
         "yaml_snippet": yaml_snippet,
     }

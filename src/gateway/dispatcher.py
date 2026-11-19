@@ -210,6 +210,87 @@ def bind_positional_arguments(
     return bound
 
 
+def _resolve_identity_claim_values(identity: CallerIdentity, claim: str) -> set[str]:
+    """Extract caller claim values (attribute first, then raw JWT claims dict)."""
+    val = getattr(identity, claim, None)
+    if val is None or val == [] or val == "":
+        val = identity.claims.get(claim)
+    if val is None:
+        return set()
+    if isinstance(val, str):
+        return {part for part in val.split() if part}
+    if isinstance(val, list | tuple | set):
+        return {str(item) for item in val if str(item)}
+    return {str(val)}
+
+
+def _apply_pre_call_abac(
+    identity: CallerIdentity,
+    tool: DiscoveredTool,
+    upstream: UpstreamConfig,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    updated = dict(arguments)
+    props = (tool.input_schema or {}).get("properties") or {}
+    for rule in upstream.abac_rules:
+        if not rule.enforce_on_args or not rule.arg_name:
+            continue
+        allowed_vals = _resolve_identity_claim_values(identity, rule.claim)
+        if not allowed_vals:
+            continue
+        if rule.arg_name in updated and updated[rule.arg_name] is not None:
+            requested = str(updated[rule.arg_name])
+            if requested not in allowed_vals:
+                raise PermissionError(
+                    f"ABAC policy denied {rule.arg_name}='{requested}' "
+                    f"for {rule.claim}={sorted(allowed_vals)}"
+                )
+        elif len(allowed_vals) == 1 and rule.arg_name in props:
+            updated[rule.arg_name] = next(iter(allowed_vals))
+    return updated
+
+
+def _apply_post_call_abac(
+    identity: CallerIdentity,
+    upstream: UpstreamConfig,
+    result: Any,
+) -> Any:
+    current = result
+    for rule in upstream.abac_rules:
+        if not rule.filter_response_rows or not rule.row_field:
+            continue
+        allowed_vals = _resolve_identity_claim_values(identity, rule.claim)
+        if not allowed_vals:
+            continue
+        field = rule.row_field
+        if (
+            rule.response_list_key
+            and isinstance(current, dict)
+            and isinstance(current.get(rule.response_list_key), list)
+        ):
+            filtered = [
+                row
+                for row in current[rule.response_list_key]
+                if not isinstance(row, dict) or str(row.get(field)) in allowed_vals
+            ]
+            current = {**current, rule.response_list_key: filtered}
+            if "count" in current:
+                current["count"] = len(filtered)
+        elif isinstance(current, list):
+            current = [
+                row
+                for row in current
+                if not isinstance(row, dict) or str(row.get(field)) in allowed_vals
+            ]
+        elif isinstance(current, dict) and field in current:
+            if str(current[field]) not in allowed_vals:
+                raise PermissionError(
+                    f"ABAC row policy denied access to record with "
+                    f"{field}='{current[field]}'"
+                )
+    return current
+
+
 class HostDispatcher:
     """Enforces policy, validates schemas, resolves credentials, and calls upstreams."""
 
@@ -291,8 +372,10 @@ class HostDispatcher:
             if budget is not None:
                 budget.consume()
 
+            scoped_args = _apply_pre_call_abac(identity, tool, upstream, arguments)
+
             try:
-                jsonschema.validate(instance=arguments, schema=tool.input_schema)
+                jsonschema.validate(instance=scoped_args, schema=tool.input_schema)
             except jsonschema.ValidationError as exc:
                 msg = f"Invalid arguments for {tool.qualified_name}: {exc.message}"
                 if code_mode_hints:
@@ -307,7 +390,7 @@ class HostDispatcher:
                 )
                 span.set_attribute("auth.token_cache_hit", cache_hit)
                 raw_result = await self.client_manager.call_tool(
-                    upstream, tool, arguments, auth_headers=auth_headers
+                    upstream, tool, scoped_args, auth_headers=auth_headers
                 )
             except Exception as exc:
                 duration_ms = round((time.perf_counter() - started) * 1000, 3)
@@ -328,7 +411,7 @@ class HostDispatcher:
             raw_encoded = json.dumps(raw_result, default=str).encode("utf-8")
             raw_bytes = len(raw_encoded)
             output_sha256 = hashlib.sha256(raw_encoded).hexdigest()[:16]
-            redacted = OutputRedactor.redact(raw_result)
+            redacted = _apply_post_call_abac(identity, upstream, OutputRedactor.redact(raw_result))
             duration_ms = round((time.perf_counter() - started) * 1000, 3)
             record = SubcallRecord(
                 tool=tool.qualified_name,

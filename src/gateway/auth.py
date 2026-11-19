@@ -41,6 +41,7 @@ class CallerIdentity(BaseModel):
     groups: list[str] = Field(default_factory=list)
     roles: list[str] = Field(default_factory=list)
     scopes: list[str] = Field(default_factory=list)
+    client_groups: list[str] = Field(default_factory=list)
     raw_token: str = Field(default="", exclude=True)
     claims: dict[str, Any] = Field(default_factory=dict)
 
@@ -54,6 +55,7 @@ class CallerIdentity(BaseModel):
             "groups": self.groups,
             "roles": self.roles,
             "scopes": self.scopes,
+            "client_groups": self.client_groups,
         }
 
 
@@ -93,6 +95,26 @@ DEV_PERSONAS: dict[str, dict[str, Any]] = {
         "roles": ["support_agent"],
         "groups": ["support"],
         "scopes": ["mcp.tools", "ops.read"],
+    },
+    "eu_accountant": {
+        "sub": "user-fin-eu-01",
+        "tenant_id": "tenant-acme-dev",
+        "email": "elena.eu@acme.example",
+        "client_id": "copilot-finance-agent",
+        "roles": ["finance_analyst", "snowflake_reader", "billing_reader"],
+        "groups": ["finance"],
+        "scopes": ["mcp.tools", "finance.read"],
+        "client_groups": ["EU"],
+    },
+    "us_accountant": {
+        "sub": "user-fin-us-01",
+        "tenant_id": "tenant-acme-dev",
+        "email": "frank.us@acme.example",
+        "client_id": "copilot-finance-agent",
+        "roles": ["finance_analyst", "snowflake_reader", "billing_reader"],
+        "groups": ["finance"],
+        "scopes": ["mcp.tools", "finance.read"],
+        "client_groups": ["US"],
     },
 }
 
@@ -147,6 +169,7 @@ class LocalDevKeyManager:
             "azp": base.get("client_id"),
             "roles": list(base.get("roles", [])),
             "groups": list(base.get("groups", [])),
+            "client_groups": list(base.get("client_groups", [])),
             "scp": " ".join(base.get("scopes", [])),
             "iat": now,
             "exp": now + ttl_seconds,
@@ -178,6 +201,7 @@ class LocalDevKeyManager:
             "email": identity.email,
             "roles": list(identity.roles),
             "groups": list(identity.groups),
+            "client_groups": list(identity.client_groups),
             "scp": scope,
             "azp": identity.client_id,
             "act": {"sub": actor_client_id},
@@ -226,6 +250,9 @@ def claims_to_identity(
     roles = _extract_str_list(claims, mapping.roles, "roles")
     groups = _extract_str_list(claims, mapping.groups, "groups")
     scopes = _extract_str_list(claims, mapping.scopes, "scp", "scope")
+    client_groups = _extract_str_list(
+        claims, mapping.client_groups, "client_groups", "allowed_regions", "regions"
+    )
     return CallerIdentity(
         sub=sub,
         tenant_id=tenant_id,
@@ -234,6 +261,7 @@ def claims_to_identity(
         groups=groups,
         roles=roles,
         scopes=scopes,
+        client_groups=client_groups,
         raw_token=raw_token,
         claims=claims,
     )

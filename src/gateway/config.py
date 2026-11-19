@@ -37,6 +37,18 @@ class ClaimMappingConfig(BaseModel):
     groups: str = "groups"
     scopes: str = "scp"
     client_id: str = "azp"
+    client_groups: str = "client_groups"
+
+
+class AbacRuleConfig(BaseModel):
+    """Gateway-enforced argument & response-row ABAC rule keyed on a caller claim."""
+
+    claim: str = "client_groups"
+    arg_name: str | None = None
+    response_list_key: str | None = None
+    row_field: str | None = None
+    enforce_on_args: bool = True
+    filter_response_rows: bool = True
 
 
 class UpstreamConfig(BaseModel):
@@ -60,6 +72,10 @@ class UpstreamConfig(BaseModel):
     allowed_clients: list[str] = Field(default_factory=list)
     allowed_scopes: list[str] = Field(default_factory=list)
     mutating_tools: list[str] = Field(default_factory=list)
+    allowed_operations: list[str] = Field(default_factory=list)
+    excluded_operations: list[str] = Field(default_factory=list)
+    preferred_mode: GatewayMode | None = None
+    abac_rules: list[AbacRuleConfig] = Field(default_factory=list)
     pinned_schema_digest: str | None = None
     enabled: bool = True
 
