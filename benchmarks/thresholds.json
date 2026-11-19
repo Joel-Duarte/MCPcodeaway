@@ -1,0 +1,32 @@
+{
+  "version": "1.0",
+  "scaling": {
+    "20": { "min_reduction_pct": 72.0 },
+    "50": { "min_reduction_pct": 85.0 },
+    "150": { "min_reduction_pct": 95.0 },
+    "300": { "min_reduction_pct": 97.5 },
+    "500": { "min_reduction_pct": 98.5, "max_codemode_surface_tokens": 600 }
+  },
+  "scenarios": {
+    "reconcile_overdue": {
+      "min_context_token_savings_pct": 65.0,
+      "require_winner": "code_mode",
+      "require_ok": true
+    },
+    "reconcile_bulk_200": {
+      "min_context_token_savings_pct": 88.0,
+      "min_raw_upstream_bytes": 50000,
+      "max_payload_bytes": 2000,
+      "require_winner": "code_mode",
+      "require_ok": true
+    },
+    "trial_balance_audit": {
+      "min_context_token_savings_pct": 68.0,
+      "require_winner": "code_mode",
+      "require_ok": true
+    },
+    "single_lookup": {
+      "require_ok": true
+    }
+  }
+}

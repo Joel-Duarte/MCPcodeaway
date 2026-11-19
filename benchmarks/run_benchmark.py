@@ -126,6 +126,57 @@ async def run_offline_benchmark(
     return report
 
 
+def verify_benchmark_thresholds(
+    report: dict[str, Any],
+    thresholds: dict[str, Any],
+) -> list[str]:
+    """Check measured scaling & scenario metrics against locked threshold invariants."""
+    failures: list[str] = []
+    scaling_by_count = {str(r["tool_count"]): r for r in report.get("scaling", [])}
+    for count_key, bounds in (thresholds.get("scaling") or {}).items():
+        row = scaling_by_count.get(str(count_key))
+        if row is None:
+            failures.append(f"scaling[{count_key}]: missing benchmark row")
+            continue
+        min_red = bounds.get("min_reduction_pct")
+        if min_red is not None and row["reduction_pct"] < float(min_red):
+            failures.append(
+                f"scaling[{count_key}].reduction_pct={row['reduction_pct']} < {min_red}"
+            )
+        max_surf = bounds.get("max_codemode_surface_tokens")
+        if max_surf is not None and row["codemode_surface_tokens"] > int(max_surf):
+            failures.append(
+                f"scaling[{count_key}].codemode_surface_tokens="
+                f"{row['codemode_surface_tokens']} > {max_surf}"
+            )
+
+    scenarios_by_name = {s["scenario"]: s for s in report.get("scenarios", [])}
+    for sc_name, bounds in (thresholds.get("scenarios") or {}).items():
+        sc = scenarios_by_name.get(sc_name)
+        if sc is None:
+            failures.append(f"scenarios[{sc_name}]: missing benchmark scenario")
+            continue
+        cm = sc.get("code_mode") or {}
+        if bounds.get("require_ok") and not cm.get("ok"):
+            failures.append(f"scenarios[{sc_name}].code_mode.ok is False")
+        req_winner = bounds.get("require_winner")
+        if req_winner is not None and sc.get("winner") != req_winner:
+            failures.append(f"scenarios[{sc_name}].winner={sc.get('winner')} != {req_winner}")
+        min_sav = bounds.get("min_context_token_savings_pct")
+        sav = (sc.get("deltas") or {}).get("context_token_savings_pct", 0.0)
+        if min_sav is not None and sav < float(min_sav):
+            failures.append(f"scenarios[{sc_name}].context_token_savings_pct={sav} < {min_sav}")
+        min_raw = bounds.get("min_raw_upstream_bytes")
+        raw_b = int(cm.get("raw_upstream_bytes") or 0)
+        if min_raw is not None and raw_b < int(min_raw):
+            failures.append(f"scenarios[{sc_name}].raw_upstream_bytes={raw_b} < {min_raw}")
+        max_ret = bounds.get("max_payload_bytes")
+        ret_b = int(cm.get("payload_bytes") or cm.get("returned_bytes") or 0)
+        if max_ret is not None and ret_b > int(max_ret):
+            failures.append(f"scenarios[{sc_name}].payload_bytes={ret_b} > {max_ret}")
+    return failures
+
+
 def _print_summary(report: dict[str, Any]) -> None:
     print("\n=== Catalog Scaling: Classic MCP vs. Code Mode ===")
     print("| Tools | Classic Tokens | Code Mode Surface Tokens | Reduction |")
@@ -152,9 +203,20 @@ def _print_summary(report: dict[str, Any]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run deterministic MCP vs Code Mode benchmark")
     parser.add_argument("--output", default="benchmarks/results.json")
+    parser.add_argument("--verify-thresholds", action="store_true")
+    parser.add_argument("--thresholds", default="benchmarks/thresholds.json")
     args = parser.parse_args(argv)
     report = asyncio.run(run_offline_benchmark(output_path=Path(args.output)))
     _print_summary(report)
+    if args.verify_thresholds:
+        thresholds = json.loads(Path(args.thresholds).read_text(encoding="utf-8"))
+        failures = verify_benchmark_thresholds(report, thresholds)
+        if failures:
+            print("\nTHRESHOLD VIOLATIONS:", file=sys.stderr)
+            for item in failures:
+                print(f"  - {item}", file=sys.stderr)
+            return 1
+        print("\nAll benchmark thresholds PASSED.")
     return 0
 
 

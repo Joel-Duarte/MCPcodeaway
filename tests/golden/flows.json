@@ -1,0 +1,87 @@
+{
+  "version": "1.0",
+  "description": "Deterministic end-to-end Golden Dataset flows through MCPcodeaway gateway and mock enterprise upstreams.",
+  "flows": [
+    {
+      "id": "rbac_deny_support_finance",
+      "kind": "mcp_tools_list",
+      "persona": "support_agent",
+      "query": "mode=traditional",
+      "expected_present_prefixes": ["ops_ticketing__"],
+      "expected_absent_prefixes": [
+        "snowflake_ledger__",
+        "billing_legacy_eu__",
+        "billing_legacy_us__"
+      ]
+    },
+    {
+      "id": "obo_rls_eu_vs_us_isolation",
+      "kind": "obo_rls_matrix",
+      "eu_persona": "eu_accountant",
+      "us_persona": "us_accountant",
+      "expected_eu_region": "EU",
+      "expected_eu_customer": "CUST-1003",
+      "expected_us_region": "US",
+      "expected_us_customer": "CUST-1024"
+    },
+    {
+      "id": "codemode_reconcile_overdue_grounded",
+      "kind": "mcp_codemode_exec",
+      "persona": "finance_analyst",
+      "query": "mode=codemode&require_grounding=true",
+      "code": "import asyncio\nledger, eu, us = await asyncio.gather(\n    snowflake_ledger__query_debt_ledger(status='overdue'),\n    billing_legacy_eu__list_eu_invoices(status='overdue'),\n    billing_legacy_us__list_us_invoices(status='overdue'),\n)\nbills = {i['customer_id']: i for i in (eu['invoices'] + us['invoices'])}\nmismatches = []\nfor row in ledger['rows']:\n    b = bills.get(row['customer_id'])\n    if b and round(row['ledger_balance'] - b['amount'], 2) != 0:\n        mismatches.append({'customer_id': row['customer_id'], 'delta': round(row['ledger_balance'] - b['amount'], 2)})\nsorted(mismatches, key=lambda m: m['customer_id'])",
+      "expected_ok": true,
+      "expected_grounded": true,
+      "expected_customer_ids": ["CUST-1003", "CUST-1024"],
+      "expect_compression": true
+    },
+    {
+      "id": "grounding_blocks_hallucinated_id",
+      "kind": "mcp_codemode_exec",
+      "persona": "finance_analyst",
+      "query": "mode=codemode&require_grounding=true",
+      "code": "await snowflake_ledger__get_customer_balance(customer_id='CUST-1003')\n{'customer_id': 'CUST-9999', 'note': 'hallucinated'}",
+      "expected_ok": false,
+      "expected_error_type": "UnverifiedEntityError",
+      "expected_error_substring": "CUST-9999"
+    },
+    {
+      "id": "abac_post_filter_and_pii_redaction",
+      "kind": "legacy_abac_and_pii",
+      "persona": "eu_accountant",
+      "expected_allowed_customer": "CUST-1003",
+      "expected_blocked_customer": "CUST-1024",
+      "expected_redacted_marker": "[REDACTED"
+    },
+    {
+      "id": "auto_mode_algorithmic_routing",
+      "kind": "mcp_auto_route",
+      "persona": "finance_analyst",
+      "query": "execution=auto",
+      "headers": {
+        "X-Intent": "reconcile all overdue invoices and summarize variance"
+      },
+      "expected_header_prefix": "auto->codemode",
+      "expected_tool_present": "execute_code"
+    },
+    {
+      "id": "admin_rbac_and_tenant_audit_isolation",
+      "kind": "control_plane_rbac",
+      "admin_persona": "gateway_admin",
+      "non_admin_persona": "finance_analyst",
+      "foreign_tenant": "tenant-other"
+    },
+    {
+      "id": "profile_production_barebones_gate",
+      "kind": "profile_gate",
+      "profile": "production",
+      "open_paths": ["/health", "/ready", "/metrics"],
+      "blocked_gets": [
+        "/dashboard",
+        "/dashboard/legacy",
+        "/benchmarks/latest",
+        "/dev/oidc/jwks"
+      ]
+    }
+  ]
+}
