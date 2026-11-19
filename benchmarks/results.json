@@ -1,45 +1,45 @@
 {
-  "generated_at": "2026-11-19T01:09:23.215010+00:00",
+  "generated_at": "2026-11-19T01:59:30.652889+00:00",
   "scaling": [
     {
       "tool_count": 20,
       "classic_schema_bytes": 8117,
       "classic_schema_tokens": 2030,
-      "codemode_surface_tokens": 265,
+      "codemode_surface_tokens": 463,
       "codemode_search_top5_tokens": 190,
-      "reduction_pct": 86.95
+      "reduction_pct": 77.19
     },
     {
       "tool_count": 50,
       "classic_schema_bytes": 20291,
       "classic_schema_tokens": 5073,
-      "codemode_surface_tokens": 265,
+      "codemode_surface_tokens": 463,
       "codemode_search_top5_tokens": 190,
-      "reduction_pct": 94.78
+      "reduction_pct": 90.87
     },
     {
       "tool_count": 150,
       "classic_schema_bytes": 60871,
       "classic_schema_tokens": 15218,
-      "codemode_surface_tokens": 265,
+      "codemode_surface_tokens": 463,
       "codemode_search_top5_tokens": 190,
-      "reduction_pct": 98.26
+      "reduction_pct": 96.96
     },
     {
       "tool_count": 300,
       "classic_schema_bytes": 121741,
       "classic_schema_tokens": 30436,
-      "codemode_surface_tokens": 265,
+      "codemode_surface_tokens": 463,
       "codemode_search_top5_tokens": 190,
-      "reduction_pct": 99.13
+      "reduction_pct": 98.48
     },
     {
       "tool_count": 500,
       "classic_schema_bytes": 202901,
       "classic_schema_tokens": 50726,
-      "codemode_surface_tokens": 265,
+      "codemode_surface_tokens": 463,
       "codemode_search_top5_tokens": 190,
-      "reduction_pct": 99.48
+      "reduction_pct": 99.09
     }
   ],
   "scenarios": [
@@ -52,7 +52,7 @@
         "payload_tokens": 648,
         "total_context_tokens": 2556,
         "token_exchanges": 3,
-        "duration_ms": 100.515,
+        "duration_ms": 89.118,
         "results": [
           {
             "queried_by": "user-fin-01",
@@ -234,14 +234,14 @@
         ]
       },
       "code_mode": {
-        "schema_tokens_per_turn": 265,
+        "schema_tokens_per_turn": 463,
         "round_trips": 2,
         "raw_upstream_bytes": 2837,
         "payload_bytes": 193,
         "payload_tokens": 616,
-        "total_context_tokens": 1146,
+        "total_context_tokens": 1542,
         "token_exchanges": 0,
-        "duration_ms": 9.854,
+        "duration_ms": 9.187,
         "ok": true,
         "error": null,
         "result": [
@@ -254,10 +254,10 @@
             "delta": -320.0
           }
         ],
-        "run_id": "run_1077e3fde899"
+        "run_id": "run_02437390bee7"
       },
       "deltas": {
-        "context_token_savings_pct": 55.16,
+        "context_token_savings_pct": 39.67,
         "round_trips_saved": 2,
         "payload_bytes_saved": 2644
       },
@@ -273,7 +273,7 @@
         "payload_tokens": 175,
         "total_context_tokens": 2560,
         "token_exchanges": 0,
-        "duration_ms": 6.934,
+        "duration_ms": 6.126,
         "results": [
           {
             "lines": [
@@ -324,14 +324,14 @@
         ]
       },
       "code_mode": {
-        "schema_tokens_per_turn": 265,
+        "schema_tokens_per_turn": 463,
         "round_trips": 2,
         "raw_upstream_bytes": 750,
         "payload_bytes": 356,
         "payload_tokens": 654,
-        "total_context_tokens": 1184,
+        "total_context_tokens": 1580,
         "token_exchanges": 0,
-        "duration_ms": 8.218,
+        "duration_ms": 7.585,
         "ok": true,
         "error": null,
         "result": [
@@ -351,10 +351,10 @@
             "contact": "ap@merchant24.example"
           }
         ],
-        "run_id": "run_1302353d2bc5"
+        "run_id": "run_183d0b79ce81"
       },
       "deltas": {
-        "context_token_savings_pct": 53.75,
+        "context_token_savings_pct": 38.28,
         "round_trips_saved": 3,
         "payload_bytes_saved": 394
       },
@@ -370,7 +370,7 @@
         "payload_tokens": 31,
         "total_context_tokens": 985,
         "token_exchanges": 0,
-        "duration_ms": 2.24,
+        "duration_ms": 1.425,
         "results": [
           {
             "customer_id": "CUST-1003",
@@ -383,14 +383,14 @@
         ]
       },
       "code_mode": {
-        "schema_tokens_per_turn": 265,
+        "schema_tokens_per_turn": 463,
         "round_trips": 2,
         "raw_upstream_bytes": 131,
         "payload_bytes": 231,
         "payload_tokens": 624,
-        "total_context_tokens": 1154,
+        "total_context_tokens": 1550,
         "token_exchanges": 0,
-        "duration_ms": 2.421,
+        "duration_ms": 2.319,
         "ok": true,
         "error": null,
         "result": {
@@ -401,10 +401,10 @@
           "status": "overdue",
           "days_past_due": 90
         },
-        "run_id": "run_c569b75914e2"
+        "run_id": "run_9923993dbe17"
       },
       "deltas": {
-        "context_token_savings_pct": -17.16,
+        "context_token_savings_pct": -57.36,
         "round_trips_saved": 0,
         "payload_bytes_saved": 0
       },

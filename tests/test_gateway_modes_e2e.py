@@ -34,7 +34,7 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://gw"
         ) as gw:
-            # 1. Code Mode tools/list returns ONLY search_tools and execute_code
+            # 1. Code Mode tools/list returns ONLY list_servers, search_tools, and execute_code
             cm_list = await gw.post(
                 "/mcp?mode=codemode",
                 headers={"Authorization": f"Bearer {fin_token}"},
@@ -42,7 +42,7 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
             )
             assert cm_list.status_code == 200
             cm_names = [t["name"] for t in cm_list.json()["result"]["tools"]]
-            assert cm_names == ["search_tools", "execute_code"]
+            assert cm_names == ["list_servers", "search_tools", "execute_code"]
 
             # 2. RBAC-filtered search_tools hides ops_ticketing from finance_analyst
             search = await gw.post(
@@ -146,6 +146,7 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
             )
             hyb_names = [t["name"] for t in hyb_list.json()["result"]["tools"]]
             assert hyb_names == [
+                "list_servers",
                 "search_tools",
                 "execute_code",
                 "ops_ticketing__create_collection_case",

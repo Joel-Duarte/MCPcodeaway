@@ -22,7 +22,12 @@ from gateway.auth import LocalDevKeyManager
 from gateway.catalog import ToolCatalog, estimate_tokens, to_mcp_tool_definition
 from gateway.comparator import run_side_by_side_comparison
 from gateway.config import GatewaySettings, UpstreamConfig, UpstreamRegistry
-from gateway.server import EXECUTE_CODE_DEF, SEARCH_TOOLS_DEF, GatewayRuntime
+from gateway.server import (
+    EXECUTE_CODE_DEF,
+    LIST_SERVERS_DEF,
+    SEARCH_TOOLS_DEF,
+    GatewayRuntime,
+)
 from gateway.state import SQLiteAuditStore
 from gateway.upstream_clients import DiscoveredTool
 
@@ -30,8 +35,8 @@ from gateway.upstream_clients import DiscoveredTool
 def run_scaling_sweep(
     tool_counts: tuple[int, ...] = (20, 50, 150, 300, 500),
 ) -> list[dict[str, Any]]:
-    """Measure Classic tools/list bloat vs. Code Mode constant 2-tool surface."""
-    surface_tokens = estimate_tokens([SEARCH_TOOLS_DEF, EXECUTE_CODE_DEF])
+    """Measure Classic tools/list bloat vs. Code Mode constant 3-tool surface."""
+    surface_tokens = estimate_tokens([LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, EXECUTE_CODE_DEF])
     rows: list[dict[str, Any]] = []
     for count in tool_counts:
         catalog = ToolCatalog()

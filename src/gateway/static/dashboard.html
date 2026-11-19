@@ -233,24 +233,47 @@
 
     <section id="auth" class="tab">
       <div class="card">
-        <h2>OIDC Delegation &amp; Team/Agent RBAC Simulator</h2>
-        <label>Persona</label>
-        <select id="auth-persona">
-          <option value="finance_analyst">finance_analyst</option>
-          <option value="ops_engineer">ops_engineer</option>
-          <option value="readonly_auditor">readonly_auditor</option>
-          <option value="support_agent">support_agent</option>
-        </select>
-        <button class="btn" onclick="simulateAuth()">Mint OIDC JWT &amp; Inspect RBAC Tools</button>
+        <h2>OIDC Delegation, Multi-MCP Scoping &amp; Pluggable Discovery</h2>
+        <div class="grid-2">
+          <div>
+            <label>Persona</label>
+            <select id="auth-persona">
+              <option value="finance_analyst">finance_analyst</option>
+              <option value="ops_engineer">ops_engineer</option>
+              <option value="readonly_auditor">readonly_auditor</option>
+              <option value="support_agent">support_agent</option>
+            </select>
+            <label>Gateway Mode</label>
+            <select id="auth-mode">
+              <option value="codemode">codemode (Python Stubs + execute_code)</option>
+              <option value="traditional_discover">traditional_discover (Deferred Classic Schemas)</option>
+            </select>
+          </div>
+          <div>
+            <label>Discovery Backend</label>
+            <select id="auth-discovery">
+              <option value="bm25">bm25 (Okapi BM25 &lt;1ms)</option>
+              <option value="keyword">keyword (Substring Baseline)</option>
+              <option value="embedding">embedding (POST /v1/embeddings)</option>
+              <option value="system1">system1 (Two-Stage /v1/systemone)</option>
+              <option value="hybrid_system1">hybrid_system1 (BM25 Prefilter + System 1)</option>
+            </select>
+            <label>Optional Server Ceiling (?servers=comma,separated)</label>
+            <input id="auth-servers" placeholder="e.g. snowflake_ledger,billing_legacy_eu" />
+          </div>
+        </div>
+        <label>Query / X-Intent (optional semantic or keyword query)</label>
+        <input id="auth-intent" value="overdue customer balances vs billing invoices" />
+        <button class="btn" onclick="simulateAuth()">Mint JWT &amp; Run Two-Level Discovery</button>
       </div>
       <div class="grid-2" style="margin-top: 16px;">
         <div class="card">
-          <h3>Verified CallerIdentity (/auth/me)</h3>
-          <pre id="auth-me-out">Click "Mint OIDC JWT" to inspect claims.</pre>
+          <h3>Verified Identity (/auth/me) &amp; Authorized Servers (list_servers)</h3>
+          <pre id="auth-me-out">Click "Mint JWT &amp; Run Two-Level Discovery" to inspect claims &amp; servers.</pre>
         </div>
         <div class="card">
-          <h3>RBAC-Filtered Tools (search_tools)</h3>
-          <pre id="auth-tools-out">Click "Mint OIDC JWT" to inspect accessible tools.</pre>
+          <h3>Discovered Tools (search_tools + X-Intent tools/list)</h3>
+          <pre id="auth-tools-out">Click "Mint JWT &amp; Run Two-Level Discovery" to inspect discovered tools.</pre>
         </div>
       </div>
     </section>
@@ -418,31 +441,62 @@
 
     async function simulateAuth() {
       const persona = document.getElementById("auth-persona").value;
+      const mode = document.getElementById("auth-mode").value;
+      const discovery = document.getElementById("auth-discovery").value;
+      const servers = document.getElementById("auth-servers").value.trim();
+      const intent = document.getElementById("auth-intent").value.trim();
+
       const tokResp = await fetch("/dev/auth/token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ persona }),
       }).then((r) => r.json());
       const token = tokResp.access_token;
-      const [me, tools] = await Promise.all([
+
+      const params = new URLSearchParams({ mode, discovery });
+      if (servers) params.set("servers", servers);
+      const mcpUrl = `/mcp?${params.toString()}`;
+      const mcpHeaders = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      };
+      if (intent) mcpHeaders["X-Intent"] = intent;
+
+      const [me, srvRes, searchRes, listRes] = await Promise.all([
         fetch("/auth/me", { headers: { Authorization: `Bearer ${token}` } }).then((r) => r.json()),
-        fetch("/mcp?mode=codemode", {
+        fetch(mcpUrl, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-          },
+          headers: mcpHeaders,
           body: JSON.stringify({
             jsonrpc: "2.0",
             id: 1,
             method: "tools/call",
-            params: { name: "search_tools", arguments: { query: "", limit: 30 } },
+            params: { name: "list_servers", arguments: {} },
           }),
         }).then((r) => r.json()),
+        fetch(mcpUrl, {
+          method: "POST",
+          headers: mcpHeaders,
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 2,
+            method: "tools/call",
+            params: { name: "search_tools", arguments: { query: intent, limit: 10 } },
+          }),
+        }).then((r) => r.json()),
+        fetch(mcpUrl, {
+          method: "POST",
+          headers: mcpHeaders,
+          body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }),
+        }).then((r) => r.json()),
       ]);
-      document.getElementById("auth-me-out").textContent = JSON.stringify(me, null, 2);
+      document.getElementById("auth-me-out").textContent = JSON.stringify(
+        { identity: me, servers: srvRes.result.structuredContent },
+        null,
+        2
+      );
       document.getElementById("auth-tools-out").textContent = JSON.stringify(
-        tools.result.structuredContent,
+        { search_tools: searchRes.result.structuredContent, tools_list: listRes.result },
         null,
         2
       );

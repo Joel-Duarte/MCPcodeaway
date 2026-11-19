@@ -15,7 +15,8 @@ from gateway.state import AuditStore
 AppEnv = Literal["sandbox", "uat", "prod"]
 AuthMode = Literal["dev", "oidc"]
 TokenExchangeDialect = Literal["dev_local", "rfc8693", "entra_v2_obo"]
-GatewayMode = Literal["codemode", "traditional", "hybrid"]
+GatewayMode = Literal["codemode", "traditional", "traditional_discover", "hybrid"]
+DiscoveryBackendMode = Literal["keyword", "bm25", "embedding", "system1", "hybrid_system1"]
 UpstreamType = Literal["mcp_http", "mcp_stdio", "openapi"]
 UpstreamAuthType = Literal["delegated_token", "bearer_secret", "api_key", "none"]
 
@@ -102,6 +103,15 @@ class GatewaySettings(BaseSettings):
     sandbox_backend: Literal["local", "remote"] = "local"
     sandbox_worker_url: str | None = None
     redis_url: str | None = None
+
+    discovery_backend: DiscoveryBackendMode = "bm25"
+    system1_url: str | None = None
+    system1_model: str = "laya"
+    system1_api_key: str = ""
+    system1_threshold: float = 0.35
+    embedding_url: str | None = None
+    embedding_model: str = "text-embedding-qwen3-embedding-0.6b"
+    embedding_api_key: str = ""
 
     sqlite_path: str = "data/gateway.db"
     upstreams_config_path: str = "config/upstreams.yaml"

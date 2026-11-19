@@ -276,7 +276,7 @@ async def test_prod_environment_locks_dynamic_upstreams_and_warns_at_scale(tmp_p
         candidate_tools=syn_120,
     )
     assert audit["classic_mcp"]["tool_limit_status"] == "critical"
-    assert audit["code_mode"]["exposed_tool_count"] == 2
+    assert audit["code_mode"]["exposed_tool_count"] == 3
     assert audit["code_mode"]["schema_token_reduction_pct"] > 90.0
 
 

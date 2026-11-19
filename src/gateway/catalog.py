@@ -8,7 +8,8 @@ import math
 from typing import Any
 
 from gateway.auth import CallerIdentity, PolicyEvaluator
-from gateway.config import UpstreamConfig, UpstreamRegistry
+from gateway.config import DiscoveryBackendMode, UpstreamConfig, UpstreamRegistry
+from gateway.discovery import DiscoveryEngine
 from gateway.upstream_clients import (
     DiscoveredTool,
     UpstreamClientManager,
@@ -153,21 +154,128 @@ class ToolCatalog:
                 warnings.append(f"Upstream '{upstream.name}' discovery failed: {exc}")
         return warnings
 
+    def list_accessible_servers(
+        self,
+        identity: CallerIdentity,
+        policy: PolicyEvaluator,
+        registry: UpstreamRegistry,
+        *,
+        allowed_servers: set[str] | None = None,
+        query: str = "",
+    ) -> list[dict[str, Any]]:
+        """Return RBAC-filtered server summaries for Level-1 multi-MCP discovery."""
+        q_terms = [tok for tok in query.lower().split() if tok]
+        servers: list[dict[str, Any]] = []
+        for upstream in registry.list_upstreams():
+            if allowed_servers is not None and upstream.name not in allowed_servers:
+                continue
+            if not policy.can_access_upstream(identity, upstream)[0]:
+                continue
+            permitted_tools = [
+                t
+                for t in self._tools_by_server.get(upstream.name, [])
+                if policy.can_execute_tool(identity, upstream, t.name, t.mutating)[0]
+            ]
+            if q_terms:
+                text = (
+                    f"{upstream.name} {upstream.type} "
+                    + " ".join(f"{t.name} {t.description}" for t in permitted_tools)
+                ).lower()
+                if not any(term in text for term in q_terms):
+                    continue
+            servers.append(
+                {
+                    "server": upstream.name,
+                    "type": upstream.type,
+                    "auth_type": upstream.auth_type,
+                    "tool_count": len(permitted_tools),
+                    "mutating_count": sum(1 for t in permitted_tools if t.mutating),
+                    "sample_tools": [t.name for t in permitted_tools[:5]],
+                    "summary": (
+                        f"{upstream.name} ({upstream.type}, {len(permitted_tools)} tools)"
+                    ),
+                }
+            )
+        return servers
+
     def list_accessible_tools(
         self,
         identity: CallerIdentity,
         policy: PolicyEvaluator,
         registry: UpstreamRegistry,
+        *,
+        allowed_servers: set[str] | None = None,
     ) -> list[DiscoveredTool]:
         """Return only tools authorized for this caller's roles, groups, client, and scopes."""
         accessible: list[DiscoveredTool] = []
         for upstream in registry.list_upstreams():
+            if allowed_servers is not None and upstream.name not in allowed_servers:
+                continue
             if not policy.can_access_upstream(identity, upstream)[0]:
                 continue
             for tool in self._tools_by_server.get(upstream.name, []):
                 if policy.can_execute_tool(identity, upstream, tool.name, tool.mutating)[0]:
                     accessible.append(tool)
         return accessible
+
+    async def discover_tools_for_caller(
+        self,
+        identity: CallerIdentity,
+        policy: PolicyEvaluator,
+        registry: UpstreamRegistry,
+        discovery_engine: DiscoveryEngine,
+        *,
+        query: str = "",
+        servers: list[str] | None = None,
+        allowed_servers: set[str] | None = None,
+        backend: DiscoveryBackendMode | None = None,
+        limit: int = 15,
+        include_schemas: bool = False,
+    ) -> dict[str, Any]:
+        """RBAC-first, ceiling-enforced pluggable tool discovery."""
+        accessible = self.list_accessible_tools(
+            identity, policy, registry, allowed_servers=allowed_servers
+        )
+        if servers:
+            requested = set(servers)
+            candidates = [t for t in accessible if t.server in requested]
+        else:
+            candidates = accessible
+
+        outcome = await discovery_engine.discover(
+            query,
+            candidates,
+            catalog_version=self._catalog_version,
+            backend=backend,
+            limit=limit,
+        )
+        payload: dict[str, Any] = {
+            "catalog_version": self._catalog_version,
+            "backend_requested": outcome.backend_requested,
+            "backend_used": outcome.backend_used,
+            "fallback_triggered": outcome.fallback_triggered,
+            "fallback_reason": outcome.fallback_reason,
+            "stage1_servers": outcome.stage1_servers,
+            "latency_ms": outcome.latency_ms,
+            "total_accessible": len(accessible),
+            "returned": len(outcome.tools),
+            "tools": [
+                {
+                    "qualified_name": st.tool.qualified_name,
+                    "server": st.tool.server,
+                    "name": st.tool.name,
+                    "mutating": st.tool.mutating,
+                    "score": st.score,
+                    "stage1_server_score": st.stage1_server_score,
+                    "description": st.tool.description,
+                    "stub": render_python_stub(st.tool),
+                }
+                for st in outcome.tools
+            ],
+        }
+        if include_schemas:
+            payload["hydrated_tools"] = [to_mcp_tool_definition(st.tool) for st in outcome.tools]
+        return payload
 
     def search_tools(
         self,
@@ -179,7 +287,7 @@ class ToolCatalog:
         server: str | None = None,
         limit: int = 15,
     ) -> dict[str, Any]:
-        """RBAC-filtered progressive discovery returning compact Python stubs."""
+        """Sync keyword discovery kept for backwards compatibility."""
         accessible = self.list_accessible_tools(identity, policy, registry)
         if server:
             accessible = [t for t in accessible if t.server == server]

@@ -44,13 +44,20 @@ _TRADITIONAL_SYSTEM = (
     "(ledger_balance - invoice_amount)."
 )
 
+_TRADITIONAL_DISCOVER_SYSTEM = (
+    "You are an enterprise finance assistant using deferred MCP tool discovery. "
+    "Call search_tools first to discover and hydrate the relevant finance/billing tools, "
+    "then call those hydrated tools to answer with exact customer IDs and numeric deltas "
+    "(ledger_balance - invoice_amount)."
+)
+
 _CODEMODE_SYSTEM = (
     "You are an enterprise finance assistant using a Code-Mode MCP Gateway. "
     "First call search_tools to discover exact async tool names and signatures. "
-    "Then call execute_code with one Python script using await / asyncio.gather to fetch, "
-    "join, and filter data—make the final expression of your script the compact result "
-    "dict/list. Return the exact customer IDs and numeric deltas "
-    "(ledger_balance - invoice_amount)."
+    "Then call execute_code with one Python script running inside Pydantic Monty: "
+    "top-level await and 'import asyncio' / asyncio.gather work; do NOT import external "
+    "modules like 'json' or 'requests'; make your final expression the compact result "
+    "dict/list. Return exact customer IDs and numeric deltas (ledger_balance - invoice_amount)."
 )
 
 _THINK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
@@ -89,10 +96,20 @@ def _detect_provider(preferred: str | None = None) -> tuple[str, str] | None:
     return None
 
 
-async def _list_mcp_tools(gw: httpx.AsyncClient, gw_token: str, mode: str) -> list[dict[str, Any]]:
+async def _list_mcp_tools(
+    gw: httpx.AsyncClient,
+    gw_token: str,
+    mode: str,
+    *,
+    discovery_backend: str = "bm25",
+    x_intent: str | None = None,
+) -> list[dict[str, Any]]:
+    headers = {"Authorization": f"Bearer {gw_token}"}
+    if x_intent:
+        headers["X-Intent"] = x_intent
     resp = await gw.post(
-        f"/mcp?mode={mode}",
-        headers={"Authorization": f"Bearer {gw_token}"},
+        f"/mcp?mode={mode}&discovery={discovery_backend}",
+        headers=headers,
         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
     )
     resp.raise_for_status()
@@ -100,10 +117,17 @@ async def _list_mcp_tools(gw: httpx.AsyncClient, gw_token: str, mode: str) -> li
 
 
 async def _call_mcp_tool(
-    gw: httpx.AsyncClient, gw_token: str, mode: str, req_id: int, name: str, args: dict[str, Any]
+    gw: httpx.AsyncClient,
+    gw_token: str,
+    mode: str,
+    req_id: int,
+    name: str,
+    args: dict[str, Any],
+    *,
+    discovery_backend: str = "bm25",
 ) -> dict[str, Any]:
     resp = await gw.post(
-        f"/mcp?mode={mode}",
+        f"/mcp?mode={mode}&discovery={discovery_backend}",
         headers={"Authorization": f"Bearer {gw_token}"},
         json={
             "jsonrpc": "2.0",
@@ -186,16 +210,22 @@ async def _call_openai_loop(
     model: str,
     *,
     base_url: str = "https://api.openai.com/v1",
+    discovery_backend: str = "bm25",
+    x_intent: str | None = None,
     prompt: str = TASK_PROMPT,
     system_prompt: str | None = None,
     timeout: float = 180.0,
     temperature: float = 0.0,
     max_tokens: int = 2048,
     max_turns: int = 10,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
-    mcp_tools = await _list_mcp_tools(gw, gw_token, mode)
-    oai_tools = [
-        {
+    mcp_tools = await _list_mcp_tools(
+        gw, gw_token, mode, discovery_backend=discovery_backend, x_intent=x_intent
+    )
+
+    def _to_oai(t: dict[str, Any]) -> dict[str, Any]:
+        return {
             "type": "function",
             "function": {
                 "name": t["name"],
@@ -203,9 +233,18 @@ async def _call_openai_loop(
                 "parameters": t.get("inputSchema", {"type": "object", "properties": {}}),
             },
         }
-        for t in mcp_tools
-    ]
-    sys_msg = system_prompt or (_CODEMODE_SYSTEM if mode == "codemode" else _TRADITIONAL_SYSTEM)
+
+    oai_tools = [_to_oai(t) for t in mcp_tools]
+    known_names = {t["function"]["name"] for t in oai_tools}
+    initial_exposed_count = len(oai_tools)
+    if system_prompt:
+        sys_msg = system_prompt
+    elif mode == "codemode":
+        sys_msg = _CODEMODE_SYSTEM
+    elif mode == "traditional_discover":
+        sys_msg = _TRADITIONAL_DISCOVER_SYSTEM
+    else:
+        sys_msg = _TRADITIONAL_SYSTEM
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": sys_msg},
         {"role": "user", "content": prompt},
@@ -224,6 +263,8 @@ async def _call_openai_loop(
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             }
+            if reasoning_effort is not None:
+                body["reasoning_effort"] = reasoning_effort
             if oai_tools:
                 body["tools"] = oai_tools
             resp = await llm.post(
@@ -239,7 +280,11 @@ async def _call_openai_loop(
                 return {
                     "model": model,
                     "mode": mode,
-                    "exposed_tool_count": len(oai_tools),
+                    "discovery_backend": discovery_backend,
+                    "x_intent": bool(x_intent),
+                    "reasoning_effort": reasoning_effort,
+                    "exposed_tool_count": initial_exposed_count,
+                    "final_tool_count": len(oai_tools),
                     "turns": turns,
                     "mcp_tool_calls": mcp_calls,
                     "self_corrections": self_corrections,
@@ -279,7 +324,11 @@ async def _call_openai_loop(
                 return {
                     "model": model,
                     "mode": mode,
-                    "exposed_tool_count": len(oai_tools),
+                    "discovery_backend": discovery_backend,
+                    "x_intent": bool(x_intent),
+                    "reasoning_effort": reasoning_effort,
+                    "exposed_tool_count": initial_exposed_count,
+                    "final_tool_count": len(oai_tools),
                     "turns": turns,
                     "mcp_tool_calls": mcp_calls,
                     "subcalls_total": subcalls_total,
@@ -313,22 +362,48 @@ async def _call_openai_loop(
                     continue
 
                 mcp_calls += 1
-                res = await _call_mcp_tool(gw, gw_token, mode, mcp_calls, fn["name"], parsed_args)
+                res = await _call_mcp_tool(
+                    gw,
+                    gw_token,
+                    mode,
+                    mcp_calls,
+                    fn["name"],
+                    parsed_args,
+                    discovery_backend=discovery_backend,
+                )
                 if res.get("isError"):
                     self_corrections += 1
                 sc = res.get("structuredContent") if isinstance(res, dict) else None
                 if isinstance(sc, dict) and sc.get("run_id"):
                     run_ids.append(str(sc["run_id"]))
-                text_blocks = res.get("content") if isinstance(res, dict) else None
+
+                # Deferred tool hydration for traditional_discover
                 if (
-                    isinstance(text_blocks, list)
-                    and text_blocks
-                    and isinstance(text_blocks[0], dict)
-                    and "text" in text_blocks[0]
+                    mode == "traditional_discover"
+                    and fn["name"] == "search_tools"
+                    and isinstance(sc, dict)
+                    and isinstance(sc.get("hydrated_tools"), list)
                 ):
-                    tool_text = str(text_blocks[0]["text"])
+                    newly_hydrated: list[str] = []
+                    for ht in sc["hydrated_tools"]:
+                        if isinstance(ht, dict) and ht.get("name") not in known_names:
+                            known_names.add(ht["name"])
+                            oai_tools.append(_to_oai(ht))
+                            newly_hydrated.append(ht["name"])
+                    compact_sc = {k: v for k, v in sc.items() if k != "hydrated_tools"}
+                    compact_sc["hydrated_into_next_turn"] = newly_hydrated
+                    tool_text = json.dumps(compact_sc, default=str)
                 else:
-                    tool_text = json.dumps(res, default=str)
+                    text_blocks = res.get("content") if isinstance(res, dict) else None
+                    if (
+                        isinstance(text_blocks, list)
+                        and text_blocks
+                        and isinstance(text_blocks[0], dict)
+                        and "text" in text_blocks[0]
+                    ):
+                        tool_text = str(text_blocks[0]["text"])
+                    else:
+                        tool_text = json.dumps(res, default=str)
                 messages.append(
                     {
                         "role": "tool",
@@ -340,7 +415,11 @@ async def _call_openai_loop(
     return {
         "model": model,
         "mode": mode,
-        "exposed_tool_count": len(oai_tools),
+        "discovery_backend": discovery_backend,
+        "x_intent": bool(x_intent),
+        "reasoning_effort": reasoning_effort,
+        "exposed_tool_count": initial_exposed_count,
+        "final_tool_count": len(oai_tools),
         "turns": turns,
         "mcp_tool_calls": mcp_calls,
         "self_corrections": self_corrections,
@@ -506,9 +585,14 @@ async def run_openai_compatible_suite(
     api_key: str,
     models: list[str],
     synthetic_counts: list[int],
+    modes: list[str] | None = None,
+    discovery_backend: str = "bm25",
+    use_x_intent: bool = False,
+    reasoning_effort: str | None = None,
     output_path: Path | None = Path("benchmarks/live_llm_results.json"),
 ) -> dict[str, Any]:
-    """Run full AuthN/RBAC verification and 4B vs 9B Traditional vs Code Mode benchmarks."""
+    """Run AuthN/RBAC verification and 4B vs 9B Traditional/Discover/CodeMode benchmarks."""
+    chosen_modes = modes or ["traditional", "traditional_discover", "codemode"]
     runs: list[dict[str, Any]] = []
     rbac_checks: list[dict[str, Any]] = []
     auth_preflight: dict[str, Any] = {}
@@ -522,13 +606,15 @@ async def run_openai_compatible_suite(
             transport=httpx.ASGITransport(app=backends_app), base_url="http://127.0.0.1:8001"
         )
         try:
-            # Build one GatewayApp per synthetic tool level so catalog sizes are realistic
             apps_by_syn: dict[int, Any] = {}
             for syn in synthetic_counts:
                 cfg_path, preloaded = _build_upstreams_config(tmpdir, syn)
                 settings = GatewaySettings(
                     auth_mode="dev",
                     rate_limit_per_minute=2000,
+                    discovery_backend=discovery_backend,  # type: ignore[arg-type]
+                    embedding_url=f"{base_url.rstrip('/')}/embeddings",
+                    system1_url=f"{base_url.rstrip('/')}/systemone",
                     sqlite_path=f"{tmpdir}/live_{syn}.db",
                     upstreams_config_path=cfg_path,
                 )
@@ -540,7 +626,6 @@ async def run_openai_compatible_suite(
                     preloaded_tools=preloaded,
                 )
 
-            # AuthN / Discovery / RBAC preflight once
             first_app = apps_by_syn[synthetic_counts[0]]
             async with first_app.router.lifespan_context(first_app):
                 async with httpx.AsyncClient(
@@ -551,7 +636,6 @@ async def run_openai_compatible_suite(
             fin_token = dev_keys.issue_user_token(persona="finance_analyst")
             sup_token = dev_keys.issue_user_token(persona="support_agent")
 
-            # Group by model to avoid repeated LM Studio JIT model swaps
             for model in models:
                 for syn in synthetic_counts:
                     app = apps_by_syn[syn]
@@ -559,7 +643,12 @@ async def run_openai_compatible_suite(
                         async with httpx.AsyncClient(
                             transport=httpx.ASGITransport(app=app), base_url="http://gw"
                         ) as gw:
-                            for mode in ("traditional", "codemode"):
+                            for mode in chosen_modes:
+                                intent_str = (
+                                    TASK_PROMPT
+                                    if (use_x_intent and mode != "traditional")
+                                    else None
+                                )
                                 res = await _call_openai_loop(
                                     gw,
                                     fin_token,
@@ -567,11 +656,13 @@ async def run_openai_compatible_suite(
                                     mode,
                                     model,
                                     base_url=base_url,
+                                    discovery_backend=discovery_backend,
+                                    x_intent=intent_str,
+                                    reasoning_effort=reasoning_effort,
                                 )
                                 res["extra_synthetic_tools"] = syn
                                 runs.append(res)
 
-                # Live RBAC boundary test with support_agent token (only once per model)
                 app0 = apps_by_syn[synthetic_counts[0]]
                 async with app0.router.lifespan_context(app0):
                     async with httpx.AsyncClient(
@@ -584,8 +675,10 @@ async def run_openai_compatible_suite(
                             "codemode",
                             model,
                             base_url=base_url,
+                            discovery_backend=discovery_backend,
                             prompt=RBAC_BOUNDARY_PROMPT,
                             max_turns=5,
+                            reasoning_effort=reasoning_effort,
                         )
                         leaked_secret_val = "1375" in rbac_res.get("answer", "")
                         rbac_checks.append(
@@ -605,6 +698,9 @@ async def run_openai_compatible_suite(
         "generated_at": datetime.now(UTC).isoformat(),
         "provider": "openai_compatible",
         "base_url": base_url,
+        "discovery_backend": discovery_backend,
+        "x_intent_enabled": use_x_intent,
+        "reasoning_effort": reasoning_effort,
         "auth_preflight": auth_preflight,
         "rbac_live_boundary": rbac_checks,
         "runs": runs,
@@ -622,6 +718,10 @@ async def run_live_bench(
     *,
     base_url: str | None = None,
     models: list[str] | None = None,
+    modes: list[str] | None = None,
+    discovery_backend: str = "bm25",
+    use_x_intent: bool = False,
+    reasoning_effort: str | None = None,
     synthetic_counts: list[int] | None = None,
     output_path: Path | None = Path("benchmarks/live_llm_results.json"),
 ) -> dict[str, Any]:
@@ -646,6 +746,10 @@ async def run_live_bench(
             base_url=resolved_base,
             api_key=api_key,
             models=resolved_models,
+            modes=modes,
+            discovery_backend=discovery_backend,
+            use_x_intent=use_x_intent,
+            reasoning_effort=reasoning_effort,
             synthetic_counts=synthetic_counts or [0, 50],
             output_path=output_path,
         )
@@ -697,14 +801,19 @@ def _print_report(result: dict[str, Any]) -> None:
 
     print("\n=== Live LLM Comparison: Traditional MCP vs. Code Mode ===")
     print(
-        "| Model | Extra Tools | Mode | Exposed | Turns | Prompt Tok | Comp Tok | "
+        "| Model | Extra | Mode | Init->Final Tools | Turns | Prompt Tok | Comp Tok | "
         "Total Tok | Time (ms) | Retries | Correct |"
     )
-    print("| :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |")
+    print(
+        "| :--- | ---: | :--- | :---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |"
+    )
     for r in result["runs"]:
+        init_cnt = r["exposed_tool_count"]
+        final_cnt = r.get("final_tool_count", init_cnt)
+        tool_span = f"{init_cnt}->{final_cnt}"
         print(
             f"| {r['model']} | {r['extra_synthetic_tools']} | {r['mode']} | "
-            f"{r['exposed_tool_count']} | {r['turns']} | {r['prompt_tokens']} | "
+            f"{tool_span} | {r['turns']} | {r['prompt_tokens']} | "
             f"{r['completion_tokens']} | {r['total_tokens']} | {r['duration_ms']} | "
             f"{r.get('self_corrections', 0)} | {r.get('correct')} |"
         )
@@ -720,12 +829,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--model", default=None)
     parser.add_argument("--models", nargs="+", default=None)
+    parser.add_argument("--modes", default="traditional,traditional_discover,codemode")
+    parser.add_argument(
+        "--discovery",
+        default="bm25",
+        choices=["keyword", "bm25", "embedding", "system1", "hybrid_system1"],
+    )
+    parser.add_argument("--x-intent", action="store_true")
+    parser.add_argument(
+        "--reasoning-effort",
+        default=None,
+        choices=["none", "minimal", "low", "medium", "high"],
+    )
     parser.add_argument("--synthetic-tools", default="0,50")
     parser.add_argument("--output", default="benchmarks/live_llm_results.json")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
     syn_counts = [int(x.strip()) for x in args.synthetic_tools.split(",") if x.strip()]
+    chosen_modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     result = asyncio.run(
         run_live_bench(
             args.provider,
@@ -733,6 +855,10 @@ def main(argv: list[str] | None = None) -> int:
             args.dry_run,
             base_url=args.base_url,
             models=args.models,
+            modes=chosen_modes,
+            discovery_backend=args.discovery,
+            use_x_intent=args.x_intent,
+            reasoning_effort=args.reasoning_effort,
             synthetic_counts=syn_counts,
             output_path=Path(args.output),
         )

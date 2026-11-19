@@ -26,7 +26,14 @@ from gateway.auth import (
 )
 from gateway.catalog import ToolCatalog, estimate_tokens, to_mcp_tool_definition
 from gateway.comparator import audit_catalog_comparison, run_side_by_side_comparison
-from gateway.config import GatewayMode, GatewaySettings, UpstreamConfig, UpstreamRegistry
+from gateway.config import (
+    DiscoveryBackendMode,
+    GatewayMode,
+    GatewaySettings,
+    UpstreamConfig,
+    UpstreamRegistry,
+)
+from gateway.discovery import DiscoveryEngine
 from gateway.dispatcher import (
     ExecutionBudget,
     HostDispatcher,
@@ -45,13 +52,14 @@ from gateway.state import (
 from gateway.telemetry import TelemetryRecorder, configure_telemetry
 from gateway.upstream_clients import DiscoveredTool, UpstreamClientManager, inspect_upstream
 
-_VALID_MODES: set[str] = {"codemode", "traditional", "hybrid"}
+_VALID_MODES: set[str] = {"codemode", "traditional", "traditional_discover", "hybrid"}
+_VALID_DISCOVERY: set[str] = {"keyword", "bm25", "embedding", "system1", "hybrid_system1"}
 
-SEARCH_TOOLS_DEF: dict[str, Any] = {
-    "name": "search_tools",
+LIST_SERVERS_DEF: dict[str, Any] = {
+    "name": "list_servers",
     "description": (
-        "Search authorized upstream MCP tools and OpenAPI endpoints, returning compact "
-        "typed Python function signatures for use inside execute_code."
+        "List RBAC-authorized upstream MCP servers and OpenAPI services available to you, "
+        "including tool counts and sample tool names."
     ),
     "inputSchema": {
         "type": "object",
@@ -59,11 +67,36 @@ SEARCH_TOOLS_DEF: dict[str, Any] = {
             "query": {
                 "type": "string",
                 "default": "",
-                "description": "Keyword query (e.g. 'invoice', 'ledger balance').",
+                "description": "Optional keyword filter across server names and tools.",
+            }
+        },
+    },
+    "annotations": {"readOnlyHint": True},
+}
+
+SEARCH_TOOLS_DEF: dict[str, Any] = {
+    "name": "search_tools",
+    "description": (
+        "Search authorized upstream MCP tools and OpenAPI endpoints across one or more "
+        "servers, returning compact typed Python stubs (or full JSON Schemas in "
+        "traditional_discover mode)."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "default": "",
+                "description": "Natural-language or keyword query (e.g. 'overdue invoices').",
             },
             "server": {
                 "type": "string",
-                "description": "Optional upstream server slug filter.",
+                "description": "Optional single upstream server slug filter.",
+            },
+            "servers": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional list of upstream server slugs to search across.",
             },
             "limit": {
                 "type": "integer",
@@ -79,9 +112,10 @@ SEARCH_TOOLS_DEF: dict[str, Any] = {
 EXECUTE_CODE_DEF: dict[str, Any] = {
     "name": "execute_code",
     "description": (
-        "Execute sandboxed Python inside Pydantic Monty with async access to authorized "
-        "upstream tool stubs discovered via search_tools. Use loops, filtering, and "
-        "asyncio.gather to batch calls and return only the final distilled result."
+        "Execute sandboxed Python inside Pydantic Monty (Rust Python) with async access to "
+        "authorized upstream tools discovered via search_tools. Top-level await and "
+        "'import asyncio' / asyncio.gather work; do not import external modules like 'json' "
+        "or 'requests'; make your final expression the compact result dict/list."
     ),
     "inputSchema": {
         "type": "object",
@@ -89,6 +123,14 @@ EXECUTE_CODE_DEF: dict[str, Any] = {
             "code": {
                 "type": "string",
                 "description": "Python script to execute inside the Monty sandbox.",
+            },
+            "servers": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional least-privilege server allowlist for this run "
+                    "(bounded by any request-level server ceiling)."
+                ),
             },
             "timeout_ms": {
                 "type": "integer",
@@ -114,6 +156,7 @@ class GatewayRuntime:
         store: AuditStore | None = None,
         dev_keys: LocalDevKeyManager | None = None,
         http_client: httpx.AsyncClient | None = None,
+        discovery_http_client: httpx.AsyncClient | None = None,
         sandbox_backend: SandboxBackend | None = None,
         preloaded_tools: dict[str, list[DiscoveredTool]] | None = None,
     ) -> None:
@@ -142,6 +185,9 @@ class GatewayRuntime:
         self.registry = UpstreamRegistry(self.settings, store=self.store)
         self.client_manager = UpstreamClientManager(http_client=http_client)
         self.catalog = ToolCatalog()
+        self.discovery_engine = DiscoveryEngine(
+            self.settings, http_client=discovery_http_client
+        )
         self.dispatcher = HostDispatcher(
             settings=self.settings,
             policy=self.policy,
@@ -273,16 +319,96 @@ class GatewayRuntime:
         if hasattr(self.store, "close"):
             await self.store.close()  # type: ignore[attr-defined]
 
-    def tools_for_mode(self, identity: CallerIdentity, mode: GatewayMode) -> list[dict[str, Any]]:
-        """Build the exact MCP tools/list payload for the requested gateway mode."""
-        accessible = self.catalog.list_accessible_tools(identity, self.policy, self.registry)
+    def tools_for_mode(
+        self,
+        identity: CallerIdentity,
+        mode: GatewayMode,
+        *,
+        allowed_servers: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Build the baseline MCP tools/list payload for the requested gateway mode."""
+        accessible = self.catalog.list_accessible_tools(
+            identity, self.policy, self.registry, allowed_servers=allowed_servers
+        )
         if mode == "codemode":
-            return [SEARCH_TOOLS_DEF, EXECUTE_CODE_DEF]
+            return [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, EXECUTE_CODE_DEF]
+        if mode == "traditional_discover":
+            return [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF]
         if mode == "traditional":
             return [to_mcp_tool_definition(tool) for tool in accessible]
         # hybrid: Code Mode for orchestration + direct MCP definitions for mutating writes
         direct_mutating = [to_mcp_tool_definition(tool) for tool in accessible if tool.mutating]
-        return [SEARCH_TOOLS_DEF, EXECUTE_CODE_DEF, *direct_mutating]
+        return [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, EXECUTE_CODE_DEF, *direct_mutating]
+
+    async def list_tools_for_request(
+        self,
+        identity: CallerIdentity,
+        mode: GatewayMode,
+        *,
+        allowed_servers: set[str] | None = None,
+        discovery_backend: DiscoveryBackendMode | None = None,
+        intent: str | None = None,
+        query: str | None = None,
+        requested_servers: list[str] | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Build tools/list response supporting X-Intent zero-turn hydration and pagination."""
+        effective_ceiling = allowed_servers
+        if requested_servers:
+            req_set = set(requested_servers)
+            effective_ceiling = (
+                (effective_ceiling & req_set) if effective_ceiling is not None else req_set
+            )
+
+        filter_text = (intent or query or "").strip()
+        if filter_text:
+            top_k = min(limit or 10, 20)
+            discovered = await self.catalog.discover_tools_for_caller(
+                identity,
+                self.policy,
+                self.registry,
+                self.discovery_engine,
+                query=filter_text,
+                allowed_servers=effective_ceiling,
+                backend=discovery_backend,
+                limit=top_k,
+                include_schemas=(mode in {"traditional", "traditional_discover"}),
+            )
+            if mode == "traditional":
+                tools = list(discovered["hydrated_tools"])
+            elif mode == "traditional_discover":
+                tools = [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, *discovered["hydrated_tools"]]
+            else:
+                exec_copy = dict(EXECUTE_CODE_DEF)
+                stubs = "\n\n".join(t["stub"] for t in discovered["tools"])
+                if stubs:
+                    exec_copy["description"] = (
+                        f"{EXECUTE_CODE_DEF['description']}\n\n"
+                        f"Pre-discovered matching stubs ({discovered['backend_used']}):\n{stubs}"
+                    )
+                if mode == "codemode":
+                    tools = [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, exec_copy]
+                else:
+                    accessible = self.catalog.list_accessible_tools(
+                        identity, self.policy, self.registry, allowed_servers=effective_ceiling
+                    )
+                    direct_mutating = [
+                        to_mcp_tool_definition(t) for t in accessible if t.mutating
+                    ]
+                    tools = [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, exec_copy, *direct_mutating]
+        else:
+            tools = self.tools_for_mode(identity, mode, allowed_servers=effective_ceiling)
+
+        if cursor is not None or limit is not None:
+            offset = max(0, int(cursor)) if cursor else 0
+            page_size = max(1, min(limit or len(tools) or 1, 200))
+            page = tools[offset : offset + page_size]
+            out: dict[str, Any] = {"tools": page}
+            if offset + page_size < len(tools):
+                out["nextCursor"] = str(offset + page_size)
+            return out
+        return {"tools": tools}
 
     async def execute_code_for_identity(
         self,
@@ -290,13 +416,28 @@ class GatewayRuntime:
         code: str,
         *,
         mode: GatewayMode = "codemode",
+        servers: list[str] | None = None,
+        allowed_servers: set[str] | None = None,
         timeout_ms: int = 10000,
     ) -> dict[str, Any]:
         """Run Code Mode Python script in SandboxBackend and record audit telemetry."""
         started = time.perf_counter()
         await self.ensure_catalog_for_identity(identity)
-        accessible = self.catalog.list_accessible_tools(identity, self.policy, self.registry)
-        schema_tokens = estimate_tokens(self.tools_for_mode(identity, mode))
+        if allowed_servers is not None and servers is not None:
+            effective_servers: set[str] | None = allowed_servers & set(servers)
+        elif allowed_servers is not None:
+            effective_servers = allowed_servers
+        elif servers is not None:
+            effective_servers = set(servers)
+        else:
+            effective_servers = None
+
+        accessible = self.catalog.list_accessible_tools(
+            identity, self.policy, self.registry, allowed_servers=effective_servers
+        )
+        schema_tokens = estimate_tokens(
+            self.tools_for_mode(identity, mode, allowed_servers=allowed_servers)
+        )
 
         budget = ExecutionBudget(self.settings.max_calls_per_execution)
         subcalls: list[SubcallRecord] = []
@@ -376,13 +517,18 @@ class GatewayRuntime:
         arguments: dict[str, Any],
         *,
         mode: GatewayMode = "traditional",
+        allowed_servers: set[str] | None = None,
     ) -> dict[str, Any]:
-        """Invoke a single upstream tool directly (traditional mode or hybrid mutating tool)."""
+        """Invoke a single upstream tool directly (traditional / traditional_discover / hybrid)."""
         started = time.perf_counter()
         await self.ensure_catalog_for_identity(identity)
         tool = self.catalog.get_tool(tool_name)
         if tool is None:
             raise KeyError(f"Unknown tool '{tool_name}'")
+        if allowed_servers is not None and tool.server not in allowed_servers:
+            raise PermissionError(
+                f"Server '{tool.server}' is outside the request-level server ceiling"
+            )
         if mode == "hybrid" and not tool.mutating:
             raise PermissionError(
                 f"Non-mutating tool '{tool_name}' should run via execute_code in hybrid mode"
@@ -391,7 +537,9 @@ class GatewayRuntime:
         if upstream is None:
             raise KeyError(f"Upstream '{tool.server}' not found")
 
-        schema_tokens = estimate_tokens(self.tools_for_mode(identity, mode))
+        schema_tokens = estimate_tokens(
+            self.tools_for_mode(identity, mode, allowed_servers=allowed_servers)
+        )
         result, rec = await self.dispatcher.invoke_tool(
             identity, tool, upstream, arguments, code_mode_hints=False
         )
@@ -434,6 +582,31 @@ def _resolve_mode(
     return chosen  # type: ignore[return-value]
 
 
+def _resolve_discovery(
+    default_backend: DiscoveryBackendMode,
+    query_backend: str | None,
+    header_backend: str | None,
+) -> DiscoveryBackendMode:
+    chosen = query_backend or header_backend or default_backend
+    if chosen not in _VALID_DISCOVERY:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid discovery backend '{chosen}'. "
+                f"Expected one of: {sorted(_VALID_DISCOVERY)}"
+            ),
+        )
+    return chosen  # type: ignore[return-value]
+
+
+def _parse_servers_ceiling(query_val: str | None, header_val: str | None) -> set[str] | None:
+    raw = query_val if query_val is not None else header_val
+    if raw is None or not raw.strip():
+        return None
+    parts = {item.strip() for item in raw.split(",") if item.strip()}
+    return parts or None
+
+
 def _jsonrpc_ok(req_id: Any, result: Any) -> JSONResponse:
     return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": result})
 
@@ -458,6 +631,7 @@ def create_gateway_app(
     store: AuditStore | None = None,
     dev_keys: LocalDevKeyManager | None = None,
     http_client: httpx.AsyncClient | None = None,
+    discovery_http_client: httpx.AsyncClient | None = None,
     sandbox_backend: SandboxBackend | None = None,
     preloaded_tools: dict[str, list[DiscoveredTool]] | None = None,
 ) -> FastAPI:
@@ -468,6 +642,7 @@ def create_gateway_app(
         store=store,
         dev_keys=dev_keys,
         http_client=http_client,
+        discovery_http_client=discovery_http_client,
         sandbox_backend=sandbox_backend,
         preloaded_tools=preloaded_tools,
     )
@@ -508,7 +683,12 @@ def create_gateway_app(
     async def mcp_endpoint(
         request: Request,
         mode: str | None = Query(default=None),
+        discovery: str | None = Query(default=None),
+        servers: str | None = Query(default=None),
         x_gateway_mode: str | None = Header(default=None),
+        x_discovery_backend: str | None = Header(default=None),
+        x_mcp_servers: str | None = Header(default=None),
+        x_intent: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ) -> JSONResponse:
         try:
@@ -520,6 +700,10 @@ def create_gateway_app(
             ) from exc
 
         effective_mode = _resolve_mode(runtime.settings.gateway_mode, mode, x_gateway_mode)
+        effective_discovery = _resolve_discovery(
+            runtime.settings.discovery_backend, discovery, x_discovery_backend
+        )
+        allowed_servers = _parse_servers_ceiling(servers, x_mcp_servers)
         payload = await request.json()
         req_id = payload.get("id")
         method = payload.get("method")
@@ -530,8 +714,23 @@ def create_gateway_app(
                 req_id,
                 {
                     "protocolVersion": "2025-03-26",
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {"listChanged": True}},
                     "serverInfo": {"name": "mcpcodeaway", "version": __version__},
+                },
+            )
+        if method == "server/discover":
+            return _jsonrpc_ok(
+                req_id,
+                {
+                    "supportedVersions": ["2025-03-26"],
+                    "capabilities": {"tools": {"listChanged": True}},
+                    "ttlMs": 30000,
+                    "cacheScope": "private",
+                    "instructions": (
+                        "Stateless multi-MCP gateway. Call list_servers then search_tools "
+                        "(or pass X-Intent / ?servers=...) before calling execute_code or "
+                        "hydrated tools."
+                    ),
                 },
             )
         if method == "notifications/initialized":
@@ -540,24 +739,66 @@ def create_gateway_app(
         await runtime.ensure_catalog_for_identity(identity)
 
         if method == "tools/list":
-            return _jsonrpc_ok(req_id, {"tools": runtime.tools_for_mode(identity, effective_mode)})
+            req_srvs = params.get("servers")
+            if not req_srvs and params.get("server"):
+                req_srvs = [str(params["server"])]
+            listed = await runtime.list_tools_for_request(
+                identity,
+                effective_mode,
+                allowed_servers=allowed_servers,
+                discovery_backend=effective_discovery,
+                intent=x_intent,
+                query=params.get("query"),
+                requested_servers=req_srvs,
+                limit=params.get("limit"),
+                cursor=params.get("cursor"),
+            )
+            return _jsonrpc_ok(req_id, listed)
 
         if method == "tools/call":
             tool_name = str(params.get("name") or "")
             arguments = dict(params.get("arguments") or {})
+
+            if tool_name == "list_servers":
+                srv_rows = runtime.catalog.list_accessible_servers(
+                    identity,
+                    runtime.policy,
+                    runtime.registry,
+                    allowed_servers=allowed_servers,
+                    query=str(arguments.get("query", "")),
+                )
+                srv_payload = {
+                    "catalog_version": runtime.catalog.catalog_version,
+                    "server_count": len(srv_rows),
+                    "servers": srv_rows,
+                }
+                return _jsonrpc_ok(
+                    req_id,
+                    {
+                        "content": [{"type": "text", "text": json.dumps(srv_payload)}],
+                        "structuredContent": srv_payload,
+                    },
+                )
 
             if tool_name == "search_tools":
                 if effective_mode == "traditional":
                     return _jsonrpc_err(
                         req_id, -32601, "search_tools is disabled in traditional mode"
                     )
-                res = runtime.catalog.search_tools(
+                req_srvs = arguments.get("servers")
+                if not req_srvs and arguments.get("server"):
+                    req_srvs = [str(arguments["server"])]
+                res = await runtime.catalog.discover_tools_for_caller(
                     identity,
                     runtime.policy,
                     runtime.registry,
+                    runtime.discovery_engine,
                     query=str(arguments.get("query", "")),
-                    server=arguments.get("server"),
+                    servers=req_srvs,
+                    allowed_servers=allowed_servers,
+                    backend=effective_discovery,
                     limit=int(arguments.get("limit", 15)),
+                    include_schemas=(effective_mode == "traditional_discover"),
                 )
                 return _jsonrpc_ok(
                     req_id,
@@ -568,9 +809,9 @@ def create_gateway_app(
                 )
 
             if tool_name == "execute_code":
-                if effective_mode == "traditional":
+                if effective_mode in {"traditional", "traditional_discover"}:
                     return _jsonrpc_err(
-                        req_id, -32601, "execute_code is disabled in traditional mode"
+                        req_id, -32601, f"execute_code is disabled in {effective_mode} mode"
                     )
                 code = str(arguments.get("code") or "")
                 if not code.strip():
@@ -579,6 +820,8 @@ def create_gateway_app(
                     identity,
                     code,
                     mode=effective_mode,
+                    servers=arguments.get("servers"),
+                    allowed_servers=allowed_servers,
                     timeout_ms=int(arguments.get("timeout_ms", 10000)),
                 )
                 return _jsonrpc_ok(
@@ -600,7 +843,11 @@ def create_gateway_app(
 
             try:
                 res = await runtime.call_direct_tool_for_identity(
-                    identity, tool_name, arguments, mode=effective_mode
+                    identity,
+                    tool_name,
+                    arguments,
+                    mode=effective_mode,
+                    allowed_servers=allowed_servers,
                 )
             except KeyError as exc:
                 return _jsonrpc_err(req_id, -32601, str(exc))
@@ -771,11 +1018,18 @@ def create_gateway_app(
         results_path = Path("benchmarks/results.json")
         load_path = Path("benchmarks/load_results.json")
         live_path = Path("benchmarks/live_llm_results.json")
+        discovery_path = Path("benchmarks/discovery_results.json")
         payload: dict[str, Any] = {
-            "available": results_path.exists() or load_path.exists() or live_path.exists(),
+            "available": (
+                results_path.exists()
+                or load_path.exists()
+                or live_path.exists()
+                or discovery_path.exists()
+            ),
             "offline": None,
             "load": None,
             "live_llm": None,
+            "discovery": None,
         }
         if results_path.exists():
             payload["offline"] = json.loads(results_path.read_text(encoding="utf-8"))
@@ -783,6 +1037,8 @@ def create_gateway_app(
             payload["load"] = json.loads(load_path.read_text(encoding="utf-8"))
         if live_path.exists():
             payload["live_llm"] = json.loads(live_path.read_text(encoding="utf-8"))
+        if discovery_path.exists():
+            payload["discovery"] = json.loads(discovery_path.read_text(encoding="utf-8"))
         return payload
 
     @app.get("/dashboard", response_class=HTMLResponse)

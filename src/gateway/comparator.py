@@ -19,7 +19,7 @@ from gateway.upstream_clients import DiscoveredTool
 if TYPE_CHECKING:
     from gateway.server import GatewayRuntime
 
-_GATEWAY_SURFACE_OVERHEAD_TOKENS = 190  # search_tools + execute_code JSON Schema footprint
+_GATEWAY_SURFACE_OVERHEAD_TOKENS = 360  # list_servers + search_tools + execute_code schemas
 
 
 def audit_catalog_comparison(
@@ -110,7 +110,7 @@ def audit_catalog_comparison(
             "tool_limit_note": limit_note,
         },
         "code_mode": {
-            "exposed_tool_count": 2,
+            "exposed_tool_count": 3,
             "gateway_surface_tokens": _GATEWAY_SURFACE_OVERHEAD_TOKENS,
             "all_stubs_tokens": all_stubs_tokens,
             "typical_search_tokens": typical_search_tokens,
