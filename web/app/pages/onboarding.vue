@@ -320,6 +320,36 @@ function applyRecommendation(enableLiveSplit = false) {
   draftAbEnabled.value = enableLiveSplit;
   statusMessage.value = `Applied recommended mode '${patch.preferred_mode}' to draft form.`;
 }
+
+const onboardingStep = ref<1 | 2 | 3>(1);
+const promptTab = ref("prompt");
+
+function applyQuickPreset(preset: "mock-eu" | "mock-snowflake") {
+  if (preset === "mock-eu") {
+    draftName.value = "billing_eu_sandbox";
+    draftType.value = "openapi";
+    draftUrl.value = "http://mock-backends:8001/billing-eu";
+    draftSpecUrl.value = "http://mock-backends:8001/billing-eu/openapi.json";
+    draftAuthType.value = "delegated_token";
+    draftRoles.value = "finance_analyst, billing_reader, gateway_admin";
+  } else {
+    draftName.value = "snowflake_sandbox";
+    draftType.value = "mcp_http";
+    draftUrl.value = "http://mock-backends:8001/snowflake/mcp";
+    draftSpecUrl.value = "";
+    draftAuthType.value = "delegated_token";
+    draftRoles.value = "finance_analyst, snowflake_reader, gateway_admin";
+  }
+  onboardingStep.value = 1;
+  statusMessage.value = `Loaded preset '${draftName.value}'. Click Inspect Schema to verify tools.`;
+}
+
+async function copyPromptText() {
+  if (typeof navigator !== "undefined" && navigator.clipboard && agentPromptText.value) {
+    await navigator.clipboard.writeText(agentPromptText.value);
+    statusMessage.value = "Copied Agent Onboarding Prompt to clipboard.";
+  }
+}
 </script>
 
 <template>
@@ -355,6 +385,41 @@ function applyRecommendation(enableLiveSplit = false) {
       <AppIcon name="alert" :size="16" class="mt-0.5" />
       <span>{{ errorMessage }}</span>
     </div>
+
+    <!-- 3-Step Onboarding Stepper & Presets -->
+    <section
+      aria-label="Onboarding workflow steps"
+      class="flex flex-col gap-3 rounded-lg border border-[#E4E4E7] bg-white p-4 sm:flex-row sm:items-center sm:justify-between"
+    >
+      <div class="flex flex-wrap items-center gap-2">
+        <Button
+          :data-variant="onboardingStep === 1 ? 'primary' : undefined"
+          class="text-xs"
+          @click="onboardingStep = 1"
+        >
+          1. Connect &amp; Inspect
+        </Button>
+        <Button
+          :data-variant="onboardingStep === 2 ? 'primary' : undefined"
+          class="text-xs"
+          @click="onboardingStep = 2"
+        >
+          2. Policy &amp; Mode
+        </Button>
+        <Button
+          :data-variant="onboardingStep === 3 ? 'primary' : undefined"
+          class="text-xs"
+          @click="onboardingStep = 3"
+        >
+          3. A/B Test &amp; Save
+        </Button>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="text-xs text-[#71717A]">Quick presets:</span>
+        <Button class="text-xs" @click="applyQuickPreset('mock-eu')">Mock OpenAPI</Button>
+        <Button class="text-xs" @click="applyQuickPreset('mock-snowflake')">Mock MCP HTTP</Button>
+      </div>
+    </section>
 
     <!-- Split Workspace -->
     <div class="grid grid-cols-1 gap-6 xl:grid-cols-12">
@@ -493,6 +558,7 @@ function applyRecommendation(enableLiveSplit = false) {
           <Button
             v-if="dynamicPermitted"
             data-variant="primary"
+            data-agent-confirm="Register or update this upstream service in the gateway?"
             pending-announcement="Registering upstream"
             @click="handleRegister"
           >
@@ -718,12 +784,32 @@ function applyRecommendation(enableLiveSplit = false) {
     <Dialog v-model:open="promptDialogOpen">
       <DialogBackdrop />
       <DialogContent class="sm:max-w-2xl w-[calc(100%-2rem)]">
-        <DialogTitle>Generic Coding-Agent Onboarding Prompt</DialogTitle>
+        <DialogTitle>AI Agent Onboarding (WebMCP, Self-Admin MCP &amp; JSON)</DialogTitle>
         <DialogDescription>
-          Copy this prompt for your coding agent to inspect any upstream API/MCP service and emit valid UpstreamConfig JSON.
+          Agents can fill this UI via WebMCP, configure the gateway directly over POST /admin/mcp, or emit UpstreamConfig JSON.
         </DialogDescription>
-        <pre class="max-h-72 overflow-auto rounded border border-[#E4E4E7] bg-[#F4F4F5] p-3 font-mono-data text-xs text-[#09090B]">{{ agentPromptText }}</pre>
-        <div class="flex justify-end gap-2">
+        <Tabs v-model:value="promptTab" class="mt-2">
+          <TabsList aria-label="Agent onboarding integration modes">
+            <TabsTab value="prompt">Copyable Prompt</TabsTab>
+            <TabsTab value="admin-mcp">Self-Admin MCP</TabsTab>
+          </TabsList>
+          <TabsPanel value="prompt" class="pt-3">
+            <pre class="max-h-72 overflow-auto rounded border border-[#E4E4E7] bg-[#F4F4F5] p-3 font-mono-data text-xs text-[#09090B]">{{ agentPromptText }}</pre>
+          </TabsPanel>
+          <TabsPanel value="admin-mcp" class="pt-3 space-y-2 text-xs text-[#52525B]">
+            <p>
+              Point any MCP client with a <code class="font-mono-data text-[#09090B]">gateway_admin</code> Bearer token at <code class="font-mono-data text-[#09090B]">POST /admin/mcp</code>:
+            </p>
+            <pre class="overflow-auto rounded border border-[#E4E4E7] bg-[#F4F4F5] p-3 font-mono-data text-xs text-[#09090B]">{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+// Tools: admin_list_upstreams, admin_inspect_upstream, admin_run_ab_test,
+//        admin_save_upstream, admin_get_runtime_telemetry, admin_get_analytics, admin_demo_traffic_burst</pre>
+          </TabsPanel>
+        </Tabs>
+        <div class="mt-4 flex justify-end gap-2">
+          <Button @click="copyPromptText">
+            <AppIcon name="copy" :size="14" />
+            <span>Copy Prompt</span>
+          </Button>
           <DialogClose data-variant="primary">Close</DialogClose>
         </div>
       </DialogContent>

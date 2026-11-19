@@ -3,8 +3,32 @@ import type { IconName } from "~/components/AppIcon.vue";
 
 const route = useRoute();
 const { session, runtimeMeta, authConfig, logout } = useAdminApi();
+const { pendingConfirm, webMcpActive, initAgentBridge, resolveConfirm } = useUiAgentBridge();
+const {
+  status: demoStatus,
+  busy: demoBusy,
+  refreshStatus: refreshDemoStatus,
+  startTraffic,
+  stopTraffic,
+  runBurst,
+} = useDemoTraffic();
 
 const navOpen = ref(false);
+let demoPoll: ReturnType<typeof setInterval> | null = null;
+
+onMounted(async () => {
+  initAgentBridge();
+  await refreshDemoStatus();
+  demoPoll = setInterval(() => {
+    if (demoStatus.value.running) {
+      refreshDemoStatus();
+    }
+  }, 3000);
+});
+
+onBeforeUnmount(() => {
+  if (demoPoll) clearInterval(demoPoll);
+});
 
 watch(
   () => route.fullPath,
@@ -90,13 +114,10 @@ const adminRoleText = computed(() => {
           </span>
         </div>
         <div class="mt-1.5 flex items-center justify-between gap-2">
-          <span>Classic Console</span>
-          <a
-            href="/dashboard/legacy"
-            class="text-[#0F766E] hover:underline"
-          >
-            Legacy HTML
-          </a>
+          <span>UI Agent Bridge</span>
+          <span class="font-medium text-[#0F766E]">
+            {{ webMcpActive ? "WebMCP Ready" : "UI-SDK Ready" }}
+          </span>
         </div>
       </div>
     </aside>
@@ -172,6 +193,42 @@ const adminRoleText = computed(() => {
         </div>
 
         <div class="flex shrink-0 items-center gap-2">
+          <div
+            v-if="demoStatus.enabled"
+            class="hidden md:flex items-center gap-1.5 rounded-md border border-[#E4E4E7] bg-[#F4F4F5] px-2 py-1 text-xs"
+          >
+            <span
+              class="inline-block h-2 w-2 rounded-full"
+              :class="demoStatus.running ? 'bg-[#059669] animate-pulse' : 'bg-[#71717A]'"
+            />
+            <span class="font-medium text-[#09090B] tabular-nums">
+              Demo {{ demoStatus.requests_sent }} reqs
+            </span>
+            <Button
+              v-if="!demoStatus.running"
+              class="px-2 py-0.5 text-[11px]"
+              :disabled="demoBusy"
+              @click="startTraffic"
+            >
+              Start Demo Traffic
+            </Button>
+            <Button
+              v-else
+              data-variant="danger"
+              class="px-2 py-0.5 text-[11px]"
+              :disabled="demoBusy"
+              @click="stopTraffic"
+            >
+              Stop Demo Traffic
+            </Button>
+            <Button
+              class="px-2 py-0.5 text-[11px]"
+              :disabled="demoBusy"
+              @click="runBurst(6)"
+            >
+              Burst +6
+            </Button>
+          </div>
           <div class="hidden sm:flex items-center gap-2 text-xs">
             <span class="font-medium text-[#09090B] truncate max-w-[160px]">
               {{ adminLabel }}
@@ -205,5 +262,20 @@ const adminRoleText = computed(() => {
         <slot />
       </main>
     </div>
+
+    <!-- Human-in-the-loop confirmation dialog for data-agent-confirm actions -->
+    <Dialog :open="Boolean(pendingConfirm)" @update:open="(v) => { if (!v) resolveConfirm(false); }">
+      <DialogBackdrop />
+      <DialogContent class="sm:max-w-md w-[calc(100%-2rem)]">
+        <DialogTitle>Confirm UI Agent Action</DialogTitle>
+        <DialogDescription class="mt-2 text-sm text-[#52525B]">
+          {{ pendingConfirm?.message || "Approve this action requested by an agent?" }}
+        </DialogDescription>
+        <div class="mt-5 flex justify-end gap-2">
+          <Button @click="resolveConfirm(false)">Deny Action</Button>
+          <Button data-variant="primary" @click="resolveConfirm(true)">Approve Action</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   </div>
 </template>

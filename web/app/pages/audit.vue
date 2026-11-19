@@ -334,7 +334,12 @@ onMounted(() => {
         </Field>
         <div class="flex justify-end gap-2 pt-2">
           <DialogClose>Cancel</DialogClose>
-          <Button data-variant="danger" pending-announcement="Pruning runs" @click="confirmPrune">
+          <Button
+            data-variant="danger"
+            data-agent-confirm="Permanently delete aged audit runs from storage?"
+            pending-announcement="Pruning runs"
+            @click="confirmPrune"
+          >
             Confirm Prune
           </Button>
         </div>

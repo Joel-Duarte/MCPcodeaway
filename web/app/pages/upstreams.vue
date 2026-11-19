@@ -315,7 +315,11 @@ const experimentRows = computed(() => {
         </DialogDescription>
         <div class="flex justify-end gap-2 pt-2">
           <DialogClose>Cancel</DialogClose>
-          <Button data-variant="danger" @click="confirmDelete">
+          <Button
+            data-variant="danger"
+            data-agent-confirm="Remove this dynamic upstream from the gateway?"
+            @click="confirmDelete"
+          >
             Delete Upstream
           </Button>
         </div>

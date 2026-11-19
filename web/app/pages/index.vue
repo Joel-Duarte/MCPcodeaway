@@ -77,6 +77,12 @@ interface AnalyticsSummary {
 }
 
 const { apiFetch, setRuntimeMeta } = useAdminApi();
+const { status: demoStatus, busy: demoBusy, runBurst } = useDemoTraffic();
+
+async function triggerOverviewBurst() {
+  await runBurst(6);
+  await fetchOverview();
+}
 
 const loading = ref(true);
 const errorMessage = ref("");
@@ -213,6 +219,22 @@ function formatUsd(n: number | undefined): string {
     </div>
 
     <template v-else>
+      <!-- Empty-state quick Demo Traffic CTA -->
+      <section
+        v-if="demoStatus.enabled && (valueData?.window_runs ?? 0) === 0"
+        class="flex flex-col gap-3 rounded-lg border border-[#99F6E4] bg-[#F0FDFA] p-4 sm:flex-row sm:items-center sm:justify-between"
+      >
+        <div class="text-[13px] text-[#09090B]">
+          <span class="font-semibold text-[#0F766E]">No /mcp runs recorded yet.</span>
+          <span class="ml-1 text-[#52525B]">
+            Generate real Classic, Code Mode, Auto, and custom-upstream traffic to inspect live telemetry and ROI.
+          </span>
+        </div>
+        <Button data-variant="primary" :disabled="demoBusy" @click="triggerOverviewBurst">
+          Run Demo Burst (+6)
+        </Button>
+      </section>
+
       <!-- 4-column KPI strip -->
       <section aria-label="Gateway value summary" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
@@ -253,6 +275,42 @@ function formatUsd(n: number | undefined): string {
           <div class="mt-1 text-xs text-[#71717A] tabular-nums">
             ABAC filtered: {{ formatInt(valueData?.security_and_governance.abac_rows_filtered) }} · PII redacted: {{ formatInt(valueData?.security_and_governance.pii_secrets_redacted) }}
           </div>
+        </div>
+      </section>
+
+      <!-- Mode Split & Efficiency Bar -->
+      <section
+        aria-label="Execution mode split"
+        class="rounded-lg border border-[#E4E4E7] bg-white p-4"
+      >
+        <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+          <span class="font-semibold text-[#09090B]">Execution Mode Split</span>
+          <div class="flex items-center gap-4 text-[#52525B] tabular-nums">
+            <span class="inline-flex items-center gap-1.5">
+              <span class="inline-block h-2.5 w-2.5 rounded-sm bg-[#0F766E]" />
+              Code Mode: {{ formatInt(analyticsData?.summary.codemode_runs) }} ({{ (analyticsData?.summary.codemode_share_pct ?? 0).toFixed(1) }}%)
+            </span>
+            <span class="inline-flex items-center gap-1.5">
+              <span class="inline-block h-2.5 w-2.5 rounded-sm bg-[#2563EB]" />
+              Classic: {{ formatInt(analyticsData?.summary.classic_runs) }}
+            </span>
+          </div>
+        </div>
+        <div class="mt-2.5 h-2.5 w-full overflow-hidden rounded-full bg-[#F4F4F5] flex">
+          <div
+            class="h-full bg-[#0F766E] transition-all duration-200"
+            :style="{ width: `${analyticsData?.summary.codemode_share_pct ?? 0}%` }"
+          />
+          <div
+            class="h-full bg-[#2563EB] transition-all duration-200"
+            :style="{
+              width: `${
+                (analyticsData?.summary.total_runs ?? 0) > 0
+                  ? Math.max(0, 100 - (analyticsData?.summary.codemode_share_pct ?? 0))
+                  : 0
+              }%`,
+            }"
+          />
         </div>
       </section>
 

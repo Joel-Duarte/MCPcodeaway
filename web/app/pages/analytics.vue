@@ -63,6 +63,12 @@ interface AnalyticsResponse {
 }
 
 const { apiFetch } = useAdminApi();
+const { status: demoStatus, busy: demoBusy, runBurst } = useDemoTraffic();
+
+async function triggerAnalyticsBurst() {
+  await runBurst(6);
+  await fetchAnalytics();
+}
 
 const loading = ref(true);
 const errorMessage = ref("");
@@ -181,6 +187,22 @@ function formatUsd(n: number | undefined): string {
     </div>
 
     <template v-else-if="analytics">
+      <!-- Empty-state quick Demo Traffic CTA -->
+      <section
+        v-if="demoStatus.enabled && analytics.summary.total_runs === 0"
+        class="flex flex-col gap-3 rounded-lg border border-[#99F6E4] bg-[#F0FDFA] p-4 sm:flex-row sm:items-center sm:justify-between"
+      >
+        <div class="text-[13px] text-[#09090B]">
+          <span class="font-semibold text-[#0F766E]">Analytics database is empty.</span>
+          <span class="ml-1 text-[#52525B]">
+            Run a live Demo Burst to populate group spend, user attribution, and Code Mode savings charts.
+          </span>
+        </div>
+        <Button data-variant="primary" :disabled="demoBusy" @click="triggerAnalyticsBurst">
+          Run Demo Burst (+6)
+        </Button>
+      </section>
+
       <!-- Summary KPI Strip -->
       <section class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
@@ -222,6 +244,61 @@ function formatUsd(n: number | undefined): string {
           </div>
           <div class="mt-1 text-xs text-[#71717A]">
             Scope: {{ analytics.tenant_scope }}
+          </div>
+        </div>
+      </section>
+
+      <!-- Group Savings Comparison Chart (SVG bars) -->
+      <section
+        v-if="analytics.by_company_group.length > 0"
+        aria-label="Company group mode and token comparison"
+        class="rounded-lg border border-[#E4E4E7] bg-white p-4"
+      >
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h2 class="text-[15px] font-semibold text-[#09090B]">
+            Code Mode vs. Classic Volume by Company Group
+          </h2>
+          <div class="flex items-center gap-4 text-xs text-[#52525B]">
+            <span class="inline-flex items-center gap-1.5">
+              <span class="inline-block h-2.5 w-2.5 rounded-sm bg-[#0F766E]" />
+              Code Mode Runs
+            </span>
+            <span class="inline-flex items-center gap-1.5">
+              <span class="inline-block h-2.5 w-2.5 rounded-sm bg-[#2563EB]" />
+              Classic Runs
+            </span>
+          </div>
+        </div>
+        <div class="mt-3 space-y-2.5">
+          <div
+            v-for="g in analytics.by_company_group"
+            :key="g.group"
+            class="grid grid-cols-1 gap-1.5 sm:grid-cols-12 sm:items-center"
+          >
+            <div class="sm:col-span-3 text-xs font-medium text-[#09090B] truncate">
+              {{ g.group }}
+            </div>
+            <div class="sm:col-span-6">
+              <svg viewBox="0 0 100 8" class="h-3 w-full overflow-hidden rounded bg-[#F4F4F5]" role="img" :aria-label="`${g.group} run split`">
+                <rect
+                  x="0"
+                  y="0"
+                  :width="g.runs > 0 ? (g.codemode_runs / g.runs) * 100 : 0"
+                  height="8"
+                  fill="#0F766E"
+                />
+                <rect
+                  :x="g.runs > 0 ? (g.codemode_runs / g.runs) * 100 : 0"
+                  y="0"
+                  :width="g.runs > 0 ? (g.classic_runs / g.runs) * 100 : 0"
+                  height="8"
+                  fill="#2563EB"
+                />
+              </svg>
+            </div>
+            <div class="sm:col-span-3 text-right text-xs text-[#52525B] tabular-nums">
+              {{ formatInt(g.tokens_saved) }} tok · {{ formatUsd(g.estimated_cost_saved_usd) }}
+            </div>
           </div>
         </div>
       </section>
