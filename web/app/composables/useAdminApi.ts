@@ -70,7 +70,8 @@ export function useAdminApi() {
     opts: Parameters<typeof $fetch<T>>[1] = {},
     skipRedirect = false
   ): Promise<T> {
-    const url = buildUrl(String(config.public.apiBase || ""), path);
+    const apiBase = String(config.public.apiBase || "").replace(/\/+$/, "");
+    const url = buildUrl(apiBase, path);
     const headers: Record<string, string> = {
       ...(opts?.headers as Record<string, string> | undefined),
     };
@@ -79,6 +80,7 @@ export function useAdminApi() {
     }
     try {
       return await $fetch<T>(url, {
+        baseURL: apiBase ? undefined : "/",
         ...opts,
         headers,
         credentials: "include",
