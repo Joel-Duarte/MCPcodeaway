@@ -49,12 +49,27 @@ If an agent or CLI harness does not support interactive browser OAuth/Entra SSO 
 
 ## 3. Agent & Model Self-Identification on First Connect
 
-An agent harness can identify **both its model and the user's intent on the very first HTTP call** (`initialize`, `tools/list`, or `tools/call`) so MCPcodeaway can run zero-round-trip discovery and model-aware Classic vs. Code Mode routing:
+An agent harness can identify **both its model and the user's intent on the first current-protocol request** (`server/discover`, `tools/list`, or `tools/call`) so MCPcodeaway can run zero-round-trip discovery and model-aware Classic vs. Code Mode routing:
 
 1. **HTTP Headers on `POST /mcp`:**
    - `X-Model-Name: qwen/qwen3.5-9b` (or `gemini-2.5-flash`, `claude-sonnet-4-5`, etc.) — tells the gateway which LLM is driving the agent.
    - `X-Intent: Reconcile overdue EU and US invoices` — triggers zero-round-trip `x_intent` discovery during `tools/list`.
-2. **Standard MCP `initialize` Handshake (`params.clientInfo`):**
-   - Standard MCP clients send `params.clientInfo = {"name": "copilot-finance-agent", "version": "1.0", "model": "..."}` on `initialize`.
+2. **Current MCP request metadata (`params._meta`):**
+   - Send `io.modelcontextprotocol/protocolVersion: "2026-07-28"`, client capabilities, and client info on each request. No initialize handshake or MCP session ID is used.
 3. **JWT `azp` / `client_id` Claim:**
    - Even if the harness sends no custom headers, the gateway extracts `identity.client_id` from the OAuth token (`azp` / `appid`) and correlates every run in `/admin/analytics/usage`.
+
+For a direct HTTP client, each request uses the same envelope and matching routing headers. A discovery request looks like:
+
+```http
+POST /mcp HTTP/1.1
+Authorization: Bearer <ACCESS_TOKEN>
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: server/discover
+
+{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"example-agent","version":"1.0"}}}}
+```
+
+`tools/call` adds `Mcp-Name` matching `params.name`; `tools/list` and `tools/call` carry the same per-request `_meta` fields. The gateway rejects `initialize`, old protocol versions, and `Mcp-Session-Id`.

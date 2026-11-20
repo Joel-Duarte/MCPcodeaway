@@ -79,6 +79,12 @@ from gateway.dispatcher import (
     build_provenance_envelope,
     summarize_value_shape,
 )
+from gateway.mcp_protocol import (
+    MCP_CLIENT_CAPABILITIES_META,
+    MCP_PROTOCOL_VERSION,
+    MCP_PROTOCOL_VERSION_META,
+    MCP_SERVER_INFO_META,
+)
 from gateway.oauth_discovery import create_oauth_discovery_router
 from gateway.observability import (
     MetricsRegistry,
@@ -113,11 +119,6 @@ from gateway.upstream_clients import (
 )
 
 _TRACER = trace.get_tracer("mcpcodeaway.server")
-MCP_PROTOCOL_VERSION = "2026-07-28"
-MCP_LEGACY_PROTOCOL_VERSIONS = {"2025-11-25", "2025-06-18", "2025-03-26"}
-MCP_PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion"
-MCP_CLIENT_CAPABILITIES_META = "io.modelcontextprotocol/clientCapabilities"
-MCP_SERVER_INFO_META = "io.modelcontextprotocol/serverInfo"
 
 _VALID_MODES: set[str] = {
     "codemode",
@@ -296,8 +297,6 @@ class GatewayRuntime:
         self.registry = UpstreamRegistry(self.settings, store=self.store)
         self.client_manager = UpstreamClientManager(
             http_client=http_client,
-            cache=self.cache,
-            session_ttl_seconds=self.settings.mcp_session_ttl_seconds,
             app_env=self.settings.app_env,
             block_private_ips_in_prod=self.settings.block_private_ips_in_prod,
             allowed_hosts=self.settings.allowed_upstream_hosts,
@@ -1389,13 +1388,16 @@ def _jsonrpc_err(req_id: Any, code: int, message: str) -> JSONResponse:
 
 
 def _validate_modern_mcp_request(request: Request, payload: Any) -> JSONResponse | None:
-    """Validate the 2026 per-request envelope and Streamable HTTP mirror headers.
-
-    Requests without modern metadata are retained temporarily for handshake-era clients.
-    Neither path creates or depends on a protocol session.
-    """
+    """Require the current sessionless per-request envelope and HTTP headers."""
     if not isinstance(payload, dict):
-        return None
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32020, "message": "MCP request must be a JSON object"},
+            },
+            status_code=400,
+        )
     method = payload.get("method")
     params = payload.get("params")
     params = params if isinstance(params, dict) else {}
@@ -1405,22 +1407,6 @@ def _validate_modern_mcp_request(request: Request, payload: Any) -> JSONResponse
     header_version = request.headers.get("mcp-protocol-version")
     method_header = request.headers.get("mcp-method")
     name_header = request.headers.get("mcp-name")
-    if (
-        body_version is None
-        and header_version in MCP_LEGACY_PROTOCOL_VERSIONS
-        and method_header is None
-        and name_header is None
-    ):
-        return None
-    modern = (
-        body_version is not None
-        or header_version is not None
-        or method_header is not None
-        or name_header is not None
-    )
-    if not modern:
-        return None
-
     req_id = payload.get("id")
 
     def mismatch(message: str) -> JSONResponse:
@@ -1428,6 +1414,9 @@ def _validate_modern_mcp_request(request: Request, payload: Any) -> JSONResponse
             {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32020, "message": message}},
             status_code=400,
         )
+
+    if request.headers.get("mcp-session-id"):
+        return mismatch("MCP protocol sessions are not supported")
 
     request_id = payload.get("id")
     if payload.get("jsonrpc") != "2.0" or not (
@@ -1722,10 +1711,6 @@ def create_gateway_app(
                 method = payload.get("method")
                 params = payload.get("params") or {}
                 request_meta = params.get("_meta", {}) if isinstance(params, dict) else {}
-                modern_request = (
-                    isinstance(request_meta, dict)
-                    and request_meta.get(MCP_PROTOCOL_VERSION_META) == MCP_PROTOCOL_VERSION
-                )
                 client_info = (
                     request_meta.get("io.modelcontextprotocol/clientInfo")
                     or params.get("clientInfo")
@@ -1787,17 +1772,6 @@ def create_gateway_app(
                         resp.headers["X-Gateway-Model"] = effective_model_name
                     return resp
 
-                if method == "initialize":
-                    return _finish(
-                        _jsonrpc_ok(
-                            req_id,
-                            {
-                                "protocolVersion": "2025-11-25",
-                                "capabilities": {"tools": {"listChanged": True}},
-                                "serverInfo": {"name": "mcpcodeaway", "version": __version__},
-                            },
-                        )
-                    )
                 if method == "server/discover":
                     return _finish(
                         _jsonrpc_ok(
@@ -1821,23 +1795,6 @@ def create_gateway_app(
                             },
                         )
                     )
-                if method == "notifications/initialized":
-                    if modern_request:
-                        return JSONResponse(
-                            {
-                                "jsonrpc": "2.0",
-                                "error": {
-                                    "code": -32600,
-                                    "message": (
-                                        "Client notifications are not supported over modern "
-                                        "Streamable HTTP"
-                                    ),
-                                },
-                            },
-                            status_code=400,
-                        )
-                    return _finish(JSONResponse({}, status_code=202))
-
                 await runtime.ensure_catalog_for_identity(identity)
                 target_tool_hint: str | None = None
                 if method == "tools/call" and isinstance(params, dict):
@@ -1902,9 +1859,8 @@ def create_gateway_app(
                         limit=params.get("limit"),
                         cursor=params.get("cursor"),
                     )
-                    if modern_request:
-                        listed.setdefault("ttlMs", 0)
-                        listed.setdefault("cacheScope", "private")
+                    listed.setdefault("ttlMs", 0)
+                    listed.setdefault("cacheScope", "private")
                     return _finish(_jsonrpc_ok(req_id, listed))
 
                 if method == "tools/call":
@@ -2066,8 +2022,7 @@ def create_gateway_app(
                 unsupported_method = _jsonrpc_err(
                     req_id, -32601, f"Unsupported MCP method '{method}'"
                 )
-                if modern_request:
-                    unsupported_method.status_code = 404
+                unsupported_method.status_code = 404
                 return _finish(unsupported_method, status_label="error")
             finally:
                 clear_request_context()
@@ -2511,7 +2466,6 @@ def create_gateway_app(
             q: str | None = Query(default=None),
             group: str | None = Query(default=None),
             auth_type: str | None = Query(default=None),
-            stateful: bool | None = Query(default=None),
             mode: str | None = Query(default=None),
             page: int = Query(default=1, ge=1),
             page_size: int = Query(default=200, ge=1, le=500),
@@ -2542,8 +2496,6 @@ def create_gateway_app(
                 filtered = [u for u in filtered if group in u.allowed_groups]
             if auth_type:
                 filtered = [u for u in filtered if u.auth_type == auth_type]
-            if stateful is not None:
-                filtered = [u for u in filtered if bool(u.stateful_session) is stateful]
             if mode:
                 filtered = [u for u in filtered if u.preferred_mode == mode]
 
@@ -3041,7 +2993,6 @@ def create_gateway_app(
                 target_tool,
                 body.arguments,
                 auth_headers=headers,
-                session_scope=f"{ident.tenant_id}:{ident.sub}",
             )
             return {
                 "ok": True,

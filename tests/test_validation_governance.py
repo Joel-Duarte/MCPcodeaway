@@ -114,6 +114,12 @@ async def test_pluggable_auth_types_and_schema_drift_detection(tmp_path, monkeyp
         if x_partner_key != "partner-key-999":
             raise HTTPException(status_code=401, detail="Invalid API key")
         method = request.get("method")
+        if method == "server/discover":
+            return {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"supportedVersions": ["2026-07-28"]},
+            }
         if method == "tools/list":
             return {
                 "jsonrpc": "2.0",
@@ -138,6 +144,12 @@ async def test_pluggable_auth_types_and_schema_drift_detection(tmp_path, monkeyp
     async def bearer_mcp(request: dict, authorization: str | None = Header(default=None)):
         if authorization != "Bearer partner-bearer-777":
             raise HTTPException(status_code=401, detail="Invalid bearer secret")
+        if request.get("method") == "server/discover":
+            return {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"supportedVersions": ["2026-07-28"]},
+            }
         if request.get("method") == "tools/list":
             return {
                 "jsonrpc": "2.0",
@@ -160,6 +172,12 @@ async def test_pluggable_auth_types_and_schema_drift_detection(tmp_path, monkeyp
 
     @custom_app.post("/open/mcp")
     async def open_mcp(request: dict):
+        if request.get("method") == "server/discover":
+            return {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"supportedVersions": ["2026-07-28"]},
+            }
         if request.get("method") == "tools/list":
             return {
                 "jsonrpc": "2.0",

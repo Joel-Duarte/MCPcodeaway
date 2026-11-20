@@ -15,6 +15,7 @@ from gateway.auth import LocalDevKeyManager
 from gateway.cli import main as cli_main
 from gateway.comparator import audit_catalog_comparison
 from gateway.config import GatewaySettings, UpstreamConfig
+from gateway.mcp_protocol import request_headers, request_meta
 from gateway.server import GatewayRuntime, create_gateway_app
 from gateway.state import SQLiteAuditStore
 from gateway.upstream_clients import DiscoveredTool
@@ -36,6 +37,12 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
 
     @extra_app.post("/extra/mcp")
     async def extra_mcp(request: dict):
+        if request.get("method") == "server/discover":
+            return {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"supportedVersions": ["2026-07-28"]},
+            }
         if request.get("method") == "tools/list":
             return {
                 "jsonrpc": "2.0",
@@ -168,8 +175,16 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
             # Verify hot-reload into BOTH traditional tools/list and codemode search+execute
             trad_tools = await gw.post(
                 "/mcp?mode=traditional",
-                headers={"Authorization": f"Bearer {token}"},
-                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    **request_headers("tools/list"),
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {"_meta": request_meta()},
+                },
             )
             trad_names = {t["name"] for t in trad_tools.json()["result"]["tools"]}
             assert "orders_swagger__get_order" in trad_names
@@ -177,12 +192,16 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
 
             cm_exec = await gw.post(
                 "/mcp?mode=codemode",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    **request_headers("tools/call", tool_name="execute_code"),
+                },
                 json={
                     "jsonrpc": "2.0",
                     "id": 2,
                     "method": "tools/call",
                     "params": {
+                        "_meta": request_meta(),
                         "name": "execute_code",
                         "arguments": {
                             "code": (

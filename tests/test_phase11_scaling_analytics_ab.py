@@ -22,7 +22,7 @@ from gateway.dispatcher import (
 from gateway.sandbox_worker import create_sandbox_worker_app
 from gateway.server import GatewayRuntime, create_gateway_app
 from gateway.state import InMemoryCacheBackend, PostgresAuditStore, SQLiteAuditStore
-from gateway.upstream_clients import DiscoveredTool, UpstreamClientManager
+from gateway.upstream_clients import DiscoveredTool
 
 
 def test_multikey_rotation_worker_and_provenance() -> None:
@@ -82,15 +82,9 @@ def test_multikey_rotation_worker_and_provenance() -> None:
     assert verify_provenance_envelope(env, "sig_v1") is False
 
 
-async def test_shared_cache_mcp_session_and_catalog_epoch(tmp_path: Path) -> None:
+async def test_shared_cache_catalog_epoch_sync_has_no_mcp_session_state(tmp_path: Path) -> None:
     shared_cache = InMemoryCacheBackend()
-    mgr_a = UpstreamClientManager(cache=shared_cache, session_ttl_seconds=120)
-    mgr_b = UpstreamClientManager(cache=shared_cache, session_ttl_seconds=120)
-
-    await mgr_a._set_session_id("srv:tenant:sub", "sess-shared-123")
-    assert await mgr_b._get_session_id("srv:tenant:sub") == "sess-shared-123"
-    await mgr_b._delete_session_id("srv:tenant:sub")
-    assert await mgr_a._get_session_id("srv:tenant:sub") is None
+    assert await shared_cache.get("mcp_sess:srv:tenant:sub") is None
 
     # Cross-replica catalog_epoch synchronization.
     tool_v1 = DiscoveredTool(
@@ -1121,6 +1115,10 @@ def test_live_websocket_telemetry_stream_and_summary_only_payload(tmp_path: Path
             )
             assert burst_r.status_code == 200
             evt = ws.receive_json()
+            for _ in range(10):
+                if evt.get("type") == "run_recorded":
+                    break
+                evt = ws.receive_json()
             assert evt["type"] == "run_recorded"
             assert "run_id" in evt
             assert "raw_payload" not in evt

@@ -529,7 +529,6 @@ class HostDispatcher:
                     tool,
                     scoped_args,
                     auth_headers=auth_headers,
-                    session_scope=f"{identity.tenant_id}:{identity.sub}",
                 )
             except Exception as exc:
                 duration_ms = round((time.perf_counter() - started) * 1000, 3)

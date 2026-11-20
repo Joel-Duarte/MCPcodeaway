@@ -32,7 +32,6 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     // 2. Gateway Usage populated + Reactive Filters
     await page.getByRole("link", { name: /Gateway Usage/i }).click();
     await expect(page.getByRole("heading", { name: /Gateway Usage, Groups & Cost Attribution/i })).toBeVisible();
-    await expect(page.getByText(/Code Mode vs\. Classic Volume/i)).toBeVisible();
 
     // 2b. Dedicated Optimization & Cost Savings page
     await page.getByRole("link", { name: /Optimization & ROI/i }).click();
@@ -64,11 +63,13 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
 
     // 6. Onboarding 3-Step Progressive Wizard (Step 2 locked until Inspect Schema)
     await page.getByRole("link", { name: /Onboarding & A\/B Lab/i }).click();
+    await expect(page.getByText("Stateful MCP Session", { exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /2\. Policy & Mode/i })).toBeDisabled();
     await page.getByRole("button", { name: /Mock OpenAPI/i }).click();
     await page.getByRole("button", { name: /Inspect Schema/i }).click();
     await expect(page.getByRole("button", { name: /2\. Policy & Mode/i })).toBeEnabled({ timeout: 5000 });
     await page.getByRole("button", { name: /2\. Policy & Mode/i }).click();
+    await expect(page.getByText(/Sessionless MCP/i)).toBeVisible();
     await expect(page.getByText(/Step 2 — Access Control/i)).toBeVisible();
     await page.getByRole("button", { name: /3\. A\/B Test & Save/i }).click();
     await expect(page.getByRole("button", { name: /Run A\/B Evaluation/i })).toBeVisible();

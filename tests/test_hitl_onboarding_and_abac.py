@@ -11,6 +11,7 @@ from fastapi import FastAPI, Header, HTTPException
 from examples.mock_backends import create_mock_backends_app
 from gateway.auth import LocalDevKeyManager
 from gateway.config import GatewaySettings
+from gateway.mcp_protocol import request_headers, request_meta
 from gateway.server import GatewayRuntime, create_gateway_app
 from gateway.state import SQLiteAuditStore
 
@@ -26,8 +27,16 @@ async def _post_mcp(
     url = f"/mcp?{query}" if query else "/mcp"
     resp = await client.post(
         url,
-        headers={"Authorization": f"Bearer {token}"},
-        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}},
+        headers={
+            "Authorization": f"Bearer {token}",
+            **request_headers(method, tool_name=(params or {}).get("name")),
+        },
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": {"_meta": request_meta(), **(params or {})},
+        },
     )
     assert resp.status_code == 200, resp.text
     return resp.json()
@@ -341,6 +350,12 @@ async def test_host_side_abac_enforcement_for_api_key_upstream(tmp_path, monkeyp
     ):
         if x_legacy_key != "legacy-secret-123":
             raise HTTPException(status_code=401, detail="Invalid legacy API key")
+        if request.get("method") == "server/discover":
+            return {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"supportedVersions": ["2026-07-28"]},
+            }
         if request.get("method") == "tools/list":
             return {
                 "jsonrpc": "2.0",

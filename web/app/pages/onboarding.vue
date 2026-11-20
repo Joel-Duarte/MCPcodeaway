@@ -83,7 +83,6 @@ const draftSecretEnv = ref("");
 const draftApiKeyHeader = ref("X-API-Key");
 const draftRoles = ref("finance_analyst, ops_engineer, gateway_admin");
 const draftGroups = ref("");
-const draftStateful = ref(false);
 const draftPreferredMode = ref("auto");
 const draftAbEnabled = ref(false);
 const draftAbExpId = ref("ab_inventory_v1");
@@ -205,10 +204,6 @@ const authRequestPreview = computed(() => {
 const sessionAdvice = computed(() => {
   const count = inspectResult.value?.inspection.tool_count ?? 0;
   return {
-    statefulHint:
-      sourceKind.value === "mcp_http"
-        ? "Auto-detect recommended: only enable Stateful MCP Session if the server rejects stateless POST /mcp without Mcp-Session-Id."
-        : "Keep OFF for REST/OpenAPI backends — HTTP OpenAPI calls are naturally stateless.",
     abHint:
       count >= 10
         ? `Recommended: ${count} tools detected — run a Live Traffic A/B Experiment to prove Code Mode token savings.`
@@ -331,7 +326,6 @@ function buildUpstreamPayload() {
     api_key_header: draftApiKeyHeader.value.trim() || "X-API-Key",
     allowed_roles: roles,
     allowed_groups: groups,
-    stateful_session: draftStateful.value,
     preferred_mode: draftPreferredMode.value,
     enabled: true,
     ab_experiment: draftAbEnabled.value
@@ -353,7 +347,6 @@ const yamlPreview = computed(() => {
     cfg.url ? `    url: ${cfg.url}` : "",
     cfg.openapi_spec_url ? `    openapi_spec_url: ${cfg.openapi_spec_url}` : "",
     `    auth_type: ${cfg.auth_type}`,
-    `    stateful_session: ${cfg.stateful_session}`,
     `    preferred_mode: ${cfg.preferred_mode}`,
     `    allowed_roles: [${cfg.allowed_roles.join(", ")}]`,
   ].filter(Boolean);
@@ -487,7 +480,11 @@ function applyImportedJson() {
     if (typeof parsed.downstream_scope === "string") draftScope.value = parsed.downstream_scope;
     if (typeof parsed.secret_env_var === "string") draftSecretEnv.value = parsed.secret_env_var;
     if (typeof parsed.api_key_header === "string") draftApiKeyHeader.value = parsed.api_key_header;
-    if (typeof parsed.stateful_session === "boolean") draftStateful.value = parsed.stateful_session;
+    if (parsed.stateful_session === true) {
+      throw new Error(
+        "stateful_session is unsupported. MCP requests are sessionless; use explicit resource IDs in tool arguments."
+      );
+    }
     if (typeof parsed.preferred_mode === "string") draftPreferredMode.value = parsed.preferred_mode;
     if (Array.isArray(parsed.allowed_roles)) {
       draftRoles.value = parsed.allowed_roles.map((r) => String(r)).join(", ");
@@ -501,8 +498,11 @@ function applyImportedJson() {
     }
     importDialogOpen.value = false;
     statusMessage.value = "Imported JSON into draft form.";
-  } catch {
-    errorMessage.value = "Invalid JSON payload. Paste a single UpstreamConfig JSON object.";
+  } catch (err) {
+    errorMessage.value =
+      err instanceof Error
+        ? err.message
+        : "Invalid JSON payload. Paste a single UpstreamConfig JSON object.";
   }
 }
 
@@ -923,28 +923,17 @@ async function copyPromptText() {
 
       <div class="rounded border border-[#99F6E4] bg-[#F0FDFA] p-3 text-xs text-[#09090B] space-y-1">
         <div>
-          <strong class="text-[#0F766E]">Stateless by Default:</strong>
-          Monty sandboxes are 100% ephemeral, and MCP Streamable HTTP defaults to stateless. Legacy downstream <code class="font-mono-data">Mcp-Session-Id</code> handshakes are handled automatically if a 3rd-party server requires one.
+          <strong class="text-[#0F766E]">Sessionless MCP:</strong>
+          Every request uses the current sessionless MCP protocol. Multi-step business workflows pass explicit resource IDs in tool arguments; cookie-based API sessions are unsupported.
         </div>
         <div><strong class="text-[#0F766E]">A/B Advice:</strong> {{ sessionAdvice.abHint }}</div>
       </div>
 
       <details class="rounded border border-[#E4E4E7] bg-[#FAFAFA] p-3">
         <summary class="cursor-pointer text-xs font-semibold text-[#09090B]">
-          Advanced Session &amp; A/B Settings (Optional — auto-detected by default)
+          Advanced A/B Settings (Optional)
         </summary>
         <div class="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <Field>
-            <div class="flex items-center justify-between gap-2">
-              <div>
-                <FieldLabel>Stateful MCP Session</FieldLabel>
-                <FieldDescription>Only enable if upstream requires pinned Mcp-Session-Id</FieldDescription>
-              </div>
-              <Switch v-model:checked="draftStateful">
-                <SwitchThumb />
-              </Switch>
-            </div>
-          </Field>
           <Field>
             <div class="flex items-center justify-between gap-2">
               <div>

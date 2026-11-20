@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 
+from gateway.mcp_protocol import request_headers, request_meta
+
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
@@ -93,7 +95,7 @@ class DemoTrafficRunner:
                         )
                     },
                 },
-                None,
+                {"X-Model-Name": "claude-sonnet-4-5"},
             ),
             (
                 "sales_ops_analyst",
@@ -103,7 +105,7 @@ class DemoTrafficRunner:
                     "name": "billing_legacy_eu__list_eu_invoices",
                     "arguments": {"status": "overdue"},
                 },
-                None,
+                {"X-Model-Name": "gpt-4o"},
             ),
             (
                 "platform_engineer",
@@ -118,7 +120,32 @@ class DemoTrafficRunner:
                         )
                     },
                 },
-                {"X-Intent": "reconcile overdue invoices and trial balance variances"},
+                {
+                    "X-Intent": "reconcile overdue invoices and trial balance variances",
+                    "X-Model-Name": "gemini-2.5-pro",
+                },
+            ),
+            (
+                "finance_analyst",
+                "mode=codemode",
+                "finance:llama_codemode_err",
+                {
+                    "name": "execute_code",
+                    "arguments": {
+                        "code": "await billing_legacy_eu__list_eu_invoices(invalid_arg=True)"
+                    },
+                },
+                {"X-Model-Name": "llama-3.3-70b"},
+            ),
+            (
+                "finance_analyst",
+                "mode=traditional",
+                "finance:llama_classic_ok",
+                {
+                    "name": "billing_legacy_eu__list_eu_invoices",
+                    "arguments": {"status": "overdue"},
+                },
+                {"X-Model-Name": "llama-3.3-70b"},
             ),
             (
                 "legal_counsel",
@@ -268,7 +295,12 @@ class DemoTrafficRunner:
         if dev_keys is None:
             return False
         token = dev_keys.issue_user_token(persona=persona)
-        headers = {"Authorization": f"Bearer {token}", **(extra_headers or {})}
+        headers = {
+            **request_headers("tools/call", tool_name=str(params.get("name") or "") or None),
+            "Authorization": f"Bearer {token}",
+            **(extra_headers or {}),
+        }
+        payload_params = {"_meta": request_meta(), **params}
         try:
             resp = await client.post(
                 f"/mcp?{query}",
@@ -277,7 +309,7 @@ class DemoTrafficRunner:
                     "jsonrpc": "2.0",
                     "id": self._step + 1,
                     "method": "tools/call",
-                    "params": params,
+                    "params": payload_params,
                 },
             )
             self.requests_sent += 1

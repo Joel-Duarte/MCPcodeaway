@@ -12,17 +12,15 @@ from gateway import __version__
 from gateway.ab_testing import OnboardingAbTestRequest, run_onboarding_ab_test
 from gateway.auth import CallerIdentity
 from gateway.config import UpstreamConfig
+from gateway.mcp_protocol import MCP_PROTOCOL_VERSION, MCP_SERVER_INFO_META
 from gateway.upstream_clients import validate_upstream_url
-
-_MCP_PROTOCOL_VERSION = "2026-07-28"
-_MCP_SERVER_INFO_META = "io.modelcontextprotocol/serverInfo"
 
 
 def _admin_mcp_result(result: dict[str, Any]) -> dict[str, Any]:
     result.setdefault("resultType", "complete")
     result.setdefault(
         "_meta",
-        {_MCP_SERVER_INFO_META: {"name": "mcpcodeaway-self-admin", "version": __version__}},
+        {MCP_SERVER_INFO_META: {"name": "mcpcodeaway-self-admin", "version": __version__}},
     )
     return result
 
@@ -148,25 +146,6 @@ async def handle_admin_mcp_request(
     req_id = payload.get("id")
     method = payload.get("method")
     params = payload.get("params") or {}
-    meta = params.get("_meta") if isinstance(params, dict) else None
-    modern_request = (
-        isinstance(meta, dict)
-        and meta.get("io.modelcontextprotocol/protocolVersion") == _MCP_PROTOCOL_VERSION
-    )
-
-    if method == "initialize":
-        return JSONResponse(
-            {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "protocolVersion": "2025-11-25",
-                    "serverInfo": {"name": "mcpcodeaway-self-admin", "version": __version__},
-                    "capabilities": {"tools": {}},
-                },
-            }
-        )
-
     if method == "server/discover":
         return JSONResponse(
             {
@@ -174,10 +153,10 @@ async def handle_admin_mcp_request(
                 "id": req_id,
                 "result": _admin_mcp_result(
                     {
-                        "supportedVersions": [_MCP_PROTOCOL_VERSION],
+                        "supportedVersions": [MCP_PROTOCOL_VERSION],
                         "capabilities": {"tools": {}},
                         "_meta": {
-                            _MCP_SERVER_INFO_META: {
+                            MCP_SERVER_INFO_META: {
                                 "name": "mcpcodeaway-self-admin",
                                 "version": __version__,
                             }
@@ -191,8 +170,7 @@ async def handle_admin_mcp_request(
 
     if method == "tools/list":
         tool_list_result: dict[str, Any] = {"tools": _ADMIN_MCP_TOOLS}
-        if modern_request:
-            tool_list_result.update({"ttlMs": 0, "cacheScope": "private"})
+        tool_list_result.update({"ttlMs": 0, "cacheScope": "private"})
         return JSONResponse(
             {
                 "jsonrpc": "2.0",
@@ -208,7 +186,7 @@ async def handle_admin_mcp_request(
                 "id": req_id,
                 "error": {"code": -32601, "message": f"Method '{method}' not found"},
             },
-            status_code=404 if modern_request else 200,
+            status_code=404,
         )
         return response
 

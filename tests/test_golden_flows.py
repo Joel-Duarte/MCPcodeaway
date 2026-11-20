@@ -15,6 +15,7 @@ from examples.mock_backends import create_mock_backends_app
 from gateway.auth import LocalDevKeyManager
 from gateway.config import GatewaySettings
 from gateway.dispatcher import verify_provenance_envelope
+from gateway.mcp_protocol import request_headers, request_meta
 from gateway.server import create_gateway_app
 from gateway.state import SQLiteAuditStore
 
@@ -32,11 +33,20 @@ async def _mcp_call(
     headers: dict[str, str] | None = None,
 ) -> httpx.Response:
     url = f"/mcp?{query}" if query else "/mcp"
-    req_headers = {"Authorization": f"Bearer {token}", **(headers or {})}
+    req_headers = {
+        "Authorization": f"Bearer {token}",
+        **request_headers(method, tool_name=(params or {}).get("name")),
+        **(headers or {}),
+    }
     return await client.post(
         url,
         headers=req_headers,
-        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}},
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": {"_meta": request_meta(), **(params or {})},
+        },
     )
 
 
@@ -49,6 +59,12 @@ def _build_legacy_sloppy_backend(base_backends: FastAPI) -> FastAPI:
     ) -> dict[str, Any]:
         if x_legacy_key != "golden-legacy-key":
             raise HTTPException(status_code=401, detail="Invalid legacy API key")
+        if request.get("method") == "server/discover":
+            return {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"supportedVersions": ["2026-07-28"]},
+            }
         if request.get("method") == "tools/list":
             return {
                 "jsonrpc": "2.0",
@@ -320,6 +336,15 @@ async def test_startup_discovery_recovers_after_transient_failure(tmp_path: Path
         attempts += 1
         if attempts == 1:
             return httpx.Response(500, json={"error": "jwks not ready yet"})
+        if json.loads(request.content).get("method") == "server/discover":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"supportedVersions": ["2026-07-28"]},
+                },
+            )
         return httpx.Response(
             200,
             json={

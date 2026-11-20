@@ -15,10 +15,11 @@ from fastapi import FastAPI, Header, HTTPException
 from examples.mock_backends import create_mock_backends_app
 from gateway.auth import LocalDevKeyManager
 from gateway.config import GatewaySettings
+from gateway.mcp_protocol import request_headers, request_meta
 from gateway.sandbox import RemoteMontyWorkerBackend
 from gateway.sandbox_worker import create_sandbox_worker_app
 from gateway.server import create_gateway_app
-from gateway.state import RedisCacheBackend, SQLiteAuditStore
+from gateway.state import InMemoryCacheBackend, RedisCacheBackend, SQLiteAuditStore
 
 
 def _free_port() -> int:
@@ -260,6 +261,12 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(tmp_path) ->
             audience="api://whoami-srv",
             issuer=settings.oidc_issuer,
         )
+        if request.get("method") == "server/discover":
+            return {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"supportedVersions": ["2026-07-28"]},
+            }
         if request.get("method") == "tools/list":
             return {
                 "jsonrpc": "2.0",
@@ -314,13 +321,30 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(tmp_path) ->
         store=SQLiteAuditStore(settings.sqlite_path),
         dev_keys=dev_keys,
         http_client=backend_client,
+        cache=InMemoryCacheBackend(),
+    )
+    shared_cache = app.state.runtime.cache
+    replica_app = create_gateway_app(
+        settings=settings,
+        store=SQLiteAuditStore(settings.sqlite_path),
+        dev_keys=dev_keys,
+        http_client=backend_client,
+        cache=shared_cache,
     )
     request_slots = asyncio.Semaphore(4)
 
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://gw"
-        ) as gw:
+    async with (
+        app.router.lifespan_context(app),
+        replica_app.router.lifespan_context(replica_app),
+    ):
+        async with (
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://gw-a"
+            ) as gw_a,
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=replica_app), base_url="http://gw-b"
+            ) as gw_b,
+        ):
 
             async def _run_user(idx: int) -> tuple[str, str, dict[str, Any]]:
                 tenant = "tenant-alpha" if idx % 2 == 0 else "tenant-beta"
@@ -332,14 +356,21 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(tmp_path) ->
                     overrides={"sub": sub, "tenant_id": tenant},
                 )
                 async with request_slots:
+                    # Alternate each caller between two independent gateway
+                    # runtimes, modeling a load balancer without sticky affinity.
+                    gw = gw_a if idx % 2 == 0 else gw_b
                     resp = await gw.post(
                         "/mcp?mode=codemode",
-                        headers={"Authorization": f"Bearer {tok}"},
+                        headers={
+                            "Authorization": f"Bearer {tok}",
+                            **request_headers("tools/call", tool_name="execute_code"),
+                        },
                         json={
                             "jsonrpc": "2.0",
                             "id": idx,
                             "method": "tools/call",
                             "params": {
+                                "_meta": request_meta(),
                                 "name": "execute_code",
                                 "arguments": {"code": "await whoami_srv__whoami()"},
                             },
@@ -357,14 +388,18 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(tmp_path) ->
                 persona="finance_analyst",
                 overrides={"sub": "rate-limited-user", "tenant_id": "tenant-alpha"},
             )
-            rl_resp = await gw.post(
+            rl_resp = await gw_a.post(
                 "/mcp?mode=codemode",
-                headers={"Authorization": f"Bearer {rl_tok}"},
+                headers={
+                    "Authorization": f"Bearer {rl_tok}",
+                    **request_headers("tools/call", tool_name="execute_code"),
+                },
                 json={
                     "jsonrpc": "2.0",
                     "id": 99,
                     "method": "tools/call",
                     "params": {
+                        "_meta": request_meta(),
                         "name": "execute_code",
                         "arguments": {
                             "code": ("for _ in range(25):\n    await whoami_srv__whoami()\n")

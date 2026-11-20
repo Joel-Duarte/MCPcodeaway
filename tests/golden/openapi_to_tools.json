@@ -1,0 +1,75 @@
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Inventory API", "version": "1.0.0"},
+  "paths": {
+    "/records/{record_id}": {
+      "get": {
+        "operationId": "getRecord",
+        "summary": "Fetch one inventory record",
+        "parameters": [
+          {"name": "record_id", "in": "path", "required": true, "schema": {"type": "string"}},
+          {"name": "include_history", "in": "query", "schema": {"type": "boolean"}}
+        ],
+        "responses": {
+          "200": {
+            "description": "Record",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Record"}}}
+          }
+        }
+      }
+    },
+    "/records": {
+      "post": {
+        "operationId": "createRecord",
+        "summary": "Create an inventory record",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}, "owner": {"type": "string"}},
+                "required": ["title", "owner"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created record",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Record"}}}
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Record": {
+        "type": "object",
+        "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "owner": {"type": "string"}},
+        "required": ["id", "title", "owner"]
+      }
+    }
+  },
+  "expected_tools": [
+    {
+      "name": "getRecord",
+      "qualified_name": "inventory_api__getRecord",
+      "method": "GET",
+      "path": "/records/{record_id}",
+      "path_params": ["record_id"],
+      "query_params": ["include_history"],
+      "required": ["record_id"]
+    },
+    {
+      "name": "createRecord",
+      "qualified_name": "inventory_api__createRecord",
+      "method": "POST",
+      "path": "/records",
+      "path_params": [],
+      "query_params": [],
+      "required": ["title", "owner"]
+    }
+  ]
+}

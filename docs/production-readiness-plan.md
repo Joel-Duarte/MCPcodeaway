@@ -28,22 +28,24 @@ Record expected tenants, concurrent users, peak MCP requests, maximum Code Mode 
 
 **Gate:** A workload profile and measurable latency/error/availability objectives are written down.
 
-### Phase 1 — Prove identity, cache, and protocol-state isolation
+### Phase 1 — Prove identity, cache, and sessionless protocol isolation
+
+The gateway and its HTTP MCP upstream adapter use only MCP `2026-07-28`. Every request is independently authorized and carries its protocol metadata and routing headers; the gateway never creates, stores, forwards, or accepts MCP session IDs. It does not perform an older initialize handshake or fall back to an older protocol. OpenAPI generation rejects cookie-based auth requirements, and the pooled HTTP adapter does not reuse response cookies.
 
 Add deterministic fake IdP/upstream tests with unique tenant/user sentinels and barriers that force requests to overlap. Exercise:
 
-- Same subject in two tenants; two subjects in one tenant; many interleaved requests.
+- Same subject in two tenants; two subjects in one tenant; many interleaved requests routed across two independent gateway runtimes sharing cache state.
 - Delegated-token cache keys and outbound token claims, audience, and scope.
-- Current MCP protocol metadata/header validation, unsupported-version rejection, and request handling without a gateway-issued MCP session ID.
-- Outbound MCP client interoperability. The gateway's client-facing `/mcp` surface now speaks 2026-07-28, but the upstream client manager still uses handshake-era 2025-03-26 framing for legacy/stateful calls. Add modern outbound requests and a tested, explicit fallback policy for upstream servers that do not support 2026-07-28 before claiming end-to-end current-protocol interoperability.
-- Legacy stateful upstream session mappings across identities and gateway instances, including upstream session rejection/reinitialization and cache loss.
+- Current MCP metadata/header validation, unsupported-version rejection, discovery, tools/list, and tools/call; prove no protocol session ID or cookie appears on any hop.
+- Outbound MCP HTTP framing and current-version advertisement from the server before tool discovery.
+- Golden OpenAPI input-to-generated-tool mapping, including path/query/body mapping, URL encoding, per-request credentials, and rejection of cookie session requirements.
 - Remote sandbox callbacks retaining the request's verified identity while other users execute concurrently.
 - Audit and telemetry ownership for success, failure, cancellation, and timeout paths.
-- Same user in separate conversations. MCP 2026-07-28 carries no conversation session ID; the gateway must not infer conversation state from a connection or protocol session. The legacy downstream mapping remains principal-scoped (`tenant_id:sub`), so an upstream that stores conversation-specific state in its legacy session may share that state across the same principal. Keep that adapter disabled unless the upstream's behavior is acceptable or it provides explicit application handles.
+- Same user in separate conversations: because the protocol has no gateway session, any required business workflow state must be represented by explicit application resource IDs in call arguments and authorized independently on every call.
 
-Run deterministic tests repeatedly and with randomized scheduling. A pass must assert exact owners for every response, downstream session, token, and audit row; “no exception” is not sufficient.
+Run deterministic tests repeatedly and with randomized scheduling. A pass must assert exact owners for every response, callback, token, and audit row; “no exception” is not sufficient.
 
-**Gate:** No cross-tenant/user sentinel or credential appears in another principal's response, callback, session, audit data, or tenant-scoped telemetry.
+**Gate:** No cross-tenant/user sentinel or credential appears in another principal's response, callback, audit data, or tenant-scoped telemetry. A legacy handshake, MCP session ID, or implicit cookie must be rejected or ignored safely.
 
 ### Phase 2 — Prove resource bounds and overload behavior
 
@@ -63,9 +65,9 @@ Test local and remote sandbox paths with a controlled fake backend and real Mont
 
 Use two gateway instances, shared Redis, and shared Postgres (first with local containers, then the chosen managed services):
 
-- Verify OIDC/session/rate-limit/catalog state is correctly shared and scoped.
+- Verify OIDC PKCE/rate-limit/catalog state is correctly shared and scoped. Admin browser login sessions are separate control-plane sessions; they are not MCP protocol sessions.
 - Route the same principal across replicas; restart one replica during requests and between requests.
-- Verify stale worker or upstream sessions are rejected/recreated only within their owner scope.
+- Verify no MCP protocol session or cookie state is needed to move a request between replicas.
 - Test Redis/Postgres unavailability and recovery. Liveness remains process-level; readiness removes a replica only when a required dependency is unavailable.
 - Move retention work to a singleton/lease before production to avoid every replica running the same job.
 - Verify graceful termination/draining and that incomplete mutating calls are not silently replayed.

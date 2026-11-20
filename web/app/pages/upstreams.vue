@@ -6,7 +6,6 @@ interface UpstreamEntry {
   type: string;
   url?: string | null;
   auth_type: string;
-  stateful_session?: boolean;
   preferred_mode?: string;
   allowed_groups?: string[];
   enabled: boolean;
@@ -50,7 +49,6 @@ const deleteDialogOpen = ref(false);
 const searchQuery = ref("");
 const groupFilter = ref("");
 const authFilter = ref("");
-const statefulFilter = ref<"all" | "stateful" | "stateless">("all");
 const modeFilter = ref("");
 const page = ref(1);
 const pageSize = 25;
@@ -68,8 +66,6 @@ async function fetchData(resetPage = false) {
     if (searchQuery.value.trim()) params.set("q", searchQuery.value.trim());
     if (groupFilter.value) params.set("group", groupFilter.value);
     if (authFilter.value) params.set("auth_type", authFilter.value);
-    if (statefulFilter.value === "stateful") params.set("stateful", "true");
-    if (statefulFilter.value === "stateless") params.set("stateful", "false");
     if (modeFilter.value) params.set("mode", modeFilter.value);
 
     const ups = await apiFetch<UpstreamsResponse>(`/admin/upstreams?${params.toString()}`);
@@ -93,7 +89,7 @@ watch(searchQuery, () => {
   }, 200);
 });
 
-watch([groupFilter, authFilter, statefulFilter, modeFilter], () => {
+watch([groupFilter, authFilter, modeFilter], () => {
   void fetchData(true);
 });
 
@@ -101,7 +97,6 @@ function clearFilters() {
   searchQuery.value = "";
   groupFilter.value = "";
   authFilter.value = "";
-  statefulFilter.value = "all";
   modeFilter.value = "";
   void fetchData(true);
 }
@@ -153,7 +148,7 @@ onMounted(() => {
           Upstreams Service Catalog
         </h1>
         <p class="mt-0.5 text-[13px] text-[#52525B]">
-          Search, filter, and manage registered MCP/OpenAPI services, stateful session configuration, and schema digests.
+          Search, filter, and manage registered MCP/OpenAPI services and schema digests.
         </p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
@@ -226,14 +221,9 @@ onMounted(() => {
           </select>
         </div>
         <div>
-          <label class="block text-xs font-medium text-[#52525B]">Session &amp; Mode</label>
-          <div class="mt-1 flex gap-1.5">
-            <select v-model="statefulFilter" class="w-1/2 rounded-md border border-[#E4E4E7] bg-white px-2 py-1.5 text-xs">
-              <option value="all">All Sessions</option>
-              <option value="stateful">Stateful</option>
-              <option value="stateless">Stateless</option>
-            </select>
-            <select v-model="modeFilter" class="w-1/2 rounded-md border border-[#E4E4E7] bg-white px-2 py-1.5 text-xs">
+          <label class="block text-xs font-medium text-[#52525B]">Preferred Mode</label>
+          <div class="mt-1">
+            <select v-model="modeFilter" class="w-full rounded-md border border-[#E4E4E7] bg-white px-2 py-1.5 text-xs">
               <option value="">All Modes</option>
               <option v-for="m in upstreamsData?.facets?.modes || []" :key="m" :value="m">{{ m }}</option>
             </select>
@@ -273,7 +263,6 @@ onMounted(() => {
                 <th class="px-4 py-2.5 whitespace-nowrap">Name</th>
                 <th class="px-4 py-2.5 whitespace-nowrap">Type / Auth</th>
                 <th class="px-4 py-2.5 whitespace-nowrap">Groups</th>
-                <th class="px-4 py-2.5 whitespace-nowrap">Stateful MCP</th>
                 <th class="px-4 py-2.5 whitespace-nowrap">Preferred Mode</th>
                 <th class="px-4 py-2.5 whitespace-nowrap">Digest</th>
                 <th v-if="upstreamsData.dynamic_upstreams_permitted" class="px-4 py-2.5 whitespace-nowrap text-right">
@@ -292,18 +281,6 @@ onMounted(() => {
                 </td>
                 <td class="px-4 py-2.5 text-xs text-[#52525B] whitespace-nowrap">
                   {{ (u.allowed_groups || []).join(", ") || "open" }}
-                </td>
-                <td class="px-4 py-2.5 text-xs whitespace-nowrap">
-                  <span
-                    class="rounded border px-2 py-0.5 font-medium"
-                    :class="
-                      u.stateful_session
-                        ? 'border-[#99F6E4] bg-[#F0FDFA] text-[#0F766E]'
-                        : 'border-[#E4E4E7] bg-[#F4F4F5] text-[#52525B]'
-                    "
-                  >
-                    {{ u.stateful_session ? "Redis Mcp-Session" : "Stateless" }}
-                  </span>
                 </td>
                 <td class="px-4 py-2.5 font-mono-data text-xs text-[#09090B] whitespace-nowrap">
                   {{ u.preferred_mode || "codemode" }}

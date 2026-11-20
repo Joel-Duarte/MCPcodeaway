@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from gateway.alerts import AlertEvaluator, CustomAlertRule
 from gateway.config import GatewaySettings
+from gateway.mcp_protocol import request_headers, request_meta
 from gateway.server import create_gateway_app
 
 
@@ -142,11 +143,13 @@ def test_admin_upstreams_filtering_and_audit_archive(tmp_path) -> None:
         # 4. Self-Admin MCP admin_save_upstream and read-only optimize-mode (no AttributeError)
         mcp_save = client.post(
             "/admin/mcp",
+            headers=request_headers("tools/call", tool_name="admin_save_upstream"),
             json={
                 "jsonrpc": "2.0",
                 "id": 99,
                 "method": "tools/call",
                 "params": {
+                    "_meta": request_meta(),
                     "name": "admin_save_upstream",
                     "arguments": {
                         "upstream": {
@@ -171,7 +174,7 @@ def test_admin_upstreams_filtering_and_audit_archive(tmp_path) -> None:
                 },
             },
         )
-        assert mcp_save.status_code == 200
+        assert mcp_save.status_code == 200, mcp_save.text
         mcp_res = mcp_save.json()["result"]
         assert mcp_res["isError"] is False
         assert mcp_res["structuredContent"]["saved"] is True

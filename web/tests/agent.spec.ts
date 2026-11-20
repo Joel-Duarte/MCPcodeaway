@@ -70,6 +70,7 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
     .snapshot()
     .filter((entry) => !entry.offPage && entry.component !== "more");
   const labels = components.map((entry) => entry.label);
+  expect(wrapper.text()).not.toContain("Stateful MCP Session");
 
   for (const requiredLabel of [
     "Upstream Name",
@@ -102,6 +103,7 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
     steps: [{ ref: "2. Policy & Mode", action: "press" }],
   });
   expect(navStep2.ok, navStep2.error?.message).toBe(true);
+  expect(wrapper.text()).toContain("Sessionless MCP");
   const step2Labels = agent
     .snapshot()
     .filter((entry) => !entry.offPage && entry.component !== "more")

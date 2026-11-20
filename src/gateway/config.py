@@ -91,9 +91,18 @@ class UpstreamConfig(BaseModel):
     preferred_mode: GatewayMode | None = None
     abac_rules: list[AbacRuleConfig] = Field(default_factory=list)
     pinned_schema_digest: str | None = None
-    stateful_session: bool = False
     ab_experiment: AbExperimentConfig | None = None
     enabled: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_protocol_sessions(cls, value: Any) -> Any:
+        if isinstance(value, dict) and value.get("stateful_session") is True:
+            raise ValueError(
+                "stateful_session is not supported; MCP requests are sessionless. "
+                "Pass explicit application resource IDs as tool arguments instead."
+            )
+        return value
 
     @field_validator("name")
     @classmethod
@@ -177,7 +186,6 @@ class GatewaySettings(BaseSettings):
     context_overflow_threshold_tokens: int = 32768
     metrics_require_auth: bool = False
 
-    mcp_session_ttl_seconds: int = 1800
     audit_retention_days: int = 90
     admin_session_secret: str = ""
     admin_session_ttl_seconds: int = 28800

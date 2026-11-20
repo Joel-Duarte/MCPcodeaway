@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 from collections.abc import Callable
@@ -13,6 +15,13 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from jwt.algorithms import RSAAlgorithm
 from pydantic import BaseModel
+
+from gateway.mcp_protocol import (
+    MCP_CLIENT_CAPABILITIES_META,
+    MCP_PROTOCOL_VERSION,
+    MCP_PROTOCOL_VERSION_META,
+    MCP_SERVER_INFO_META,
+)
 
 
 class CreateCollectionCaseRequest(BaseModel):
@@ -348,6 +357,9 @@ def _build_billing_subapp(
 
 
 def _jsonrpc_result(req_id: Any, result: Any) -> JSONResponse:
+    if isinstance(result, dict):
+        result.setdefault("resultType", "complete")
+        result.setdefault("_meta", {MCP_SERVER_INFO_META: {"name": "mock-mcp", "version": "1.0.0"}})
     return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": result})
 
 
@@ -365,27 +377,46 @@ async def _handle_mcp_rpc(
     tools: list[dict[str, Any]],
     call_fn: Callable[[str, dict[str, Any]], Any],
 ) -> JSONResponse:
-    """Shared JSON-RPC 2.0 MCP handler for mock MCP endpoints."""
+    """Strict mock of the current sessionless Streamable HTTP contract."""
     payload = await request.json()
     req_id = payload.get("id")
     method = payload.get("method")
     params = payload.get("params") or {}
-
-    if method == "initialize":
+    meta = params.get("_meta") or {}
+    if (
+        payload.get("jsonrpc") != "2.0"
+        or not isinstance(req_id, (str, int))
+        or isinstance(req_id, bool)
+        or meta.get(MCP_PROTOCOL_VERSION_META) != MCP_PROTOCOL_VERSION
+        or not isinstance(meta.get(MCP_CLIENT_CAPABILITIES_META), dict)
+        or request.headers.get("mcp-protocol-version") != MCP_PROTOCOL_VERSION
+        or request.headers.get("mcp-method") != method
+    ):
+        return _jsonrpc_error(req_id, -32020, "Invalid current MCP request framing", 400)
+    if request.headers.get("mcp-session-id"):
+        return _jsonrpc_error(req_id, -32020, "MCP protocol sessions are not supported", 400)
+    if method == "server/discover":
         return _jsonrpc_result(
             req_id,
             {
-                "protocolVersion": "2025-03-26",
+                "supportedVersions": [MCP_PROTOCOL_VERSION],
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": server_name, "version": "1.0.0"},
+                "ttlMs": 30000,
+                "cacheScope": "private",
             },
         )
-    if method == "notifications/initialized":
-        return JSONResponse({}, status_code=202)
     if method == "tools/list":
-        return _jsonrpc_result(req_id, {"tools": tools})
+        return _jsonrpc_result(req_id, {"tools": tools, "ttlMs": 0, "cacheScope": "private"})
     if method == "tools/call":
         name = str(params.get("name") or "")
+        header_name = request.headers.get("mcp-name") or ""
+        if header_name.startswith("=?base64?") and header_name.endswith("?="):
+            try:
+                header_name = base64.b64decode(header_name[9:-2], validate=True).decode("utf-8")
+            except (binascii.Error, UnicodeDecodeError):
+                return _jsonrpc_error(req_id, -32020, "Invalid Mcp-Name", 400)
+        if header_name != name:
+            return _jsonrpc_error(req_id, -32020, "Mcp-Name does not match tool name", 400)
         args = params.get("arguments") or {}
         try:
             data = call_fn(name, args)

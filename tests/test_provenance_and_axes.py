@@ -19,6 +19,7 @@ from gateway.auth import LocalDevKeyManager
 from gateway.catalog import render_python_stub, to_mcp_tool_definition
 from gateway.comparator import run_side_by_side_comparison
 from gateway.config import GatewaySettings
+from gateway.mcp_protocol import request_headers, request_meta
 from gateway.sandbox_worker import create_sandbox_worker_app
 from gateway.server import GatewayRuntime, create_gateway_app
 from gateway.state import SQLiteAuditStore
@@ -41,13 +42,21 @@ async def _post_mcp(
     req_id: int = 1,
 ) -> dict[str, Any]:
     url = f"/mcp?{query}" if query else "/mcp"
-    req_headers = {"Authorization": f"Bearer {token}"}
+    req_headers = {
+        "Authorization": f"Bearer {token}",
+        **request_headers(method, tool_name=(params or {}).get("name")),
+    }
     if headers:
         req_headers.update(headers)
     resp = await client.post(
         url,
         headers=req_headers,
-        json={"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}},
+        json={
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": method,
+            "params": {"_meta": request_meta(), **(params or {})},
+        },
     )
     assert resp.status_code == 200, resp.text
     return resp.json()
@@ -459,6 +468,12 @@ async def test_typed_output_schemas_and_keyerror_shape_hints(tmp_path) -> None:
 
     @schemaless.post("/mcp")
     async def schemaless_mcp(request: dict[str, Any]):
+        if request.get("method") == "server/discover":
+            return {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"supportedVersions": ["2026-07-28"]},
+            }
         if request.get("method") == "tools/list":
             return {
                 "jsonrpc": "2.0",

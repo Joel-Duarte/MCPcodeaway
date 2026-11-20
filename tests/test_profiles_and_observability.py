@@ -163,76 +163,96 @@ async def test_pooled_http_client_reuse_and_shutdown(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_stateful_mcp_session_id_negotiation_and_traceparent() -> None:
+async def test_current_mcp_http_framing_is_sessionless_and_does_not_reuse_cookies() -> None:
     calls_seen: list[dict[str, Any]] = []
-    session_counter = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal session_counter
         body = json.loads(request.content.decode("utf-8"))
         method = body.get("method")
-        sid = request.headers.get("mcp-session-id")
         calls_seen.append(
             {
                 "method": method,
-                "mcp_session_id": sid,
+                "protocol": request.headers.get("mcp-protocol-version"),
+                "method_header": request.headers.get("mcp-method"),
+                "name_header": request.headers.get("mcp-name"),
+                "session_id": request.headers.get("mcp-session-id"),
+                "cookie": request.headers.get("cookie"),
+                "metadata": body.get("params", {}).get("_meta", {}),
                 "traceparent": request.headers.get("traceparent"),
-                "sub": request.headers.get("authorization"),
             }
         )
-        if method == "initialize":
-            session_counter += 1
+        if method == "server/discover":
             return httpx.Response(
                 200,
-                headers={"Mcp-Session-Id": f"sess-{session_counter}"},
-                json={"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-03-26"}},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"supportedVersions": ["2026-07-28"]},
+                },
+                headers={"Set-Cookie": "upstream_session=tenant-a; HttpOnly"},
             )
-        if sid == "expired-force":
-            return httpx.Response(404, json={"error": "Session expired"})
-        if not sid:
-            return httpx.Response(400, json={"error": "Missing Mcp-Session-Id"})
+        if method == "tools/list":
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": body["id"], "result": {"tools": []}},
+            )
+        if method != "tools/call":
+            return httpx.Response(404)
         return httpx.Response(
             200,
             json={
                 "jsonrpc": "2.0",
-                "id": 1,
-                "result": {"structuredContent": {"session_echo": sid}},
+                "id": body["id"],
+                "result": {"structuredContent": {"caller": body["params"]["arguments"]["caller"]}},
             },
+            headers=(
+                {"Mcp-Session-Id": "server-created-session"}
+                if body["params"]["arguments"]["caller"] == "unexpected-session"
+                else None
+            ),
         )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     manager = UpstreamClientManager(http_client=client)
     upstream = UpstreamConfig(
-        name="stateful_srv",
+        name="sessionless_srv",
         type="mcp_http",
         url="https://mcp.example/mcp",
         auth_type="none",
-        stateful_session=True,
     )
+    discovered = await manager.discover_tools(upstream)
+    assert discovered == []
     tool = DiscoveredTool(
-        server="stateful_srv",
+        server="sessionless_srv",
         name="run_step",
-        qualified_name="stateful_srv__run_step",
+        qualified_name="sessionless_srv__run_step",
     )
 
     tracer = trace.get_tracer("test.traceparent")
     with tracer.start_as_current_span("test.outbound"):
         res_a, res_b = await asyncio.gather(
-            manager.call_tool(upstream, tool, {}, session_scope="tenant-a:shared-user"),
-            manager.call_tool(upstream, tool, {}, session_scope="tenant-b:shared-user"),
+            manager.call_tool(upstream, tool, {"caller": "tenant-a"}),
+            manager.call_tool(upstream, tool, {"caller": "tenant-b"}),
         )
-        res_a2 = await manager.call_tool(upstream, tool, {}, session_scope="tenant-a:shared-user")
-        res_c = await manager.call_tool(upstream, tool, {}, session_scope="tenant-a:other-user")
 
-    assert res_a["session_echo"] != res_b["session_echo"]
-    assert res_a2 == res_a
-    assert res_c["session_echo"] not in {res_a["session_echo"], res_b["session_echo"]}
-    assert all(entry["traceparent"] for entry in calls_seen)
-
-    # Simulate stale server session -> manager recovers cleanly via re-initialize + retry.
-    manager._session_ids["stateful_srv:tenant-a:shared-user"] = "expired-force"
-    recovered = await manager.call_tool(upstream, tool, {}, session_scope="tenant-a:shared-user")
-    assert recovered == {"session_echo": f"sess-{session_counter}"}
+    assert res_a == {"caller": "tenant-a"}
+    assert res_b == {"caller": "tenant-b"}
+    assert all(entry["protocol"] == "2026-07-28" for entry in calls_seen)
+    assert all(entry["method_header"] == entry["method"] for entry in calls_seen)
+    assert all(entry["session_id"] is None for entry in calls_seen)
+    assert all(entry["cookie"] is None for entry in calls_seen)
+    assert all(
+        entry["metadata"].get("io.modelcontextprotocol/protocolVersion") == "2026-07-28"
+        for entry in calls_seen
+    )
+    assert [entry["method"] for entry in calls_seen] == [
+        "server/discover",
+        "tools/list",
+        "tools/call",
+        "tools/call",
+    ]
+    with pytest.raises(RuntimeError, match="protocol sessions are unsupported"):
+        await manager.call_tool(upstream, tool, {"caller": "unexpected-session"})
 
     await client.aclose()
 

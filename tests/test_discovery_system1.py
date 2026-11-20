@@ -10,6 +10,7 @@ from benchmarks.discovery_benchmark import run_discovery_benchmark
 from examples.mock_backends import build_synthetic_tools, create_mock_backends_app
 from gateway.auth import LocalDevKeyManager
 from gateway.config import GatewaySettings, UpstreamConfig
+from gateway.mcp_protocol import request_headers, request_meta
 from gateway.server import create_gateway_app
 from gateway.state import SQLiteAuditStore
 from gateway.upstream_clients import DiscoveredTool
@@ -26,13 +27,21 @@ async def _mcp_post(
     req_id: int = 1,
 ) -> dict[str, Any]:
     url = f"/mcp?{query}" if query else "/mcp"
-    req_headers = {"Authorization": f"Bearer {token}"}
+    req_headers = {
+        "Authorization": f"Bearer {token}",
+        **request_headers(method, tool_name=(params or {}).get("name")),
+    }
     if headers:
         req_headers.update(headers)
     resp = await client.post(
         url,
         headers=req_headers,
-        json={"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}},
+        json={
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": method,
+            "params": {"_meta": request_meta(), **(params or {})},
+        },
     )
     assert resp.status_code == 200, resp.text
     return resp.json()
@@ -312,6 +321,21 @@ async def test_modern_mcp_metadata_headers_and_discovery_contract(tmp_path) -> N
             assert mismatch.status_code == 400
             assert mismatch.json()["error"]["code"] == -32020
 
+            with_session_id = await client.post(
+                "/mcp",
+                headers={**headers, "Mcp-Session-Id": "unexpected-session"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 30,
+                    "method": "server/discover",
+                    "params": {"_meta": metadata},
+                },
+            )
+            assert with_session_id.status_code == 400
+            assert (
+                "protocol sessions are not supported" in with_session_id.json()["error"]["message"]
+            )
+
             unsupported = await client.post(
                 "/mcp",
                 headers={**headers, "MCP-Protocol-Version": "2025-03-26"},
@@ -349,8 +373,7 @@ async def test_modern_mcp_metadata_headers_and_discovery_contract(tmp_path) -> N
                 headers={"Authorization": f"Bearer {token}"},
                 json={"jsonrpc": "2.0", "id": 6, "method": "initialize", "params": {}},
             )
-            assert initialize.status_code == 200
-            assert initialize.json()["result"]["protocolVersion"] == "2025-11-25"
+            assert initialize.status_code == 400
 
             legacy_followup = await client.post(
                 "/mcp",
@@ -360,8 +383,8 @@ async def test_modern_mcp_metadata_headers_and_discovery_contract(tmp_path) -> N
                 },
                 json={"jsonrpc": "2.0", "id": 8, "method": "tools/list", "params": {}},
             )
-            assert legacy_followup.status_code == 200
-            assert "tools" in legacy_followup.json()["result"]
+            assert legacy_followup.status_code == 400
+            assert legacy_followup.json()["error"]["code"] == -32020
 
             unknown_method = await client.post(
                 "/mcp",
