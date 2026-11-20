@@ -136,6 +136,9 @@ class SubcallRecord(BaseModel):
     abac_rows_filtered: int = 0
     redactions_count: int = 0
     error: str | None = None
+    schema_covered: bool | None = None
+    is_mutating: bool | None = None
+    invalid_arguments: int | None = None
 
 
 _ENTITY_ID_RE = re.compile(r"\b[A-Z]{2,6}-[A-Z0-9-]{2,}\b")
@@ -771,6 +774,8 @@ class HostDispatcher:
                     token_cache_hit=cache_hit,
                     downstream_audience=audience,
                     error=str(exc),
+                    schema_covered=tool.input_schema is not None and tool.output_schema is not None,
+                    is_mutating=bool(tool.mutating),
                 )
                 if self.metrics is not None:
                     self.metrics.inc_counter(
@@ -867,5 +872,7 @@ class HostDispatcher:
                 output_sha256=output_sha256,
                 abac_rows_filtered=abac_rows_filtered,
                 redactions_count=redactions_count,
+                schema_covered=tool.input_schema is not None and tool.output_schema is not None,
+                is_mutating=bool(tool.mutating),
             )
             return filtered, record

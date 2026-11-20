@@ -33,15 +33,16 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     await page.getByRole("link", { name: /Gateway Usage/i }).click();
     await expect(page.getByRole("heading", { name: /Gateway Usage, Groups & Cost Attribution/i })).toBeVisible();
 
-    // 2b. Dedicated Optimization & Cost Savings page
-    await page.getByRole("link", { name: /Optimization & ROI/i }).click();
-    await expect(page.getByRole("heading", { name: /Optimization & Cost Savings/i })).toBeVisible();
-    await expect(page.getByRole("heading", { name: /Automatic routing is configured per tool/i })).toBeVisible();
+    // 2b. Legacy optimization route redirects to workflow efficiency.
+    await page.goto(`${BASE}/dashboard/optimization`);
+    await expect(page).toHaveURL(/model-performance\?tab=efficiency/);
+    await expect(page.getByRole("heading", { name: /Model Performance/i })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /Matched cohort differences/i })).toBeVisible();
 
-    // 2c. Paired model/tool performance view and raw arm observations
+    // 2c. Paired workflow performance views.
     await page.getByRole("link", { name: /Model Performance/i }).click();
     await expect(page.getByRole("heading", { name: /Model Performance/i })).toBeVisible();
-    await expect(page.getByRole("heading", { name: /Paired model \/ tool comparison/i })).toBeVisible();
+    await expect(page.getByRole("tab", { name: "Routing" })).toBeVisible();
 
     // 2d. Dedicated Traces & Latency Timeline page
     await page.getByRole("link", { name: /Traces & Timeline/i }).click();
@@ -71,21 +72,21 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
 
     // Demo controls are a real server traffic runner, not a browser simulation
     await page.getByRole("link", { name: /Demo Control/i }).click();
-    await expect(page.getByRole("heading", { name: "Traffic generator", exact: true })).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Server-managed model profiles", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Continuous Demo Traffic Runner", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Simulated Model Performance Profiles", exact: true })).toBeVisible();
 
     // 7. Onboarding 3-Step Progressive Wizard (Step 2 locked until Inspect Schema)
-    await page.getByRole("link", { name: /Onboarding & A\/B Lab/i }).click();
+    await page.getByRole("link", { name: /Onboarding/i }).click();
     await expect(page.getByText("Stateful MCP Session", { exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /2\. Policy & Mode/i })).toBeDisabled();
-    await page.getByRole("button", { name: /Mock OpenAPI/i }).click();
+    await page.getByRole("button", { name: /Paste OpenAPI document/i }).click();
     await page.getByRole("button", { name: /Inspect Schema/i }).click();
     await expect(page.getByRole("button", { name: /2\. Policy & Mode/i })).toBeEnabled({ timeout: 5000 });
     await page.getByRole("button", { name: /2\. Policy & Mode/i }).click();
-    await expect(page.getByText(/Sessionless MCP/i)).toBeVisible();
-    await expect(page.getByText(/Step 2 — Access Control/i)).toBeVisible();
+    await expect(page.getByText(/Allowed RBAC roles/i)).toBeVisible();
+    await expect(page.getByText(/Step 2 — Access & Execution/i)).toBeVisible();
     await page.getByRole("button", { name: /3\. Test & Save/i }).click();
-    await expect(page.getByRole("button", { name: /Run A\/B Evaluation/i })).toBeVisible();
+    await expect(page.getByRole("button", { name: /Estimate Code Mode vs Classic/i })).toBeVisible();
 
     await page.getByRole("button", { name: /Agent Onboarding Prompt/i }).click();
     await expect(page.getByRole("tab", { name: /Self-Admin MCP/i })).toBeVisible();

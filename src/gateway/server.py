@@ -8,6 +8,7 @@ import binascii
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -41,6 +42,13 @@ from gateway.ab_testing import (
     evaluate_mode_algorithm,
     resolve_ab_experiment_variant,
     run_onboarding_ab_test,
+)
+from gateway.adaptive_execution import (
+    EVIDENCE_VERSION,
+    MAX_IMPORT_CLOCK_SKEW,
+    WORKLOADS,
+    infer_workload,
+    summarize_pairs,
 )
 from gateway.admin_auth import AdminSessionManager, create_admin_auth_router
 from gateway.admin_mcp import handle_admin_mcp_request
@@ -494,6 +502,7 @@ class GatewayRuntime:
         explicit_override: bool,
         model_name: str | None = None,
         target_tool: str | None = None,
+        workload_profile: str | None = None,
     ) -> tuple[
         ExecutionMode,
         DiscoveryMode,
@@ -513,6 +522,9 @@ class GatewayRuntime:
 
         tools = self.catalog.list_accessible_tools(
             identity, self.policy, self.registry, allowed_servers=allowed_servers
+        )
+        workload = (
+            workload_profile if workload_profile in WORKLOADS else infer_workload(intent, tools)
         )
         inferred_tool = target_tool
         if not inferred_tool and intent:
@@ -597,12 +609,127 @@ class GatewayRuntime:
                     str(entry.get("notes") or "")
                     or f"Admin score override for '{model_name}' ({model_delta:+.1f})"
                 )
-            else:
-                learned = compute_empirical_model_delta(
-                    recent, model_name, target_tool=inferred_tool
-                )
-                if learned is not None:
-                    model_delta, model_reason = learned
+        adaptive_observation_note: str | None = None
+        if (
+            requested_exec == "auto"
+            and workload
+            and model_name
+            and tools
+            and not any(t.mutating for t in tools)
+        ):
+            tenant_key = f"adaptive_execution:{identity.tenant_id or ''}"
+            adaptive_setting = (
+                await self.store.get_setting(tenant_key)
+                if hasattr(self.store, "get_setting")
+                else None
+            )
+            adaptive_mode = (
+                adaptive_setting.get("mode", "observe")
+                if isinstance(adaptive_setting, dict)
+                else "observe"
+            )
+            evidence = await self.store.list_adaptive_evidence(identity.tenant_id or "")
+            cutoff = datetime.now(UTC).timestamp() - 30 * 86400
+            evidence = [
+                r
+                for r in evidence
+                if _valid_run_timestamp(r.get("created_at"))
+                and datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00")).timestamp()
+                >= cutoff
+            ]
+            pricing = await self.merged_model_pricing()
+            model_rows = [
+                r
+                for r in summarize_pairs(evidence, pricing=pricing)
+                if r["model"].lower() == model_name.lower()
+            ]
+            exact = [r for r in model_rows if r["workload"] == workload]
+            selected = exact[0] if exact and exact[0].get("recommended_mode") else None
+            tier = "exact"
+            exact_sparse = not exact or exact[0].get("pairs", 0) < 5
+            if selected is None and exact_sparse:
+                family_map = {
+                    "small_fanout": "fanout",
+                    "large_fanout": "fanout",
+                    "data_reconciliation": "reconciliation",
+                    "large_data_reconciliation": "reconciliation",
+                }
+                family = family_map.get(workload)
+                siblings = [
+                    r for r in model_rows if family and family_map.get(r["workload"]) == family
+                ]
+                family_qualified = [r for r in siblings if r.get("recommended_mode")]
+                winners = {r["recommended_mode"] for r in family_qualified}
+                if len(winners) == 1:
+                    selected, tier = family_qualified[0], "workload_family"
+                elif not family_qualified:
+                    pooled = [
+                        dict(
+                            item,
+                            scenario_id=f"{item.get('workload')}:{item.get('scenario_id')}",
+                            workload=workload,
+                        )
+                        for item in evidence
+                        if item.get("model", "").lower() == model_name.lower()
+                        and family
+                        and family_map.get(item.get("workload")) == family
+                    ]
+                    pooled_rows = summarize_pairs(pooled, pricing=pricing)
+                    pooled_winner = next(
+                        (
+                            r
+                            for r in pooled_rows
+                            if r["workload"] == workload and r.get("recommended_mode")
+                        ),
+                        None,
+                    )
+                    if pooled_winner:
+                        selected, tier = pooled_winner, "workload_family"
+                    else:
+                        qualified = [r for r in model_rows if r.get("recommended_mode")]
+                        model_winners = {r["recommended_mode"] for r in qualified}
+                        if len(model_winners) == 1:
+                            selected = qualified[0]
+                            tier = "model_wide"
+                        elif not qualified:
+                            pooled_all = [
+                                dict(
+                                    item,
+                                    scenario_id=f"{item.get('workload')}:{item.get('scenario_id')}",
+                                    workload=workload,
+                                )
+                                for item in evidence
+                                if item.get("model", "").lower() == model_name.lower()
+                            ]
+                            broad = summarize_pairs(pooled_all, pricing=pricing)
+                            pooled_winner = next(
+                                (
+                                    r
+                                    for r in broad
+                                    if r["workload"] == workload and r.get("recommended_mode")
+                                ),
+                                None,
+                            )
+                            if pooled_winner:
+                                selected, tier = pooled_winner, "model_wide"
+            if selected:
+                winner = selected["recommended_mode"]
+                adaptive_observation_note = f"adaptive_recommendation:{tier}:{workload}:{winner}"
+                if adaptive_mode == "active":
+                    routed: GatewayMode = "codemode" if winner == "codemode" else "traditional"
+                    routed_exec = "codemode" if winner == "codemode" else "classic"
+                    routed_disc = requested_disc
+                    if routed_disc not in {"upfront", "deferred", "x_intent"}:
+                        routed_disc = _MODE_TO_AXES[routed][1]
+                    return (
+                        routed_exec,
+                        routed_disc,
+                        routed,
+                        f"adaptive_{tier}:{workload}:{winner}",
+                        None,
+                        None,
+                        None,
+                    )
 
         decision = evaluate_mode_algorithm(
             tool_count=tool_count,
@@ -620,7 +747,9 @@ class GatewayRuntime:
             decision.execution,
             decision.discovery_mode,
             decision.gateway_mode,
-            decision.reason,
+            f"{decision.reason}; {adaptive_observation_note}"
+            if adaptive_observation_note
+            else decision.reason,
             decision.score,
             None,
             None,
@@ -1531,6 +1660,14 @@ class UpstreamTestCallRequest(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
+def _valid_run_timestamp(value: Any) -> bool:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.tzinfo is not None
+    except (TypeError, ValueError):
+        return False
+
+
 def create_gateway_app(
     *,
     settings: GatewaySettings | None = None,
@@ -1669,6 +1806,7 @@ def create_gateway_app(
         x_discovery_backend: str | None = Header(default=None),
         x_mcp_servers: str | None = Header(default=None),
         x_intent: str | None = Header(default=None),
+        x_workload_profile: str | None = Header(default=None),
         x_model_name: str | None = Header(default=None),
         x_agent_model: str | None = Header(default=None),
         x_require_grounding: str | None = Header(default=None),
@@ -1920,7 +2058,14 @@ def create_gateway_app(
                     ab_variant,
                 ) = await runtime.resolve_dynamic_mode(
                     identity,
-                    requested_exec=eff_exec,
+                    requested_exec=(
+                        "auto"
+                        if method == "tools/call"
+                        and isinstance(params, dict)
+                        and params.get("name") == "execute_code"
+                        and not has_explicit_mode
+                        else eff_exec
+                    ),
                     requested_disc=eff_disc_mode,
                     requested_mode=effective_mode,
                     allowed_servers=allowed_servers,
@@ -1929,7 +2074,19 @@ def create_gateway_app(
                     explicit_override=has_explicit_mode,
                     model_name=effective_model_name,
                     target_tool=target_tool_hint,
+                    workload_profile=x_workload_profile,
                 )
+                if (
+                    method == "tools/call"
+                    and isinstance(params, dict)
+                    and params.get("name") == "execute_code"
+                    and not has_explicit_mode
+                    and not str(mode_decision_reason or "").startswith("adaptive_")
+                ):
+                    eff_exec = "codemode"
+                    effective_mode = "codemode"
+                    if "adaptive_recommendation:" not in str(mode_decision_reason or ""):
+                        mode_decision_reason = "auto:execute_code->codemode"
                 mcp_span.set_attribute("mcp.mode", effective_mode)
                 if mode_decision_reason:
                     mcp_span.set_attribute("mcp.mode_decision_reason", mode_decision_reason)
@@ -3369,6 +3526,402 @@ def create_gateway_app(
             }
             cache[ck] = (now, payload_out)
             return payload_out
+
+        @app.get("/admin/adaptive-execution/report")
+        async def admin_adaptive_execution_report(
+            window: str = Query(default="30d"),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True, allow_viewer=True
+            )
+            tenant = _resolve_audit_tenant_scope(identity, None) or (
+                identity.tenant_id
+                if identity
+                else (
+                    runtime.settings.allowed_tenants[0]
+                    if runtime.settings.allowed_tenants
+                    else "tenant-acme-dev"
+                )
+            )
+            evidence = await runtime.store.list_adaptive_evidence(tenant or "")
+            days = {"1h": 1 / 24, "24h": 1, "7d": 7, "30d": 30, "all": None}.get(window, 30)
+            pricing = await runtime.merged_model_pricing()
+            return {
+                "window": window if window in {"1h", "24h", "7d", "30d", "all"} else "30d",
+                "rows": summarize_pairs(evidence, days=days, pricing=pricing),
+                "adaptive_mode": (
+                    await runtime.store.get_setting(f"adaptive_execution:{tenant or ''}") or {}
+                ).get("mode", "observe"),
+            }
+
+        @app.get("/admin/adaptive-execution/tool-health")
+        async def admin_adaptive_tool_health(
+            window: str = Query(default="30d"),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True, allow_viewer=True
+            )
+            tenant = _resolve_audit_tenant_scope(identity, None) or (
+                identity.tenant_id
+                if identity
+                else (
+                    runtime.settings.allowed_tenants[0]
+                    if runtime.settings.allowed_tenants
+                    else "tenant-acme-dev"
+                )
+            )
+            hours = {"1h": 1, "24h": 24, "7d": 168, "30d": 720, "all": 24 * 3650}.get(window, 720)
+            runs = await runtime.store.list_runs(limit=5000, tenant_id=tenant)
+            cut = datetime.now(UTC).timestamp() - hours * 3600
+            try:
+                runs = [
+                    r
+                    for r in runs
+                    if datetime.fromisoformat(
+                        str(r.get("created_at", "")).replace("Z", "+00:00")
+                    ).timestamp()
+                    >= cut
+                ]
+            except ValueError:
+                runs = [
+                    r
+                    for r in runs
+                    if _valid_run_timestamp(r.get("created_at"))
+                    and datetime.fromisoformat(
+                        str(r["created_at"]).replace("Z", "+00:00")
+                    ).timestamp()
+                    >= cut
+                ]
+            buckets: dict[tuple[str, str], dict[str, Any]] = {}
+            for run in runs:
+                for call in (
+                    run.get("subcalls", []) if isinstance(run.get("subcalls"), list) else []
+                ):
+                    if not isinstance(call, dict):
+                        continue
+                    server, name = (
+                        str(call.get("server") or "unknown"),
+                        str(call.get("tool") or "unknown"),
+                    )
+                    key = (server, name)
+                    b = buckets.setdefault(
+                        key,
+                        {
+                            "count": 0,
+                            "bytes": 0,
+                            "latencies": [],
+                            "errors": 0,
+                            "timeouts": 0,
+                            "invalid_arguments": 0,
+                            "schema_known": 0,
+                            "schema_covered": 0,
+                            "read": 0,
+                            "write": 0,
+                        },
+                    )
+                    b["count"] += 1
+                    if isinstance(call.get("raw_bytes"), (int, float)):
+                        b["bytes"] += int(call["raw_bytes"])
+                    if isinstance(call.get("duration_ms"), (int, float)):
+                        b["latencies"].append(float(call["duration_ms"]))
+                    status, error = str(call.get("status") or ""), str(call.get("error") or "")
+                    b["errors"] += int(status != "ok" or bool(error))
+                    b["timeouts"] += int("timeout" in (status + " " + error).lower())
+                    if isinstance(call.get("invalid_arguments"), (int, float)):
+                        b["invalid_arguments"] += int(call["invalid_arguments"])
+                    if isinstance(call.get("schema_covered"), bool):
+                        b["schema_known"] += 1
+                        b["schema_covered"] += int(call["schema_covered"])
+                    if call.get("is_mutating") is True:
+                        b["write"] += 1
+                    elif call.get("is_mutating") is False:
+                        b["read"] += 1
+            rows = []
+            for (server, tool), b in sorted(buckets.items()):
+                latencies = sorted(b["latencies"])
+                rows.append(
+                    {
+                        "server": server,
+                        "tool": tool,
+                        "count": b["count"],
+                        "bytes": b["bytes"],
+                        "mean_latency_ms": round(sum(latencies) / len(latencies), 2)
+                        if latencies
+                        else None,
+                        "p95_latency_ms": round(
+                            latencies[min(len(latencies) - 1, int((len(latencies) - 1) * 0.95))], 2
+                        )
+                        if latencies
+                        else None,
+                        "errors": b["errors"],
+                        "timeouts": b["timeouts"],
+                        "invalid_arguments": b["invalid_arguments"]
+                        if any(
+                            call.get("invalid_arguments") is not None
+                            for run in runs
+                            for call in (
+                                run.get("subcalls", [])
+                                if isinstance(run.get("subcalls"), list)
+                                else []
+                            )
+                            if isinstance(call, dict)
+                            and str(call.get("server") or "unknown") == server
+                            and str(call.get("tool") or "unknown") == tool
+                        )
+                        else None,
+                        "schema_coverage_pct": round(
+                            100 * b["schema_covered"] / b["schema_known"], 1
+                        )
+                        if b["schema_known"]
+                        else None,
+                        "read_calls": b["read"] if b["read"] or b["write"] else None,
+                        "write_calls": b["write"] if b["read"] or b["write"] else None,
+                    }
+                )
+            return {"window": window, "rows": rows}
+
+        @app.post("/admin/adaptive-execution/evidence")
+        async def admin_import_adaptive_evidence(
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=False,
+            )
+            tenant = _resolve_audit_tenant_scope(identity, None) or (
+                identity.tenant_id
+                if identity
+                else (
+                    runtime.settings.allowed_tenants[0]
+                    if runtime.settings.allowed_tenants
+                    else "tenant-acme-dev"
+                )
+            )
+            body = await request.json()
+            rows = body.get("evidence") if isinstance(body, dict) else None
+            if not isinstance(rows, list) or len(rows) > 10000:
+                raise HTTPException(
+                    status_code=400, detail="evidence must be a list of at most 10000 rows"
+                )
+            safe_rows = []
+            pricing = (
+                await runtime.store.list_model_pricing()
+                if hasattr(runtime.store, "list_model_pricing")
+                else {}
+            )
+            required = {
+                "evidence_id",
+                "created_at",
+                "model",
+                "workload",
+                "scenario_id",
+                "repeat_id",
+                "mode",
+                "correct",
+                "grounded",
+            }
+            for row in rows:
+                if (
+                    not isinstance(row, dict)
+                    or not required.issubset(row)
+                    or row.get("version") != EVIDENCE_VERSION
+                ):
+                    raise HTTPException(
+                        status_code=400, detail="unsupported or incomplete evidence row"
+                    )
+                try:
+                    created_at = datetime.fromisoformat(
+                        str(row["created_at"]).replace("Z", "+00:00")
+                    )
+                    if created_at.tzinfo is None:
+                        raise ValueError("timezone required")
+                    if created_at.astimezone(UTC) > datetime.now(UTC) + MAX_IMPORT_CLOCK_SKEW:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="created_at cannot be more than 5 minutes in the future",
+                        )
+                except (TypeError, ValueError):
+                    raise HTTPException(
+                        status_code=400, detail="created_at must be an ISO timestamp with timezone"
+                    ) from None
+                if not all(
+                    isinstance(row.get(k), str) and row[k].strip()
+                    for k in ("evidence_id", "model", "scenario_id", "repeat_id")
+                ):
+                    raise HTTPException(
+                        status_code=400, detail="evidence identity fields must be non-empty strings"
+                    )
+                if (
+                    not isinstance(row["workload"], str)
+                    or row["workload"] not in WORKLOADS
+                    or not isinstance(row["mode"], str)
+                    or row["mode"]
+                    not in {
+                        "traditional",
+                        "codemode",
+                    }
+                ):
+                    raise HTTPException(status_code=400, detail="invalid workload or mode")
+                allowed_keys = required | {
+                    "version",
+                    "fixture_id",
+                    "discovery_config",
+                    "input_tokens",
+                    "output_tokens",
+                    "wall_ms",
+                    "upstream_calls",
+                    "turns",
+                    "recovery_count",
+                    "runtime_failure",
+                    "run_ids",
+                }
+                if set(row) - allowed_keys:
+                    raise HTTPException(status_code=400, detail="unsupported evidence fields")
+                config = row.get("discovery_config", {})
+                config_keys = {
+                    "task",
+                    "synthetic_tools",
+                    "discovery_mode",
+                    "discovery_backend",
+                    "x_intent",
+                    "reasoning_effort",
+                    "runner_version",
+                    "model_source",
+                    "model_config",
+                }
+                if (
+                    not isinstance(config, dict)
+                    or set(config) - config_keys
+                    or any(isinstance(v, (dict, list)) for v in config.values())
+                ):
+                    raise HTTPException(status_code=400, detail="invalid discovery_config")
+                if row.get("run_ids") is not None and (
+                    not isinstance(row["run_ids"], list)
+                    or any(not isinstance(v, str) for v in row["run_ids"])
+                ):
+                    raise HTTPException(status_code=400, detail="run_ids must be a list of strings")
+                if not isinstance(row.get("runtime_failure", False), bool):
+                    raise HTTPException(status_code=400, detail="runtime_failure must be boolean")
+                # The evidence contract intentionally excludes prompt and answer material.
+                if any(
+                    any(
+                        term in str(k).lower()
+                        for term in ("prompt", "answer", "response", "message")
+                    )
+                    for k in row
+                ):
+                    raise HTTPException(
+                        status_code=400, detail="prompt and answer content cannot be imported"
+                    )
+                clean = {
+                    k: row.get(k)
+                    for k in (
+                        "version",
+                        "evidence_id",
+                        "created_at",
+                        "model",
+                        "workload",
+                        "scenario_id",
+                        "repeat_id",
+                        "fixture_id",
+                        "discovery_config",
+                        "mode",
+                        "correct",
+                        "grounded",
+                        "input_tokens",
+                        "output_tokens",
+                        "wall_ms",
+                        "upstream_calls",
+                        "turns",
+                        "recovery_count",
+                        "runtime_failure",
+                        "run_ids",
+                    )
+                }
+                if not isinstance(clean["correct"], bool) or not isinstance(
+                    clean["grounded"], bool
+                ):
+                    raise HTTPException(
+                        status_code=400, detail="correct and grounded must be booleans"
+                    )
+                for metric in (
+                    "input_tokens",
+                    "output_tokens",
+                    "wall_ms",
+                    "upstream_calls",
+                    "turns",
+                    "recovery_count",
+                ):
+                    if clean.get(metric) is not None and (
+                        not isinstance(clean[metric], (int, float))
+                        or isinstance(clean[metric], bool)
+                        or not math.isfinite(clean[metric])
+                        or clean[metric] < 0
+                    ):
+                        raise HTTPException(
+                            status_code=400, detail=f"{metric} must be numeric or null"
+                        )
+                clean["created_at"] = created_at.astimezone(UTC).isoformat()
+                clean["model"] = str(clean["model"]).strip().lower()
+                costs = pricing.get(str(clean["model"]), {})
+                input_price, output_price = (
+                    float(costs.get("input", 0)),
+                    float(costs.get("output", 0)),
+                )
+                if (
+                    clean["input_tokens"] is not None
+                    and clean["output_tokens"] is not None
+                    and (input_price > 0 or output_price > 0)
+                ):
+                    clean["cost_usd"] = (
+                        clean["input_tokens"] * input_price + clean["output_tokens"] * output_price
+                    ) / 1_000_000
+                else:
+                    clean["cost_usd"] = None
+                safe_rows.append(clean)
+            if not tenant:
+                raise HTTPException(status_code=401, detail="tenant identity is required")
+            imported = await runtime.store.import_adaptive_evidence(tenant, safe_rows)
+            return {"received": len(rows), "imported": imported, "duplicates": len(rows) - imported}
+
+        @app.post("/admin/adaptive-execution/settings")
+        async def admin_set_adaptive_execution(
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=False,
+            )
+            tenant = _resolve_audit_tenant_scope(identity, None) or (
+                identity.tenant_id
+                if identity
+                else (
+                    runtime.settings.allowed_tenants[0]
+                    if runtime.settings.allowed_tenants
+                    else "tenant-acme-dev"
+                )
+            )
+            body = await request.json()
+            mode = body.get("mode") if isinstance(body, dict) else None
+            if mode not in {"observe", "active"}:
+                raise HTTPException(status_code=400, detail="mode must be observe or active")
+            key = f"adaptive_execution:{tenant or ''}"
+            await runtime.store.save_setting(
+                key, {"mode": mode, "updated_at": datetime.now(UTC).isoformat()}
+            )
+            return {"mode": mode}
 
         @app.patch("/admin/upstreams/{name}/mode")
         async def admin_set_upstream_preferred_mode(

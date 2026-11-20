@@ -1,387 +1,155 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { Tabs, TabsList, TabsPanel, TabsTab } from "@ui-sdk/vue/tabs";
+import {
+  Select, SelectContent, SelectItem, SelectLabel, SelectTrigger, SelectValue,
+} from "@ui-sdk/vue/select";
+import { Field, FieldLabel } from "@ui-sdk/vue/field";
+import { Input } from "@ui-sdk/vue/input";
+import { Button } from "@ui-sdk/vue/button";
+import { computed, onMounted, ref, watch } from "vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
 
-interface ModelPerfRow {
-  model: string;
-  server: string;
-  tool: string;
-  mode: string;
-  runs: number;
-  success_rate_pct: number;
-  avg_duration_ms: number;
-  avg_tokens: number;
-  recommended_mode?: string | null;
-}
-
-interface ArmSummary {
-  runs: number;
-  successPct: number;
-  avgLatencyMs: number;
-  avgTokens: number;
-}
-
-interface ModelToolPair {
-  key: string;
-  model: string;
-  server: string;
-  tool: string;
-  code: ArmSummary | null;
-  classic: ArmSummary | null;
-  hybridRuns: number;
-  otherRuns: number;
-  recommendation: string;
-}
-
+interface Arm { correct_pct: number; grounded_pct: number; verified_pct: number; mean_cost_usd: number | null; mean_provider_tokens: number | null; p95_wall_ms: number | null; mean_upstream_calls: number | null; mean_recovery: number | null }
+interface Row { model: string; workload: string; pairs: number; qualification?: string; latest_evidence_at?: string | null; evidence_tier?: string; traditional: Arm | null; codemode: Arm | null; recommended_mode: string | null; reason: string }
 const { apiFetch } = useAdminApi();
-const rows = ref<ModelPerfRow[]>([]);
+const { selectedRange } = useReportRange();
+const route = useRoute();
+const rows = ref<Row[]>([]);
+const adaptiveMode = ref("observe");
 const loading = ref(true);
-const errorMessage = ref("");
-const searchQuery = ref("");
-const selectedRecommendation = ref("all");
-const selectedMode = ref("all");
-const showRawObservations = ref(false);
-const { selectedRange: selectedWindow } = useReportRange();
-
-const calibrationPolicy = ref<{
-  turn_penalty_pts: number;
-  tokens_per_penalty_pt: number;
-  calibration_runs_per_arm: number;
-} | null>(null);
-
-let pollTimer: ReturnType<typeof setInterval> | null = null;
+const error = ref("");
+const query = ref("");
+const modelFilter = ref("all");
+const recommendationFilter = ref("all");
+const modeFilter = ref("all");
+const expanded = ref<string[]>([]);
+const models = computed(() => [...new Set(rows.value.map((r) => r.model))].sort());
+const modelItems = computed(() => [{ value: "all", label: "All models" }, ...models.value.map((model) => ({ value: model, label: model }))]);
+const recommendationItems = [
+  { value: "all", label: "All recommendations" }, { value: "codemode", label: "Code Mode" },
+  { value: "traditional", label: "Classic" }, { value: "none", label: "No recommendation" },
+];
+const evidenceItems = [
+  { value: "all", label: "Both arms" }, { value: "traditional", label: "Classic present" },
+  { value: "codemode", label: "Code Mode present" },
+];
+const filtered = computed(() => rows.value.filter((r) => {
+  const text = `${r.model} ${workloadLabel(r.workload)}`.toLowerCase();
+  return (!query.value || text.includes(query.value.toLowerCase())) &&
+    (modelFilter.value === "all" || modelFilter.value === r.model) &&
+    (recommendationFilter.value === "all" || (r.recommended_mode || "none") === recommendationFilter.value) &&
+    (modeFilter.value === "all" || (modeFilter.value === "traditional" ? !!r.traditional : !!r.codemode));
+}));
+const fmt = (n: number | null | undefined, d = 1) => n == null ? "Unknown" : Number(n).toLocaleString("en-US", { maximumFractionDigits: d });
+const money = (n: number | null | undefined) => n == null ? "Unknown" : `$${n.toFixed(6)}`;
+const cost = (a: Arm | null) => a?.mean_cost_usd != null ? money(a.mean_cost_usd) : a?.mean_provider_tokens != null ? `${fmt(a.mean_provider_tokens, 0)} tokens` : "Unknown";
+const signed = (n: number, digits = 1) => `${n > 0 ? "+" : ""}${fmt(n, digits)}`;
+const signedMoney = (n: number) => `${n < 0 ? "-" : "+"}$${Math.abs(n).toFixed(6)}`;
+const workloadLabel = (value: string) => ({
+  single_read: "Single read", small_fanout: "Small fan out", large_fanout: "Large fan out",
+  data_reconciliation: "Data reconciliation", large_data_reconciliation: "Large data reconciliation",
+  batch_compute: "Batch computation", sequential_workflow: "Sequential workflow",
+  mutating_workflow: "Mutating workflow", large_payload_processing: "Large payload processing",
+}[value] || value);
+function toggle(key: string) { expanded.value = expanded.value.includes(key) ? expanded.value.filter((x) => x !== key) : [...expanded.value, key]; }
 let requestSequence = 0;
-
-async function loadData() {
+async function load() {
   const requestId = ++requestSequence;
-  errorMessage.value = "";
+  loading.value = true; error.value = "";
   try {
-    const params = new URLSearchParams({ window: selectedWindow.value, limit: "5000" });
-    const res = await apiFetch<{ rows: ModelPerfRow[] }>(
-      `/admin/ab/model-performance?${params.toString()}`
-    );
+    const window = selectedRange.value;
+    const result = await apiFetch<{ rows: Row[]; adaptive_mode?: string }>(`/admin/adaptive-execution/report?window=${encodeURIComponent(window)}`);
     if (requestId !== requestSequence) return;
-    rows.value = Array.isArray(res?.rows) ? res.rows : [];
+    rows.value = result.rows || [];
+    adaptiveMode.value = result.adaptive_mode || "observe";
   } catch (err) {
-    if (requestId === requestSequence) errorMessage.value = extractErrorMessage(err);
+    if (requestId === requestSequence) error.value = extractErrorMessage(err);
   } finally {
     if (requestId === requestSequence) loading.value = false;
   }
 }
-
-async function loadCalibrationPolicy() {
-  try {
-    calibrationPolicy.value = await apiFetch<{
-      turn_penalty_pts: number;
-      tokens_per_penalty_pt: number;
-      calibration_runs_per_arm: number;
-    }>("/admin/ab/settings");
-  } catch {
-    calibrationPolicy.value = null;
-  }
-}
-
-function modeFamily(mode: string): "code" | "classic" | "hybrid" | "other" {
-  const normalized = (mode || "").toLowerCase();
-  if (normalized === "codemode" || normalized === "codemode_upfront") return "code";
-  if (normalized === "traditional" || normalized === "traditional_discover") return "classic";
-  if (normalized === "hybrid") return "hybrid";
-  return "other";
-}
-
-function modeLabel(mode: string): string {
-  if (mode === "codemode" || mode === "codemode_upfront") return "Code Mode MCP";
-  if (mode === "traditional" || mode === "traditional_discover") return "Classic MCP";
-  if (mode === "hybrid") return "Hybrid";
-  return mode || "Unknown";
-}
-
-function recommendationLabel(mode: string): string {
-  if (mode === "codemode") return "Code Mode";
-  if (mode === "traditional") return "Classic MCP";
-  if (mode === "varies") return "Varies by observation";
-  if (!mode || mode === "—" || mode === "none") return "No recommendation yet";
-  return modeLabel(mode);
-}
-
-function summarizeArm(items: ModelPerfRow[]): ArmSummary | null {
-  const runs = items.reduce((sum, item) => sum + Math.max(0, item.runs || 0), 0);
-  if (!runs) return null;
-  const weighted = (field: "success_rate_pct" | "avg_duration_ms" | "avg_tokens") =>
-    items.reduce((sum, item) => sum + Math.max(0, item.runs || 0) * Number(item[field] || 0), 0) / runs;
-  return {
-    runs,
-    successPct: weighted("success_rate_pct"),
-    avgLatencyMs: weighted("avg_duration_ms"),
-    avgTokens: weighted("avg_tokens"),
-  };
-}
-
-const allPairs = computed<ModelToolPair[]>(() => {
-  const grouped = new Map<string, ModelPerfRow[]>();
-  for (const row of rows.value) {
-    const server = row.server || "gateway";
-    const key = `${row.model}\u0000${server}\u0000${row.tool}`;
-    const current = grouped.get(key) || [];
-    current.push(row);
-    grouped.set(key, current);
-  }
-
-  return [...grouped.entries()].map(([key, items]) => {
-    const recommendations = new Set(
-      items
-        .map((item) => {
-          const mode = String(item.recommended_mode || "").trim();
-          const family = modeFamily(mode);
-          return family === "code" ? "codemode" : family === "classic" ? "traditional" : family === "hybrid" ? "hybrid" : mode;
-        })
-        .filter((mode) => mode && mode !== "—" && mode !== "none")
-    );
-    const recommendation = recommendations.size === 1
-      ? [...recommendations][0]
-      : recommendations.size > 1 ? "varies" : "none";
-    const codeItems = items.filter((item) => modeFamily(item.mode) === "code");
-    const classicItems = items.filter((item) => modeFamily(item.mode) === "classic");
-    return {
-      key,
-      model: items[0].model,
-      server: items[0].server || "gateway",
-      tool: items[0].tool,
-      code: summarizeArm(codeItems),
-      classic: summarizeArm(classicItems),
-      hybridRuns: items.filter((item) => modeFamily(item.mode) === "hybrid").reduce((sum, item) => sum + item.runs, 0),
-      otherRuns: items.filter((item) => modeFamily(item.mode) === "other").reduce((sum, item) => sum + item.runs, 0),
-      recommendation,
-    };
-  }).sort((a, b) => a.model.localeCompare(b.model) || a.server.localeCompare(b.server) || a.tool.localeCompare(b.tool));
-});
-
-const filteredPairs = computed(() => {
-  const query = searchQuery.value.trim().toLowerCase();
-  return allPairs.value.filter((pair) => {
-    if (selectedRecommendation.value !== "all") {
-      if (selectedRecommendation.value === "unresolved") {
-        if (pair.recommendation !== "none" && pair.recommendation !== "varies") return false;
-      } else if (pair.recommendation !== selectedRecommendation.value) {
-        return false;
-      }
-    }
-    if (!query) return true;
-    return `${pair.model} ${pair.server} ${pair.tool}`.toLowerCase().includes(query);
-  });
-});
-
-const filteredObservations = computed(() => {
-  const pairKeys = new Set(filteredPairs.value.map((pair) => pair.key));
-  return rows.value.filter((row) => {
-    const key = `${row.model}\u0000${row.server || "gateway"}\u0000${row.tool}`;
-    return pairKeys.has(key) && (selectedMode.value === "all" || modeFamily(row.mode) === selectedMode.value);
-  });
-});
-
-const totalPairRuns = computed(() => filteredPairs.value.reduce((sum, pair) =>
-  sum + (pair.code?.runs || 0) + (pair.classic?.runs || 0) + pair.hybridRuns + pair.otherRuns, 0));
-const modelsTracked = computed(() => new Set(filteredPairs.value.map((pair) => pair.model)).size);
-const serversTracked = computed(() => new Set(filteredPairs.value.map((pair) => pair.server)).size);
-const decidedPairs = computed(() => filteredPairs.value.filter((pair) =>
-  modeFamily(pair.recommendation) === "code" || modeFamily(pair.recommendation) === "classic"));
-const codeModeRecommendedPairs = computed(() => decidedPairs.value.filter((pair) => modeFamily(pair.recommendation) === "code").length);
-const classicRecommendedPairs = computed(() => decidedPairs.value.filter((pair) => modeFamily(pair.recommendation) === "classic").length);
-const unresolvedPairs = computed(() => filteredPairs.value.length - decidedPairs.value.length);
-const codeModeRecommendationPct = computed(() => decidedPairs.value.length
-  ? Math.round((codeModeRecommendedPairs.value / decidedPairs.value.length) * 100)
-  : 0);
-const weightedExecutionSuccessPct = computed(() => {
-  let weightedSuccesses = 0;
-  let runCount = 0;
-  for (const pair of filteredPairs.value) {
-    for (const arm of [pair.code, pair.classic]) {
-      if (!arm) continue;
-      weightedSuccesses += arm.runs * arm.successPct;
-      runCount += arm.runs;
-    }
-  }
-  return runCount ? weightedSuccesses / runCount : 0;
-});
-const classicPenaltyTokenEquivalent = computed(() => {
-  if (!calibrationPolicy.value) return null;
-  return calibrationPolicy.value.turn_penalty_pts * calibrationPolicy.value.tokens_per_penalty_pt;
-});
-
-function formatMetric(value: number | undefined, digits = 1): string {
-  return typeof value === "number" && Number.isFinite(value)
-    ? value.toLocaleString("en-US", { maximumFractionDigits: digits })
-    : "—";
-}
-
-watch(selectedWindow, () => { void loadData(); });
-
-onMounted(() => {
-  void loadData();
-  void loadCalibrationPolicy();
-  pollTimer = setInterval(loadData, 15000);
-});
-
-onUnmounted(() => {
-  if (pollTimer) clearInterval(pollTimer);
+onMounted(load);
+watch(selectedRange, load);
+const selectedTab = ref(route.query.tab === "efficiency" ? "efficiency" : "routing");
+watch(() => route.query.tab, (value) => { selectedTab.value = value === "efficiency" ? "efficiency" : "routing"; });
+watch(selectedTab, (value) => {
+  const tab = value === "efficiency" ? "efficiency" : "routing";
+  if (route.query.tab !== tab) void navigateTo({ query: { ...route.query, tab } }, { replace: true });
 });
 </script>
 
 <template>
-  <div class="space-y-6">
-    <div class="flex flex-wrap items-start justify-between gap-3">
-      <div>
-        <div class="flex items-center gap-2">
-          <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">Model Performance</h1>
-          <span class="inline-flex items-center gap-1 rounded-full border border-[#99F6E4] bg-[#F0FDFA] px-2 py-0.5 text-[11px] font-medium text-[#0F766E]">
-            <span class="h-1.5 w-1.5 rounded-full bg-[#0F766E]" />
-            Refreshes every 15s
-          </span>
+  <div class="space-y-5">
+    <header>
+      <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">Model Performance</h1>
+      <p class="mt-1 text-[13px] text-[#52525B]">Paired workflow evidence by model and workload. Routing uses qualified 30-day evidence; reports can show all retained evidence.</p>
+    </header>
+    <div v-if="error" role="alert" class="rounded-lg border border-[#FECACA] bg-[#FEF2F2] p-3 text-sm text-[#B91C1C]">{{ error }} <Button class="ml-2 min-h-11 rounded border border-[#D4D4D8] px-3 text-sm" @click="load">Retry report</Button></div>
+    <div v-if="loading" aria-label="Loading workflow evidence" class="h-32 animate-pulse rounded-lg border border-[#E4E4E7] bg-white" />
+    <p v-if="!loading" class="text-xs text-[#52525B]">Adaptive routing: {{ adaptiveMode === "active" ? "Active" : "Observe" }}. Reports distinguish sparse from qualified exact workload evidence.</p>
+    <div v-if="!loading" class="grid grid-cols-1 gap-3 rounded-lg border border-[#E4E4E7] bg-white p-3 sm:grid-cols-2 lg:grid-cols-4">
+          <Field><FieldLabel class="text-xs text-[#52525B]">Search model or workload</FieldLabel><Input v-model="query" type="search" class="mt-1 min-h-11 w-full rounded-md border border-[#D4D4D8] px-3 text-sm text-[#09090B] focus-visible:outline-2 focus-visible:outline-[#0F766E]" /></Field>
+          <div class="min-w-0"><Select v-model:value="modelFilter" :items="modelItems">
+            <SelectLabel class="block text-xs text-[#52525B]">Model</SelectLabel>
+            <SelectTrigger class="mt-1 flex min-h-11 w-full items-center justify-between rounded-md border border-[#D4D4D8] bg-white px-3 text-sm focus-visible:outline-2 focus-visible:outline-[#0F766E]"><SelectValue /></SelectTrigger>
+            <SelectContent class="z-50 max-h-64 overflow-auto rounded-md border border-[#E4E4E7] bg-white p-1 shadow-[0_4px_12px_rgb(9_9_11_/_0.08)]">
+              <SelectItem v-for="item in modelItems" :key="item.value" :value="item.value" class="min-h-11 cursor-pointer rounded px-3 py-2 text-sm data-[highlighted]:bg-[#F4F4F5] data-[selected]:font-medium">{{ item.label }}</SelectItem>
+            </SelectContent>
+          </Select></div>
+          <div class="min-w-0"><Select v-model:value="recommendationFilter" :items="recommendationItems">
+            <SelectLabel class="block text-xs text-[#52525B]">Recommendation</SelectLabel>
+            <SelectTrigger class="mt-1 flex min-h-11 w-full items-center justify-between rounded-md border border-[#D4D4D8] bg-white px-3 text-sm focus-visible:outline-2 focus-visible:outline-[#0F766E]"><SelectValue /></SelectTrigger>
+            <SelectContent class="z-50 max-h-64 overflow-auto rounded-md border border-[#E4E4E7] bg-white p-1 shadow-[0_4px_12px_rgb(9_9_11_/_0.08)]">
+              <SelectItem v-for="item in recommendationItems" :key="item.value" :value="item.value" class="min-h-11 cursor-pointer rounded px-3 py-2 text-sm data-[highlighted]:bg-[#F4F4F5] data-[selected]:font-medium">{{ item.label }}</SelectItem>
+            </SelectContent>
+          </Select></div>
+          <div class="min-w-0"><Select v-model:value="modeFilter" :items="evidenceItems">
+            <SelectLabel class="block text-xs text-[#52525B]">Evidence arm</SelectLabel>
+            <SelectTrigger class="mt-1 flex min-h-11 w-full items-center justify-between rounded-md border border-[#D4D4D8] bg-white px-3 text-sm focus-visible:outline-2 focus-visible:outline-[#0F766E]"><SelectValue /></SelectTrigger>
+            <SelectContent class="z-50 max-h-64 overflow-auto rounded-md border border-[#E4E4E7] bg-white p-1 shadow-[0_4px_12px_rgb(9_9_11_/_0.08)]">
+              <SelectItem v-for="item in evidenceItems" :key="item.value" :value="item.value" class="min-h-11 cursor-pointer rounded px-3 py-2 text-sm data-[highlighted]:bg-[#F4F4F5] data-[selected]:font-medium">{{ item.label }}</SelectItem>
+            </SelectContent>
+          </Select></div>
         </div>
-        <p class="mt-1 max-w-3xl text-[13px] leading-5 text-[#52525B]">
-          Compare the observed Code Mode and Classic MCP arms for each model, upstream server and tool. The gateway's recommendation is scoped to that model/tool pair—not a global mode setting.
-        </p>
-      </div>
-    </div>
-
-    <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-5">
-      <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-        <div class="text-xs text-[#71717A]">Observed runs</div>
-        <div class="mt-1 font-mono-data text-2xl font-semibold tabular-nums text-[#09090B]">{{ totalPairRuns.toLocaleString("en-US") }}</div>
-      </div>
-      <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-        <div class="text-xs text-[#71717A]">Models tracked</div>
-        <div class="mt-1 font-mono-data text-2xl font-semibold tabular-nums text-[#09090B]">{{ modelsTracked }}</div>
-      </div>
-      <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-        <div class="text-xs text-[#71717A]">Upstream servers</div>
-        <div class="mt-1 font-mono-data text-2xl font-semibold tabular-nums text-[#09090B]">{{ serversTracked }}</div>
-      </div>
-      <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-        <div class="text-xs text-[#71717A]">Code Mode recommended</div>
-        <div class="mt-1 font-mono-data text-2xl font-semibold tabular-nums text-[#0F766E]">{{ codeModeRecommendationPct }}%</div>
-        <div class="mt-1 text-[11px] text-[#71717A] tabular-nums">{{ codeModeRecommendedPairs }} Code · {{ classicRecommendedPairs }} Classic · {{ unresolvedPairs }} unresolved</div>
-      </div>
-      <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-        <div class="text-xs text-[#71717A]">Observed success · Code + Classic</div>
-        <div class="mt-1 font-mono-data text-2xl font-semibold tabular-nums text-[#09090B]">{{ formatMetric(weightedExecutionSuccessPct, 1) }}%</div>
-        <div class="mt-1 text-[11px] text-[#71717A]">Run-weighted · paired arms only</div>
-      </div>
-    </div>
-
-    <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-      <div class="mb-3 flex flex-wrap items-start justify-between gap-2">
-        <div>
-          <h2 class="text-[15px] font-semibold text-[#09090B]">Paired model / tool comparison</h2>
-          <p class="mt-1 text-xs leading-5 text-[#71717A]">Each row is one model + server + tool combination. Arm metrics are weighted by observed runs.</p>
+    <Tabs v-model:value="selectedTab" class="space-y-4">
+      <TabsList aria-label="Model performance views" class="flex min-h-11 gap-1 border-b border-[#E4E4E7]">
+        <TabsTab value="routing" class="min-h-11 border-b-2 px-4 text-sm data-[selected]:border-[#0F766E] data-[selected]:font-semibold data-[selected]:text-[#0F766E]">Routing</TabsTab>
+        <TabsTab value="efficiency" class="min-h-11 border-b-2 px-4 text-sm data-[selected]:border-[#0F766E] data-[selected]:font-semibold data-[selected]:text-[#0F766E]">Efficiency</TabsTab>
+      </TabsList>
+      <TabsPanel value="routing" class="space-y-4">
+        <div v-if="!filtered.length" class="rounded-lg border border-[#E4E4E7] bg-white p-8 text-center text-sm text-[#52525B]">No matched workflow evidence in this range. Import paired benchmark evidence to populate routing reports.</div>
+        <template v-else>
+        <div class="divide-y divide-[#E4E4E7] rounded-lg border border-[#E4E4E7] bg-white md:hidden">
+          <article v-for="row in filtered" :key="`mobile:${row.model}:${row.workload}`" class="px-4 py-3">
+            <Button class="flex min-h-11 w-full flex-col items-start justify-center text-left focus-visible:outline-2 focus-visible:outline-[#0F766E]" :aria-label="`${row.model} ${workloadLabel(row.workload)} details`" :aria-expanded="expanded.includes(`${row.model}:${row.workload}`)" @click="toggle(`${row.model}:${row.workload}`)">
+              <span class="font-medium text-[#09090B]">{{ row.model }}</span>
+              <span class="text-sm text-[#52525B]">{{ workloadLabel(row.workload) }} · {{ row.pairs }} matched pairs</span>
+              <span class="mt-1 text-xs text-[#52525B]">{{ row.recommended_mode ? `Recommended: ${row.recommended_mode === 'codemode' ? 'Code Mode' : 'Classic'}` : "No recommendation" }} · verified {{ fmt(row.traditional?.verified_pct) }}% / {{ fmt(row.codemode?.verified_pct) }}%</span>
+            </Button>
+            <dl v-if="expanded.includes(`${row.model}:${row.workload}`)" class="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 border-t border-[#E4E4E7] pt-3 text-xs">
+              <div><dt class="text-[#71717A]">Cost / completion · Classic / Code</dt><dd class="tabular-nums">{{ cost(row.traditional) }} / {{ cost(row.codemode) }}</dd></div>
+              <div><dt class="text-[#71717A]">p95 wall time · Classic / Code</dt><dd class="tabular-nums">{{ fmt(row.traditional?.p95_wall_ms) }} / {{ fmt(row.codemode?.p95_wall_ms) }} ms</dd></div>
+              <div><dt class="text-[#71717A]">Upstream calls · Classic / Code</dt><dd class="tabular-nums">{{ fmt(row.traditional?.mean_upstream_calls) }} / {{ fmt(row.codemode?.mean_upstream_calls) }}</dd></div>
+              <div><dt class="text-[#71717A]">Recovery · Classic / Code</dt><dd class="tabular-nums">{{ fmt(row.traditional?.mean_recovery) }} / {{ fmt(row.codemode?.mean_recovery) }}</dd></div>
+              <div class="col-span-2"><dt class="text-[#71717A]">Decision reason</dt><dd>{{ row.reason }} · {{ row.evidence_tier || "exact" }} tier · {{ row.qualification || "sparse" }} · {{ row.latest_evidence_at || "age unknown" }}</dd></div>
+            </dl>
+          </article>
         </div>
-        <span class="text-xs tabular-nums text-[#71717A]">{{ filteredPairs.length }} pairs</span>
-      </div>
-      <div class="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-[minmax(14rem,1fr)_minmax(12rem,0.5fr)]">
-        <Input v-model="searchQuery" placeholder="Search model, upstream or tool…" aria-label="Search model, upstream or tool" />
-        <select v-model="selectedRecommendation" aria-label="Filter by recommendation" class="min-h-10 rounded-md border border-[#D4D4D8] bg-white px-3 text-xs text-[#09090B]">
-          <option value="all">All recommendations</option>
-          <option value="codemode">Recommended: Code Mode</option>
-          <option value="traditional">Recommended: Classic MCP</option>
-          <option value="unresolved">No recommendation / varying</option>
-        </select>
-      </div>
-
-      <div v-if="errorMessage" role="alert" class="mb-3 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-3 py-2 text-xs text-[#B91C1C]">
-        {{ errorMessage }} <button type="button" class="ml-2 underline" @click="loadData">Retry</button>
-      </div>
-      <div v-if="loading" class="py-8 text-center text-xs text-[#71717A]">Loading paired model performance…</div>
-      <div v-else-if="filteredPairs.length === 0" class="py-8 text-center text-xs text-[#71717A]">No matching model/tool comparisons. Trigger server demo traffic or adjust the filters.</div>
-      <div v-else class="table-scroll overflow-x-auto rounded-md border border-[#E4E4E7]">
-        <table class="w-full min-w-[1120px] text-left text-xs tabular-nums">
-          <thead class="bg-[#F4F4F5] text-[#52525B]">
-            <tr>
-              <th class="px-3 py-2.5 font-medium">Model / server / tool</th>
-              <th class="px-3 py-2.5 font-medium">Code Mode MCP</th>
-              <th class="px-3 py-2.5 font-medium">Classic MCP</th>
-              <th class="px-3 py-2.5 font-medium">Gateway recommendation</th>
-            </tr>
-          </thead>
-          <tbody class="divide-y divide-[#E4E4E7]">
-            <tr v-for="pair in filteredPairs" :key="pair.key" class="align-top hover:bg-[#FAFAFA]">
-              <td class="max-w-[20rem] px-3 py-3">
-                <div class="break-all font-medium text-[#09090B]">{{ pair.model }}</div>
-                <div class="mt-1 break-all font-mono-data text-[11px] text-[#71717A]">{{ pair.server }} / {{ pair.tool }}</div>
-                <div v-if="pair.hybridRuns || pair.otherRuns" class="mt-1 text-[11px] text-[#71717A]">Other observations: {{ pair.hybridRuns + pair.otherRuns }} runs</div>
-              </td>
-              <td class="px-3 py-3">
-                <template v-if="pair.code">
-                  <div class="font-semibold text-[#0F766E]">{{ pair.code.runs.toLocaleString("en-US") }} runs</div>
-                  <div class="mt-1">Success {{ formatMetric(pair.code.successPct, 1) }}%</div>
-                  <div>Avg. latency {{ formatMetric(pair.code.avgLatencyMs, 2) }} ms</div>
-                  <div>Avg. measured tokens {{ formatMetric(pair.code.avgTokens, 0) }}</div>
-                </template>
-                <span v-else class="text-[#A1A1AA]">No Code Mode observations</span>
-              </td>
-              <td class="px-3 py-3">
-                <template v-if="pair.classic">
-                  <div class="font-semibold text-[#1D4ED8]">{{ pair.classic.runs.toLocaleString("en-US") }} runs</div>
-                  <div class="mt-1">Success {{ formatMetric(pair.classic.successPct, 1) }}%</div>
-                  <div>Avg. latency {{ formatMetric(pair.classic.avgLatencyMs, 2) }} ms</div>
-                  <div>Avg. measured tokens {{ formatMetric(pair.classic.avgTokens, 0) }}</div>
-                </template>
-                <span v-else class="text-[#A1A1AA]">No Classic MCP observations</span>
-              </td>
-              <td class="px-3 py-3">
-                <span class="inline-flex rounded border px-2 py-1 text-[11px] font-medium"
-                  :class="pair.recommendation === 'codemode' ? 'border-[#99F6E4] bg-[#F0FDFA] text-[#0F766E]' : pair.recommendation === 'traditional' ? 'border-[#BFDBFE] bg-[#EFF6FF] text-[#1D4ED8]' : 'border-[#E4E4E7] bg-[#F4F4F5] text-[#52525B]'">
-                  {{ recommendationLabel(pair.recommendation) }}
-                </span>
-                <div class="mt-1.5 max-w-[14rem] text-[11px] leading-4 text-[#71717A]">This is the gateway's current calibration recommendation for this model/tool pair.</div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-      <h2 class="text-sm font-semibold text-[#09090B]">Calibration accounting</h2>
-      <p v-if="calibrationPolicy" class="mt-1 text-xs leading-5 text-[#52525B]">
-        Configured target: {{ calibrationPolicy.calibration_runs_per_arm }} runs per arm. Classic MCP adds {{ classicPenaltyTokenEquivalent?.toLocaleString("en-US") }} modeled token-equivalents per turn after the first ({{ calibrationPolicy.turn_penalty_pts }} points × {{ calibrationPolicy.tokens_per_penalty_pt }} token-equivalents/point). Code Mode has no turn penalty in this policy.
-      </p>
-      <p v-else class="mt-1 text-xs leading-5 text-[#71717A]">Calibration policy could not be loaded. Open Settings → Routing &amp; calibration to verify the active values.</p>
-      <p class="mt-2 text-xs leading-5 text-[#71717A]">
-        The performance endpoint reports average measured tokens and does not return average turn counts. Therefore this table does not invent an adjusted token-equivalent average: measured tokens remain separate from the modeled Classic turn overhead. Token-equivalents are not provider-billed tokens or a cash-savings figure.
-      </p>
-    </section>
-
-    <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-      <div class="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 class="text-sm font-semibold text-[#09090B]">Raw mode observations</h2>
-          <p class="mt-1 text-xs text-[#71717A]">Arm-level rows used to build the paired comparison.</p>
-        </div>
-        <button type="button" class="min-h-10 rounded-md border border-[#D4D4D8] px-3 text-xs font-medium text-[#52525B] hover:bg-[#F4F4F5]" :aria-expanded="showRawObservations" @click="showRawObservations = !showRawObservations">
-          {{ showRawObservations ? "Hide raw rows" : "Show raw rows" }}
-        </button>
-      </div>
-      <div v-if="showRawObservations" class="mt-4 space-y-3">
-        <select v-model="selectedMode" aria-label="Filter raw observations by mode" class="min-h-10 w-full max-w-xs rounded-md border border-[#D4D4D8] bg-white px-3 text-xs text-[#09090B]">
-          <option value="all">All modes</option>
-          <option value="code">Code Mode MCP</option>
-          <option value="classic">Classic MCP</option>
-          <option value="hybrid">Hybrid</option>
-          <option value="other">Other</option>
-        </select>
-        <div class="table-scroll overflow-x-auto rounded-md border border-[#E4E4E7]">
-          <table class="w-full min-w-[900px] text-left text-xs tabular-nums">
-            <thead class="bg-[#F4F4F5] text-[#52525B]"><tr>
-              <th class="px-3 py-2 font-medium">Model</th><th class="px-3 py-2 font-medium">Server</th><th class="px-3 py-2 font-medium">Tool</th><th class="px-3 py-2 font-medium">Arm</th><th class="px-3 py-2 text-right font-medium">Runs</th><th class="px-3 py-2 text-right font-medium">Success</th><th class="px-3 py-2 text-right font-medium">Avg. latency</th><th class="px-3 py-2 text-right font-medium">Avg. measured tokens</th>
-            </tr></thead>
-            <tbody class="divide-y divide-[#E4E4E7]">
-              <tr v-for="(row, index) in filteredObservations" :key="`${row.model}-${row.server}-${row.tool}-${row.mode}-${index}`">
-                <td class="px-3 py-2 font-mono-data">{{ row.model }}</td><td class="px-3 py-2">{{ row.server || "gateway" }}</td><td class="px-3 py-2">{{ row.tool }}</td><td class="px-3 py-2">{{ modeLabel(row.mode) }}</td><td class="px-3 py-2 text-right">{{ row.runs }}</td><td class="px-3 py-2 text-right">{{ formatMetric(row.success_rate_pct, 1) }}%</td><td class="px-3 py-2 text-right">{{ formatMetric(row.avg_duration_ms, 2) }} ms</td><td class="px-3 py-2 text-right">{{ formatMetric(row.avg_tokens, 0) }}</td>
-              </tr>
-            </tbody>
+        <div class="hidden overflow-x-auto rounded-lg border border-[#E4E4E7] bg-white md:block">
+          <table class="w-full min-w-[760px] border-collapse text-left text-xs">
+            <thead class="bg-[#F4F4F5] text-[#52525B]"><tr><th class="px-3 py-3">Model / workload</th><th class="px-3 py-3 text-right">Matched pairs</th><th class="px-3 py-3 text-right">Verified rate</th><th class="px-3 py-3 text-right">Cost / completion</th><th class="px-3 py-3 text-right">p95 wall time</th><th class="px-3 py-3">Recommendation</th></tr></thead>
+            <tbody><template v-for="row in filtered" :key="`${row.model}:${row.workload}`"><tr class="border-t border-[#E4E4E7] hover:bg-[#FAFAFA]"><td class="px-3 py-3"><Button class="min-h-11 text-left font-medium text-[#09090B] underline decoration-[#A1A1AA] underline-offset-2 focus-visible:outline-2 focus-visible:outline-[#0F766E]" :aria-label="`${row.model} ${workloadLabel(row.workload)} details`" :aria-expanded="expanded.includes(`${row.model}:${row.workload}`)" @click="toggle(`${row.model}:${row.workload}`)">{{ row.model }}<span class="block font-normal text-[#71717A]">{{ workloadLabel(row.workload) }}</span></Button></td><td class="px-3 py-3 text-right tabular-nums">{{ row.pairs }}</td><td class="px-3 py-3 text-right tabular-nums">Classic {{ fmt(row.traditional?.verified_pct) }}% · Code {{ fmt(row.codemode?.verified_pct) }}%</td><td class="px-3 py-3 text-right tabular-nums">{{ cost(row.traditional) }} · {{ cost(row.codemode) }}</td><td class="px-3 py-3 text-right tabular-nums">{{ fmt(row.traditional?.p95_wall_ms) }} · {{ fmt(row.codemode?.p95_wall_ms) }} ms</td><td class="px-3 py-3">{{ row.recommended_mode === 'codemode' ? "Code Mode" : row.recommended_mode === 'traditional' ? "Classic" : "No recommendation" }}</td></tr>
+              <tr v-if="expanded.includes(`${row.model}:${row.workload}`)" class="border-t border-[#E4E4E7] bg-[#FAFAFA]"><td colspan="6" class="px-4 py-4"><p class="font-medium text-[#09090B]">{{ row.reason }}</p><p class="mt-1 text-[#71717A]">{{ row.evidence_tier || "exact" }} tier · {{ row.qualification || "sparse" }} · {{ row.latest_evidence_at || "age unknown" }}</p><p class="mt-2 text-[#52525B]">Calls per completion: {{ fmt(row.traditional?.mean_upstream_calls) }} / {{ fmt(row.codemode?.mean_upstream_calls) }} · Recovery count: {{ fmt(row.traditional?.mean_recovery) }} / {{ fmt(row.codemode?.mean_recovery) }}</p><p class="mt-1 text-[#71717A]">Correct and grounded: {{ fmt(row.traditional?.correct_pct) }}% / {{ fmt(row.traditional?.grounded_pct) }}% · {{ fmt(row.codemode?.correct_pct) }}% / {{ fmt(row.codemode?.grounded_pct) }}%</p></td></tr>
+            </template></tbody>
           </table>
         </div>
-      </div>
-    </section>
+        </template>
+      </TabsPanel>
+      <TabsPanel value="efficiency" class="rounded-lg border border-[#E4E4E7] bg-white p-4">
+        <h2 class="text-[15px] font-semibold text-[#09090B]">Matched cohort differences</h2>
+        <p class="mt-1 text-sm text-[#52525B]">Signed differences below use Code Mode minus Classic. Positive cost, latency, calls, or recovery indicate a regression. Quality remains the routing priority.</p>
+        <div class="mt-4 divide-y divide-[#E4E4E7]"><div v-for="row in filtered" :key="`${row.model}:${row.workload}:delta`" class="py-3 text-xs"><h3 class="font-medium text-[#09090B]">{{ row.model }} · {{ workloadLabel(row.workload) }} ({{ row.pairs }} pairs)</h3><dl class="mt-2 grid grid-cols-1 gap-2 tabular-nums sm:grid-cols-2 lg:grid-cols-5"><div><dt class="text-[#71717A]">Cost per completion (Code − Classic)</dt><dd>{{ row.traditional?.mean_cost_usd != null && row.codemode?.mean_cost_usd != null ? signedMoney(row.codemode.mean_cost_usd - row.traditional.mean_cost_usd) : row.traditional?.mean_provider_tokens != null && row.codemode?.mean_provider_tokens != null ? `${signed(row.codemode.mean_provider_tokens - row.traditional.mean_provider_tokens, 0)} tokens` : "Unknown" }}</dd></div><div><dt class="text-[#71717A]">Provider tokens / completion</dt><dd>{{ row.traditional?.mean_provider_tokens == null || row.codemode?.mean_provider_tokens == null ? "Unknown" : `${signed(row.codemode.mean_provider_tokens - row.traditional.mean_provider_tokens, 0)} tokens` }}</dd></div><div><dt class="text-[#71717A]">p95 wall time</dt><dd>{{ row.traditional?.p95_wall_ms == null || row.codemode?.p95_wall_ms == null ? "Unknown" : `${signed(row.codemode.p95_wall_ms - row.traditional.p95_wall_ms)} ms` }}</dd></div><div><dt class="text-[#71717A]">Upstream calls per completion</dt><dd>{{ row.traditional?.mean_upstream_calls == null || row.codemode?.mean_upstream_calls == null ? "Unknown" : signed(row.codemode.mean_upstream_calls - row.traditional.mean_upstream_calls) }}</dd></div><div><dt class="text-[#71717A]">Recovery count per completion</dt><dd>{{ row.traditional?.mean_recovery == null || row.codemode?.mean_recovery == null ? "Unknown" : signed(row.codemode.mean_recovery - row.traditional.mean_recovery) }}</dd></div></dl></div></div>
+      </TabsPanel>
+    </Tabs>
   </div>
 </template>

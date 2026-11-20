@@ -10,6 +10,7 @@ import re
 import sys
 import tempfile
 import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -203,8 +204,25 @@ def _parse_mode_spec(mode_spec: str) -> tuple[str, str, str, str]:
         return aliases[mode_spec]
     if ":" in mode_spec:
         ex, dm = (part.strip() for part in mode_spec.split(":", 1))
+        ex = "classic" if ex == "traditional" else ex
+        if ex not in {"classic", "codemode", "hybrid"} or dm not in {
+            "upfront",
+            "deferred",
+            "x_intent",
+        }:
+            raise ValueError(f"Invalid benchmark mode axis '{mode_spec}'")
         return mode_spec, f"execution={ex}&discovery_mode={dm}", ex, dm
-    return mode_spec, f"mode={mode_spec}", "codemode", "deferred"
+    raise ValueError(f"Unknown benchmark mode '{mode_spec}'")
+
+
+def _force_mode_for_axes(execution: str, discovery: str) -> str:
+    if execution == "classic":
+        return "traditional" if discovery == "upfront" else "traditional_discover"
+    if execution == "codemode":
+        return "codemode_upfront" if discovery == "upfront" else "codemode"
+    if execution == "hybrid":
+        return "hybrid"
+    raise ValueError(f"Unsupported benchmark execution axis '{execution}'")
 
 
 def _detect_provider(preferred: str | None = None) -> tuple[str, str] | None:
@@ -233,12 +251,14 @@ async def _list_mcp_tools(
     discovery_backend: str = "bm25",
     x_intent: str | None = None,
 ) -> list[dict[str, Any]]:
-    _, _, resolved_mode, _ = _parse_mode_spec(mode)
+    _, _, execution, discovery = _parse_mode_spec(mode)
     headers = {
         **request_headers("tools/list"),
         "Authorization": f"Bearer {gw_token}",
-        "X-Admin-Force-Mode": resolved_mode,
+        "X-Admin-Force-Mode": _force_mode_for_axes(execution, discovery),
     }
+    if discovery == "x_intent":
+        headers["X-Discovery-Mode"] = "x_intent"
     if x_intent:
         headers["X-Intent"] = x_intent
     resp = await gw.post(
@@ -264,15 +284,21 @@ async def _call_mcp_tool(
     args: dict[str, Any],
     *,
     discovery_backend: str = "bm25",
+    x_intent: str | None = None,
 ) -> dict[str, Any]:
-    _, _, resolved_mode, _ = _parse_mode_spec(mode)
+    _, _, execution, discovery = _parse_mode_spec(mode)
+    headers = {
+        **request_headers("tools/call", tool_name=name),
+        "Authorization": f"Bearer {gw_token}",
+        "X-Admin-Force-Mode": _force_mode_for_axes(execution, discovery),
+    }
+    if discovery == "x_intent":
+        headers["X-Discovery-Mode"] = "x_intent"
+    if x_intent:
+        headers["X-Intent"] = x_intent
     resp = await gw.post(
         f"/mcp?discovery={discovery_backend}",
-        headers={
-            **request_headers("tools/call", tool_name=name),
-            "Authorization": f"Bearer {gw_token}",
-            "X-Admin-Force-Mode": resolved_mode,
-        },
+        headers=headers,
         json={
             "jsonrpc": "2.0",
             "id": req_id,
@@ -412,6 +438,7 @@ async def _call_openai_loop(
         {"role": "user", "content": prompt},
     ]
     prompt_toks, comp_toks, turns, mcp_calls, self_corrections = 0, 0, 0, 0, 0
+    usage_complete = True
     run_ids: list[str] = []
     provenance_states: list[bool] = []
     started = time.perf_counter()
@@ -436,6 +463,7 @@ async def _call_openai_loop(
                 json=body,
             )
             if resp.status_code >= 400:
+                usage_complete = False
                 err_text = resp.text
                 prompt_match = re.search(r'"n_prompt_tokens"\s*:\s*(\d+)', err_text)
                 if prompt_match and prompt_toks == 0:
@@ -455,16 +483,21 @@ async def _call_openai_loop(
                     "mcp_tool_calls": mcp_calls,
                     "self_corrections": self_corrections,
                     "provenance_grounded": all(provenance_states) if provenance_states else None,
-                    "prompt_tokens": prompt_toks,
-                    "completion_tokens": comp_toks,
-                    "total_tokens": prompt_toks + comp_toks,
+                    "prompt_tokens": prompt_toks if usage_complete else None,
+                    "completion_tokens": comp_toks if usage_complete else None,
+                    "total_tokens": prompt_toks + comp_toks if usage_complete else None,
                     "duration_ms": round((time.perf_counter() - started) * 1000, 2),
                     "correct": False,
+                    "runtime_failure": True,
                     "error": f"HTTP {resp.status_code}: {err_text[:300]}",
                     "run_ids": run_ids,
                 }
             data = resp.json()
             usage = data.get("usage") or {}
+            if not isinstance(usage.get("prompt_tokens"), (int, float)) or not isinstance(
+                usage.get("completion_tokens"), (int, float)
+            ):
+                usage_complete = False
             prompt_toks += int(usage.get("prompt_tokens", 0))
             comp_toks += int(usage.get("completion_tokens", 0))
             choice = data["choices"][0]["message"]
@@ -482,12 +515,84 @@ async def _call_openai_loop(
                 clean_answer = _strip_think(raw_answer)
                 subcalls_total = 0
                 token_hops = 0
+                audit_execution_seen = False
+                audit_execution_verified = True
+                successful_tools: set[str] = set()
                 for rid in run_ids:
                     audit = await gw.get(f"/audit/runs/{rid}")
                     if audit.status_code == 200:
                         doc = audit.json()
                         subcalls_total += int(doc.get("subcall_count", 0))
                         token_hops += len(doc.get("token_hops", []))
+                        for call in (
+                            doc.get("subcalls", []) if isinstance(doc.get("subcalls"), list) else []
+                        ):
+                            if (
+                                isinstance(call, dict)
+                                and call.get("status") == "ok"
+                                and call.get("tool")
+                            ):
+                                successful_tools.add(str(call["tool"]))
+                        tool_name = str(doc.get("tool_name") or "")
+                        if tool_name not in {
+                            "list_servers",
+                            "search_tools",
+                            "tools/list",
+                            "list_tools",
+                            "execute_code",
+                        } and doc.get("ok"):
+                            successful_tools.add(tool_name)
+                        if tool_name not in {
+                            "list_servers",
+                            "search_tools",
+                            "tools/list",
+                            "list_tools",
+                        }:
+                            audit_execution_seen = True
+                            if not doc.get("ok") or (
+                                tool_name == "execute_code" and int(doc.get("subcall_count", 0)) < 1
+                            ):
+                                audit_execution_verified = False
+                    else:
+                        audit_execution_verified = False
+                        audit_execution_seen = True
+                expected_tools = {
+                    "single_lookup": {"get_customer_balance"},
+                    "standard": {"query_debt_ledger", "list_eu_invoices", "list_us_invoices"},
+                    "reconcile_overdue": {
+                        "query_debt_ledger",
+                        "list_eu_invoices",
+                        "list_us_invoices",
+                    },
+                    "bulk_200": {"query_debt_ledger", "list_eu_invoices", "list_us_invoices"},
+                    "reconcile_bulk_200": {
+                        "query_debt_ledger",
+                        "list_eu_invoices",
+                        "list_us_invoices",
+                    },
+                    "trial_balance_audit": {
+                        "get_trial_balance_lines",
+                        "get_eu_customer",
+                        "get_us_customer",
+                    },
+                    "compute_batch_penalties": {"query_debt_ledger", "compute_interest_penalty"},
+                    "mutating_ticket_workflow": {
+                        "list_terminal_incidents",
+                        "search_sentry_errors",
+                        "get_github_release_commit",
+                        "create_collection_case",
+                        "post_slack_incident_alert",
+                    },
+                }.get(task_name, set())
+                audit_evidence_verified = (
+                    audit_execution_seen
+                    and audit_execution_verified
+                    and bool(expected_tools)
+                    and all(
+                        any(name.endswith(required) for name in successful_tools)
+                        for required in expected_tools
+                    )
+                )
                 return {
                     "model": model,
                     "task": task_name,
@@ -505,11 +610,13 @@ async def _call_openai_loop(
                     "delegated_token_hops": token_hops,
                     "self_corrections": self_corrections,
                     "provenance_grounded": all(provenance_states) if provenance_states else None,
-                    "prompt_tokens": prompt_toks,
-                    "completion_tokens": comp_toks,
-                    "total_tokens": prompt_toks + comp_toks,
+                    "audit_evidence_verified": audit_evidence_verified,
+                    "prompt_tokens": prompt_toks if usage_complete else None,
+                    "completion_tokens": comp_toks if usage_complete else None,
+                    "total_tokens": prompt_toks + comp_toks if usage_complete else None,
                     "duration_ms": round((time.perf_counter() - started) * 1000, 2),
                     "correct": scorer(raw_answer),
+                    "runtime_failure": False,
                     "answer": clean_answer[:600],
                     "run_ids": run_ids,
                 }
@@ -541,6 +648,7 @@ async def _call_openai_loop(
                     fn["name"],
                     parsed_args,
                     discovery_backend=discovery_backend,
+                    x_intent=x_intent,
                 )
                 if res.get("isError"):
                     self_corrections += 1
@@ -600,11 +708,12 @@ async def _call_openai_loop(
         "mcp_tool_calls": mcp_calls,
         "self_corrections": self_corrections,
         "provenance_grounded": all(provenance_states) if provenance_states else None,
-        "prompt_tokens": prompt_toks,
-        "completion_tokens": comp_toks,
-        "total_tokens": prompt_toks + comp_toks,
+        "prompt_tokens": prompt_toks if usage_complete else None,
+        "completion_tokens": comp_toks if usage_complete else None,
+        "total_tokens": prompt_toks + comp_toks if usage_complete else None,
         "duration_ms": round((time.perf_counter() - started) * 1000, 2),
         "correct": False,
+        "runtime_failure": True,
         "error": "Max turns reached",
         "run_ids": run_ids,
     }
@@ -756,6 +865,39 @@ def _build_upstreams_config(
     return str(out_path), preloaded
 
 
+def _create_isolated_mutating_job_app(
+    tmpdir: str,
+    *,
+    discovery_backend: str,
+    dev_keys: LocalDevKeyManager,
+    upstreams_config_path: str,
+    preloaded_tools: dict[str, list[DiscoveredTool]],
+) -> tuple[Any, Any, httpx.AsyncClient]:
+    """Build a private mutable mock backend and audit store for one mutation probe."""
+    backend_app = create_mock_backends_app(
+        public_key_pem=dev_keys.public_pem, expected_issuer=dev_keys.issuer
+    )
+    backend_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=backend_app), base_url="http://127.0.0.1:8001"
+    )
+    settings = GatewaySettings(
+        auth_mode="dev",
+        rate_limit_per_minute=2000,
+        discovery_backend=discovery_backend,  # type: ignore[arg-type]
+        sqlite_path=str(Path(tmpdir) / f"mutation_{uuid.uuid4().hex}.db"),
+        upstreams_config_path=upstreams_config_path,
+    )
+    store = SQLiteAuditStore(settings.sqlite_path)
+    app = create_gateway_app(
+        settings=settings,
+        store=store,
+        dev_keys=dev_keys,
+        http_client=backend_client,
+        preloaded_tools=preloaded_tools,
+    )
+    return app, backend_app, backend_client
+
+
 async def run_openai_compatible_suite(
     *,
     base_url: str,
@@ -857,19 +999,51 @@ async def run_openai_compatible_suite(
                                     ops_token if t_name == "mutating_ticket_workflow" else fin_token
                                 )
                                 async with sem:
-                                    res = await _call_openai_loop(
-                                        gw,
-                                        tok,
-                                        api_key,
-                                        m_name,
-                                        cur_model,
-                                        base_url=base_url,
-                                        discovery_backend=discovery_backend,
-                                        x_intent=i_str,
-                                        prompt=p_text,
-                                        task_name=t_name,
-                                        reasoning_effort=reasoning_effort,
-                                    )
+                                    if t_name == "mutating_ticket_workflow":
+                                        job_app, _, job_http_client = (
+                                            _create_isolated_mutating_job_app(
+                                                tmpdir,
+                                                discovery_backend=discovery_backend,
+                                                dev_keys=dev_keys,
+                                                upstreams_config_path=cfg_path,
+                                                preloaded_tools=preloaded,
+                                            )
+                                        )
+                                        try:
+                                            async with job_app.router.lifespan_context(job_app):
+                                                async with httpx.AsyncClient(
+                                                    transport=httpx.ASGITransport(app=job_app),
+                                                    base_url="http://gw",
+                                                ) as job_gw:
+                                                    res = await _call_openai_loop(
+                                                        job_gw,
+                                                        tok,
+                                                        api_key,
+                                                        m_name,
+                                                        cur_model,
+                                                        base_url=base_url,
+                                                        discovery_backend=discovery_backend,
+                                                        x_intent=i_str,
+                                                        prompt=p_text,
+                                                        task_name=t_name,
+                                                        reasoning_effort=reasoning_effort,
+                                                    )
+                                        finally:
+                                            await job_http_client.aclose()
+                                    else:
+                                        res = await _call_openai_loop(
+                                            gw,
+                                            tok,
+                                            api_key,
+                                            m_name,
+                                            cur_model,
+                                            base_url=base_url,
+                                            discovery_backend=discovery_backend,
+                                            x_intent=i_str,
+                                            prompt=p_text,
+                                            task_name=t_name,
+                                            reasoning_effort=reasoning_effort,
+                                        )
                                     res["extra_synthetic_tools"] = cur_syn
                                     return res
 
@@ -921,10 +1095,90 @@ async def run_openai_compatible_suite(
         "rbac_live_boundary": rbac_checks,
         "runs": runs,
     }
+    report["adaptive_evidence"] = export_adaptive_evidence(report)
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
+
+
+def export_adaptive_evidence(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Export prompt-free, repeatable workload observations for tenant import."""
+    import hashlib
+
+    created = str(report.get("generated_at") or datetime.now(UTC).isoformat())
+    rows = []
+    for index, run in enumerate(report.get("runs", [])):
+        task = str(run.get("task") or "standard")
+        syn = int(run.get("extra_synthetic_tools") or 0)
+        workloads = {
+            "single_lookup": "single_read",
+            "standard": "data_reconciliation",
+            "reconcile_overdue": "data_reconciliation",
+            "bulk_200": "large_data_reconciliation",
+            "reconcile_bulk_200": "large_data_reconciliation",
+            "trial_balance_audit": "data_reconciliation",
+            "compute_batch_penalties": "batch_compute",
+            "mutating_ticket_workflow": "mutating_workflow",
+        }
+        execution = run.get("execution")
+        if execution not in {"classic", "codemode"}:
+            continue
+        workload = workloads.get(task)
+        if workload is None:
+            continue
+        config = {
+            "task": task,
+            "synthetic_tools": syn,
+            "discovery_mode": run.get("discovery_mode"),
+            "discovery_backend": run.get("discovery_backend"),
+            "x_intent": run.get("x_intent"),
+            "reasoning_effort": run.get("reasoning_effort"),
+            "runner_version": "live_llm_bench_v1",
+            "model_source": report.get("provider"),
+            "model_config": json.dumps(
+                {
+                    "reasoning_effort": run.get("reasoning_effort"),
+                    "discovery_backend": run.get("discovery_backend"),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+        scenario = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:24]
+        mode = "codemode" if execution == "codemode" else "traditional"
+        repeat_id = hashlib.sha256(f"{created}:{run.get('model')}:{scenario}".encode()).hexdigest()[
+            :24
+        ]
+        repeat_key = f"{created}:{index}:{run.get('model')}:{scenario}:{mode}"
+        rows.append(
+            {
+                "version": 1,
+                "evidence_id": hashlib.sha256(repeat_key.encode()).hexdigest(),
+                "created_at": created,
+                "model": str(run.get("model") or "unknown"),
+                "workload": workload,
+                "scenario_id": scenario,
+                "fixture_id": f"{task}:{syn}",
+                "repeat_id": repeat_id,
+                "discovery_config": config,
+                "mode": mode,
+                "correct": bool(run.get("correct")),
+                "grounded": bool(
+                    run.get("audit_evidence_verified")
+                    and (mode != "codemode" or run.get("provenance_grounded"))
+                ),
+                "input_tokens": run.get("prompt_tokens"),
+                "output_tokens": run.get("completion_tokens"),
+                "wall_ms": run.get("duration_ms"),
+                "upstream_calls": run.get("subcalls_total"),
+                "turns": run.get("turns"),
+                "recovery_count": run.get("self_corrections"),
+                "runtime_failure": bool(run.get("runtime_failure")),
+                "run_ids": run.get("run_ids", []),
+            }
+        )
+    return rows
 
 
 async def run_live_bench(

@@ -76,6 +76,12 @@ uv run gateway compare --scenario reconcile_overdue --persona finance_analyst
 
 ## Proof of Performance (Measured Results)
 
+### Adaptive Execution Intelligence
+
+Run the live benchmark in at least five distinct invocations with the same model, workload, fixture, runner settings, and discovery configuration to build five matched repeats; save each report to a different file. For example: `python -m benchmarks.live_llm_bench --provider openai_compatible --base-url http://127.0.0.1:1234/v1 --models qwen/qwen3.5-9b --tasks standard --synthetic-tools 0,50 --output /tmp/workflow-1.json` and repeat with `/tmp/workflow-2.json`. Each report includes a versioned `adaptive_evidence` array with correctness, grounding, provider usage where reported, latency, call/recovery counts, and stable matching metadata; prompts and answers are excluded. Merge report arrays with `jq -s '{"evidence": map(.adaptive_evidence[]) }' /tmp/workflow-*.json > /tmp/adaptive-evidence.json`, configure model input/output prices in **Settings → Model pricing**, then POST that JSON to `/admin/adaptive-execution/evidence` with an admin bearer token. Imports are idempotent and scoped to the signed-in admin tenant. This admin endpoint is a trusted operator import for verified benchmark runner artifacts: it validates the versioned evidence shape, timestamps (allowing at most five minutes of clock skew), and nonnegative finite metrics, but it does not provide cryptographic provenance attestation across databases. Do not treat arbitrary client-submitted evidence as verified benchmark output.
+
+Review **Model Performance → Routing** in Observe mode first. The router uses recent qualified evidence only after five matched pairs and a 90% jointly correct and grounded floor; Active can then be enabled under **Settings → Routing & calibration**. Active routing applies only to Auto requests with an explicitly supplied or deterministically inferred workload and entirely read-only accessible tools. Return to Observe at any time to roll back adaptive decisions.
+
 Full breakdowns and raw telemetry live in [BENCHMARKS.md](BENCHMARKS.md) ([benchmarks/live_llm_results.json](benchmarks/live_llm_results.json) and [benchmarks/subagent_flash_results.json](benchmarks/subagent_flash_results.json)).
 
 ### Win #1: SOTA Discovery Saves 71%–99% of Initial Schema Tokens (In BOTH Modes)

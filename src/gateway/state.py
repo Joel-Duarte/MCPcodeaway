@@ -172,6 +172,10 @@ class AuditStore(Protocol):
 
     async def record_run(self, run: dict[str, Any]) -> None: ...
 
+    async def import_adaptive_evidence(self, tenant_id: str, rows: list[dict[str, Any]]) -> int: ...
+
+    async def list_adaptive_evidence(self, tenant_id: str) -> list[dict[str, Any]]: ...
+
     async def list_runs(
         self, limit: int = 50, tenant_id: str | None = None
     ) -> list[dict[str, Any]]: ...
@@ -290,6 +294,11 @@ class SQLiteAuditStore:
                 updated_at TEXT NOT NULL
             )
             """
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS adaptive_evidence (
+                tenant_id TEXT NOT NULL, evidence_id TEXT NOT NULL, created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL, PRIMARY KEY (tenant_id, evidence_id))"""
         )
         conn.execute(
             """
@@ -664,6 +673,43 @@ class SQLiteAuditStore:
             )
             conn.commit()
 
+    async def import_adaptive_evidence(self, tenant_id: str, rows: list[dict[str, Any]]) -> int:
+        async with self._lock:
+            conn = self._ensure_conn()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                inserted = 0
+                for row in rows:
+                    evidence_id = str(row["evidence_id"])
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO adaptive_evidence VALUES (?, ?, ?, ?)",
+                        (
+                            tenant_id,
+                            evidence_id,
+                            str(row["created_at"]),
+                            json.dumps(row, default=str),
+                        ),
+                    )
+                    inserted += cur.rowcount
+                conn.commit()
+                return inserted
+            except Exception:
+                conn.rollback()
+                raise
+
+    async def list_adaptive_evidence(self, tenant_id: str) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = (
+                self._ensure_conn()
+                .execute(
+                    "SELECT payload_json FROM adaptive_evidence "
+                    "WHERE tenant_id=? ORDER BY created_at DESC",
+                    (tenant_id,),
+                )
+                .fetchall()
+            )
+        return [json.loads(r[0]) for r in rows]
+
     async def set_gateway_secret(self, name: str, ciphertext: str, *, updated_by: str = "") -> None:
         now = datetime.now(UTC).isoformat()
         async with self._lock:
@@ -836,6 +882,11 @@ class PostgresAuditStore:
 
     async def init(self) -> None:
         pool = await self._get_pool()
+        await pool.execute(
+            """CREATE TABLE IF NOT EXISTS adaptive_evidence (
+                tenant_id TEXT NOT NULL, evidence_id TEXT NOT NULL, created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL, PRIMARY KEY (tenant_id, evidence_id))"""
+        )
         await pool.execute(
             """
             CREATE TABLE IF NOT EXISTS audit_runs (
@@ -1144,6 +1195,31 @@ class PostgresAuditStore:
             payload,
             now,
         )
+
+    async def import_adaptive_evidence(self, tenant_id: str, rows: list[dict[str, Any]]) -> int:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                count = 0
+                for row in rows:
+                    status = await conn.execute(
+                        "INSERT INTO adaptive_evidence VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+                        tenant_id,
+                        str(row["evidence_id"]),
+                        str(row["created_at"]),
+                        json.dumps(row),
+                    )
+                    count += int(str(status).split()[-1])
+        return count
+
+    async def list_adaptive_evidence(self, tenant_id: str) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            "SELECT payload_json FROM adaptive_evidence "
+            "WHERE tenant_id=$1 ORDER BY created_at DESC",
+            tenant_id,
+        )
+        return [self._decode_json(r["payload_json"]) for r in rows]
 
     async def set_gateway_secret(self, name: str, ciphertext: str, *, updated_by: str = "") -> None:
         pool = await self._get_pool()

@@ -1,14 +1,15 @@
 <script setup lang="ts">
 import { extractErrorMessage } from "~/composables/useAdminApi";
+import { summarizeUpstreamHealth } from "~/utils/upstream-health";
 
 const { apiFetch: _apiFetch } = useAdminApi();
 const expandedUpstreamName = ref<string | null>(null);
-const perfRows = ref<Array<{ model: string; server: string; tool: string; mode: string; runs: number; success_rate_pct: number; avg_duration_ms: number; avg_tokens: number; recommended_mode: string }>>([]);
+const healthRows = ref<Array<{ server: string; tool: string; count: number; bytes: number; mean_latency_ms: number | null; p95_latency_ms: number | null; errors: number | null; timeouts: number; invalid_arguments: number | null; schema_coverage_pct: number | null; read_calls: number | null; write_calls: number | null }>>([]);
 
 async function loadPerf() {
   try {
-    const res = await _apiFetch<{ rows: typeof perfRows.value }>("/admin/ab/model-performance?window=all&limit=5000");
-    if (res?.rows) perfRows.value = res.rows;
+    const res = await _apiFetch<{ rows: typeof healthRows.value }>("/admin/adaptive-execution/tool-health?window=all");
+    if (res?.rows) healthRows.value = res.rows;
   } catch {
     // ignore
   }
@@ -18,91 +19,18 @@ function toggleExpandUpstream(name: string) {
   expandedUpstreamName.value = expandedUpstreamName.value === name ? null : name;
 }
 
-function normalizeRecommendationMode(mode: string | null | undefined): string {
-  const normalized = String(mode || "").trim().toLowerCase();
-  if (["codemode", "codemode_upfront", "code", "code_mode"].includes(normalized)) return "codemode";
-  if (["traditional", "traditional_discover", "classic", "classic_mcp"].includes(normalized)) return "traditional";
-  if (["", "—", "none", "unknown", "unavailable", "auto"].includes(normalized)) return "";
-  if (normalized === "hybrid") return "hybrid";
-  return normalized;
-}
-
-function recommendationModeLabel(mode: string): string {
-  if (mode === "codemode") return "Code Mode";
-  if (mode === "traditional") return "Classic MCP";
-  if (mode === "hybrid") return "Hybrid";
-  return mode;
-}
-
 function aggregatedToolsForUpstream(u: UpstreamEntry) {
-  const toolNames = new Set<string>(u.tools || []);
-  for (const r of perfRows.value) {
-    if (r.server === u.name) toolNames.add(r.tool);
-  }
-  return Array.from(toolNames)
-    .sort()
-    .map((tool) => {
-      const matching = perfRows.value.filter((r) => r.server === u.name && r.tool === tool);
-      const runs = matching.reduce((s, r) => s + r.runs, 0);
-      const okWeighted = matching.reduce((s, r) => s + (r.success_rate_pct / 100) * r.runs, 0);
-      const msWeighted = matching.reduce((s, r) => s + r.avg_duration_ms * r.runs, 0);
-      const tokWeighted = matching.reduce((s, r) => s + (r.avg_tokens || 0) * r.runs, 0);
-      return {
-        tool,
-        runs,
-        success_rate_pct: runs ? Math.round((okWeighted / runs) * 1000) / 10 : 0,
-        avg_duration_ms: runs ? Math.round((msWeighted / runs) * 10) / 10 : 0,
-        avg_tokens: runs ? Math.round(tokWeighted / runs) : 0,
-        recommendation_modes: [...new Set(matching.map((r) => normalizeRecommendationMode(r.recommended_mode)).filter(Boolean))].sort(),
-        recommendation_by_model: [...new Set(matching.map((r) => r.model))].sort().map((model) => ({
-          model,
-          modes: [...new Set(matching.filter((r) => r.model === model).map((r) => normalizeRecommendationMode(r.recommended_mode)).filter(Boolean))].sort(),
-        })).filter((entry) => entry.modes.length > 0),
-        recommended_mode: (() => {
-          const modes = [...new Set(matching.map((r) => normalizeRecommendationMode(r.recommended_mode)).filter(Boolean))];
-          const hasMixedHistory = matching.some((row) => {
-            const modelModes = new Set(matching.filter((candidate) => candidate.model === row.model).map((candidate) => normalizeRecommendationMode(candidate.recommended_mode)).filter(Boolean));
-            return modelModes.size > 1;
-          });
-          if (!modes.length) return "none";
-          if (hasMixedHistory) return "mixed";
-          return modes.length === 1 ? modes[0] : "varies";
-        })(),
-      };
-    });
-}
-
-function recommendationLabel(tool: ReturnType<typeof aggregatedToolsForUpstream>[number]) {
-  if (tool.recommended_mode === "codemode") return "Code Mode";
-  if (tool.recommended_mode === "traditional") return "Classic MCP";
-  if (tool.recommended_mode === "hybrid") return "Hybrid";
-  if (tool.recommended_mode === "varies") return "Differs by model";
-  if (tool.recommended_mode === "mixed") return "Mixed calibration signal";
-  if (tool.recommended_mode === "none") return "No calibration yet";
-  return tool.recommended_mode;
-}
-
-function recommendationDetail(tool: ReturnType<typeof aggregatedToolsForUpstream>[number]) {
-  const byModel = tool.recommendation_by_model || [];
-  if (byModel.length > 1) {
-    return `By model: ${byModel.map(({ model, modes }) => `${model}: ${modes.map(recommendationModeLabel).join(" / ")}`).join(" · ")}.`;
-  }
-  if (tool.recommended_mode === "none") return "No eligible calibration result is available for this tool yet.";
-  return byModel[0] ? `${byModel[0].model}: ${byModel[0].modes.map(recommendationModeLabel).join(" / ")}.` : "No model-specific recommendation is available.";
+  return healthRows.value.filter((row) => row.server === u.name).sort((a, b) => a.tool.localeCompare(b.tool));
 }
 
 function serverStats(u: UpstreamEntry) {
-  const tools = aggregatedToolsForUpstream(u);
-  const runs = tools.reduce((s, t) => s + t.runs, 0);
-  const okWeighted = tools.reduce((s, t) => s + (t.success_rate_pct / 100) * t.runs, 0);
-  const msWeighted = tools.reduce((s, t) => s + t.avg_duration_ms * t.runs, 0);
-  const tokWeighted = tools.reduce((s, t) => s + t.avg_tokens * t.runs, 0);
+  const summary = summarizeUpstreamHealth(aggregatedToolsForUpstream(u));
   return {
-    toolCount: tools.length,
-    runs,
-    success_rate_pct: runs ? Math.round((okWeighted / runs) * 1000) / 10 : 0,
-    avg_duration_ms: runs ? Math.round((msWeighted / runs) * 10) / 10 : 0,
-    avg_tokens: runs ? Math.round(tokWeighted / runs) : 0,
+    ...summary,
+    runs: summary.calls,
+    avg_duration_ms: summary.avgLatencyMs,
+    avg_tokens: null,
+    success_rate_pct: summary.successRatePct,
   };
 }
 
@@ -441,7 +369,7 @@ onMounted(() => {
           No upstreams match the active filters.
         </div>
 
-        <div v-else class="overflow-x-auto">
+        <div v-else class="relative overflow-x-auto">
           <table class="w-full border-collapse text-left text-xs">
             <thead>
               <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] font-medium text-[#52525B]">
@@ -449,10 +377,10 @@ onMounted(() => {
                 <th class="hidden lg:table-cell px-2.5 py-2">Type / Auth</th>
                 <th class="hidden xl:table-cell px-2.5 py-2">Groups</th>
                 <th class="px-2.5 py-2 text-right">Tools</th>
-                <th class="px-2.5 py-2 text-right">Runs</th>
-                <th class="px-2.5 py-2 text-right">Success</th>
-                <th class="hidden md:table-cell px-2.5 py-2 text-right">Latency</th>
-                <th class="hidden xl:table-cell px-2.5 py-2 text-right">Tokens</th>
+                <th class="px-2.5 py-2 text-right">Calls</th>
+                <th class="px-2.5 py-2 text-right">Errors</th>
+                <th class="hidden md:table-cell px-2.5 py-2 text-right">Mean latency</th>
+                <th class="hidden xl:table-cell px-2.5 py-2 text-right">Timeouts</th>
                 <th class="px-2.5 py-2 text-center">Mode</th>
                 <th v-if="upstreamsData.dynamic_upstreams_permitted" class="w-10 px-2 py-2 text-right">
                   <span class="sr-only">Actions</span>
@@ -488,13 +416,13 @@ onMounted(() => {
                     {{ serverStats(u).runs }}
                   </td>
                   <td class="px-2.5 py-2 text-right font-mono-data tabular-nums whitespace-nowrap">
-                    {{ serverStats(u).runs ? `${serverStats(u).success_rate_pct}%` : "—" }}
+                    {{ serverStats(u).errors == null ? "Unknown" : serverStats(u).errors }}
                   </td>
                   <td class="hidden md:table-cell px-2.5 py-2 text-right font-mono-data tabular-nums whitespace-nowrap">
-                    {{ serverStats(u).runs ? `${serverStats(u).avg_duration_ms} ms` : "—" }}
+                    {{ serverStats(u).avg_duration_ms == null ? "Unknown" : `${serverStats(u).avg_duration_ms} ms` }}
                   </td>
                   <td class="hidden xl:table-cell px-2.5 py-2 text-right font-mono-data tabular-nums whitespace-nowrap">
-                    {{ serverStats(u).runs ? serverStats(u).avg_tokens : "—" }}
+                    {{ aggregatedToolsForUpstream(u).reduce((sum, tool) => sum + tool.timeouts, 0) }}
                   </td>
                   <td class="px-2.5 py-2 text-center whitespace-nowrap" @click.stop>
                     <select
@@ -526,43 +454,30 @@ onMounted(() => {
                       No tools discovered for this upstream yet.
                     </div>
                     <div v-else class="overflow-x-auto">
-                      <p class="mb-2 text-[11px] leading-4 text-[#71717A]">The calibration recommendation is model-specific. A manual override applies to this upstream tool across all models and takes precedence over Auto. Choose Inherit to return to the upstream default.</p>
+                      <p class="mb-2 text-[11px] leading-4 text-[#71717A]">Observed dispatcher subcalls, payload sizes, latency, failures, and known schema metadata. Historical fields that were not captured remain unknown.</p>
                       <table class="w-full text-left text-xs tabular-nums">
                         <thead class="border-b border-[#E4E4E7] text-[#71717A]">
                           <tr>
                             <th class="py-1.5 pr-3 font-medium">Tool</th>
-                            <th class="py-1.5 pr-3 font-medium text-right">Runs</th>
-                            <th class="py-1.5 pr-3 font-medium text-right">Success</th>
-                            <th class="py-1.5 pr-3 font-medium text-right">Avg Latency</th>
-                            <th class="py-1.5 pr-3 font-medium text-right">Avg Tokens</th>
-                            <th class="py-1.5 pr-3 font-medium">Calibration signal</th>
-                            <th class="py-1.5 font-medium">Tool override · all models</th>
+                            <th class="py-1.5 pr-3 font-medium text-right">Calls</th>
+                            <th class="py-1.5 pr-3 font-medium text-right">Bytes</th>
+                            <th class="py-1.5 pr-3 font-medium text-right">Mean / p95 latency</th>
+                            <th class="py-1.5 pr-3 font-medium text-right">Errors / timeouts</th>
+                            <th class="py-1.5 pr-3 font-medium">Schema coverage</th>
+                            <th class="py-1.5 pr-3 font-medium">Read / write calls</th>
+                            <th class="py-1.5 font-medium">Invalid arguments</th>
                           </tr>
                         </thead>
                         <tbody class="divide-y divide-[#E4E4E7]">
                           <tr v-for="t in aggregatedToolsForUpstream(u)" :key="t.tool">
                             <td class="py-2 pr-3 font-mono-data text-[#09090B]">{{ t.tool }}</td>
-                            <td class="py-2 pr-3 text-right font-mono-data">{{ t.runs }}</td>
-                            <td class="py-2 pr-3 text-right font-mono-data">{{ t.runs ? `${t.success_rate_pct}%` : "—" }}</td>
-                            <td class="py-2 pr-3 text-right font-mono-data">{{ t.runs ? `${t.avg_duration_ms} ms` : "—" }}</td>
-                            <td class="py-2 pr-3 text-right font-mono-data">{{ t.runs ? t.avg_tokens : "—" }}</td>
-                            <td class="py-2 pr-3">
-                              <span class="font-medium" :class="t.recommended_mode === 'codemode' ? 'text-[#0F766E]' : t.recommended_mode === 'traditional' ? 'text-[#1D4ED8]' : 'text-[#52525B]'">{{ recommendationLabel(t) }}</span>
-                              <span v-if="t.recommended_mode === 'varies' || t.recommended_mode === 'mixed' || t.recommended_mode === 'none' || (t.recommendation_by_model?.length || 0) > 1" class="mt-0.5 block max-w-[22rem] text-[10px] leading-4 text-[#71717A]">{{ recommendationDetail(t) }}</span>
-                            </td>
-                            <td class="py-2">
-                              <select
-                                :value="u.tool_mode_overrides?.[t.tool] || 'inherit'"
-                                 :aria-label="`Routing override for ${t.tool}`"
-                                class="rounded border border-[#D4D4D8] bg-white px-2 py-1 text-xs"
-                                @change="(e) => { const el = e.target as HTMLSelectElement; const next = el.value; el.value = u.tool_mode_overrides?.[t.tool] || 'inherit'; promptModeChange('tool', u, next, t.tool); }"
-                              >
-                                <option value="inherit">Inherit server default</option>
-                                <option value="auto">Auto · follow calibration</option>
-                                <option value="codemode">Force Code Mode</option>
-                                <option value="traditional">Force Classic MCP</option>
-                              </select>
-                            </td>
+                            <td class="py-2 pr-3 text-right font-mono-data tabular-nums">{{ t.count }}</td>
+                            <td class="py-2 pr-3 text-right font-mono-data tabular-nums">{{ t.bytes.toLocaleString() }}</td>
+                            <td class="py-2 pr-3 text-right font-mono-data tabular-nums">{{ t.mean_latency_ms == null ? "Unknown" : `${t.mean_latency_ms} / ${t.p95_latency_ms ?? "Unknown"} ms` }}</td>
+                            <td class="py-2 pr-3 text-right font-mono-data tabular-nums">{{ t.errors }} / {{ t.timeouts }}</td>
+                            <td class="py-2 pr-3 tabular-nums">{{ t.schema_coverage_pct == null ? "Unknown" : `${t.schema_coverage_pct}%` }}</td>
+                            <td class="py-2 pr-3 tabular-nums">{{ t.read_calls == null ? "Unknown" : `${t.read_calls} / ${t.write_calls}` }}</td>
+                            <td class="py-2 tabular-nums">{{ t.invalid_arguments == null ? "Unknown" : t.invalid_arguments }}</td>
                           </tr>
                         </tbody>
                       </table>

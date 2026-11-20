@@ -5,6 +5,9 @@ import { extractErrorMessage } from "~/composables/useAdminApi";
 interface TraceRun {
   run_id: string;
   mode: string;
+  applied_mode?: string;
+  recommended_mode?: string | null;
+  mode_decision_reason?: string | null;
   ok: boolean;
   grounding_blocked?: boolean;
   duration_ms: number;
@@ -299,6 +302,7 @@ function otherStageMs(g: TimelineGroup): number {
                 <th class="px-4 py-2">Run</th>
                 <th class="px-4 py-2">Group / Caller</th>
                 <th class="px-4 py-2">Mode</th>
+                <th class="px-4 py-2">Applied / recommended</th>
                 <th class="px-4 py-2 text-right">Subcalls</th>
                 <th class="px-4 py-2 text-right">Duration</th>
                 <th class="px-4 py-2 text-right">Inspect</th>
@@ -308,7 +312,8 @@ function otherStageMs(g: TimelineGroup): number {
               <tr v-for="r in slowestRuns" :key="r.run_id" class="hover:bg-[#FAFAFA]">
                 <td class="px-4 py-2 font-mono-data text-xs text-[#09090B]">{{ r.run_id.slice(0, 12) }}</td>
                 <td class="px-4 py-2 text-xs text-[#52525B]">{{ (r.user_groups || []).join(", ") || "open" }} · {{ r.user_email || r.user_sub }}</td>
-                <td class="px-4 py-2 font-mono-data text-xs">{{ r.mode }}</td>
+                <td class="px-4 py-2 font-mono-data text-xs">{{ r.applied_mode || r.mode }}</td>
+                <td class="px-4 py-2 text-xs"><span>{{ r.recommended_mode || "No adaptive recommendation" }}</span><span v-if="r.mode_decision_reason" class="block max-w-[24rem] text-[10px] leading-4 text-[#71717A]">{{ r.mode_decision_reason }}</span></td>
                 <td class="px-4 py-2 text-right tabular-nums">{{ r.subcall_count }}</td>
                 <td class="px-4 py-2 text-right font-semibold tabular-nums">{{ r.duration_ms.toFixed(1) }} ms</td>
                 <td class="px-4 py-2 text-right">

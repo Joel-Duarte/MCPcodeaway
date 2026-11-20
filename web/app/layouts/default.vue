@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from "vue";
 
 const route = useRoute();
+const currentPath = computed(() => route.path.replace(/\/+$/, "") || "/");
 const { session, loadAuthState, logout } = useAdminApi();
 const { initAgentBridge } = useUiAgentBridge();
 const { refreshStatus: refreshDemoStatus } = useDemoTraffic();
@@ -10,7 +11,7 @@ const mobileNavigationOpen = ref(false);
 const sessionReady = ref(false);
 const loggingOut = ref(false);
 const { selectedRange } = useReportRange();
-const isReportPage = computed(() => ["/analytics", "/optimization", "/model-performance"].includes(route.path));
+const isReportPage = computed(() => ["/analytics", "/model-performance"].includes(currentPath.value));
 
 const navigation = [
   {
@@ -30,12 +31,6 @@ const navigation = [
     to: "/traces",
     group: "Operate",
     icon: "traces",
-  },
-  {
-    label: "Optimization & ROI",
-    to: "/optimization",
-    group: "Optimize",
-    icon: "optimization",
   },
   {
     label: "Model Performance",
@@ -84,7 +79,7 @@ const groupedNavigation = computed(() => {
 });
 
 const activeItem = computed(
-  () => navigation.find((item) => item.to === route.path) || navigation[0],
+  () => navigation.find((item) => item.to === currentPath.value) || navigation[0],
 );
 const isLoginRoute = computed(() => route.path === "/login");
 const adminIdentity = computed(() => {

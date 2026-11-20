@@ -143,62 +143,25 @@ async function loadSettings() {
   }
 }
 
-const turnPenaltyPts = ref(8.0);
-const tokensPerPenaltyPt = ref(150);
-const calibrationRunsPerArm = ref(50);
-const calibrationPolicyLoaded = ref(false);
-const calibrationLoadError = ref("");
-const classicExtraTurnTokenEquivalent = computed(() => turnPenaltyPts.value * tokensPerPenaltyPt.value);
-const savingPenalty = ref(false);
-const penaltyNotice = ref("");
+const adaptiveMode = ref<"observe" | "active">("observe");
+const savingAdaptiveMode = ref(false);
 
-async function loadAbSettings() {
+async function loadAdaptiveMode() {
   try {
-    const res = await apiFetch<{
-      turn_penalty_pts: number;
-      tokens_per_penalty_pt: number;
-      calibration_runs_per_arm: number;
-    }>("/admin/ab/settings");
-    if (res) {
-      if (typeof res.turn_penalty_pts === "number") turnPenaltyPts.value = res.turn_penalty_pts;
-      if (typeof res.tokens_per_penalty_pt === "number") tokensPerPenaltyPt.value = res.tokens_per_penalty_pt;
-      if (typeof res.calibration_runs_per_arm === "number") calibrationRunsPerArm.value = res.calibration_runs_per_arm;
-      calibrationPolicyLoaded.value = true;
-    }
-  } catch (err) {
-    calibrationLoadError.value = extractErrorMessage(err);
-  }
+    const res = await apiFetch<{ adaptive_mode?: "observe" | "active" }>("/admin/adaptive-execution/report?window=30d");
+    adaptiveMode.value = res.adaptive_mode === "active" ? "active" : "observe";
+  } catch { adaptiveMode.value = "observe"; }
 }
 
-async function saveAbPenalty() {
-  savingPenalty.value = true;
-  penaltyNotice.value = "";
-  errorMsg.value = "";
+async function saveAdaptiveMode() {
+  savingAdaptiveMode.value = true;
   try {
-    if (
-      !Number.isFinite(turnPenaltyPts.value) || turnPenaltyPts.value < 0 || turnPenaltyPts.value > 50 ||
-      !Number.isFinite(tokensPerPenaltyPt.value) || tokensPerPenaltyPt.value < 0 || tokensPerPenaltyPt.value > 2000 ||
-      !Number.isInteger(calibrationRunsPerArm.value) || calibrationRunsPerArm.value < 5 || calibrationRunsPerArm.value > 500
-    ) {
-      throw new Error("Check calibration values: penalty points 0–50, tokens per point 0–2,000, runs per arm 5–500.");
-    }
-    await apiFetch("/admin/ab/settings", {
-      method: "POST",
-      body: {
-        turn_penalty_pts: turnPenaltyPts.value,
-        tokens_per_penalty_pt: tokensPerPenaltyPt.value,
-        calibration_runs_per_arm: calibrationRunsPerArm.value,
-      },
-    });
-    calibrationPolicyLoaded.value = true;
-    calibrationLoadError.value = "";
-    penaltyNotice.value = `Saved (${turnPenaltyPts.value} pts/turn × ${tokensPerPenaltyPt.value} tok/pt, ${calibrationRunsPerArm.value} runs/arm).`;
-  } catch (err) {
-    errorMsg.value = extractErrorMessage(err);
-  } finally {
-    savingPenalty.value = false;
-  }
+    await apiFetch("/admin/adaptive-execution/settings", { method: "POST", body: { mode: adaptiveMode.value } });
+    statusMsg.value = `Adaptive routing set to ${adaptiveMode.value}.`;
+  } catch (err) { errorMsg.value = extractErrorMessage(err); }
+  finally { savingAdaptiveMode.value = false; }
 }
+
 
 const vaultSecrets = ref<Array<{ name: string; updated_by: string; updated_at: string }>>([]);
 const newSecretName = ref("");
@@ -253,7 +216,7 @@ async function deleteVaultSecret(name: string) {
 onMounted(() => {
   void loadAuthState(true).catch((err) => { errorMsg.value = extractErrorMessage(err); });
   void loadSettings();
-  void loadAbSettings();
+  void loadAdaptiveMode();
   void loadVaultSecrets();
 });
 
@@ -895,66 +858,27 @@ async function pruneAuditRuns() {
       <section v-else-if="activeSettingsTab === 'routing'" id="settings-panel-routing" role="tabpanel" class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
         <div>
           <h2 class="text-sm font-semibold text-[#09090B]">
-            Adaptive Mode Routing &amp; Calibration Policy
+            Adaptive execution routing
           </h2>
           <p class="mt-1 text-xs text-[#71717A]">
-            The configured turn penalty applies to Classic MCP only: each Classic turn after the first adds a modeled token-equivalent overhead. Code Mode remains measured-token usage. The comparison is scoped to each <code class="font-mono-data">(model, tool)</code> pair; this is a routing estimate, not additional billed tokens or a cash-saving measurement.
+            Observe records the mode applied and the evidence recommendation. Active applies qualified workflow evidence to Auto requests for read-only workloads. Explicit Hybrid, manual overrides, configured A/B splits, and dispatcher safety checks keep their existing behavior.
           </p>
         </div>
-        <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
-          <div>
-            <label class="block text-xs font-medium text-[#52525B]" for="settings-turn-penalty">
-              Classic penalty (points / extra turn)
-            </label>
-            <Input
-              id="settings-turn-penalty"
-              v-model.number="turnPenaltyPts"
-              type="number"
-              min="0"
-              max="50"
-              step="1"
-              class="mt-1 w-full font-mono-data text-xs"
-            />
-          </div>
-          <div>
-            <label class="block text-xs font-medium text-[#52525B]" for="settings-tokens-per-pt">
-              Tokens per Penalty Point
-            </label>
-            <Input
-              id="settings-tokens-per-pt"
-              v-model.number="tokensPerPenaltyPt"
-              type="number"
-              min="0"
-              max="2000"
-              step="10"
-              class="mt-1 w-full font-mono-data text-xs"
-            />
-          </div>
-          <div>
-            <label class="block text-xs font-medium text-[#52525B]" for="settings-runs-per-arm">
-              Calibration Runs per Arm (50/50)
-            </label>
-            <Input
-              id="settings-runs-per-arm"
-              v-model.number="calibrationRunsPerArm"
-              type="number"
-              min="5"
-              max="500"
-              step="5"
-              class="mt-1 w-full font-mono-data text-xs"
-            />
-          </div>
+        <div class="max-w-sm">
+          <label class="block text-xs font-medium text-[#52525B]" for="adaptive-routing-mode">Routing mode</label>
+          <select id="adaptive-routing-mode" v-model="adaptiveMode" class="mt-1 min-h-11 w-full rounded-md border border-[#D4D4D8] bg-white px-3 text-sm text-[#09090B] focus-visible:outline-2 focus-visible:outline-[#0F766E]">
+            <option value="observe">Observe</option>
+            <option value="active">Active</option>
+          </select>
         </div>
-        <div class="rounded border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 text-xs text-[#52525B]">
-          <div><strong class="text-[#09090B]">Classic effective tokens</strong> = measured tokens + max(Classic turns − 1, 0) × {{ classicExtraTurnTokenEquivalent.toLocaleString("en-US") }} token-equivalents.</div>
-          <div class="mt-1">{{ calibrationPolicyLoaded ? `Gateway policy loaded: ${calibrationRunsPerArm} calibration runs per arm.` : "Preview from the values in this form; the active gateway policy has not been confirmed." }} This modeled overhead is not included in provider-billed token counts.</div>
-          <p v-if="calibrationLoadError" class="mt-1 text-[#92400E]">Could not load the active policy: {{ calibrationLoadError }}</p>
+        <div class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3 text-xs leading-5 text-[#52525B]">
+          Eligible traffic uses Auto mode, a known workload profile, and accessible tools that are all read-only. Evidence needs at least five matched pairs within 30 days; the recommended arm must be at least 90% jointly correct and grounded. Higher verified quality wins. Equal quality requires at least 5% lower cost with bounded latency, call, and recovery regressions. Unknown, uncertain, mutating, stale, sparse, or conflicting evidence falls back to deterministic heuristics.
         </div>
         <div class="flex items-center gap-3">
-          <Button :disabled="savingPenalty" @click="saveAbPenalty">
-            {{ savingPenalty ? "Saving..." : "Save Calibration Policy" }}
+          <Button data-variant="primary" :disabled="savingAdaptiveMode" @click="saveAdaptiveMode">
+            {{ savingAdaptiveMode ? "Saving..." : "Save routing mode" }}
           </Button>
-          <span v-if="penaltyNotice" class="text-xs text-[#0F766E]">{{ penaltyNotice }}</span>
+          <span v-if="statusMsg" role="status" class="text-xs text-[#0F766E]">{{ statusMsg }}</span>
         </div>
       </section>
 

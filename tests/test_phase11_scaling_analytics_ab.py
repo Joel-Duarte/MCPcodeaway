@@ -788,12 +788,12 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
                 json={"jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {}},
             )
             assert learned_resp.status_code == 200
-            assert "ab_auto_promoted:exp_model_learn:codemode" in learned_resp.headers.get(
+            assert "ab_experiment:exp_model_learn:" in learned_resp.headers.get(
                 "x-gateway-mode-decision", ""
             )
             assert learned_resp.headers.get("x-gateway-model") == "gemini-2.5-flash"
 
-            # Layer 5: Per-tool + per-server + per-model auto-promotion & auth remediation guidance
+            # Historical per-tool runs do not override the configured A/B split.
             await rt.store.record_run(
                 {
                     "run_id": "tool_cm_fail_1",
@@ -836,9 +836,8 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
                 json={"jsonrpc": "2.0", "id": 100, "method": "tools/list", "params": {}},
             )
             assert tool_learned_resp.status_code == 200
-            assert (
-                "ab_auto_promoted_tool:exp_model_learn:inv_api__list_items:classic"
-                in tool_learned_resp.headers.get("x-gateway-mode-decision", "")
+            assert "ab_experiment:exp_model_learn:" in tool_learned_resp.headers.get(
+                "x-gateway-mode-decision", ""
             )
 
             routing_models = await gw.get(
@@ -1103,6 +1102,15 @@ def test_live_websocket_telemetry_stream_and_summary_only_payload(tmp_path: Path
         upstreams_config_path=str(tmp_path / "none.yaml"),
     )
     app = create_gateway_app(settings=settings, dev_keys=dev_keys, preloaded_tools={})
+    app.state.runtime.demo_traffic._next_workloads = lambda: [
+        (
+            "finance_analyst",
+            "mode=codemode",
+            "websocket_test:execute_code",
+            {"name": "execute_code", "arguments": {"code": "1 + 1"}},
+            None,
+        )
+    ]
     adm_tok = dev_keys.issue_user_token(persona="gateway_admin")
     with TestClient(app) as client:
         with client.websocket_connect(f"/admin/ws/telemetry?token={adm_tok}") as ws:
@@ -1114,6 +1122,8 @@ def test_live_websocket_telemetry_stream_and_summary_only_payload(tmp_path: Path
                 headers={"Authorization": f"Bearer {adm_tok}"},
             )
             assert burst_r.status_code == 200
+            assert burst_r.json()["sent"] == 1
+            assert burst_r.json()["ok"] == 1
             evt = ws.receive_json()
             for _ in range(10):
                 if evt.get("type") == "run_recorded":

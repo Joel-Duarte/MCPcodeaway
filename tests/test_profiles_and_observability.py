@@ -312,7 +312,8 @@ async def test_postgres_audit_store_crud_and_optional_dep(
     pool = FakePgPool()
     store = PostgresAuditStore("postgresql://user:pass@localhost/db", pool=pool)
     await store.init()
-    assert len(pool.ddl) == 6
+    assert len(pool.ddl) >= 7
+    assert any("adaptive_evidence" in ddl for ddl in pool.ddl)
 
     await store.record_run(
         {"run_id": "r1", "tenant_id": "t1", "created_at": "2026-01-01T00:00:01Z"}

@@ -580,55 +580,11 @@ def resolve_ab_experiment_variant(
     model_name: str | None = None,
     target_tool: str | None = None,
 ) -> tuple[GatewayMode, str, str, str] | None:
-    """Assign a request into a Classic vs. Code Mode A/B split or auto-promote winner."""
+    """Assign a request to the configured Classic vs. Code Mode split."""
     exp = upstream.ab_experiment
     if exp is None or not exp.enabled:
         return None
     exp_id = exp.experiment_id or f"exp_{upstream.name}"
-
-    if exp.auto_switch_enabled and historical_runs:
-        base_runs = [
-            r
-            for r in historical_runs
-            if r.get("experiment_id") == exp_id
-            and (not model_name or (r.get("model_name") or "") == model_name)
-        ]
-        # 1. Fine-grained per-tool + per-server + per-model auto-promotion
-        if target_tool:
-            tool_runs = [r for r in base_runs if _run_matches_tool(r, target_tool)]
-            if len(tool_runs) >= exp.auto_promote_min_runs:
-                verdict = _evaluate_learned_arms(tool_runs)
-                if verdict is not None:
-                    winner, avg_saved, cm_err = verdict
-                    gw_mode: GatewayMode = "codemode" if winner == "codemode" else "traditional"
-                    model_tag = f" model={model_name}" if model_name else ""
-                    return (
-                        gw_mode,
-                        exp_id,
-                        winner,
-                        (
-                            f"ab_auto_promoted_tool:{exp_id}:{target_tool}:{winner} "
-                            f"(n={len(tool_runs)}{model_tag} "
-                            f"saved={round(avg_saved, 1)} err_cm={round(cm_err, 1)}%)"
-                        ),
-                    )
-        # 2. Per-server + per-model auto-promotion fallback
-        if len(base_runs) >= exp.auto_promote_min_runs:
-            verdict = _evaluate_learned_arms(base_runs)
-            if verdict is not None:
-                winner, avg_saved, cm_err = verdict
-                gw_mode = "codemode" if winner == "codemode" else "traditional"
-                model_tag = f" model={model_name}" if model_name else ""
-                return (
-                    gw_mode,
-                    exp_id,
-                    winner,
-                    (
-                        f"ab_auto_promoted:{exp_id}:{winner} "
-                        f"(n={len(base_runs)}{model_tag} "
-                        f"saved={round(avg_saved, 1)} err_cm={round(cm_err, 1)}%)"
-                    ),
-                )
 
     seed = f"{exp_id}:{identity.tenant_id}:{identity.sub}:{request_id}".encode()
     bucket = int.from_bytes(hashlib.sha256(seed).digest()[:4], "big") % 100
