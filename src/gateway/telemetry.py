@@ -230,7 +230,7 @@ class TelemetryRecorder:
             "code": OutputRedactor.redact_text(code) if code else None,
             "stdout": OutputRedactor.redact_text(stdout) if stdout else "",
             "error": OutputRedactor.redact_text(error) if error else None,
-            "subcalls": [sc.model_dump() for sc in subcalls],
+            "subcalls": [OutputRedactor.redact(sc.model_dump()) for sc in subcalls],
             "subcall_count": len(subcalls),
             "token_hops": token_hops,
             "schema_tokens": schema_tokens,

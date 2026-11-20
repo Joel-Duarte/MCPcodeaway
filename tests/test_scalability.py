@@ -8,12 +8,14 @@ import socket
 from typing import Any
 
 import httpx
+import pytest
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
 
 from examples.mock_backends import create_mock_backends_app
 from gateway.auth import LocalDevKeyManager
 from gateway.config import GatewaySettings
+from gateway.sandbox import RemoteMontyWorkerBackend
 from gateway.sandbox_worker import create_sandbox_worker_app
 from gateway.server import create_gateway_app
 from gateway.state import RedisCacheBackend, SQLiteAuditStore
@@ -27,7 +29,11 @@ def _free_port() -> int:
 
 async def test_remote_monty_worker_reverse_rpc_isolation(tmp_path) -> None:
     port = _free_port()
-    worker_app = create_sandbox_worker_app(min_processes=1, max_processes=2)
+    worker_app = create_sandbox_worker_app(
+        min_processes=1,
+        max_processes=2,
+        max_concurrent_executions=2,
+    )
     config = uvicorn.Config(worker_app, host="127.0.0.1", port=port, log_level="warning")
     server = uvicorn.Server(config)
     server_task = asyncio.create_task(server.serve())
@@ -106,6 +112,103 @@ async def test_remote_monty_worker_reverse_rpc_isolation(tmp_path) -> None:
                 assert fin_token not in str(sc)
                 assert "eyJ" not in str(sc)
 
+                # Separate WebSocket executions must keep reverse-RPC callbacks
+                # bound to the caller that created each execution.
+                remote_backend = RemoteMontyWorkerBackend(f"ws://127.0.0.1:{port}/ws/execute")
+                callbacks_entered = 0
+                callbacks_lock = asyncio.Lock()
+                callbacks_ready = asyncio.Event()
+
+                def _identity_probe(marker: str):
+                    async def _probe() -> str:
+                        nonlocal callbacks_entered
+                        async with callbacks_lock:
+                            callbacks_entered += 1
+                            if callbacks_entered == 2:
+                                callbacks_ready.set()
+                        await asyncio.wait_for(callbacks_ready.wait(), timeout=5.0)
+                        return marker
+
+                    return _probe
+
+                result_a, result_b = await asyncio.gather(
+                    remote_backend.execute(
+                        "await identity_probe()",
+                        external_functions={"identity_probe": _identity_probe("tenant-a")},
+                        timeout_seconds=2.0,
+                    ),
+                    remote_backend.execute(
+                        "await identity_probe()",
+                        external_functions={"identity_probe": _identity_probe("tenant-b")},
+                        timeout_seconds=2.0,
+                    ),
+                )
+                assert result_a.ok and result_a.result == "tenant-a"
+                assert result_b.ok and result_b.result == "tenant-b"
+
+                callback_started = asyncio.Event()
+                callback_cancelled = asyncio.Event()
+
+                async def _wait_until_cancelled() -> str:
+                    callback_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        callback_cancelled.set()
+                        raise
+                    return "unreachable"
+
+                cancelled_execution = asyncio.create_task(
+                    remote_backend.execute(
+                        "await wait_until_cancelled()",
+                        external_functions={"wait_until_cancelled": _wait_until_cancelled},
+                        timeout_seconds=4.0,
+                    )
+                )
+                await asyncio.wait_for(callback_started.wait(), timeout=3.0)
+                cancelled_execution.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await cancelled_execution
+                await asyncio.wait_for(callback_cancelled.wait(), timeout=1.0)
+
+                # Saturation waits only for the bounded admission interval and
+                # rejects excess executions; it must not build an unbounded queue.
+                holds_started = 0
+                holds_lock = asyncio.Lock()
+                both_slots_held = asyncio.Event()
+                release_holds = asyncio.Event()
+
+                async def _hold_slot() -> str:
+                    nonlocal holds_started
+                    async with holds_lock:
+                        holds_started += 1
+                        if holds_started == 2:
+                            both_slots_held.set()
+                    await asyncio.wait_for(release_holds.wait(), timeout=5.0)
+                    return "released"
+
+                holding_executions = asyncio.gather(
+                    *[
+                        remote_backend.execute(
+                            "await hold_slot()",
+                            external_functions={"hold_slot": _hold_slot},
+                            timeout_seconds=4.0,
+                        )
+                        for _ in range(2)
+                    ]
+                )
+                try:
+                    await asyncio.wait_for(both_slots_held.wait(), timeout=5.0)
+                    overloaded = await remote_backend.execute(
+                        "1", external_functions={}, timeout_seconds=2.0
+                    )
+                    assert not overloaded.ok
+                    assert "capacity" in (overloaded.error or "").lower()
+                finally:
+                    release_holds.set()
+                held_results = await holding_executions
+                assert all(result.ok and result.result == "released" for result in held_results)
+
                 # 2. Unauthorized tool is never bound into remote worker
                 denied = await gw.post(
                     "/mcp?mode=codemode",
@@ -141,6 +244,9 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(tmp_path) ->
     dev_keys = LocalDevKeyManager(issuer=settings.oidc_issuer)
 
     whoami_app = FastAPI()
+    simultaneous_calls = 0
+    simultaneous_calls_lock = asyncio.Lock()
+    first_wave_entered_upstream = asyncio.Event()
 
     @whoami_app.post("/whoami/mcp")
     async def whoami_mcp(request: dict, authorization: str | None = Header(default=None)):
@@ -169,6 +275,12 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(tmp_path) ->
                 },
             }
         data = {"sub": claims["sub"], "tid": claims["tid"]}
+        nonlocal simultaneous_calls
+        async with simultaneous_calls_lock:
+            simultaneous_calls += 1
+            if simultaneous_calls >= 4:
+                first_wave_entered_upstream.set()
+        await asyncio.wait_for(first_wave_entered_upstream.wait(), timeout=5.0)
         return {
             "jsonrpc": "2.0",
             "id": request["id"],
@@ -203,6 +315,7 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(tmp_path) ->
         dev_keys=dev_keys,
         http_client=backend_client,
     )
+    request_slots = asyncio.Semaphore(4)
 
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
@@ -211,24 +324,27 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(tmp_path) ->
 
             async def _run_user(idx: int) -> tuple[str, str, dict[str, Any]]:
                 tenant = "tenant-alpha" if idx % 2 == 0 else "tenant-beta"
-                sub = f"concurrent-user-{idx:02d}"
+                # Reuse one subject in different tenants to catch cache/session
+                # keys that accidentally omit the tenant component.
+                sub = "shared-subject" if idx < 2 else f"concurrent-user-{idx:02d}"
                 tok = dev_keys.issue_user_token(
                     persona="finance_analyst",
                     overrides={"sub": sub, "tenant_id": tenant},
                 )
-                resp = await gw.post(
-                    "/mcp?mode=codemode",
-                    headers={"Authorization": f"Bearer {tok}"},
-                    json={
-                        "jsonrpc": "2.0",
-                        "id": idx,
-                        "method": "tools/call",
-                        "params": {
-                            "name": "execute_code",
-                            "arguments": {"code": "await whoami_srv__whoami()"},
+                async with request_slots:
+                    resp = await gw.post(
+                        "/mcp?mode=codemode",
+                        headers={"Authorization": f"Bearer {tok}"},
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": idx,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "execute_code",
+                                "arguments": {"code": "await whoami_srv__whoami()"},
+                            },
                         },
-                    },
-                )
+                    )
                 return sub, tenant, resp.json()["result"]["structuredContent"]
 
             results = await asyncio.gather(*[_run_user(i) for i in range(20)])

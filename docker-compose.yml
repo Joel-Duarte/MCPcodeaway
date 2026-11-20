@@ -41,7 +41,7 @@ services:
     environment:
       POSTGRES_DB: mcpcodeaway
       POSTGRES_USER: gateway
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev-postgres-password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-compose-postgres-password}
     networks:
       - control_plane
     profiles: ["prod", "scaled"]
@@ -52,12 +52,69 @@ services:
       target: sandbox-worker
     command: ["uvicorn", "gateway.sandbox_worker:app", "--host", "0.0.0.0", "--port", "8002"]
     environment:
-      GATEWAY_SANDBOX_WORKER_SECRET: ${GATEWAY_SANDBOX_WORKER_SECRET:-dev-sandbox-worker-secret}
+      GATEWAY_APP_ENV: uat
+      GATEWAY_SANDBOX_WORKER_SECRET: ${GATEWAY_SANDBOX_WORKER_SECRET:-local-compose-worker-secret-change-me}
     deploy:
       replicas: 2
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
     networks:
       - sandbox_isolated
-    profiles: ["prod", "scaled"]
+    profiles: ["scaled"]
+
+  sandbox-worker-prod:
+    build:
+      context: .
+      target: sandbox-worker
+    command: ["uvicorn", "gateway.sandbox_worker:app", "--host", "0.0.0.0", "--port", "8002"]
+    environment:
+      GATEWAY_APP_ENV: prod
+      GATEWAY_SANDBOX_WORKER_SECRET: ${GATEWAY_SANDBOX_WORKER_SECRET:-}
+      GATEWAY_MONTY_POOL_CHECKOUT_TIMEOUT_SECONDS: ${GATEWAY_MONTY_POOL_CHECKOUT_TIMEOUT_SECONDS:-0.25}
+      GATEWAY_MONTY_WORKER_REQUEST_TIMEOUT_SECONDS: ${GATEWAY_MONTY_WORKER_REQUEST_TIMEOUT_SECONDS:-15}
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    networks:
+      - sandbox_isolated
+    profiles: ["prod"]
 
   gateway-scaled:
     build:
@@ -66,6 +123,7 @@ services:
     depends_on:
       - mock-backends
       - redis
+      - postgres
       - sandbox-worker
     deploy:
       replicas: 2
@@ -77,11 +135,10 @@ services:
       GATEWAY_SANDBOX_BACKEND: remote
       GATEWAY_SANDBOX_WORKER_URL: ws://sandbox-worker:8002/ws/execute
       GATEWAY_REDIS_URL: redis://redis:6379/0
-      GATEWAY_SANDBOX_WORKER_SECRET: ${GATEWAY_SANDBOX_WORKER_SECRET:-dev-sandbox-worker-secret}
+      GATEWAY_POSTGRES_DSN: ${GATEWAY_POSTGRES_DSN:-postgresql://gateway:${POSTGRES_PASSWORD:-local-compose-postgres-password}@postgres:5432/mcpcodeaway}
+      GATEWAY_SANDBOX_WORKER_SECRET: ${GATEWAY_SANDBOX_WORKER_SECRET:-local-compose-worker-secret-change-me}
       GATEWAY_PROVENANCE_SIGNING_SECRET: ${GATEWAY_PROVENANCE_SIGNING_SECRET:-dev-provenance-secret}
       GATEWAY_ADMIN_SESSION_SECRET: ${GATEWAY_ADMIN_SESSION_SECRET:-dev-admin-session-secret}
-    ports:
-      - "8000"
     networks:
       - control_plane
       - sandbox_isolated
@@ -94,31 +151,66 @@ services:
     depends_on:
       - redis
       - postgres
-      - sandbox-worker
-    deploy:
-      replicas: 2
+      - sandbox-worker-prod
     environment:
       GATEWAY_PROFILE: production
       GATEWAY_APP_ENV: prod
       GATEWAY_AUTH_MODE: oidc
-      GATEWAY_OIDC_ISSUER: ${GATEWAY_OIDC_ISSUER:-https://idp.example/oauth2}
-      GATEWAY_OIDC_AUDIENCE: ${GATEWAY_OIDC_AUDIENCE:-api://mcp-code-gateway}
+      GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL:-}
+      GATEWAY_OIDC_ISSUER: ${GATEWAY_OIDC_ISSUER:-}
+      GATEWAY_OIDC_AUDIENCE: ${GATEWAY_OIDC_AUDIENCE:-}
+      GATEWAY_OIDC_JWKS_URI: ${GATEWAY_OIDC_JWKS_URI:-}
+      GATEWAY_OIDC_TOKEN_ENDPOINT: ${GATEWAY_OIDC_TOKEN_ENDPOINT:-}
+      GATEWAY_OIDC_CLIENT_SECRET: ${GATEWAY_OIDC_CLIENT_SECRET:-}
+      GATEWAY_CLAIM_MAPPING: '${GATEWAY_CLAIM_MAPPING:-{}}'
+      GATEWAY_ADMIN_ROLES: '${GATEWAY_ADMIN_ROLES:-["gateway_admin","platform_admin"]}'
+      GATEWAY_VIEWER_ROLES: '${GATEWAY_VIEWER_ROLES:-["operator_viewer"]}'
+      GATEWAY_METRICS_ROLES: '${GATEWAY_METRICS_ROLES:-["gateway_admin","platform_admin","ops_observer"]}'
+      GATEWAY_REQUIRE_ADMIN_AUTH: ${GATEWAY_REQUIRE_ADMIN_AUTH:-true}
+      GATEWAY_METRICS_REQUIRE_AUTH: ${GATEWAY_METRICS_REQUIRE_AUTH:-true}
+      GATEWAY_ADMIN_OIDC_AUTHORIZATION_ENDPOINT: ${GATEWAY_ADMIN_OIDC_AUTHORIZATION_ENDPOINT:-}
+      GATEWAY_ADMIN_OIDC_REDIRECT_URI: ${GATEWAY_ADMIN_OIDC_REDIRECT_URI:-}
+      GATEWAY_ADMIN_OIDC_API_SCOPE: ${GATEWAY_ADMIN_OIDC_API_SCOPE:-}
+      GATEWAY_OIDC_CLIENT_ID: ${GATEWAY_OIDC_CLIENT_ID:-}
+      GATEWAY_ALLOWED_TENANTS: ${GATEWAY_ALLOWED_TENANTS:-}
       GATEWAY_UPSTREAMS_CONFIG_PATH: config/upstreams.yaml
-      GATEWAY_POSTGRES_DSN: ${GATEWAY_POSTGRES_DSN:-postgresql://gateway:dev-postgres-password@postgres:5432/mcpcodeaway}
-      GATEWAY_REDIS_URL: redis://redis:6379/0
+      GATEWAY_POSTGRES_DSN: ${GATEWAY_POSTGRES_DSN:-}
+      GATEWAY_REDIS_URL: ${GATEWAY_REDIS_URL:-}
       GATEWAY_SANDBOX_BACKEND: remote
-      GATEWAY_SANDBOX_WORKER_URL: ws://sandbox-worker:8002/ws/execute
-      GATEWAY_SANDBOX_WORKER_SECRET: ${GATEWAY_SANDBOX_WORKER_SECRET:-dev-sandbox-worker-secret}
-      GATEWAY_PROVENANCE_SIGNING_SECRET: ${GATEWAY_PROVENANCE_SIGNING_SECRET:-dev-provenance-secret}
-      GATEWAY_ADMIN_SESSION_SECRET: ${GATEWAY_ADMIN_SESSION_SECRET:-dev-admin-session-secret}
-    ports:
-      - "8000"
+      GATEWAY_SANDBOX_WORKER_URL: ws://sandbox-worker-prod:8002/ws/execute
+      GATEWAY_SANDBOX_WORKER_SECRET: ${GATEWAY_SANDBOX_WORKER_SECRET:-}
+      GATEWAY_MONTY_POOL_CHECKOUT_TIMEOUT_SECONDS: ${GATEWAY_MONTY_POOL_CHECKOUT_TIMEOUT_SECONDS:-0.25}
+      GATEWAY_MONTY_WORKER_REQUEST_TIMEOUT_SECONDS: ${GATEWAY_MONTY_WORKER_REQUEST_TIMEOUT_SECONDS:-15}
+      GATEWAY_PROVENANCE_SIGNING_SECRET: ${GATEWAY_PROVENANCE_SIGNING_SECRET:-}
+      GATEWAY_ADMIN_SESSION_SECRET: ${GATEWAY_ADMIN_SESSION_SECRET:-}
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
     networks:
       - control_plane
       - sandbox_isolated
     profiles: ["prod"]
 
-  lb:
+  lb-scaled:
     image: nginx:1.27-alpine
     volumes:
       - ./deploy/nginx/nginx.conf:/etc/nginx/templates/default.conf.template:ro
@@ -129,7 +221,20 @@ services:
       - "8080:80"
     networks:
       - control_plane
-    profiles: ["prod", "scaled"]
+    profiles: ["scaled"]
+
+  lb-prod:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/templates/default.conf.template:ro
+    environment:
+      GATEWAY_UPSTREAM_HOST: ${GATEWAY_LB_UPSTREAM_HOST:-gateway-prod}
+      GATEWAY_UPSTREAM_PORT: ${GATEWAY_LB_UPSTREAM_PORT:-8000}
+    ports:
+      - "8080:80"
+    networks:
+      - control_plane
+    profiles: ["prod"]
 
 networks:
   control_plane:

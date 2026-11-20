@@ -336,11 +336,20 @@ class OidcTokenValidator:
             return self._jwks_cache
         if not self.settings.oidc_jwks_uri:
             raise AuthError(500, "OIDC JWKS URI is not configured")
+        if self.settings.ssrf_protection_enabled:
+            from gateway.upstream_clients import validate_upstream_url
+
+            validate_upstream_url(
+                self.settings.oidc_jwks_uri,
+                app_env=self.settings.app_env,
+                block_private_ips_in_prod=self.settings.block_private_ips_in_prod,
+                allowed_hosts=self.settings.allowed_upstream_hosts,
+            )
         if self._http_client is not None:
-            resp = await self._http_client.get(self.settings.oidc_jwks_uri)
+            resp = await self._http_client.get(self.settings.oidc_jwks_uri, follow_redirects=False)
         else:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(self.settings.oidc_jwks_uri)
+                resp = await client.get(self.settings.oidc_jwks_uri, follow_redirects=False)
         resp.raise_for_status()
         self._jwks_cache = resp.json()
         self._jwks_expires_at = time.monotonic() + 300
@@ -634,6 +643,15 @@ class DelegatedTokenExchanger:
     ) -> tuple[str, int]:
         if not self.settings.oidc_token_endpoint:
             raise AuthError(500, "oidc_token_endpoint must be set for HTTP token exchange")
+        if self.settings.ssrf_protection_enabled:
+            from gateway.upstream_clients import validate_upstream_url
+
+            validate_upstream_url(
+                self.settings.oidc_token_endpoint,
+                app_env=self.settings.app_env,
+                block_private_ips_in_prod=self.settings.block_private_ips_in_prod,
+                allowed_hosts=self.settings.allowed_upstream_hosts,
+            )
         if dialect == "rfc8693":
             form_data = {
                 "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
@@ -657,10 +675,18 @@ class DelegatedTokenExchanger:
             raise AuthError(500, f"Unsupported token exchange dialect '{dialect}'")
 
         if self._http_client is not None:
-            resp = await self._http_client.post(self.settings.oidc_token_endpoint, data=form_data)
+            resp = await self._http_client.post(
+                self.settings.oidc_token_endpoint,
+                data=form_data,
+                follow_redirects=False,
+            )
         else:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(self.settings.oidc_token_endpoint, data=form_data)
+                resp = await client.post(
+                    self.settings.oidc_token_endpoint,
+                    data=form_data,
+                    follow_redirects=False,
+                )
 
         if resp.status_code >= 400:
             raise AuthError(502, f"Token exchange failed ({resp.status_code}): {resp.text}")

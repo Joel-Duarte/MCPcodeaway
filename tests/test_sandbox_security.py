@@ -2,14 +2,261 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import httpx
 
 from examples.mock_backends import create_mock_backends_app
 from gateway.auth import LocalDevKeyManager
 from gateway.config import GatewaySettings
-from gateway.sandbox import LocalMontyBackend
+from gateway.dispatcher import SubcallRecord
+from gateway.sandbox import LocalMontyBackend, SandboxResult
 from gateway.server import create_gateway_app
 from gateway.state import SQLiteAuditStore
+from gateway.upstream_clients import DiscoveredTool
+
+
+async def test_gateway_wall_timeout_cancels_the_sandbox_backend(tmp_path) -> None:
+    class SlowSandboxBackend:
+        def __init__(self) -> None:
+            self.cancelled = asyncio.Event()
+
+        async def execute(
+            self,
+            code: str,
+            *,
+            external_functions: dict,
+            timeout_seconds: float,
+            max_output_bytes: int = 32768,
+        ) -> SandboxResult:
+            _ = (code, external_functions, timeout_seconds, max_output_bytes)
+            try:
+                await asyncio.sleep(2.0)
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return SandboxResult(ok=True, result="late")
+
+        async def close(self) -> None:
+            return None
+
+    backend = SlowSandboxBackend()
+    settings = GatewaySettings(
+        auth_mode="dev",
+        execution_wall_timeout_seconds=0.05,
+        sqlite_path=str(tmp_path / "wall-timeout.db"),
+    )
+    dev_keys = LocalDevKeyManager(issuer=settings.oidc_issuer)
+    app = create_gateway_app(
+        settings=settings,
+        store=SQLiteAuditStore(settings.sqlite_path),
+        dev_keys=dev_keys,
+        sandbox_backend=backend,
+        preloaded_tools={},
+    )
+    token = dev_keys.issue_user_token(persona="finance_analyst")
+
+    async with app.router.lifespan_context(app):
+        identity = await app.state.runtime.validator.validate_authorization_header(
+            f"Bearer {token}"
+        )
+        result = await app.state.runtime.execute_code_for_identity(identity, "1 + 1")
+        assert not result["ok"]
+        assert result["error_type"] == "ExecutionTimeoutError"
+        assert "wall-clock limit" in result["error"]
+        assert backend.cancelled.is_set()
+
+
+async def test_oversized_code_is_rejected_before_sandbox_execution(tmp_path) -> None:
+    class RecordingSandboxBackend:
+        def __init__(self) -> None:
+            self.called = False
+
+        async def execute(
+            self,
+            code: str,
+            *,
+            external_functions: dict,
+            timeout_seconds: float,
+            max_output_bytes: int = 32768,
+        ) -> SandboxResult:
+            _ = (code, external_functions, timeout_seconds, max_output_bytes)
+            self.called = True
+            return SandboxResult(ok=True, result="unexpected")
+
+        async def close(self) -> None:
+            return None
+
+    backend = RecordingSandboxBackend()
+    settings = GatewaySettings(
+        auth_mode="dev",
+        max_sandbox_code_bytes=8,
+        sqlite_path=str(tmp_path / "code-size.db"),
+    )
+    dev_keys = LocalDevKeyManager(issuer=settings.oidc_issuer)
+    app = create_gateway_app(
+        settings=settings,
+        store=SQLiteAuditStore(settings.sqlite_path),
+        dev_keys=dev_keys,
+        sandbox_backend=backend,
+        preloaded_tools={},
+    )
+    token = dev_keys.issue_user_token(persona="finance_analyst")
+
+    async with app.router.lifespan_context(app):
+        identity = await app.state.runtime.validator.validate_authorization_header(
+            f"Bearer {token}"
+        )
+        result = await app.state.runtime.execute_code_for_identity(identity, "123456789")
+
+    assert not result["ok"]
+    assert result["error_type"] == "SandboxInputTooLarge"
+    assert not backend.called
+
+
+async def test_tool_callbacks_are_bounded_per_execution(tmp_path) -> None:
+    class FanoutSandboxBackend:
+        async def execute(
+            self,
+            code: str,
+            *,
+            external_functions: dict,
+            timeout_seconds: float,
+            max_output_bytes: int = 32768,
+        ) -> SandboxResult:
+            _ = (code, timeout_seconds, max_output_bytes)
+            results = await asyncio.gather(
+                *(external_functions["mock_srv__echo"](value=i) for i in range(6))
+            )
+            return SandboxResult(ok=True, result=results)
+
+        async def close(self) -> None:
+            return None
+
+    upstreams_path = tmp_path / "upstreams.yaml"
+    upstreams_path.write_text(
+        "upstreams:\n"
+        "  - name: mock_srv\n"
+        "    type: mcp_http\n"
+        "    url: https://mock.example.test/mcp\n"
+        "    auth_type: none\n",
+        encoding="utf-8",
+    )
+    settings = GatewaySettings(
+        auth_mode="dev",
+        max_concurrent_tool_calls_per_execution=2,
+        sqlite_path=str(tmp_path / "callback-limit.db"),
+        upstreams_config_path=str(upstreams_path),
+    )
+    dev_keys = LocalDevKeyManager(issuer=settings.oidc_issuer)
+    app = create_gateway_app(
+        settings=settings,
+        store=SQLiteAuditStore(settings.sqlite_path),
+        dev_keys=dev_keys,
+        sandbox_backend=FanoutSandboxBackend(),
+        preloaded_tools={
+            "mock_srv": [
+                DiscoveredTool(
+                    server="mock_srv",
+                    name="echo",
+                    qualified_name="mock_srv__echo",
+                    input_schema={"type": "object", "properties": {"value": {"type": "integer"}}},
+                )
+            ]
+        },
+    )
+
+    async with app.router.lifespan_context(app):
+        runtime = app.state.runtime
+        active_calls = 0
+        peak_calls = 0
+
+        async def _measure_callback_concurrency(
+            identity, tool, upstream, arguments, *, budget=None, code_mode_hints=False
+        ):
+            nonlocal active_calls, peak_calls
+            _ = (identity, budget, code_mode_hints)
+            active_calls += 1
+            peak_calls = max(peak_calls, active_calls)
+            try:
+                await asyncio.sleep(0.02)
+                return arguments, SubcallRecord(
+                    tool=tool.qualified_name,
+                    server=upstream.name,
+                    duration_ms=20.0,
+                    raw_bytes=16,
+                    status="ok",
+                    auth_type="none",
+                )
+            finally:
+                active_calls -= 1
+
+        runtime.dispatcher.invoke_tool = _measure_callback_concurrency
+        token = dev_keys.issue_user_token(persona="finance_analyst")
+        identity = await runtime.validator.validate_authorization_header(f"Bearer {token}")
+        result = await runtime.execute_code_for_identity(identity, "fan out")
+
+    assert result["ok"]
+    assert len(result["result"]) == 6
+    assert peak_calls == 2
+
+
+async def test_monty_pool_checkout_timeout_bounds_waiting_executions() -> None:
+    sandbox = LocalMontyBackend(
+        min_processes=1,
+        max_processes=1,
+        checkout_timeout_seconds=0.05,
+        request_timeout_seconds=2.0,
+    )
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+
+    async def _hold_worker() -> str:
+        callback_started.set()
+        await release_callback.wait()
+        return "released"
+
+    first_execution = asyncio.create_task(
+        sandbox.execute(
+            "await hold_worker()",
+            external_functions={"hold_worker": _hold_worker},
+            timeout_seconds=1.0,
+        )
+    )
+    try:
+        await asyncio.wait_for(callback_started.wait(), timeout=2.0)
+        waiting_execution = await sandbox.execute(
+            "1 + 1", external_functions={}, timeout_seconds=1.0
+        )
+        assert not waiting_execution.ok
+        assert "timeout" in (waiting_execution.error or "").lower()
+    finally:
+        release_callback.set()
+    first_result = await first_execution
+    assert first_result.ok and first_result.result == "released"
+    await sandbox.close()
+
+
+async def test_monty_host_request_timeout_kills_a_stuck_worker() -> None:
+    sandbox = LocalMontyBackend(
+        min_processes=1,
+        max_processes=1,
+        checkout_timeout_seconds=0.1,
+        request_timeout_seconds=0.5,
+    )
+    started = time.perf_counter()
+    try:
+        result = await sandbox.execute(
+            "while True:\n    pass",
+            external_functions={},
+            timeout_seconds=5.0,
+        )
+        elapsed = time.perf_counter() - started
+        assert not result.ok
+        assert elapsed < 3.0
+    finally:
+        await sandbox.close()
 
 
 async def test_monty_blocks_fs_env_network_and_timeouts() -> None:

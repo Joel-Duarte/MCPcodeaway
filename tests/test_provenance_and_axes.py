@@ -298,8 +298,8 @@ async def test_remote_worker_ws_auth_and_prod_fail_closed(tmp_path) -> None:
                 except httpx.HTTPError:
                     await asyncio.sleep(0.05)
 
-        # 1. Prod requires sandbox_worker_secret when sandbox_backend='remote'
-        with pytest.raises(ValueError, match="sandbox_worker_secret"):
+        # 1. Production rejects dev authentication before constructing runtime.
+        with pytest.raises(ValueError, match="auth_mode must be 'oidc'"):
             GatewayRuntime(
                 settings=GatewaySettings(
                     app_env="prod",
@@ -311,7 +311,36 @@ async def test_remote_worker_ws_auth_and_prod_fail_closed(tmp_path) -> None:
                 )
             )
 
-        # 2. Wrong/missing secret is rejected at WebSocket handshake
+        # 2. With the other production settings valid, a remote worker secret
+        # is independently required before the runtime can start.
+        production_settings = GatewaySettings(
+            app_env="prod",
+            auth_mode="oidc",
+            token_exchange_dialect="rfc8693",
+            allowed_tenants=["tenant-prod"],
+            postgres_dsn="postgresql://gateway:secret@postgres.example.test/mcpcodeaway",
+            redis_url="redis://redis.example.test:6379/0",
+            oidc_issuer="https://idp.example.test/tenant",
+            oidc_audience="api://gateway-prod",
+            oidc_jwks_uri="https://idp.example.test/keys",
+            oidc_token_endpoint="https://idp.example.test/token",
+            oidc_client_id="gateway-prod-client",
+            oidc_client_secret="production-oidc-client-secret",
+            allowed_upstream_hosts=["idp.example.test"],
+            gateway_public_url="https://gateway.example.test",
+            admin_oidc_authorization_endpoint="https://idp.example.test/authorize",
+            admin_oidc_redirect_uri="https://gateway.example.test/auth/admin/callback",
+            admin_oidc_api_scope="api://gateway-prod/gateway.access",
+            provenance_signing_secret="p" * 40,
+            admin_session_secret="a" * 40,
+            sandbox_backend="remote",
+            sandbox_worker_url=f"ws://127.0.0.1:{port}/ws/execute",
+            sandbox_worker_secret="",
+        )
+        with pytest.raises(ValueError, match="sandbox_worker_secret"):
+            GatewayRuntime(settings=production_settings)
+
+        # 3. Wrong/missing secret is rejected at WebSocket handshake
         bad_app = create_gateway_app(
             settings=GatewaySettings(
                 auth_mode="dev",
@@ -337,7 +366,7 @@ async def test_remote_worker_ws_auth_and_prod_fail_closed(tmp_path) -> None:
                 assert denied["result"]["isError"] is True
                 assert denied["result"]["structuredContent"]["ok"] is False
 
-        # 3. Matching secret succeeds with remote WS reverse-RPC + provenance
+        # 4. Matching secret succeeds with remote WS reverse-RPC + provenance
         good_app = create_gateway_app(
             settings=GatewaySettings(
                 auth_mode="dev",

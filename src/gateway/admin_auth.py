@@ -10,7 +10,7 @@ import logging
 import secrets
 import time
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Cookie, Header, HTTPException, Query, Response
 from fastapi.responses import RedirectResponse
@@ -40,9 +40,44 @@ def _pkce_challenge(verifier: str) -> str:
 
 
 def _safe_next_url(next_url: str | None) -> str:
-    if not next_url or not next_url.startswith("/") or next_url.startswith("//"):
+    if (
+        not next_url
+        or not next_url.startswith("/")
+        or next_url.startswith("//")
+        or "\\" in next_url
+        or any(ord(ch) < 32 for ch in next_url)
+    ):
+        return "/dashboard/"
+    parsed = urlsplit(next_url)
+    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/"):
         return "/dashboard/"
     return next_url
+
+
+def _access_denied_url(next_url: str | None) -> str:
+    parsed = urlsplit(_safe_next_url(next_url))
+    query = [(key, value) for key, value in parse_qsl(parsed.query) if key != "auth_error"]
+    query.append(("auth_error", "not_authorized"))
+    return urlunsplit(("", "", parsed.path, urlencode(query), parsed.fragment))
+
+
+def _validate_oidc_url(settings: GatewaySettings, target: str | None) -> None:
+    if target and settings.ssrf_protection_enabled:
+        from gateway.upstream_clients import validate_upstream_url
+
+        validate_upstream_url(
+            target,
+            app_env=settings.app_env,
+            block_private_ips_in_prod=settings.block_private_ips_in_prod,
+            allowed_hosts=settings.allowed_upstream_hosts,
+        )
+
+
+def _admin_oidc_scope_value(settings: GatewaySettings) -> str:
+    scopes = [*settings.admin_oidc_scopes.split()]
+    if settings.admin_oidc_api_scope:
+        scopes.extend(settings.admin_oidc_api_scope.split())
+    return " ".join(dict.fromkeys(scopes))
 
 
 class AdminSessionManager:
@@ -52,6 +87,11 @@ class AdminSessionManager:
         self.settings = settings
 
     def create_session_token(self, identity: CallerIdentity) -> str:
+        now = int(time.time())
+        session_exp = now + self.settings.admin_session_ttl_seconds
+        token_exp = identity.claims.get("exp")
+        if isinstance(token_exp, (int, float)):
+            session_exp = min(session_exp, int(token_exp))
         payload = {
             "sub": identity.sub,
             "tenant_id": identity.tenant_id,
@@ -61,7 +101,7 @@ class AdminSessionManager:
             "groups": list(identity.groups),
             "scopes": list(identity.scopes),
             "client_groups": list(identity.client_groups),
-            "exp": int(time.time()) + self.settings.admin_session_ttl_seconds,
+            "exp": session_exp,
         }
         encoded = _b64u_encode(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -133,6 +173,16 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
             path="/",
         )
 
+    def _clear_cookie(response: Response) -> None:
+        secure = settings.app_env == "prod" or settings.admin_cookie_samesite == "none"
+        response.delete_cookie(
+            key=ADMIN_SESSION_COOKIE,
+            httponly=True,
+            samesite=settings.admin_cookie_samesite,
+            secure=secure,
+            path="/",
+        )
+
     def _require_admin(identity: CallerIdentity) -> None:
         allowed = set(settings.admin_roles) | set(settings.viewer_roles)
         if not (set(identity.roles) & allowed):
@@ -160,6 +210,7 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
             "admin_auth_required": settings.admin_auth_required,
             "oidc_enabled": oidc_enabled,
             "dev_auth_enabled": dev_enabled,
+            "token_login_enabled": settings.app_env != "prod",
             "dev_personas": sorted(DEV_PERSONAS) if dev_enabled else [],
         }
 
@@ -172,6 +223,7 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
                 status_code=400,
                 detail="admin_oidc_authorization_endpoint and oidc_token_endpoint required",
             )
+        _validate_oidc_url(settings, settings.admin_oidc_authorization_endpoint)
         verifier = secrets.token_urlsafe(48)
         state = secrets.token_urlsafe(24)
         redirect_uri = (
@@ -188,7 +240,7 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
                 "response_type": "code",
                 "client_id": settings.oidc_client_id,
                 "redirect_uri": redirect_uri,
-                "scope": settings.admin_oidc_scopes,
+                "scope": _admin_oidc_scope_value(settings),
                 "state": state,
                 "code_challenge": _pkce_challenge(verifier),
                 "code_challenge_method": "S256",
@@ -212,6 +264,7 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
         pkce_data = json.loads(raw_state)
         if not settings.oidc_token_endpoint:
             raise HTTPException(status_code=500, detail="oidc_token_endpoint not configured")
+        _validate_oidc_url(settings, settings.oidc_token_endpoint)
 
         redirect_uri = (
             settings.admin_oidc_redirect_uri
@@ -222,46 +275,66 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
             "code": code,
             "redirect_uri": redirect_uri,
             "client_id": settings.oidc_client_id,
+            "scope": _admin_oidc_scope_value(settings),
             "code_verifier": pkce_data["code_verifier"],
         }
         if settings.oidc_client_secret:
             form_data["client_secret"] = settings.oidc_client_secret
 
         http = runtime.validator._http_client or runtime.client_manager._get_client()
-        token_resp = await http.post(settings.oidc_token_endpoint, data=form_data)
+        token_resp = await http.post(
+            settings.oidc_token_endpoint,
+            data=form_data,
+            follow_redirects=False,
+        )
         if token_resp.status_code >= 400:
             raise HTTPException(
                 status_code=502,
                 detail=f"OIDC authorization code exchange failed ({token_resp.status_code})",
             )
         token_body = token_resp.json()
-        raw_jwt = token_body.get("access_token") or token_body.get("id_token")
+        raw_jwt = token_body.get("access_token")
         if not raw_jwt:
-            raise HTTPException(status_code=502, detail="OIDC token response missing token")
+            raise HTTPException(
+                status_code=502,
+                detail="OIDC token response missing gateway API access token",
+            )
         try:
             identity = await runtime.validator.validate_token(str(raw_jwt))
         except AuthError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-        _require_admin(identity)
+        try:
+            _require_admin(identity)
+        except HTTPException as exc:
+            if exc.status_code != 403:
+                raise
+            redirect = RedirectResponse(
+                url=_access_denied_url(pkce_data.get("next_url")),
+                status_code=303,
+            )
+            _clear_cookie(redirect)
+            return redirect
 
         session_tok = runtime.admin_sessions.create_session_token(identity)
         redirect = RedirectResponse(url=_safe_next_url(pkce_data.get("next_url")), status_code=302)
         _set_cookie(redirect, session_tok)
         return redirect
 
-    @router.post("/auth/admin/token-login")
-    async def admin_token_login(
-        body: TokenLoginRequest,
-        response: Response,
-    ) -> dict[str, Any]:
-        try:
-            identity = await runtime.validator.validate_token(body.token.strip())
-        except AuthError as exc:
-            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-        _require_admin(identity)
-        session_tok = runtime.admin_sessions.create_session_token(identity)
-        _set_cookie(response, session_tok)
-        return {"authenticated": True, "user": identity.public_profile()}
+    if settings.app_env != "prod":
+
+        @router.post("/auth/admin/token-login")
+        async def admin_token_login(
+            body: TokenLoginRequest,
+            response: Response,
+        ) -> dict[str, Any]:
+            try:
+                identity = await runtime.validator.validate_token(body.token.strip())
+            except AuthError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+            _require_admin(identity)
+            session_tok = runtime.admin_sessions.create_session_token(identity)
+            _set_cookie(response, session_tok)
+            return {"authenticated": True, "user": identity.public_profile()}
 
     if settings.auth_mode == "dev" and settings.active_features.dev_auth:
 
@@ -306,13 +379,18 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
                 "authenticated": False,
                 "user": None,
                 "is_admin": False,
+                "can_access_admin_console": False,
                 "admin_auth_required": settings.admin_auth_required,
             }
         is_admin = bool(set(identity.roles) & set(settings.admin_roles))
+        can_access_admin_console = is_admin or bool(
+            set(identity.roles) & set(settings.viewer_roles)
+        )
         return {
             "authenticated": True,
             "user": identity.public_profile(),
             "is_admin": is_admin,
+            "can_access_admin_console": can_access_admin_console,
             "admin_auth_required": settings.admin_auth_required,
         }
 

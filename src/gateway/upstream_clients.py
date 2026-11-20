@@ -61,7 +61,7 @@ def validate_upstream_url(
     app_env: str = "sandbox",
     block_private_ips_in_prod: bool = True,
     allowed_hosts: list[str] | None = None,
-    resolve_dns: bool = False,
+    resolve_dns: bool | None = None,
 ) -> None:
     """Reject unsafe URL schemes, cloud metadata hosts, and unallowlisted internal IPs."""
     if not url:
@@ -76,10 +76,6 @@ def validate_upstream_url(
     if not host:
         raise ValueError(f"Upstream URL '{url}' is missing a valid hostname")
 
-    allowset = {h.strip().lower().rstrip(".") for h in (allowed_hosts or []) if h.strip()}
-    if host in allowset:
-        return
-
     if (
         host in _CLOUD_METADATA_HOSTS
         or host.endswith(".metadata.google.internal")
@@ -87,6 +83,13 @@ def validate_upstream_url(
         or "100.100.100.200" in host
     ):
         raise ValueError(f"Blocked cloud metadata endpoint host '{host}' in upstream URL")
+
+    allowset = {h.strip().lower().rstrip(".") for h in (allowed_hosts or []) if h.strip()}
+    if host in allowset:
+        return
+
+    if resolve_dns is None:
+        resolve_dns = app_env == "prod" and block_private_ips_in_prod
 
     try:
         ip_obj = ipaddress.ip_address(host)
@@ -111,8 +114,10 @@ def validate_upstream_url(
         if resolve_dns:
             try:
                 infos = socket.getaddrinfo(host, None)
-            except socket.gaierror:
-                infos = []
+            except socket.gaierror as exc:
+                raise ValueError(f"Could not resolve upstream hostname '{host}'") from exc
+            if not infos:
+                raise ValueError(f"Could not resolve upstream hostname '{host}'")
             for info in infos:
                 sockaddr = info[4]
                 if sockaddr:
@@ -286,12 +291,20 @@ class UpstreamClientManager:
         *,
         cache: CacheBackend | None = None,
         session_ttl_seconds: int = 1800,
+        app_env: str = "sandbox",
+        block_private_ips_in_prod: bool = True,
+        allowed_hosts: list[str] | None = None,
+        ssrf_protection_enabled: bool = True,
     ) -> None:
         self._http_client = http_client
         self._owned_client: httpx.AsyncClient | None = None
         self._cache = cache
         self._session_ttl_seconds = max(30, session_ttl_seconds)
         self._session_ids: dict[str, str] = {}
+        self._app_env = app_env
+        self._block_private_ips_in_prod = block_private_ips_in_prod
+        self._allowed_hosts = list(allowed_hosts or [])
+        self._ssrf_protection_enabled = ssrf_protection_enabled
 
     async def _get_session_id(self, skey: str) -> str | None:
         if self._cache is not None:
@@ -326,9 +339,17 @@ class UpstreamClientManager:
             self._owned_client = None
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        if self._ssrf_protection_enabled:
+            validate_upstream_url(
+                url,
+                app_env=self._app_env,
+                block_private_ips_in_prod=self._block_private_ips_in_prod,
+                allowed_hosts=self._allowed_hosts,
+            )
         headers = {str(k): str(v) for k, v in (kwargs.pop("headers", None) or {}).items()}
         propagate.inject(headers)
         client = self._get_client()
+        kwargs.setdefault("follow_redirects", False)
         return await client.request(method, url, headers=headers, **kwargs)
 
     @staticmethod
@@ -367,7 +388,6 @@ class UpstreamClientManager:
         arguments: dict[str, Any],
         auth_headers: dict[str, str] | None = None,
         *,
-        mcp_session_id: str | None = None,
         session_scope: str | None = None,
     ) -> Any:
         if upstream.type == "mcp_http":
@@ -376,7 +396,6 @@ class UpstreamClientManager:
                 tool,
                 arguments,
                 auth_headers,
-                mcp_session_id=mcp_session_id,
                 session_scope=session_scope,
             )
         if upstream.type == "mcp_stdio":
@@ -454,7 +473,6 @@ class UpstreamClientManager:
         arguments: dict[str, Any],
         auth_headers: dict[str, str] | None,
         *,
-        mcp_session_id: str | None = None,
         session_scope: str | None = None,
     ) -> Any:
         if not upstream.url:
@@ -465,7 +483,7 @@ class UpstreamClientManager:
             **(auth_headers or {}),
         }
         skey = f"{upstream.name}:{session_scope or 'default'}"
-        active_sid = mcp_session_id
+        active_sid: str | None = None
         if not active_sid and upstream.stateful_session:
             active_sid = await self._get_session_id(skey)
             if not active_sid:
@@ -482,7 +500,7 @@ class UpstreamClientManager:
             "params": {"name": tool.name, "arguments": arguments},
         }
         resp = await self._request("POST", upstream.url, headers=headers, json=payload)
-        if resp.status_code in {400, 404} and upstream.stateful_session and not mcp_session_id:
+        if resp.status_code in {400, 404} and upstream.stateful_session:
             await self._delete_session_id(skey)
             new_sid = await self._initialize_mcp_http_session(upstream, auth_headers)
             if new_sid:
@@ -492,7 +510,7 @@ class UpstreamClientManager:
 
         resp.raise_for_status()
         resp_sid = resp.headers.get("mcp-session-id")
-        if resp_sid and upstream.stateful_session and not mcp_session_id:
+        if resp_sid and upstream.stateful_session:
             await self._set_session_id(skey, resp_sid)
         body = _parse_mcp_jsonrpc_response(resp)
         if "error" in body:

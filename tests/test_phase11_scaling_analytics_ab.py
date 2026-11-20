@@ -265,12 +265,14 @@ async def test_dual_mode_admin_auth_oidc_pkce_dev_and_cookie(tmp_path: Path) -> 
             assert q["code_challenge_method"] == ["S256"]
             state_1 = q["state"][0]
 
-            # Callback with non-admin token fails 403.
+            # Callback with non-admin token returns to the console with a generic denial status.
             bad_cb = await gw.get(
                 f"/auth/admin/callback?code=code-non-admin&state={state_1}",
                 follow_redirects=False,
             )
-            assert bad_cb.status_code == 403
+            assert bad_cb.status_code == 303
+            assert bad_cb.headers["location"] == "/dashboard/analytics?auth_error=not_authorized"
+            assert "mcpcodeaway_admin_session" not in gw.cookies
 
             # Start second PKCE flow and complete as gateway_admin.
             login_2 = await gw.get("/auth/admin/login?next_url=/dashboard/", follow_redirects=False)
@@ -293,6 +295,17 @@ async def test_dual_mode_admin_auth_oidc_pkce_dev_and_cookie(tmp_path: Path) -> 
 
             ana = await gw.get("/audit/analytics")
             assert ana.status_code == 200
+
+            # A subsequent denied sign-in clears an existing privileged browser session.
+            login_3 = await gw.get("/auth/admin/login?next_url=/dashboard/", follow_redirects=False)
+            state_3 = parse_qs(urlparse(login_3.headers["location"]).query)["state"][0]
+            denied_existing_session = await gw.get(
+                f"/auth/admin/callback?code=code-non-admin&state={state_3}",
+                follow_redirects=False,
+            )
+            assert denied_existing_session.status_code == 303
+            assert "mcpcodeaway_admin_session" not in gw.cookies
+            assert (await gw.get("/admin/upstreams")).status_code == 401
 
             # Logout clears cookie.
             out = await gw.post("/auth/admin/logout")
@@ -866,7 +879,8 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
 
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")
     assert "nginx:1.27-alpine" in compose
-    assert "lb:" in compose
+    assert "lb-scaled:" in compose
+    assert "lb-prod:" in compose
 
     for wf_path, needle in (
         (".github/workflows/backend-ci.yml", "agent_preflight.py"),
@@ -939,6 +953,28 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
             assert {"admin_list_upstreams", "admin_save_upstream", "admin_demo_traffic_burst"} <= (
                 tool_names
             )
+
+            modern_admin_discovery = await gw.post(
+                "/admin/mcp",
+                headers={
+                    "Authorization": f"Bearer {adm_tok}",
+                    "MCP-Protocol-Version": "2026-07-28",
+                    "Mcp-Method": "server/discover",
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "admin-discover",
+                    "method": "server/discover",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        }
+                    },
+                },
+            )
+            assert modern_admin_discovery.status_code == 200
+            assert modern_admin_discovery.json()["result"]["supportedVersions"] == ["2026-07-28"]
 
             burst = await gw.post(
                 "/admin/demo/traffic/burst?count=2",

@@ -456,6 +456,7 @@ async def _run_openai_llm_arm(
     ephemeral_runtime: Any,
     identity: CallerIdentity,
     mode: GatewayMode,
+    security_settings: GatewaySettings,
 ) -> dict[str, Any]:
     """Run a bounded OpenAI-compatible tool-calling A/B arm against an ephemeral runtime."""
     started = time.perf_counter()
@@ -496,6 +497,13 @@ async def _run_openai_llm_arm(
 
     for _ in range(llm.max_turns):
         turns += 1
+        if security_settings.ssrf_protection_enabled:
+            validate_upstream_url(
+                llm.base_url,
+                app_env=security_settings.app_env,
+                block_private_ips_in_prod=security_settings.block_private_ips_in_prod,
+                allowed_hosts=security_settings.allowed_upstream_hosts,
+            )
         resp = await client.post(
             endpoint,
             headers=headers,
@@ -506,6 +514,7 @@ async def _run_openai_llm_arm(
                 "temperature": 0,
             },
             timeout=30.0,
+            follow_redirects=False,
         )
         resp.raise_for_status()
         body = resp.json()
@@ -703,12 +712,14 @@ async def run_onboarding_ab_test(
                 ephemeral_runtime=ephemeral_rt,
                 identity=identity,
                 mode="codemode",
+                security_settings=runtime.settings,
             )
             cl_arm = await _run_openai_llm_arm(
                 llm=body.llm_config,
                 ephemeral_runtime=ephemeral_rt,
                 identity=identity,
                 mode="traditional",
+                security_settings=runtime.settings,
             )
             winner = (
                 "code_mode"

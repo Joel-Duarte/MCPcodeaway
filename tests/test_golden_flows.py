@@ -104,16 +104,28 @@ async def test_golden_end_to_end_flows(
     if kind == "profile_gate":
         settings = GatewaySettings(
             profile=flow["profile"],
+            # This flow verifies profile feature gates, not production secret
+            # provisioning. Keep the production feature profile while using the
+            # local verifier for its authorized metrics request.
+            app_env="sandbox",
+            auth_mode="dev",
             sqlite_path=str(tmp_path / f"{flow['id']}.db"),
             upstreams_config_path=str(tmp_path / "missing.yaml"),
         )
-        app = create_gateway_app(settings=settings, preloaded_tools={})
+        dev_keys = LocalDevKeyManager(issuer=settings.oidc_issuer)
+        app = create_gateway_app(settings=settings, dev_keys=dev_keys, preloaded_tools={})
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://gw"
             ) as gw:
                 for p in flow["open_paths"]:
-                    assert (await gw.get(p)).status_code == 200
+                    headers = {}
+                    if p == "/metrics":
+                        token = dev_keys.issue_user_token(
+                            persona="gateway_admin", audience=settings.oidc_audience
+                        )
+                        headers["Authorization"] = f"Bearer {token}"
+                    assert (await gw.get(p, headers=headers)).status_code == 200
                 for blocked in flow["blocked_gets"]:
                     assert (await gw.get(blocked)).status_code == 404
         return

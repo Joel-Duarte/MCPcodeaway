@@ -178,8 +178,9 @@ async def test_traditional_discover_server_discover_and_pagination(tmp_path) -> 
             # MCP v2 server/discover metadata
             disc = await _mcp_post(client, fin_token, "server/discover")
             disc_res = disc["result"]
-            assert disc_res["supportedVersions"] == ["2025-03-26"]
+            assert disc_res["supportedVersions"] == ["2026-07-28"]
             assert disc_res["cacheScope"] == "private"
+
             assert disc_res["ttlMs"] > 0
 
             # traditional_discover exposes ONLY list_servers + search_tools upfront
@@ -231,6 +232,157 @@ async def test_traditional_discover_server_discover_and_pagination(tmp_path) -> 
             p2_names = [t["name"] for t in p2["result"]["tools"]]
             assert len(p2_names) == 3
             assert set(p1_names).isdisjoint(set(p2_names))
+
+
+async def test_modern_mcp_metadata_headers_and_discovery_contract(tmp_path) -> None:
+    app, dev_keys = _setup_gateway(tmp_path)
+    token = dev_keys.issue_user_token(persona="finance_analyst")
+    metadata = {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "test-client", "version": "1.0"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "MCP-Protocol-Version": "2026-07-28",
+                "Mcp-Method": "server/discover",
+            }
+            discover = await client.post(
+                "/mcp",
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "modern-discover",
+                    "method": "server/discover",
+                    "params": {"_meta": metadata},
+                },
+            )
+            assert discover.status_code == 200
+            discover_result = discover.json()["result"]
+            assert discover_result["resultType"] == "complete"
+            assert discover_result["supportedVersions"] == ["2026-07-28"]
+            assert (
+                discover_result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"]
+                == "mcpcodeaway"
+            )
+
+            tool_headers = {**headers, "Mcp-Method": "tools/call", "Mcp-Name": "list_servers"}
+            tool_response = await client.post(
+                "/mcp?mode=codemode",
+                headers=tool_headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"_meta": metadata, "name": "list_servers", "arguments": {}},
+                },
+            )
+            assert tool_response.status_code == 200
+            assert tool_response.json()["result"]["resultType"] == "complete"
+
+            mismatch = await client.post(
+                "/mcp",
+                headers={**headers, "Mcp-Method": "tools/call", "Mcp-Name": "wrong_name"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"_meta": metadata, "name": "list_servers", "arguments": {}},
+                },
+            )
+            assert mismatch.status_code == 400
+            assert mismatch.json()["error"]["code"] == -32020
+
+            unsupported = await client.post(
+                "/mcp",
+                headers={**headers, "MCP-Protocol-Version": "2025-03-26"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "server/discover",
+                    "params": {
+                        "_meta": {
+                            **metadata,
+                            "io.modelcontextprotocol/protocolVersion": "2025-03-26",
+                        }
+                    },
+                },
+            )
+            assert unsupported.status_code == 400
+            assert unsupported.json()["error"]["code"] == -32022
+            assert unsupported.json()["error"]["data"]["supportedVersions"] == ["2026-07-28"]
+
+            mismatched_version = await client.post(
+                "/mcp",
+                headers={**headers, "MCP-Protocol-Version": "2025-11-25"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "server/discover",
+                    "params": {"_meta": metadata},
+                },
+            )
+            assert mismatched_version.status_code == 400
+            assert mismatched_version.json()["error"]["code"] == -32020
+
+            initialize = await client.post(
+                "/mcp",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"jsonrpc": "2.0", "id": 6, "method": "initialize", "params": {}},
+            )
+            assert initialize.status_code == 200
+            assert initialize.json()["result"]["protocolVersion"] == "2025-11-25"
+
+            legacy_followup = await client.post(
+                "/mcp",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "MCP-Protocol-Version": "2025-11-25",
+                },
+                json={"jsonrpc": "2.0", "id": 8, "method": "tools/list", "params": {}},
+            )
+            assert legacy_followup.status_code == 200
+            assert "tools" in legacy_followup.json()["result"]
+
+            unknown_method = await client.post(
+                "/mcp",
+                headers={**headers, "Mcp-Method": "resources/list"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "resources/list",
+                    "params": {"_meta": metadata},
+                },
+            )
+            assert unknown_method.status_code == 404
+            assert unknown_method.json()["error"]["code"] == -32601
+
+            modern_notification = await client.post(
+                "/mcp",
+                headers={**headers, "Mcp-Method": "notifications/initialized"},
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {"_meta": metadata},
+                },
+            )
+            assert modern_notification.status_code == 400
+
+            rejected_origin = await client.post(
+                "/mcp",
+                headers={**headers, "Origin": "https://attacker.example"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "server/discover",
+                    "params": {"_meta": metadata},
+                },
+            )
+            assert rejected_origin.status_code == 403
 
 
 async def test_bm25_and_x_intent_header_discovery(tmp_path) -> None:

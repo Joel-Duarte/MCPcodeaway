@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
@@ -138,13 +139,19 @@ class GatewaySettings(BaseSettings):
     token_cache_ttl_seconds: int = 300
     max_calls_per_execution: int = 50
     rate_limit_per_minute: int = 120
+    max_concurrent_mcp_requests: int = 64
     monty_timeout_seconds: float = 10.0
+    monty_pool_checkout_timeout_seconds: float = Field(default=0.25, gt=0)
+    monty_worker_request_timeout_seconds: float = Field(default=15.0, gt=0)
+    execution_wall_timeout_seconds: float = Field(default=60.0, gt=0)
+    max_concurrent_tool_calls_per_execution: int = Field(default=8, ge=1)
+    max_sandbox_code_bytes: int = Field(default=256 * 1024, ge=1, le=256 * 1024)
 
     sandbox_backend: Literal["local", "remote"] = "local"
     sandbox_worker_url: str | None = None
     sandbox_worker_secret: str = ""
     require_tool_grounding: bool = False
-    provenance_signing_secret: str = "dev-provenance-secret"
+    provenance_signing_secret: str = ""
     redis_url: str | None = None
 
     discovery_backend: DiscoveryBackendMode = "bm25"
@@ -156,6 +163,9 @@ class GatewaySettings(BaseSettings):
     require_admin_auth: bool | None = None
     admin_roles: list[str] = Field(default_factory=lambda: ["gateway_admin", "platform_admin"])
     viewer_roles: list[str] = Field(default_factory=lambda: ["operator_viewer"])
+    metrics_roles: list[str] = Field(
+        default_factory=lambda: ["gateway_admin", "platform_admin", "ops_observer"]
+    )
     ssrf_protection_enabled: bool = True
     block_private_ips_in_prod: bool = True
     allowed_upstream_hosts: list[str] = Field(default_factory=list)
@@ -169,12 +179,13 @@ class GatewaySettings(BaseSettings):
 
     mcp_session_ttl_seconds: int = 1800
     audit_retention_days: int = 90
-    admin_session_secret: str = "dev-admin-session-secret"
+    admin_session_secret: str = ""
     admin_session_ttl_seconds: int = 28800
     admin_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
     admin_oidc_authorization_endpoint: str | None = None
     admin_oidc_redirect_uri: str | None = None
     admin_oidc_scopes: str = "openid profile email"
+    admin_oidc_api_scope: str | None = None
     cors_allowed_origins: list[str] = Field(default_factory=list)
     model_pricing: dict[str, dict[str, float]] = Field(
         default_factory=lambda: {
@@ -213,6 +224,10 @@ class GatewaySettings(BaseSettings):
             return self
 
         if self.app_env == "prod" and self.auth_mode == "oidc":
+            if "token_exchange_dialect" not in self.model_fields_set:
+                self.token_exchange_dialect = "rfc8693"
+            if "metrics_require_auth" not in self.model_fields_set:
+                self.metrics_require_auth = True
             self._effective_profile_name = "production"
             self._resolved_features = ProfileFeatures()
         else:
@@ -260,13 +275,125 @@ class GatewaySettings(BaseSettings):
     def provenance_signing_secrets(self) -> list[str]:
         """Parse active + previous HMAC provenance keys for zero-downtime rotation."""
         keys = [s.strip() for s in self.provenance_signing_secret.split(",") if s.strip()]
-        return keys or ["dev-provenance-secret"]
+        if self.app_env == "prod" and not keys:
+            raise ValueError("provenance_signing_secret must be configured in prod")
+        return keys or ["local-development-provenance-key"]
 
     @property
     def admin_session_secrets(self) -> list[str]:
         """Parse active + previous admin session cookie HMAC signing keys."""
         keys = [s.strip() for s in self.admin_session_secret.split(",") if s.strip()]
-        return keys or ["dev-admin-session-secret"]
+        if self.app_env == "prod" and not keys:
+            raise ValueError("admin_session_secret must be configured in prod")
+        return keys or ["local-development-admin-session-key"]
+
+    def validate_production_secrets(self) -> None:
+        """Fail closed when production would otherwise use a missing or known weak key."""
+        if self.app_env != "prod":
+            return
+        if self.auth_mode != "oidc":
+            raise ValueError("auth_mode must be 'oidc' in prod")
+        if self.token_exchange_dialect == "dev_local":
+            raise ValueError("token_exchange_dialect must use a real OBO dialect in prod")
+        if not self.admin_auth_required:
+            raise ValueError("require_admin_auth must be enabled in prod")
+        if not self.metrics_require_auth:
+            raise ValueError("metrics_require_auth must be enabled in prod")
+        if not self.metrics_roles:
+            raise ValueError("metrics_roles must contain at least one authorized role in prod")
+        if not self.ssrf_protection_enabled or not self.block_private_ips_in_prod:
+            raise ValueError("SSRF protection and private-IP blocking must be enabled in prod")
+        if not self.allowed_tenants or self.allowed_tenants == ["tenant-acme-dev"]:
+            raise ValueError("allowed_tenants must be explicitly configured for prod")
+        if not self.postgres_dsn:
+            raise ValueError("postgres_dsn must be configured for prod")
+        if not self.redis_url:
+            raise ValueError("redis_url must be configured for prod")
+        if not self.oidc_audience or self.oidc_audience == "api://mcp-code-gateway":
+            raise ValueError("oidc_audience must be explicitly configured for prod")
+        if not self.oidc_jwks_uri:
+            raise ValueError("oidc_jwks_uri must be configured for prod")
+        public_url = urlsplit(self.gateway_public_url)
+        if (
+            public_url.scheme != "https"
+            or not public_url.netloc
+            or public_url.username
+            or public_url.password
+            or public_url.query
+            or public_url.fragment
+        ):
+            raise ValueError("gateway_public_url must be an HTTPS URL in prod")
+        if not self.admin_oidc_redirect_uri:
+            raise ValueError("admin_oidc_redirect_uri must be configured in prod")
+        redirect_uri = urlsplit(self.admin_oidc_redirect_uri)
+        if (
+            redirect_uri.scheme != "https"
+            or redirect_uri.netloc != public_url.netloc
+            or redirect_uri.username
+            or redirect_uri.password
+            or redirect_uri.path.rstrip("/") != "/auth/admin/callback"
+            or redirect_uri.query
+            or redirect_uri.fragment
+        ):
+            raise ValueError(
+                "admin_oidc_redirect_uri must be the public HTTPS gateway callback URL"
+            )
+        if not self.oidc_client_secret:
+            raise ValueError("oidc_client_secret must be configured for the production OIDC client")
+        if self.token_exchange_dialect != "dev_local" and not self.oidc_token_endpoint:
+            raise ValueError("oidc_token_endpoint must be configured for production token exchange")
+        if not self.admin_oidc_authorization_endpoint:
+            raise ValueError("admin_oidc_authorization_endpoint must be configured in prod")
+        if not self.admin_oidc_api_scope or not self.admin_oidc_api_scope.strip():
+            raise ValueError(
+                "admin_oidc_api_scope must request an access token for the gateway API"
+            )
+        if (
+            not self.oidc_client_id.strip()
+            or self.oidc_client_id.strip() == "mcp-code-gateway-client"
+        ):
+            raise ValueError("oidc_client_id must be explicitly configured in prod")
+        from gateway.upstream_clients import validate_upstream_url
+
+        for setting_name, target in (
+            ("oidc_issuer", self.oidc_issuer),
+            ("oidc_jwks_uri", self.oidc_jwks_uri),
+            ("oidc_token_endpoint", self.oidc_token_endpoint),
+            ("admin_oidc_authorization_endpoint", self.admin_oidc_authorization_endpoint),
+        ):
+            if target:
+                try:
+                    validate_upstream_url(
+                        target,
+                        app_env=self.app_env,
+                        block_private_ips_in_prod=self.block_private_ips_in_prod,
+                        allowed_hosts=self.allowed_upstream_hosts,
+                    )
+                except ValueError as exc:
+                    raise ValueError(f"Unsafe production setting '{setting_name}': {exc}") from exc
+        known_weak = {
+            "dev-sandbox-worker-secret",
+            "dev-provenance-secret",
+            "dev-admin-session-secret",
+            "local-development-provenance-key",
+            "local-development-admin-session-key",
+        }
+        secrets_to_check = {
+            "provenance_signing_secret": self.provenance_signing_secret,
+            "admin_session_secret": self.admin_session_secret,
+        }
+        if self.sandbox_backend == "remote":
+            secrets_to_check["sandbox_worker_secret"] = self.sandbox_worker_secret
+        errors: list[str] = []
+        for name, raw_value in secrets_to_check.items():
+            values = [value.strip() for value in raw_value.split(",") if value.strip()]
+            if not values:
+                errors.append(f"{name} is required")
+                continue
+            if any(len(value) < 32 or value.casefold() in known_weak for value in values):
+                errors.append(f"{name} must contain keys of at least 32 characters")
+        if errors:
+            raise ValueError("Unsafe production secrets: " + "; ".join(errors))
 
 
 class UpstreamRegistry:

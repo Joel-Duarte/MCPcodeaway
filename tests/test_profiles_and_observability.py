@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import builtins
 import io
 import json
@@ -87,13 +88,21 @@ def test_composable_profiles_inheritance_and_overrides(tmp_path: Path) -> None:
 async def test_barebones_production_profile_route_gating(tmp_path: Path) -> None:
     settings = GatewaySettings(
         profile="production",
+        # Keep this test about profile route gating; production deployment
+        # secret requirements are validated separately at startup.
+        app_env="sandbox",
+        auth_mode="dev",
         sqlite_path=str(tmp_path / "gateway.db"),
         upstreams_config_path=str(tmp_path / "missing.yaml"),
     )
-    app = create_gateway_app(settings=settings, preloaded_tools={})
+    dev_keys = LocalDevKeyManager(issuer=settings.oidc_issuer)
+    app = create_gateway_app(settings=settings, dev_keys=dev_keys, preloaded_tools={})
     transport = httpx.ASGITransport(app=app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as gw:
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://gateway") as gw,
+    ):
         health = await gw.get("/health")
         assert health.status_code == 200
         assert health.json()["profile"] == "production"
@@ -103,7 +112,11 @@ async def test_barebones_production_profile_route_gating(tmp_path: Path) -> None
         assert ready.status_code == 200
         assert ready.json()["ready"] is True
 
-        metrics = await gw.get("/metrics")
+        assert (await gw.get("/metrics")).status_code == 401
+        metrics_token = dev_keys.issue_user_token(
+            persona="gateway_admin", audience=settings.oidc_audience
+        )
+        metrics = await gw.get("/metrics", headers={"Authorization": f"Bearer {metrics_token}"})
         assert metrics.status_code == 200
 
         for hidden_method, hidden_path, body, expected_status in (
@@ -204,19 +217,22 @@ async def test_stateful_mcp_session_id_negotiation_and_traceparent() -> None:
 
     tracer = trace.get_tracer("test.traceparent")
     with tracer.start_as_current_span("test.outbound"):
-        res_a = await manager.call_tool(upstream, tool, {}, session_scope="tenant-a:user-1")
-        res_a2 = await manager.call_tool(upstream, tool, {}, session_scope="tenant-a:user-1")
-        res_b = await manager.call_tool(upstream, tool, {}, session_scope="tenant-a:user-2")
+        res_a, res_b = await asyncio.gather(
+            manager.call_tool(upstream, tool, {}, session_scope="tenant-a:shared-user"),
+            manager.call_tool(upstream, tool, {}, session_scope="tenant-b:shared-user"),
+        )
+        res_a2 = await manager.call_tool(upstream, tool, {}, session_scope="tenant-a:shared-user")
+        res_c = await manager.call_tool(upstream, tool, {}, session_scope="tenant-a:other-user")
 
-    assert res_a == {"session_echo": "sess-1"}
-    assert res_a2 == {"session_echo": "sess-1"}
-    assert res_b == {"session_echo": "sess-2"}
+    assert res_a["session_echo"] != res_b["session_echo"]
+    assert res_a2 == res_a
+    assert res_c["session_echo"] not in {res_a["session_echo"], res_b["session_echo"]}
     assert all(entry["traceparent"] for entry in calls_seen)
 
     # Simulate stale server session -> manager recovers cleanly via re-initialize + retry.
-    manager._session_ids["stateful_srv:tenant-a:user-1"] = "expired-force"
-    recovered = await manager.call_tool(upstream, tool, {}, session_scope="tenant-a:user-1")
-    assert recovered == {"session_echo": "sess-3"}
+    manager._session_ids["stateful_srv:tenant-a:shared-user"] = "expired-force"
+    recovered = await manager.call_tool(upstream, tool, {}, session_scope="tenant-a:shared-user")
+    assert recovered == {"session_echo": f"sess-{session_counter}"}
 
     await client.aclose()
 
@@ -488,4 +504,5 @@ def test_multitarget_dockerfile_and_compose_prod_profile() -> None:
     assert "GATEWAY_POSTGRES_DSN" in prod_gw["environment"]
     assert "prod" in compose["services"]["postgres"]["profiles"]
     assert "prod" in compose["services"]["redis"]["profiles"]
-    assert "prod" in compose["services"]["sandbox-worker"]["profiles"]
+    assert "scaled" in compose["services"]["sandbox-worker"]["profiles"]
+    assert "prod" in compose["services"]["sandbox-worker-prod"]["profiles"]

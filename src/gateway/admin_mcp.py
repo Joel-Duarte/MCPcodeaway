@@ -14,6 +14,19 @@ from gateway.auth import CallerIdentity
 from gateway.config import UpstreamConfig
 from gateway.upstream_clients import validate_upstream_url
 
+_MCP_PROTOCOL_VERSION = "2026-07-28"
+_MCP_SERVER_INFO_META = "io.modelcontextprotocol/serverInfo"
+
+
+def _admin_mcp_result(result: dict[str, Any]) -> dict[str, Any]:
+    result.setdefault("resultType", "complete")
+    result.setdefault(
+        "_meta",
+        {_MCP_SERVER_INFO_META: {"name": "mcpcodeaway-self-admin", "version": __version__}},
+    )
+    return result
+
+
 if TYPE_CHECKING:
     from gateway.server import GatewayRuntime
 
@@ -135,6 +148,11 @@ async def handle_admin_mcp_request(
     req_id = payload.get("id")
     method = payload.get("method")
     params = payload.get("params") or {}
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    modern_request = (
+        isinstance(meta, dict)
+        and meta.get("io.modelcontextprotocol/protocolVersion") == _MCP_PROTOCOL_VERSION
+    )
 
     if method == "initialize":
         return JSONResponse(
@@ -142,24 +160,54 @@ async def handle_admin_mcp_request(
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
-                    "protocolVersion": "2025-03-26",
+                    "protocolVersion": "2025-11-25",
                     "serverInfo": {"name": "mcpcodeaway-self-admin", "version": __version__},
                     "capabilities": {"tools": {}},
                 },
             }
         )
 
-    if method == "tools/list":
-        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {"tools": _ADMIN_MCP_TOOLS}})
-
-    if method != "tools/call":
+    if method == "server/discover":
         return JSONResponse(
             {
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "error": {"code": -32601, "message": f"Method '{method}' not found"},
+                "result": _admin_mcp_result(
+                    {
+                        "supportedVersions": [_MCP_PROTOCOL_VERSION],
+                        "capabilities": {"tools": {}},
+                        "_meta": {
+                            _MCP_SERVER_INFO_META: {
+                                "name": "mcpcodeaway-self-admin",
+                                "version": __version__,
+                            }
+                        },
+                        "cacheScope": "private",
+                        "ttlMs": 30000,
+                    }
+                ),
             }
         )
+
+    if method == "tools/list":
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": _admin_mcp_result({"tools": _ADMIN_MCP_TOOLS}),
+            }
+        )
+
+    if method != "tools/call":
+        response = JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"Method '{method}' not found"},
+            },
+            status_code=404 if modern_request else 200,
+        )
+        return response
 
     name = params.get("name")
     args = params.get("arguments") or {}
@@ -176,18 +224,20 @@ async def handle_admin_mcp_request(
         )
     except PermissionError as exc:
         return JSONResponse(
-            {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32003, "message": str(exc)}}
+            {"jsonrpc": "2.0", "id": req_id, "error": {"code": -31003, "message": str(exc)}}
         )
     except Exception as exc:
         return JSONResponse(
             {
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "result": {
-                    "isError": True,
-                    "content": [{"type": "text", "text": str(exc)}],
-                    "structuredContent": {"ok": False, "error": str(exc)},
-                },
+                "result": _admin_mcp_result(
+                    {
+                        "isError": True,
+                        "content": [{"type": "text", "text": str(exc)}],
+                        "structuredContent": {"ok": False, "error": str(exc)},
+                    }
+                ),
             }
         )
 
@@ -195,11 +245,13 @@ async def handle_admin_mcp_request(
         {
             "jsonrpc": "2.0",
             "id": req_id,
-            "result": {
-                "isError": False,
-                "content": [{"type": "text", "text": json.dumps(out, default=str)}],
-                "structuredContent": out,
-            },
+            "result": _admin_mcp_result(
+                {
+                    "isError": False,
+                    "content": [{"type": "text", "text": json.dumps(out, default=str)}],
+                    "structuredContent": out,
+                }
+            ),
         }
     )
 

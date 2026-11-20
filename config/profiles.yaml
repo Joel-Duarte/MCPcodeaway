@@ -5,8 +5,10 @@ profiles:
     description: "Barebones production gateway: MCP, OIDC/OBO, metrics, read-only GitOps."
     app_env: prod
     auth_mode: oidc
+    token_exchange_dialect: rfc8693
     require_admin_auth: true
     allow_dynamic_upstreams: false
+    metrics_require_auth: true
     features:
       audit_api: true
       metrics: true

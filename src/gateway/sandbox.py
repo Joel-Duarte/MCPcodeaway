@@ -74,11 +74,17 @@ class LocalMontyBackend:
         max_processes: int = 4,
         max_memory_bytes: int = 64 * 1024 * 1024,
         max_recursion_depth: int = 200,
+        checkout_timeout_seconds: float = 0.25,
+        request_timeout_seconds: float = 15.0,
     ) -> None:
         self.min_processes = min_processes
         self.max_processes = max_processes
         self.max_memory_bytes = max_memory_bytes
         self.max_recursion_depth = max_recursion_depth
+        if checkout_timeout_seconds <= 0 or request_timeout_seconds <= 0:
+            raise ValueError("Monty checkout and request timeouts must be positive")
+        self.checkout_timeout_seconds = checkout_timeout_seconds
+        self.request_timeout_seconds = request_timeout_seconds
         self._pool: pydantic_monty.AsyncMonty | None = None
         self._lock = asyncio.Lock()
 
@@ -90,6 +96,8 @@ class LocalMontyBackend:
                 pool = pydantic_monty.AsyncMonty(
                     min_processes=self.min_processes,
                     max_processes=self.max_processes,
+                    checkout_timeout=self.checkout_timeout_seconds,
+                    request_timeout=self.request_timeout_seconds,
                 )
                 await pool.__aenter__()
                 self._pool = pool
@@ -239,33 +247,39 @@ class RemoteMontyWorkerBackend:
                     async with send_lock:
                         await ws.send(json.dumps(reply, default=str))
 
-                while True:
-                    raw_msg = await ws.recv()
-                    msg = json.loads(raw_msg)
-                    msg_type = msg.get("type")
-                    if msg_type == "call":
-                        task = asyncio.create_task(_dispatch_call(msg))
-                        in_flight.add(task)
-                        task.add_done_callback(in_flight.discard)
-                    elif msg_type == "done":
-                        if in_flight:
-                            await asyncio.gather(*in_flight, return_exceptions=True)
-                        res = SandboxResult.model_validate(msg["sandbox_result"])
-                        clean_res, clean_out, trunc = truncate_and_redact_output(
-                            res.result, res.stdout, max_output_bytes
-                        )
-                        res.result = clean_res
-                        res.stdout = clean_out
-                        res.truncated = res.truncated or trunc
-                        res.duration_ms = round((time.perf_counter() - started) * 1000, 3)
-                        return res
-                    elif msg_type == "error":
-                        return SandboxResult(
-                            ok=False,
-                            error=str(msg.get("error", "Remote worker error")),
-                            error_type="RemoteWorkerError",
-                            duration_ms=round((time.perf_counter() - started) * 1000, 3),
-                        )
+                try:
+                    while True:
+                        raw_msg = await ws.recv()
+                        msg = json.loads(raw_msg)
+                        msg_type = msg.get("type")
+                        if msg_type == "call":
+                            task = asyncio.create_task(_dispatch_call(msg))
+                            in_flight.add(task)
+                            task.add_done_callback(in_flight.discard)
+                        elif msg_type == "done":
+                            if in_flight:
+                                await asyncio.gather(*in_flight, return_exceptions=True)
+                            res = SandboxResult.model_validate(msg["sandbox_result"])
+                            clean_res, clean_out, trunc = truncate_and_redact_output(
+                                res.result, res.stdout, max_output_bytes
+                            )
+                            res.result = clean_res
+                            res.stdout = clean_out
+                            res.truncated = res.truncated or trunc
+                            res.duration_ms = round((time.perf_counter() - started) * 1000, 3)
+                            return res
+                        elif msg_type == "error":
+                            return SandboxResult(
+                                ok=False,
+                                error=str(msg.get("error", "Remote worker error")),
+                                error_type="RemoteWorkerError",
+                                duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                            )
+                finally:
+                    for task in in_flight:
+                        task.cancel()
+                    if in_flight:
+                        await asyncio.gather(*in_flight, return_exceptions=True)
         except Exception as exc:
             return SandboxResult(
                 ok=False,

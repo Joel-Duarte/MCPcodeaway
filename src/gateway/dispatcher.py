@@ -313,8 +313,14 @@ def _apply_pre_call_abac(
                     f"ABAC policy denied {rule.arg_name}='{requested}' "
                     f"for {rule.claim}={sorted(allowed_vals)}"
                 )
-        elif len(allowed_vals) == 1 and rule.arg_name in props:
-            updated[rule.arg_name] = next(iter(allowed_vals))
+        elif rule.arg_name in props:
+            if len(allowed_vals) == 1:
+                updated[rule.arg_name] = next(iter(allowed_vals))
+            else:
+                raise PermissionError(
+                    f"ABAC policy denied: specify '{rule.arg_name}' from the caller's "
+                    f"allowed {rule.claim} values {sorted(allowed_vals)}"
+                )
     return updated
 
 
@@ -338,16 +344,17 @@ def _apply_post_call_abac_with_count(
                 )
             continue
         field = rule.row_field
-        if (
-            rule.response_list_key
-            and isinstance(current, dict)
-            and isinstance(current.get(rule.response_list_key), list)
-        ):
+        if rule.response_list_key:
+            if not (
+                isinstance(current, dict) and isinstance(current.get(rule.response_list_key), list)
+            ):
+                raise PermissionError(
+                    "ABAC response policy denied: expected list field "
+                    f"'{rule.response_list_key}' was missing or had an invalid shape"
+                )
             orig = current[rule.response_list_key]
             filtered = [
-                row
-                for row in orig
-                if not isinstance(row, dict) or str(row.get(field)) in allowed_vals
+                row for row in orig if isinstance(row, dict) and str(row.get(field)) in allowed_vals
             ]
             dropped += len(orig) - len(filtered)
             current = {**current, rule.response_list_key: filtered}
@@ -358,7 +365,7 @@ def _apply_post_call_abac_with_count(
             current = [
                 row
                 for row in orig_list
-                if not isinstance(row, dict) or str(row.get(field)) in allowed_vals
+                if isinstance(row, dict) and str(row.get(field)) in allowed_vals
             ]
             dropped += len(orig_list) - len(current)
         elif isinstance(current, dict) and field in current:
@@ -433,7 +440,6 @@ class HostDispatcher:
         *,
         budget: ExecutionBudget | None = None,
         code_mode_hints: bool = False,
-        mcp_session_id: str | None = None,
     ) -> tuple[Any, SubcallRecord]:
         started = time.perf_counter()
         with _TRACER.start_as_current_span("gateway.downstream.call") as span:
@@ -523,7 +529,6 @@ class HostDispatcher:
                     tool,
                     scoped_args,
                     auth_headers=auth_headers,
-                    mcp_session_id=mcp_session_id,
                     session_scope=f"{identity.tenant_id}:{identity.sub}",
                 )
             except Exception as exc:

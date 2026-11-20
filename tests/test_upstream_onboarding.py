@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi import FastAPI
 
 from examples.mock_backends import build_synthetic_tools, create_mock_backends_app
@@ -235,27 +236,12 @@ async def test_prod_environment_locks_dynamic_upstreams_and_warns_at_scale(tmp_p
         auth_mode="dev",
         sqlite_path=str(tmp_path / "prod.db"),
     )
-    app = create_gateway_app(
-        settings=prod_settings,
-        store=SQLiteAuditStore(prod_settings.sqlite_path),
-    )
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://gw"
-        ) as gw:
-            post_res = await gw.post(
-                "/admin/upstreams",
-                json={
-                    "name": "blocked_api",
-                    "type": "mcp_http",
-                    "url": "http://127.0.0.1:9999/mcp",
-                    "auth_type": "none",
-                },
-            )
-            assert post_res.status_code == 403
-
-            del_res = await gw.delete("/admin/upstreams/blocked_api")
-            assert del_res.status_code == 403
+    assert prod_settings.dynamic_upstreams_permitted is False
+    with pytest.raises(ValueError, match="auth_mode must be 'oidc'"):
+        create_gateway_app(
+            settings=prod_settings,
+            store=SQLiteAuditStore(prod_settings.sqlite_path),
+        )
 
     # Verify tool_limit_status thresholds (>30 warning, >100 critical)
     runtime = GatewayRuntime(settings=GatewaySettings(sqlite_path=str(tmp_path / "cmp.db")))

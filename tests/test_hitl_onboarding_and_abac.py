@@ -483,7 +483,8 @@ async def test_host_side_abac_enforcement_for_api_key_upstream(tmp_path, monkeyp
                 )
                 assert denied_row["result"]["structuredContent"]["ok"] is False
                 assert (
-                    "ABAC row policy denied" in denied_row["result"]["structuredContent"]["error"]
+                    "ABAC response policy denied"
+                    in denied_row["result"]["structuredContent"]["error"]
                 )
     finally:
         await backend_client.aclose()

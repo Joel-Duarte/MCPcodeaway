@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -87,7 +89,12 @@ from gateway.observability import (
     update_request_context,
 )
 from gateway.runtime_stats import ProcessStatsCollector, collect_runtime_telemetry
-from gateway.sandbox import LocalMontyBackend, RemoteMontyWorkerBackend, SandboxBackend
+from gateway.sandbox import (
+    LocalMontyBackend,
+    RemoteMontyWorkerBackend,
+    SandboxBackend,
+    SandboxResult,
+)
 from gateway.state import (
     AuditStore,
     CacheBackend,
@@ -106,6 +113,11 @@ from gateway.upstream_clients import (
 )
 
 _TRACER = trace.get_tracer("mcpcodeaway.server")
+MCP_PROTOCOL_VERSION = "2026-07-28"
+MCP_LEGACY_PROTOCOL_VERSIONS = {"2025-11-25", "2025-06-18", "2025-03-26"}
+MCP_PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion"
+MCP_CLIENT_CAPABILITIES_META = "io.modelcontextprotocol/clientCapabilities"
+MCP_SERVER_INFO_META = "io.modelcontextprotocol/serverInfo"
 
 _VALID_MODES: set[str] = {
     "codemode",
@@ -252,6 +264,7 @@ class GatewayRuntime:
         preloaded_tools: dict[str, list[DiscoveredTool]] | None = None,
     ) -> None:
         self.settings = settings or GatewaySettings()
+        self.settings.validate_production_secrets()
         configure_logging(self.settings.log_format, self.settings.log_level)
         configure_telemetry(otlp_endpoint=self.settings.otlp_endpoint)
         self.metrics = MetricsRegistry()
@@ -285,6 +298,10 @@ class GatewayRuntime:
             http_client=http_client,
             cache=self.cache,
             session_ttl_seconds=self.settings.mcp_session_ttl_seconds,
+            app_env=self.settings.app_env,
+            block_private_ips_in_prod=self.settings.block_private_ips_in_prod,
+            allowed_hosts=self.settings.allowed_upstream_hosts,
+            ssrf_protection_enabled=self.settings.ssrf_protection_enabled,
         )
         self.process_stats = ProcessStatsCollector()
         self.admin_sessions = AdminSessionManager(self.settings)
@@ -316,12 +333,16 @@ class GatewayRuntime:
                 worker_secret=self.settings.sandbox_worker_secret,
             )
         else:
-            self.sandbox = LocalMontyBackend()
+            self.sandbox = LocalMontyBackend(
+                checkout_timeout_seconds=self.settings.monty_pool_checkout_timeout_seconds,
+                request_timeout_seconds=self.settings.monty_worker_request_timeout_seconds,
+            )
         self.telemetry = TelemetryRecorder(self.store)
         self.preloaded_tools = preloaded_tools or {}
         self.startup_warnings: list[str] = []
         self._startup_retry_task: asyncio.Task[None] | None = None
         self._retention_task: asyncio.Task[None] | None = None
+        self._ready = False
         self.demo_traffic = DemoTrafficRunner(self)
         self.alert_evaluator = AlertEvaluator()
 
@@ -620,6 +641,7 @@ class GatewayRuntime:
                 continue
 
     async def startup(self) -> None:
+        self._ready = False
         await self.store.init()
         if hasattr(self.store, "get_setting"):
             saved_rules = await self.store.get_setting("alert_rules")
@@ -629,8 +651,28 @@ class GatewayRuntime:
         if self.startup_warnings:
             self._startup_retry_task = asyncio.create_task(self._retry_failed_startup_upstreams())
         self._retention_task = asyncio.create_task(self._retention_loop())
+        self._ready = True
+
+    async def is_ready(self) -> bool:
+        """Check lifecycle state and required shared dependencies for readiness probes."""
+        if not self._ready:
+            return False
+        if isinstance(self.cache, RedisCacheBackend):
+            try:
+                if not await asyncio.wait_for(self.cache.health_check(), timeout=1.0):
+                    return False
+            except Exception:
+                return False
+        if isinstance(self.store, PostgresAuditStore):
+            try:
+                if not await asyncio.wait_for(self.store.health_check(), timeout=1.0):
+                    return False
+            except Exception:
+                return False
+        return True
 
     async def shutdown(self) -> None:
+        self._ready = False
         await self.demo_traffic.stop()
         if self._retention_task is not None and not self._retention_task.done():
             self._retention_task.cancel()
@@ -826,7 +868,9 @@ class GatewayRuntime:
         run: dict[str, Any],
     ) -> int:
         total_saved = int(run["estimated_tokens_saved"]) + int(run["schema_tokens_saved"])
-        metric_labels = {"tenant": identity.tenant_id, "mode": mode}
+        # Prometheus is deployment-wide and commonly readable by operations
+        # identities. Keep labels bounded and avoid exporting tenant identifiers.
+        metric_labels = {"mode": mode}
         self.metrics.inc_counter(
             "gateway_tokens_saved_total", amount=total_saved, labels=metric_labels
         )
@@ -865,7 +909,6 @@ class GatewayRuntime:
         allowed_servers: set[str] | None = None,
         timeout_ms: int = 10000,
         require_grounding: bool = False,
-        mcp_session_id: str | None = None,
         mode_decision_reason: str | None = None,
         mode_decision_score: float | None = None,
         experiment_id: str | None = None,
@@ -888,7 +931,6 @@ class GatewayRuntime:
                 allowed_servers=allowed_servers,
                 timeout_ms=timeout_ms,
                 require_grounding=require_grounding,
-                mcp_session_id=mcp_session_id,
                 mode_decision_reason=mode_decision_reason,
                 mode_decision_score=mode_decision_score,
                 experiment_id=experiment_id,
@@ -911,7 +953,6 @@ class GatewayRuntime:
         allowed_servers: set[str] | None = None,
         timeout_ms: int = 10000,
         require_grounding: bool = False,
-        mcp_session_id: str | None = None,
         mode_decision_reason: str | None = None,
         mode_decision_score: float | None = None,
         experiment_id: str | None = None,
@@ -946,6 +987,7 @@ class GatewayRuntime:
         )
 
         budget = ExecutionBudget(self.settings.max_calls_per_execution)
+        tool_call_slots = asyncio.Semaphore(self.settings.max_concurrent_tool_calls_per_execution)
         subcalls: list[SubcallRecord] = []
         observed_tool_outputs: list[Any] = []
         observed_tool_shapes: dict[str, Any] = {}
@@ -961,15 +1003,15 @@ class GatewayRuntime:
             def _make_wrapper(t: DiscoveredTool, u: UpstreamConfig) -> Callable[..., Any]:
                 async def _wrapper(*args: Any, **kwargs: Any) -> Any:
                     bound = bind_positional_arguments(t, args, kwargs)
-                    res, rec = await self.dispatcher.invoke_tool(
-                        identity,
-                        t,
-                        u,
-                        bound,
-                        budget=budget,
-                        code_mode_hints=True,
-                        mcp_session_id=mcp_session_id,
-                    )
+                    async with tool_call_slots:
+                        res, rec = await self.dispatcher.invoke_tool(
+                            identity,
+                            t,
+                            u,
+                            bound,
+                            budget=budget,
+                            code_mode_hints=True,
+                        )
                     subcalls.append(rec)
                     if isinstance(res, dict) and "_dispatch_error" in res:
                         raise RuntimeError(res["_dispatch_error"])
@@ -985,11 +1027,33 @@ class GatewayRuntime:
         with _TRACER.start_as_current_span("gateway.sandbox.execute") as span:
             span.set_attribute("mcp.mode", mode)
             span.set_attribute("mcp.accessible_tools", len(external_functions))
-            sandbox_res = await self.sandbox.execute(
-                code,
-                external_functions=external_functions,
-                timeout_seconds=timeout_seconds,
-            )
+            code_bytes = len(code.encode("utf-8", errors="replace"))
+            if code_bytes > self.settings.max_sandbox_code_bytes:
+                sandbox_res = SandboxResult(
+                    ok=False,
+                    error=(
+                        "Sandbox code payload exceeds the configured limit of "
+                        f"{self.settings.max_sandbox_code_bytes} bytes."
+                    ),
+                    error_type="SandboxInputTooLarge",
+                )
+            else:
+                try:
+                    async with asyncio.timeout(self.settings.execution_wall_timeout_seconds):
+                        sandbox_res = await self.sandbox.execute(
+                            code,
+                            external_functions=external_functions,
+                            timeout_seconds=timeout_seconds,
+                        )
+                except TimeoutError:
+                    sandbox_res = SandboxResult(
+                        ok=False,
+                        error=(
+                            "Execution exceeded the gateway wall-clock limit of "
+                            f"{self.settings.execution_wall_timeout_seconds:g} seconds."
+                        ),
+                        error_type="ExecutionTimeoutError",
+                    )
             span.set_attribute("sandbox.ok", sandbox_res.ok)
             span.set_attribute("sandbox.subcalls", len(subcalls))
         duration_ms = round((time.perf_counter() - started) * 1000, 3)
@@ -1119,7 +1183,6 @@ class GatewayRuntime:
         *,
         mode: GatewayMode = "traditional",
         allowed_servers: set[str] | None = None,
-        mcp_session_id: str | None = None,
         mode_decision_reason: str | None = None,
         mode_decision_score: float | None = None,
         experiment_id: str | None = None,
@@ -1159,7 +1222,6 @@ class GatewayRuntime:
                 upstream,
                 arguments,
                 code_mode_hints=False,
-                mcp_session_id=mcp_session_id,
             )
             duration_ms = round((time.perf_counter() - started) * 1000, 3)
             ok = rec.status == "ok"
@@ -1309,6 +1371,14 @@ def _parse_servers_ceiling(query_val: str | None, header_val: str | None) -> set
 
 
 def _jsonrpc_ok(req_id: Any, result: Any) -> JSONResponse:
+    if isinstance(result, dict):
+        result.setdefault("resultType", "complete")
+        result.setdefault(
+            "_meta",
+            {
+                MCP_SERVER_INFO_META: {"name": "mcpcodeaway", "version": __version__},
+            },
+        )
     return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": result})
 
 
@@ -1316,6 +1386,100 @@ def _jsonrpc_err(req_id: Any, code: int, message: str) -> JSONResponse:
     return JSONResponse(
         {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
     )
+
+
+def _validate_modern_mcp_request(request: Request, payload: Any) -> JSONResponse | None:
+    """Validate the 2026 per-request envelope and Streamable HTTP mirror headers.
+
+    Requests without modern metadata are retained temporarily for handshake-era clients.
+    Neither path creates or depends on a protocol session.
+    """
+    if not isinstance(payload, dict):
+        return None
+    method = payload.get("method")
+    params = payload.get("params")
+    params = params if isinstance(params, dict) else {}
+    meta = params.get("_meta")
+    meta = meta if isinstance(meta, dict) else {}
+    body_version = meta.get(MCP_PROTOCOL_VERSION_META)
+    header_version = request.headers.get("mcp-protocol-version")
+    method_header = request.headers.get("mcp-method")
+    name_header = request.headers.get("mcp-name")
+    if (
+        body_version is None
+        and header_version in MCP_LEGACY_PROTOCOL_VERSIONS
+        and method_header is None
+        and name_header is None
+    ):
+        return None
+    modern = (
+        body_version is not None
+        or header_version is not None
+        or method_header is not None
+        or name_header is not None
+    )
+    if not modern:
+        return None
+
+    req_id = payload.get("id")
+
+    def mismatch(message: str) -> JSONResponse:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32020, "message": message}},
+            status_code=400,
+        )
+
+    request_id = payload.get("id")
+    if payload.get("jsonrpc") != "2.0" or not (
+        isinstance(request_id, str)
+        or (isinstance(request_id, int) and not isinstance(request_id, bool))
+    ):
+        return mismatch("MCP requests require JSON-RPC 2.0 and a non-null string or integer id")
+    if not isinstance(method, str):
+        return mismatch("MCP request method must be a string")
+
+    if not isinstance(body_version, str) or not isinstance(
+        meta.get(MCP_CLIENT_CAPABILITIES_META), dict
+    ):
+        return mismatch(
+            "Modern MCP requests require protocolVersion and clientCapabilities metadata"
+        )
+    if not header_version or header_version != body_version:
+        return mismatch("MCP-Protocol-Version header does not match request metadata")
+    if not isinstance(method, str) or not method_header or method_header != method:
+        return mismatch("Mcp-Method header does not match request method")
+
+    if body_version != MCP_PROTOCOL_VERSION:
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32022,
+                    "message": "Unsupported protocol version",
+                    "data": {"supportedVersions": [MCP_PROTOCOL_VERSION]},
+                },
+            },
+            status_code=400,
+        )
+
+    if method == "tools/call":
+        name = params.get("name")
+        name_header = request.headers.get("mcp-name")
+        if (
+            isinstance(name_header, str)
+            and name_header.startswith("=?base64?")
+            and name_header.endswith("?=")
+        ):
+            try:
+                name_header = base64.b64decode(
+                    name_header[len("=?base64?") : -2], validate=True
+                ).decode("utf-8")
+            except (binascii.Error, UnicodeDecodeError):
+                return mismatch("Mcp-Name header contains invalid Base64 encoding")
+        if not isinstance(name, str) or not name_header or name_header != name:
+            return mismatch("Mcp-Name header does not match tools/call name")
+    return None
 
 
 class CompareRequest(BaseModel):
@@ -1399,6 +1563,8 @@ def create_gateway_app(
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
+        if runtime.settings.app_env == "prod":
+            return {"status": "ok"}
         return {
             "status": "ok",
             "version": __version__,
@@ -1413,13 +1579,31 @@ def create_gateway_app(
             "startup_warnings": runtime.startup_warnings,
         }
 
-    @app.get("/ready")
-    async def ready() -> dict[str, Any]:
-        return {
-            "ready": True,
-            "profile": runtime.settings.effective_profile_name,
-            "upstreams": len(runtime.registry.list_upstreams()),
-        }
+    @app.get("/ready", response_model=None)
+    async def ready() -> dict[str, Any] | JSONResponse:
+        is_ready = await runtime.is_ready()
+        if not is_ready:
+            return JSONResponse(status_code=503, content={"ready": False})
+        return {"ready": True}
+
+    mcp_request_slots = asyncio.Semaphore(max(1, runtime.settings.max_concurrent_mcp_requests))
+
+    @app.middleware("http")
+    async def bound_mcp_concurrency(request: Request, call_next: Callable[..., Any]) -> Any:
+        if request.url.path != "/mcp":
+            return await call_next(request)
+        try:
+            await asyncio.wait_for(mcp_request_slots.acquire(), timeout=0.05)
+        except TimeoutError:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Gateway is at its concurrent request limit."},
+                headers={"Retry-After": "1"},
+            )
+        try:
+            return await call_next(request)
+        finally:
+            mcp_request_slots.release()
 
     @app.post("/mcp")
     async def mcp_endpoint(
@@ -1441,7 +1625,6 @@ def create_gateway_app(
         x_agent_model: str | None = Header(default=None),
         x_require_grounding: str | None = Header(default=None),
         x_request_id: str | None = Header(default=None),
-        mcp_session_id: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ) -> JSONResponse:
         req_corr_id = x_request_id or f"req_{uuid.uuid4().hex[:12]}"
@@ -1453,6 +1636,11 @@ def create_gateway_app(
         with _TRACER.start_as_current_span("gateway.mcp.request") as mcp_span:
             mcp_span.set_attribute("gateway.profile", runtime.settings.effective_profile_name)
             try:
+                origin = request.headers.get("origin")
+                if origin is not None and origin not in runtime.settings.cors_allowed_origins:
+                    return JSONResponse(
+                        {"detail": "Origin is not allowed for the MCP endpoint."}, status_code=403
+                    )
                 try:
                     identity = await runtime.validator.validate_authorization_header(authorization)
                 except AuthError as exc:
@@ -1527,10 +1715,23 @@ def create_gateway_app(
                     )
                 )
                 payload = await request.json()
+                protocol_error = _validate_modern_mcp_request(request, payload)
+                if protocol_error is not None:
+                    return protocol_error
                 req_id = payload.get("id")
                 method = payload.get("method")
                 params = payload.get("params") or {}
-                client_info = params.get("clientInfo") if isinstance(params, dict) else None
+                request_meta = params.get("_meta", {}) if isinstance(params, dict) else {}
+                modern_request = (
+                    isinstance(request_meta, dict)
+                    and request_meta.get(MCP_PROTOCOL_VERSION_META) == MCP_PROTOCOL_VERSION
+                )
+                client_info = (
+                    request_meta.get("io.modelcontextprotocol/clientInfo")
+                    or params.get("clientInfo")
+                    if isinstance(params, dict) and isinstance(request_meta, dict)
+                    else None
+                )
                 client_model = (
                     (client_info.get("model") or client_info.get("name"))
                     if isinstance(client_info, dict)
@@ -1591,7 +1792,7 @@ def create_gateway_app(
                         _jsonrpc_ok(
                             req_id,
                             {
-                                "protocolVersion": "2025-03-26",
+                                "protocolVersion": "2025-11-25",
                                 "capabilities": {"tools": {"listChanged": True}},
                                 "serverInfo": {"name": "mcpcodeaway", "version": __version__},
                             },
@@ -1602,8 +1803,14 @@ def create_gateway_app(
                         _jsonrpc_ok(
                             req_id,
                             {
-                                "supportedVersions": ["2025-03-26"],
-                                "capabilities": {"tools": {"listChanged": True}},
+                                "supportedVersions": [MCP_PROTOCOL_VERSION],
+                                "capabilities": {"tools": {}},
+                                "_meta": {
+                                    MCP_SERVER_INFO_META: {
+                                        "name": "mcpcodeaway",
+                                        "version": __version__,
+                                    }
+                                },
                                 "ttlMs": 30000,
                                 "cacheScope": "private",
                                 "instructions": (
@@ -1615,6 +1822,20 @@ def create_gateway_app(
                         )
                     )
                 if method == "notifications/initialized":
+                    if modern_request:
+                        return JSONResponse(
+                            {
+                                "jsonrpc": "2.0",
+                                "error": {
+                                    "code": -32600,
+                                    "message": (
+                                        "Client notifications are not supported over modern "
+                                        "Streamable HTTP"
+                                    ),
+                                },
+                            },
+                            status_code=400,
+                        )
                     return _finish(JSONResponse({}, status_code=202))
 
                 await runtime.ensure_catalog_for_identity(identity)
@@ -1776,7 +1997,6 @@ def create_gateway_app(
                             allowed_servers=allowed_servers,
                             timeout_ms=int(arguments.get("timeout_ms", 10000)),
                             require_grounding=enforce_grounding,
-                            mcp_session_id=mcp_session_id,
                             mode_decision_reason=mode_decision_reason,
                             mode_decision_score=mode_decision_score,
                             experiment_id=experiment_id,
@@ -1815,7 +2035,6 @@ def create_gateway_app(
                             arguments,
                             mode=effective_mode,
                             allowed_servers=allowed_servers,
-                            mcp_session_id=mcp_session_id,
                             mode_decision_reason=mode_decision_reason,
                             mode_decision_score=mode_decision_score,
                             experiment_id=experiment_id,
@@ -1825,7 +2044,7 @@ def create_gateway_app(
                     except KeyError as exc:
                         return _finish(_jsonrpc_err(req_id, -32601, str(exc)), status_label="error")
                     except PermissionError as exc:
-                        return _finish(_jsonrpc_err(req_id, -32003, str(exc)), status_label="error")
+                        return _finish(_jsonrpc_err(req_id, -31003, str(exc)), status_label="error")
                     except (ValueError, RuntimeError) as exc:
                         return _finish(_jsonrpc_err(req_id, -32602, str(exc)), status_label="error")
 
@@ -1841,10 +2060,12 @@ def create_gateway_app(
                         status_label="ok" if res["ok"] else "error",
                     )
 
-                return _finish(
-                    _jsonrpc_err(req_id, -32601, f"Unsupported MCP method '{method}'"),
-                    status_label="error",
+                unsupported_method = _jsonrpc_err(
+                    req_id, -32601, f"Unsupported MCP method '{method}'"
                 )
+                if modern_request:
+                    unsupported_method.status_code = 404
+                return _finish(unsupported_method, status_label="error")
             finally:
                 clear_request_context()
 
@@ -1854,6 +2075,7 @@ def create_gateway_app(
         *,
         require_admin_role: bool = True,
         allow_viewer: bool = False,
+        allowed_roles: set[str] | None = None,
     ) -> CallerIdentity | None:
         if authorization:
             try:
@@ -1876,10 +2098,14 @@ def create_gateway_app(
                 raise HTTPException(
                     status_code=exc.status_code, detail=exc.detail, headers=headers
                 ) from exc
-            allowed_roles = set(runtime.settings.admin_roles)
+            role_allowlist = (
+                set(allowed_roles)
+                if allowed_roles is not None
+                else set(runtime.settings.admin_roles)
+            )
             if allow_viewer:
-                allowed_roles |= set(runtime.settings.viewer_roles)
-            if require_admin_role and not (set(identity.roles) & allowed_roles):
+                role_allowlist |= set(runtime.settings.viewer_roles)
+            if require_admin_role and not (set(identity.roles) & role_allowlist):
                 runtime.metrics.inc_counter(
                     "gateway_auth_denials_total",
                     labels={"surface": "control_plane", "status_code": 403},
@@ -1899,10 +2125,14 @@ def create_gateway_app(
         if admin_cookie:
             cookie_id = runtime.admin_sessions.verify_session_token(admin_cookie)
             if cookie_id is not None:
-                allowed_roles = set(runtime.settings.admin_roles)
+                role_allowlist = (
+                    set(allowed_roles)
+                    if allowed_roles is not None
+                    else set(runtime.settings.admin_roles)
+                )
                 if allow_viewer:
-                    allowed_roles |= set(runtime.settings.viewer_roles)
-                if require_admin_role and not (set(cookie_id.roles) & allowed_roles):
+                    role_allowlist |= set(runtime.settings.viewer_roles)
+                if require_admin_role and not (set(cookie_id.roles) & role_allowlist):
                     raise HTTPException(
                         status_code=403,
                         detail="Admin role required for control-plane access.",
@@ -1963,9 +2193,12 @@ def create_gateway_app(
             authorization: str | None = Header(default=None),
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> PlainTextResponse:
-            if runtime.settings.metrics_require_auth:
+            if runtime.settings.app_env == "prod" or runtime.settings.metrics_require_auth:
                 await _authorize_control_plane(
-                    authorization, mcpcodeaway_admin_session, require_admin_role=False
+                    authorization,
+                    mcpcodeaway_admin_session,
+                    require_admin_role=True,
+                    allowed_roles=set(runtime.settings.metrics_roles),
                 )
             return PlainTextResponse(
                 runtime.metrics.render_prometheus(),
@@ -2119,12 +2352,11 @@ def create_gateway_app(
         @app.websocket("/admin/ws/telemetry")
         async def admin_ws_telemetry(
             websocket: WebSocket,
-            token: str | None = Query(default=None),
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> None:
-            auth_hdr = f"Bearer {token}" if token else websocket.headers.get("authorization")
+            auth_hdr = websocket.headers.get("authorization")
             try:
-                await _authorize_control_plane(
+                identity = await _authorize_control_plane(
                     auth_hdr,
                     mcpcodeaway_admin_session,
                     require_admin_role=True,
@@ -2134,9 +2366,14 @@ def create_gateway_app(
                 await websocket.close(code=4403)
                 return
 
+            is_admin = identity is None or bool(
+                set(identity.roles) & set(runtime.settings.admin_roles)
+            )
+            tenant_scope = None if is_admin else identity.tenant_id
+
             await websocket.accept()
             initial_rt = await collect_runtime_telemetry(runtime)
-            recent_runs = await runtime.store.list_runs(limit=50)
+            recent_runs = await runtime.store.list_runs(limit=50, tenant_id=tenant_scope)
             initial_alerts = runtime.alert_evaluator.evaluate(
                 runs=recent_runs,
                 drift_warnings=runtime.catalog.drift_warnings,
@@ -2156,13 +2393,19 @@ def create_gateway_app(
                 if not hasattr(runtime.cache, "subscribe_events"):
                     return
                 async for raw_msg in runtime.cache.subscribe_events("mcpcodeaway:telemetry"):
-                    await websocket.send_text(raw_msg)
+                    try:
+                        event = json.loads(raw_msg)
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if not is_admin and event.get("tenant_id") != tenant_scope:
+                        continue
+                    await websocket.send_json(event)
 
             async def _runtime_ticks() -> None:
                 while True:
                     await asyncio.sleep(2.0)
                     rt_snap = await collect_runtime_telemetry(runtime)
-                    tick_runs = await runtime.store.list_runs(limit=50)
+                    tick_runs = await runtime.store.list_runs(limit=50, tenant_id=tenant_scope)
                     tick_alerts = runtime.alert_evaluator.evaluate(
                         runs=tick_runs,
                         drift_warnings=runtime.catalog.drift_warnings,
@@ -2791,7 +3034,11 @@ def create_gateway_app(
                     status_code=400, detail="Live test call only supports read-only tools"
                 )
             result = await runtime.client_manager.call_tool(
-                body.upstream, target_tool, body.arguments, auth_headers=headers
+                body.upstream,
+                target_tool,
+                body.arguments,
+                auth_headers=headers,
+                session_scope=f"{ident.tenant_id}:{ident.sub}",
             )
             return {
                 "ok": True,
@@ -2932,10 +3179,18 @@ def create_gateway_app(
             authorization: str | None = Header(default=None),
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> JSONResponse:
+            origin = request.headers.get("origin")
+            if origin is not None and origin not in runtime.settings.cors_allowed_origins:
+                return JSONResponse(
+                    {"detail": "Origin is not allowed for the MCP endpoint."}, status_code=403
+                )
             caller = await _authorize_control_plane(
                 authorization, mcpcodeaway_admin_session, require_admin_role=True
             )
             payload = await request.json()
+            protocol_error = _validate_modern_mcp_request(request, payload)
+            if protocol_error is not None:
+                return protocol_error
             return await handle_admin_mcp_request(
                 runtime,
                 caller,

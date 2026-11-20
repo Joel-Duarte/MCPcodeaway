@@ -104,6 +104,12 @@ class RedisCacheBackend:
             self._client = aioredis.from_url(self.redis_url, decode_responses=True)
         return self._client
 
+    async def health_check(self) -> bool:
+        try:
+            return bool(await self._get_client().ping())
+        except Exception:
+            return False
+
     async def get(self, key: str) -> str | None:
         val = await self._get_client().get(key)
         return val.decode("utf-8") if isinstance(val, bytes) else val
@@ -505,6 +511,14 @@ class PostgresAuditStore:
                 ) from exc
             self._pool = await asyncpg.create_pool(self.dsn)
         return self._pool
+
+    async def health_check(self) -> bool:
+        try:
+            pool = await self._get_pool()
+            await pool.execute("SELECT 1")
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def _decode_json(value: Any) -> dict[str, Any]:

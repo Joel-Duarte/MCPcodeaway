@@ -18,6 +18,7 @@ PROFILE_SETTING_FIELDS: tuple[str, ...] = (
     "require_admin_auth",
     "require_tool_grounding",
     "allow_dynamic_upstreams",
+    "metrics_require_auth",
     "upstreams_config_path",
 )
 
@@ -50,6 +51,7 @@ class GatewayProfile(BaseModel):
     require_admin_auth: bool | None = None
     require_tool_grounding: bool | None = None
     allow_dynamic_upstreams: bool | None = None
+    metrics_require_auth: bool | None = None
     upstreams_config_path: str | None = None
     features: dict[str, bool] = Field(default_factory=dict)
 
@@ -69,6 +71,7 @@ class ResolvedProfile(BaseModel):
     require_admin_auth: bool | None = None
     require_tool_grounding: bool | None = None
     allow_dynamic_upstreams: bool | None = None
+    metrics_require_auth: bool | None = None
     upstreams_config_path: str | None = None
     features: ProfileFeatures = Field(default_factory=ProfileFeatures)
 
@@ -79,8 +82,10 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
         "extends": None,
         "app_env": "prod",
         "auth_mode": "oidc",
+        "token_exchange_dialect": "rfc8693",
         "require_admin_auth": True,
         "allow_dynamic_upstreams": False,
+        "metrics_require_auth": True,
         "features": {
             "audit_api": True,
             "metrics": True,
