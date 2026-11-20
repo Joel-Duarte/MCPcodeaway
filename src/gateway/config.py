@@ -24,7 +24,15 @@ GatewayMode = Literal[
 ]
 DiscoveryBackendMode = Literal["keyword", "bm25"]
 UpstreamType = Literal["mcp_http", "mcp_stdio", "openapi"]
-UpstreamAuthType = Literal["delegated_token", "bearer_secret", "api_key", "none"]
+UpstreamAuthType = Literal[
+    "delegated_token",
+    "client_credentials",
+    "bearer_secret",
+    "api_key",
+    "user_oauth",
+    "user_api_key",
+    "none",
+]
 
 _SLUG_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -65,6 +73,19 @@ class AbExperimentConfig(BaseModel):
     auto_switch_enabled: bool = True
 
 
+class UpstreamOAuthConfig(BaseModel):
+    """Per-upstream OAuth / OIDC overrides for delegated, M2M, or user_oauth."""
+
+    token_exchange_dialect: TokenExchangeDialect | None = None
+    authorize_endpoint: str | None = None
+    token_endpoint: str | None = None
+    client_id: str | None = None
+    client_secret_ref: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+    token_header: str = "Authorization"
+    token_prefix: str = "Bearer"
+
+
 class UpstreamConfig(BaseModel):
     """Declarative configuration for a downstream MCP server or OpenAPI service."""
 
@@ -80,7 +101,9 @@ class UpstreamConfig(BaseModel):
     downstream_audience: str | None = None
     downstream_scope: str | None = None
     secret_env_var: str | None = None
+    secret_ref: str | None = None
     api_key_header: str = "X-API-Key"
+    oauth: UpstreamOAuthConfig | None = None
     allowed_roles: list[str] = Field(default_factory=list)
     allowed_groups: list[str] = Field(default_factory=list)
     allowed_clients: list[str] = Field(default_factory=list)
@@ -188,6 +211,9 @@ class GatewaySettings(BaseSettings):
     metrics_require_auth: bool = False
 
     audit_retention_days: int = 90
+    credential_encryption_key: str = ""
+    allowed_secret_dirs: list[str] = Field(default_factory=lambda: ["/run/secrets"])
+    connect_ticket_ttl_seconds: int = Field(default=600, ge=60, le=3600)
     admin_session_secret: str = ""
     admin_session_ttl_seconds: int = 28800
     admin_cookie_samesite: Literal["lax", "strict", "none"] = "lax"

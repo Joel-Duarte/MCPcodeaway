@@ -2,25 +2,35 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
-import os
 import re
 import time
 from typing import Any
+from urllib.parse import quote
 
+import httpx
 import jsonschema
 from opentelemetry import trace
 from pydantic import BaseModel
 
-from gateway.auth import CallerIdentity, DelegatedTokenExchanger, PolicyEvaluator
+from gateway.auth import (
+    CallerIdentity,
+    ClientCredentialsProvider,
+    DelegatedTokenExchanger,
+    PolicyEvaluator,
+    UserCredentialRequiredError,
+)
 from gateway.catalog import ToolCatalog, render_python_stub
 from gateway.config import GatewaySettings, UpstreamConfig
+from gateway.crypto import sign_connect_ticket
 from gateway.observability import MetricsRegistry, log_event
+from gateway.secrets import CredentialVault, SecretResolver
 from gateway.state import CacheBackend
-from gateway.upstream_clients import DiscoveredTool, UpstreamClientManager
+from gateway.upstream_clients import DiscoveredTool, UpstreamClientManager, validate_upstream_url
 
 _TRACER = trace.get_tracer("mcpcodeaway.dispatcher")
 
@@ -397,6 +407,11 @@ class HostDispatcher:
         client_manager: UpstreamClientManager,
         catalog: ToolCatalog,
         metrics: MetricsRegistry | None = None,
+        secret_resolver: SecretResolver | None = None,
+        credential_vault: CredentialVault | None = None,
+        client_credentials: ClientCredentialsProvider | None = None,
+        connect_signing_key: bytes | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.settings = settings
         self.policy = policy
@@ -405,6 +420,110 @@ class HostDispatcher:
         self.client_manager = client_manager
         self.catalog = catalog
         self.metrics = metrics
+        self.secret_resolver = secret_resolver or SecretResolver(settings=settings)
+        self.credential_vault = credential_vault
+        self.client_credentials = client_credentials or ClientCredentialsProvider(
+            settings=settings, cache=cache, http_client=http_client
+        )
+        self._connect_signing_key = connect_signing_key
+        self._http_client = http_client
+        self._refresh_locks: dict[str, asyncio.Lock] = {}
+
+    def _build_connect_url(self, identity: CallerIdentity, upstream: UpstreamConfig) -> str:
+        base = self.settings.gateway_public_url.rstrip("/")
+        path = f"{base}/auth/connect/{quote(upstream.name, safe='')}"
+        if self._connect_signing_key is None:
+            return path
+        ticket = sign_connect_ticket(
+            signing_key=self._connect_signing_key,
+            sub=identity.sub,
+            tenant_id=identity.tenant_id,
+            upstream_name=upstream.name,
+            ttl_seconds=self.settings.connect_ticket_ttl_seconds,
+        )
+        return f"{path}?ticket={quote(ticket, safe='')}"
+
+    async def _resolve_oauth_client_secret(self, upstream: UpstreamConfig) -> str | None:
+        if upstream.oauth and upstream.oauth.client_secret_ref:
+            return await self.secret_resolver.resolve(
+                upstream.oauth.client_secret_ref, allow_bare_env=True
+            )
+        return None
+
+    async def _refresh_user_oauth(
+        self,
+        identity: CallerIdentity,
+        upstream: UpstreamConfig,
+        payload: dict[str, Any],
+    ) -> dict[str, str]:
+        oauth = upstream.oauth
+        refresh_token = payload.get("refresh_token")
+        if not oauth or not oauth.token_endpoint or not oauth.client_id or not refresh_token:
+            raise UserCredentialRequiredError(
+                upstream_name=upstream.name,
+                auth_type=upstream.auth_type,
+                connect_url=self._build_connect_url(identity, upstream),
+                reason="expired",
+            )
+        if self.settings.ssrf_protection_enabled:
+            validate_upstream_url(
+                oauth.token_endpoint,
+                app_env=self.settings.app_env,
+                block_private_ips_in_prod=self.settings.block_private_ips_in_prod,
+                allowed_hosts=self.settings.allowed_upstream_hosts,
+            )
+        form_data: dict[str, str] = {
+            "grant_type": "refresh_token",
+            "refresh_token": str(refresh_token),
+            "client_id": oauth.client_id,
+        }
+        client_secret = await self._resolve_oauth_client_secret(upstream)
+        if client_secret:
+            form_data["client_secret"] = client_secret
+
+        if self._http_client is not None:
+            resp = await self._http_client.post(
+                oauth.token_endpoint, data=form_data, follow_redirects=False
+            )
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    oauth.token_endpoint, data=form_data, follow_redirects=False
+                )
+        if resp.status_code >= 400:
+            raise UserCredentialRequiredError(
+                upstream_name=upstream.name,
+                auth_type=upstream.auth_type,
+                connect_url=self._build_connect_url(identity, upstream),
+                reason="refresh_failed",
+            )
+        body = resp.json()
+        new_access = body.get("access_token")
+        if not new_access:
+            raise UserCredentialRequiredError(
+                upstream_name=upstream.name,
+                auth_type=upstream.auth_type,
+                connect_url=self._build_connect_url(identity, upstream),
+                reason="refresh_failed",
+            )
+        expires_in = int(body.get("expires_in", 3600))
+        expires_at = int(time.time()) + expires_in
+        new_payload = {
+            "access_token": str(new_access),
+            "refresh_token": str(body.get("refresh_token") or refresh_token),
+            "token_type": str(body.get("token_type") or "Bearer"),
+            "expires_at": expires_at,
+        }
+        if self.credential_vault is not None:
+            await self.credential_vault.save_user_credential(
+                tenant_id=identity.tenant_id,
+                user_sub=identity.sub,
+                upstream_name=upstream.name,
+                auth_kind="user_oauth",
+                payload=new_payload,
+                expires_at=expires_at,
+            )
+        return new_payload
 
     async def resolve_upstream_headers(
         self, identity: CallerIdentity, upstream: UpstreamConfig
@@ -415,20 +534,130 @@ class HostDispatcher:
         if upstream.auth_type == "delegated_token":
             audience = upstream.downstream_audience or f"api://{upstream.name}"
             scope = upstream.downstream_scope or "mcp.tools"
-            exchanged = await self.exchanger.exchange(identity, audience=audience, scope=scope)
+            oauth = upstream.oauth
+            client_secret = await self._resolve_oauth_client_secret(upstream)
+            exchanged = await self.exchanger.exchange(
+                identity,
+                audience=audience,
+                scope=scope,
+                dialect_override=oauth.token_exchange_dialect if oauth else None,
+                token_endpoint_override=oauth.token_endpoint if oauth else None,
+                client_id_override=oauth.client_id if oauth else None,
+                client_secret_override=client_secret,
+            )
             return (
                 {"Authorization": f"Bearer {exchanged.access_token}"},
                 exchanged.cache_hit,
                 audience,
             )
-        secret_env = upstream.secret_env_var or ""
-        secret_val = os.getenv(secret_env, "") if secret_env else ""
-        if not secret_val:
-            raise RuntimeError(f"Upstream '{upstream.name}' requires secret env var '{secret_env}'")
-        if upstream.auth_type == "bearer_secret":
-            return {"Authorization": f"Bearer {secret_val}"}, False, None
-        if upstream.auth_type == "api_key":
+        if upstream.auth_type == "client_credentials":
+            oauth = upstream.oauth
+            if not oauth or not oauth.token_endpoint or not oauth.client_id:
+                raise RuntimeError(
+                    f"Upstream '{upstream.name}' requires oauth.token_endpoint and oauth.client_id"
+                )
+            client_secret = await self._resolve_oauth_client_secret(upstream)
+            if not client_secret:
+                raise RuntimeError(
+                    f"Upstream '{upstream.name}' requires oauth.client_secret_ref "
+                    "for client_credentials"
+                )
+            scopes = oauth.scopes or (
+                [upstream.downstream_scope] if upstream.downstream_scope else []
+            )
+            token, cache_hit = await self.client_credentials.get_token(
+                upstream_name=upstream.name,
+                token_endpoint=oauth.token_endpoint,
+                client_id=oauth.client_id,
+                client_secret=client_secret,
+                scopes=scopes,
+            )
+            header = oauth.token_header or "Authorization"
+            prefix = f"{oauth.token_prefix} " if oauth.token_prefix else ""
+            return {header: f"{prefix}{token}"}, cache_hit, upstream.downstream_audience
+        if upstream.auth_type in ("bearer_secret", "api_key"):
+            ref = upstream.secret_ref or (
+                f"env://{upstream.secret_env_var}" if upstream.secret_env_var else ""
+            )
+            if not ref:
+                raise RuntimeError(
+                    f"Upstream '{upstream.name}' requires secret_ref or secret_env_var"
+                )
+            secret_val = await self.secret_resolver.resolve(ref, allow_bare_env=True)
+            if upstream.auth_type == "bearer_secret":
+                return {"Authorization": f"Bearer {secret_val}"}, False, None
             return {upstream.api_key_header: secret_val}, False, None
+        if upstream.auth_type in ("user_oauth", "user_api_key"):
+            if self.credential_vault is None:
+                raise RuntimeError("CredentialVault is required for per-user upstream auth")
+            record = await self.credential_vault.load_user_credential(
+                tenant_id=identity.tenant_id,
+                user_sub=identity.sub,
+                upstream_name=upstream.name,
+            )
+            if record is None:
+                raise UserCredentialRequiredError(
+                    upstream_name=upstream.name,
+                    auth_type=upstream.auth_type,
+                    connect_url=self._build_connect_url(identity, upstream),
+                    reason="not_connected",
+                )
+            payload = record["payload"]
+            if upstream.auth_type == "user_api_key":
+                api_key = str(payload.get("api_key") or "")
+                if not api_key:
+                    raise UserCredentialRequiredError(
+                        upstream_name=upstream.name,
+                        auth_type=upstream.auth_type,
+                        connect_url=self._build_connect_url(identity, upstream),
+                        reason="not_connected",
+                    )
+                header = (
+                    upstream.oauth.token_header
+                    if upstream.oauth and upstream.oauth.token_header
+                    else upstream.api_key_header
+                )
+                prefix = (
+                    f"{upstream.oauth.token_prefix} "
+                    if upstream.oauth and upstream.oauth.token_prefix
+                    else ""
+                )
+                return {header: f"{prefix}{api_key}"}, False, None
+
+            expires_at = payload.get("expires_at")
+            if isinstance(expires_at, int | float) and int(expires_at) <= int(time.time()) + 30:
+                lock_key = f"{identity.tenant_id}:{identity.sub}:{upstream.name}"
+                lock = self._refresh_locks.setdefault(lock_key, asyncio.Lock())
+                async with lock:
+                    latest = await self.credential_vault.load_user_credential(
+                        tenant_id=identity.tenant_id,
+                        user_sub=identity.sub,
+                        upstream_name=upstream.name,
+                    )
+                    latest_payload = latest["payload"] if latest else payload
+                    latest_exp = latest_payload.get("expires_at")
+                    if (
+                        isinstance(latest_exp, int | float)
+                        and int(latest_exp) > int(time.time()) + 30
+                    ):
+                        payload = latest_payload
+                    else:
+                        payload = await self._refresh_user_oauth(identity, upstream, latest_payload)
+            access_token = str(payload.get("access_token") or "")
+            if not access_token:
+                raise UserCredentialRequiredError(
+                    upstream_name=upstream.name,
+                    auth_type=upstream.auth_type,
+                    connect_url=self._build_connect_url(identity, upstream),
+                    reason="not_connected",
+                )
+            header = upstream.oauth.token_header if upstream.oauth else "Authorization"
+            prefix = (
+                f"{upstream.oauth.token_prefix} "
+                if upstream.oauth and upstream.oauth.token_prefix
+                else "Bearer "
+            )
+            return {header: f"{prefix}{access_token}"}, False, None
         raise ValueError(f"Unsupported upstream auth_type '{upstream.auth_type}'")
 
     async def invoke_tool(

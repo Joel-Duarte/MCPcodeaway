@@ -34,6 +34,28 @@ class AuthError(Exception):
         self.www_authenticate = www_authenticate
 
 
+class UserCredentialRequiredError(Exception):
+    """Raised when a per-user upstream credential is missing or expired/revoked."""
+
+    def __init__(
+        self,
+        *,
+        upstream_name: str,
+        auth_type: str,
+        connect_url: str,
+        reason: str = "not_connected",
+    ) -> None:
+        self.upstream_name = upstream_name
+        self.auth_type = auth_type
+        self.connect_url = connect_url
+        self.reason = reason
+        super().__init__(
+            f"User credential required for upstream '{upstream_name}' ({auth_type}, {reason}). "
+            f"Direct the user to open {connect_url} in their browser to link their account. "
+            "Do not ask the user to paste tokens or API keys into chat."
+        )
+
+
 class CallerIdentity(BaseModel):
     """Verified identity extracted from the incoming OIDC Bearer JWT."""
 
@@ -548,10 +570,25 @@ class DelegatedTokenExchanger:
         identity: CallerIdentity,
         audience: str,
         scope: str,
+        *,
+        dialect_override: str | None = None,
+        token_endpoint_override: str | None = None,
+        client_id_override: str | None = None,
+        client_secret_override: str | None = None,
     ) -> TokenExchangeResult:
         with _TRACER.start_as_current_span("gateway.auth.obo_exchange") as span:
             started = time.perf_counter()
-            dialect = self.settings.token_exchange_dialect
+            dialect = dialect_override or self.settings.token_exchange_dialect
+            token_endpoint = token_endpoint_override or self.settings.oidc_token_endpoint
+            client_id = client_id_override or self.settings.oidc_client_id
+            client_secret = (
+                client_secret_override
+                if client_secret_override is not None
+                else self.settings.oidc_client_secret
+            )
+            endpoint_fp = hashlib.sha256((token_endpoint or "local").encode("utf-8")).hexdigest()[
+                :12
+            ]
             span.set_attribute("auth.dialect", dialect)
             span.set_attribute("auth.audience", audience)
             span.set_attribute("tenant.id", identity.tenant_id)
@@ -562,7 +599,8 @@ class DelegatedTokenExchanger:
                 else "no_raw"
             )
             cache_key = (
-                f"delegated:{identity.tenant_id}:{identity.sub}:{token_fp}:{audience}:{scope}"
+                f"delegated:{dialect}:{endpoint_fp}:{identity.tenant_id}:{identity.sub}:"
+                f"{token_fp}:{audience}:{scope}"
             )
             cached = await self.cache.get(cache_key)
             if cached is not None:
@@ -603,6 +641,9 @@ class DelegatedTokenExchanger:
                     identity=identity,
                     audience=audience,
                     scope=scope,
+                    token_endpoint=token_endpoint,
+                    client_id=client_id,
+                    client_secret=client_secret,
                 )
 
             caller_exp = identity.claims.get("exp") if isinstance(identity.claims, dict) else None
@@ -640,14 +681,22 @@ class DelegatedTokenExchanger:
         identity: CallerIdentity,
         audience: str,
         scope: str,
+        token_endpoint: str | None = None,
+        client_id: str | None = None,
+        client_secret: str | None = None,
     ) -> tuple[str, int]:
-        if not self.settings.oidc_token_endpoint:
+        endpoint = token_endpoint or self.settings.oidc_token_endpoint
+        effective_client_id = client_id or self.settings.oidc_client_id
+        effective_client_secret = (
+            client_secret if client_secret is not None else self.settings.oidc_client_secret
+        )
+        if not endpoint:
             raise AuthError(500, "oidc_token_endpoint must be set for HTTP token exchange")
         if self.settings.ssrf_protection_enabled:
             from gateway.upstream_clients import validate_upstream_url
 
             validate_upstream_url(
-                self.settings.oidc_token_endpoint,
+                endpoint,
                 app_env=self.settings.app_env,
                 block_private_ips_in_prod=self.settings.block_private_ips_in_prod,
                 allowed_hosts=self.settings.allowed_upstream_hosts,
@@ -659,8 +708,8 @@ class DelegatedTokenExchanger:
                 "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
                 "audience": audience,
                 "scope": scope,
-                "client_id": self.settings.oidc_client_id,
-                "client_secret": self.settings.oidc_client_secret,
+                "client_id": effective_client_id,
+                "client_secret": effective_client_secret,
             }
         elif dialect == "entra_v2_obo":
             form_data = {
@@ -668,22 +717,22 @@ class DelegatedTokenExchanger:
                 "assertion": identity.raw_token,
                 "requested_token_use": "on_behalf_of",
                 "scope": scope,
-                "client_id": self.settings.oidc_client_id,
-                "client_secret": self.settings.oidc_client_secret,
+                "client_id": effective_client_id,
+                "client_secret": effective_client_secret,
             }
         else:
             raise AuthError(500, f"Unsupported token exchange dialect '{dialect}'")
 
         if self._http_client is not None:
             resp = await self._http_client.post(
-                self.settings.oidc_token_endpoint,
+                endpoint,
                 data=form_data,
                 follow_redirects=False,
             )
         else:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(
-                    self.settings.oidc_token_endpoint,
+                    endpoint,
                     data=form_data,
                     follow_redirects=False,
                 )
@@ -696,3 +745,71 @@ class DelegatedTokenExchanger:
             raise AuthError(502, "Token exchange response missing access_token")
         expires_in = int(body.get("expires_in", self.settings.token_cache_ttl_seconds))
         return str(token), expires_in
+
+
+class ClientCredentialsProvider:
+    """Fetches and caches OAuth 2.0 client_credentials tokens for downstream M2M upstreams."""
+
+    def __init__(
+        self,
+        settings: GatewaySettings,
+        cache: CacheBackend,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self.settings = settings
+        self.cache = cache
+        self._http_client = http_client
+
+    async def get_token(
+        self,
+        *,
+        upstream_name: str,
+        token_endpoint: str,
+        client_id: str,
+        client_secret: str,
+        scopes: list[str] | None = None,
+    ) -> tuple[str, bool]:
+        """Return `(access_token, cache_hit)` for a downstream client_credentials upstream."""
+        scope_str = " ".join(s for s in (scopes or []) if s)
+        endpoint_fp = hashlib.sha256(token_endpoint.encode("utf-8")).hexdigest()[:12]
+        cache_key = f"m2m:{upstream_name}:{endpoint_fp}:{scope_str}"
+        cached = await self.cache.get(cache_key)
+        if cached is not None:
+            return cached, True
+
+        if self.settings.ssrf_protection_enabled:
+            from gateway.upstream_clients import validate_upstream_url
+
+            validate_upstream_url(
+                token_endpoint,
+                app_env=self.settings.app_env,
+                block_private_ips_in_prod=self.settings.block_private_ips_in_prod,
+                allowed_hosts=self.settings.allowed_upstream_hosts,
+            )
+
+        form_data: dict[str, str] = {
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }
+        if scope_str:
+            form_data["scope"] = scope_str
+
+        if self._http_client is not None:
+            resp = await self._http_client.post(
+                token_endpoint, data=form_data, follow_redirects=False
+            )
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(token_endpoint, data=form_data, follow_redirects=False)
+
+        if resp.status_code >= 400:
+            raise AuthError(502, f"Client credentials token request failed ({resp.status_code})")
+        body = resp.json()
+        token = body.get("access_token")
+        if not token:
+            raise AuthError(502, "Client credentials response missing access_token")
+        expires_in = int(body.get("expires_in", self.settings.token_cache_ttl_seconds))
+        ttl = min(max(expires_in - 30, 1), self.settings.token_cache_ttl_seconds)
+        await self.cache.set(cache_key, str(token), ttl_seconds=ttl)
+        return str(token), False

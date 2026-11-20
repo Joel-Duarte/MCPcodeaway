@@ -188,6 +188,39 @@ class AuditStore(Protocol):
 
     async def prune_runs_older_than(self, retention_days: int) -> int: ...
 
+    async def set_gateway_secret(
+        self, name: str, ciphertext: str, *, updated_by: str = ""
+    ) -> None: ...
+
+    async def get_gateway_secret(self, name: str) -> str | None: ...
+
+    async def list_gateway_secrets(self) -> list[dict[str, Any]]: ...
+
+    async def delete_gateway_secret(self, name: str) -> bool: ...
+
+    async def set_user_credential(
+        self,
+        tenant_id: str,
+        user_sub: str,
+        upstream_name: str,
+        auth_kind: str,
+        ciphertext: str,
+        *,
+        expires_at: int | None = None,
+    ) -> None: ...
+
+    async def get_user_credential(
+        self, tenant_id: str, user_sub: str, upstream_name: str
+    ) -> dict[str, Any] | None: ...
+
+    async def list_user_credentials(
+        self, tenant_id: str, user_sub: str
+    ) -> list[dict[str, Any]]: ...
+
+    async def delete_user_credential(
+        self, tenant_id: str, user_sub: str, upstream_name: str
+    ) -> bool: ...
+
 
 class SQLiteAuditStore:
     """Zero-dependency SQLite-backed store for execution audit runs and dynamic upstreams."""
@@ -255,6 +288,30 @@ class SQLiteAuditStore:
                 key TEXT PRIMARY KEY,
                 value_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gateway_secrets (
+                name TEXT PRIMARY KEY,
+                ciphertext TEXT NOT NULL,
+                updated_by TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_upstream_credentials (
+                tenant_id TEXT NOT NULL,
+                user_sub TEXT NOT NULL,
+                upstream_name TEXT NOT NULL,
+                auth_kind TEXT NOT NULL,
+                ciphertext TEXT NOT NULL,
+                expires_at INTEGER,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, user_sub, upstream_name)
             )
             """
         )
@@ -607,6 +664,143 @@ class SQLiteAuditStore:
             )
             conn.commit()
 
+    async def set_gateway_secret(self, name: str, ciphertext: str, *, updated_by: str = "") -> None:
+        now = datetime.now(UTC).isoformat()
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute(
+                """
+                INSERT INTO gateway_secrets (name, ciphertext, updated_by, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    ciphertext=excluded.ciphertext,
+                    updated_by=excluded.updated_by,
+                    updated_at=excluded.updated_at
+                """,
+                (name, ciphertext, updated_by, now),
+            )
+            conn.commit()
+
+    async def get_gateway_secret(self, name: str) -> str | None:
+        async with self._lock:
+            conn = self._ensure_conn()
+            row = conn.execute(
+                "SELECT ciphertext FROM gateway_secrets WHERE name = ?",
+                (name,),
+            ).fetchone()
+        return str(row["ciphertext"]) if row is not None else None
+
+    async def list_gateway_secrets(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            conn = self._ensure_conn()
+            rows = conn.execute(
+                "SELECT name, updated_by, updated_at FROM gateway_secrets ORDER BY name ASC"
+            ).fetchall()
+        return [
+            {
+                "name": str(r["name"]),
+                "updated_by": str(r["updated_by"]),
+                "updated_at": str(r["updated_at"]),
+            }
+            for r in rows
+        ]
+
+    async def delete_gateway_secret(self, name: str) -> bool:
+        async with self._lock:
+            conn = self._ensure_conn()
+            cursor = conn.execute("DELETE FROM gateway_secrets WHERE name = ?", (name,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    async def set_user_credential(
+        self,
+        tenant_id: str,
+        user_sub: str,
+        upstream_name: str,
+        auth_kind: str,
+        ciphertext: str,
+        *,
+        expires_at: int | None = None,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute(
+                """
+                INSERT INTO user_upstream_credentials (
+                    tenant_id, user_sub, upstream_name, auth_kind,
+                    ciphertext, expires_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, user_sub, upstream_name) DO UPDATE SET
+                    auth_kind=excluded.auth_kind,
+                    ciphertext=excluded.ciphertext,
+                    expires_at=excluded.expires_at,
+                    updated_at=excluded.updated_at
+                """,
+                (tenant_id, user_sub, upstream_name, auth_kind, ciphertext, expires_at, now),
+            )
+            conn.commit()
+
+    async def get_user_credential(
+        self, tenant_id: str, user_sub: str, upstream_name: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            conn = self._ensure_conn()
+            row = conn.execute(
+                """
+                SELECT auth_kind, ciphertext, expires_at, updated_at
+                FROM user_upstream_credentials
+                WHERE tenant_id = ? AND user_sub = ? AND upstream_name = ?
+                """,
+                (tenant_id, user_sub, upstream_name),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "auth_kind": str(row["auth_kind"]),
+            "ciphertext": str(row["ciphertext"]),
+            "expires_at": int(row["expires_at"]) if row["expires_at"] is not None else None,
+            "updated_at": str(row["updated_at"]),
+        }
+
+    async def list_user_credentials(self, tenant_id: str, user_sub: str) -> list[dict[str, Any]]:
+        async with self._lock:
+            conn = self._ensure_conn()
+            rows = conn.execute(
+                """
+                SELECT upstream_name, auth_kind, expires_at, updated_at
+                FROM user_upstream_credentials
+                WHERE tenant_id = ? AND user_sub = ?
+                ORDER BY upstream_name ASC
+                """,
+                (tenant_id, user_sub),
+            ).fetchall()
+        return [
+            {
+                "upstream_name": str(r["upstream_name"]),
+                "auth_kind": str(r["auth_kind"]),
+                "expires_at": int(r["expires_at"]) if r["expires_at"] is not None else None,
+                "updated_at": str(r["updated_at"]),
+            }
+            for r in rows
+        ]
+
+    async def delete_user_credential(
+        self, tenant_id: str, user_sub: str, upstream_name: str
+    ) -> bool:
+        async with self._lock:
+            conn = self._ensure_conn()
+            cursor = conn.execute(
+                """
+                DELETE FROM user_upstream_credentials
+                WHERE tenant_id = ? AND user_sub = ? AND upstream_name = ?
+                """,
+                (tenant_id, user_sub, upstream_name),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
 
 class PostgresAuditStore:
     """Postgres-backed AuditStore for multi-replica production deployments."""
@@ -676,6 +870,30 @@ class PostgresAuditStore:
                 input_per_1m_usd DOUBLE PRECISION NOT NULL,
                 output_per_1m_usd DOUBLE PRECISION NOT NULL,
                 updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gateway_secrets (
+                name TEXT PRIMARY KEY,
+                ciphertext TEXT NOT NULL,
+                updated_by TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_upstream_credentials (
+                tenant_id TEXT NOT NULL,
+                user_sub TEXT NOT NULL,
+                upstream_name TEXT NOT NULL,
+                auth_kind TEXT NOT NULL,
+                ciphertext TEXT NOT NULL,
+                expires_at BIGINT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, user_sub, upstream_name)
             )
             """
         )
@@ -926,6 +1144,141 @@ class PostgresAuditStore:
             payload,
             now,
         )
+
+    async def set_gateway_secret(self, name: str, ciphertext: str, *, updated_by: str = "") -> None:
+        pool = await self._get_pool()
+        now = datetime.now(UTC).isoformat()
+        await pool.execute(
+            """
+            INSERT INTO gateway_secrets (name, ciphertext, updated_by, updated_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (name) DO UPDATE SET
+                ciphertext = EXCLUDED.ciphertext,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = EXCLUDED.updated_at
+            """,
+            name,
+            ciphertext,
+            updated_by,
+            now,
+        )
+
+    async def get_gateway_secret(self, name: str) -> str | None:
+        pool = await self._get_pool()
+        row = await pool.fetchrow("SELECT ciphertext FROM gateway_secrets WHERE name = $1", name)
+        return str(row["ciphertext"]) if row is not None else None
+
+    async def list_gateway_secrets(self) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            "SELECT name, updated_by, updated_at FROM gateway_secrets ORDER BY name ASC"
+        )
+        return [
+            {
+                "name": str(r["name"]),
+                "updated_by": str(r["updated_by"]),
+                "updated_at": str(r["updated_at"]),
+            }
+            for r in rows
+        ]
+
+    async def delete_gateway_secret(self, name: str) -> bool:
+        pool = await self._get_pool()
+        res = await pool.execute("DELETE FROM gateway_secrets WHERE name = $1", name)
+        return str(res).endswith("1")
+
+    async def set_user_credential(
+        self,
+        tenant_id: str,
+        user_sub: str,
+        upstream_name: str,
+        auth_kind: str,
+        ciphertext: str,
+        *,
+        expires_at: int | None = None,
+    ) -> None:
+        pool = await self._get_pool()
+        now = datetime.now(UTC).isoformat()
+        await pool.execute(
+            """
+            INSERT INTO user_upstream_credentials (
+                tenant_id, user_sub, upstream_name, auth_kind, ciphertext, expires_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (tenant_id, user_sub, upstream_name) DO UPDATE SET
+                auth_kind = EXCLUDED.auth_kind,
+                ciphertext = EXCLUDED.ciphertext,
+                expires_at = EXCLUDED.expires_at,
+                updated_at = EXCLUDED.updated_at
+            """,
+            tenant_id,
+            user_sub,
+            upstream_name,
+            auth_kind,
+            ciphertext,
+            expires_at,
+            now,
+        )
+
+    async def get_user_credential(
+        self, tenant_id: str, user_sub: str, upstream_name: str
+    ) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        row = await pool.fetchrow(
+            """
+            SELECT auth_kind, ciphertext, expires_at, updated_at
+            FROM user_upstream_credentials
+            WHERE tenant_id = $1 AND user_sub = $2 AND upstream_name = $3
+            """,
+            tenant_id,
+            user_sub,
+            upstream_name,
+        )
+        if row is None:
+            return None
+        return {
+            "auth_kind": str(row["auth_kind"]),
+            "ciphertext": str(row["ciphertext"]),
+            "expires_at": int(row["expires_at"]) if row["expires_at"] is not None else None,
+            "updated_at": str(row["updated_at"]),
+        }
+
+    async def list_user_credentials(self, tenant_id: str, user_sub: str) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            """
+            SELECT upstream_name, auth_kind, expires_at, updated_at
+            FROM user_upstream_credentials
+            WHERE tenant_id = $1 AND user_sub = $2
+            ORDER BY upstream_name ASC
+            """,
+            tenant_id,
+            user_sub,
+        )
+        return [
+            {
+                "upstream_name": str(r["upstream_name"]),
+                "auth_kind": str(r["auth_kind"]),
+                "expires_at": int(r["expires_at"]) if r["expires_at"] is not None else None,
+                "updated_at": str(r["updated_at"]),
+            }
+            for r in rows
+        ]
+
+    async def delete_user_credential(
+        self, tenant_id: str, user_sub: str, upstream_name: str
+    ) -> bool:
+        pool = await self._get_pool()
+        res = await pool.execute(
+            """
+            DELETE FROM user_upstream_credentials
+            WHERE tenant_id = $1 AND user_sub = $2 AND upstream_name = $3
+            """,
+            tenant_id,
+            user_sub,
+            upstream_name,
+        )
+        return str(res).endswith("1")
 
     async def close(self) -> None:
         if self._pool is not None and hasattr(self._pool, "close"):

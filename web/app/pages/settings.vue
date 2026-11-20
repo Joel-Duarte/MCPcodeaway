@@ -142,9 +142,60 @@ async function saveAbPenalty() {
   }
 }
 
+const vaultSecrets = ref<Array<{ name: string; updated_by: string; updated_at: string }>>([]);
+const newSecretName = ref("");
+const newSecretValue = ref("");
+const savingSecret = ref(false);
+const secretNotice = ref("");
+
+async function loadVaultSecrets() {
+  try {
+    const res = await apiFetch<{ secrets: Array<{ name: string; updated_by: string; updated_at: string }> }>("/admin/secrets");
+    vaultSecrets.value = res.secrets || [];
+  } catch {
+    // ignore if unavailable
+  }
+}
+
+async function saveVaultSecret() {
+  const name = newSecretName.value.trim();
+  const value = newSecretValue.value.trim();
+  if (!name || !value) return;
+  savingSecret.value = true;
+  secretNotice.value = "";
+  errorMsg.value = "";
+  try {
+    await apiFetch(`/admin/secrets/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: { value },
+    });
+    newSecretName.value = "";
+    newSecretValue.value = "";
+    secretNotice.value = `Encrypted and stored vault://${name}.`;
+    await loadVaultSecrets();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err);
+  } finally {
+    savingSecret.value = false;
+  }
+}
+
+async function deleteVaultSecret(name: string) {
+  secretNotice.value = "";
+  errorMsg.value = "";
+  try {
+    await apiFetch(`/admin/secrets/${encodeURIComponent(name)}`, { method: "DELETE" });
+    secretNotice.value = `Deleted vault://${name}.`;
+    await loadVaultSecrets();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err);
+  }
+}
+
 onMounted(() => {
   void loadSettings();
   void loadAbSettings();
+  void loadVaultSecrets();
 });
 
 const allModelEntries = computed(() => {
@@ -848,6 +899,69 @@ async function pruneAuditRuns() {
             {{ savingPenalty ? "Saving..." : "Save Calibration Policy" }}
           </Button>
           <span v-if="penaltyNotice" class="text-xs text-[#0F766E]">{{ penaltyNotice }}</span>
+        </div>
+      </section>
+
+      <section class="space-y-4 rounded-lg border border-[#E4E4E7] bg-white p-5">
+        <div>
+          <h2 class="text-[0.9375rem] font-semibold text-[#09090B]">Vault Secrets (vault://)</h2>
+          <p class="mt-1 text-xs text-[#52525B]">
+            Store encrypted shared API keys and OAuth client secrets for dynamic upstreams without container restarts. Plaintext values are write-only and never returned.
+          </p>
+        </div>
+
+        <form class="grid grid-cols-1 gap-3 sm:grid-cols-3" @submit.prevent="saveVaultSecret">
+          <div>
+            <label class="block text-xs font-medium text-[#52525B]" for="vault-secret-name">Secret Name</label>
+            <Input
+              id="vault-secret-name"
+              v-model="newSecretName"
+              placeholder="partner_api_key"
+              class="mt-1 w-full font-mono-data text-xs"
+            />
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-[#52525B]" for="vault-secret-val">Secret Value (Write-Only)</label>
+            <Input
+              id="vault-secret-val"
+              v-model="newSecretValue"
+              type="password"
+              autocomplete="off"
+              placeholder="Paste secret value"
+              class="mt-1 w-full font-mono-data text-xs"
+            />
+          </div>
+          <div class="flex items-end gap-2">
+            <Button type="submit" :disabled="savingSecret || !newSecretName.trim() || !newSecretValue.trim()">
+              {{ savingSecret ? "Saving..." : "Store Encrypted Secret" }}
+            </Button>
+          </div>
+        </form>
+        <p v-if="secretNotice" class="text-xs text-[#0F766E]">{{ secretNotice }}</p>
+
+        <div v-if="vaultSecrets.length > 0" class="overflow-x-auto rounded border border-[#E4E4E7]">
+          <table class="w-full border-collapse text-left text-xs">
+            <thead>
+              <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-[#52525B]">
+                <th class="px-3 py-2 font-medium">Reference</th>
+                <th class="px-3 py-2 font-medium">Updated By</th>
+                <th class="px-3 py-2 font-medium">Updated At</th>
+                <th class="px-3 py-2 text-right font-medium">Action</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-[#E4E4E7]">
+              <tr v-for="sec in vaultSecrets" :key="sec.name">
+                <td class="px-3 py-2 font-mono-data text-[#09090B]">vault://{{ sec.name }}</td>
+                <td class="px-3 py-2 text-[#52525B]">{{ sec.updated_by || "admin" }}</td>
+                <td class="px-3 py-2 font-mono-data tabular-nums text-[#71717A]">
+                  {{ sec.updated_at.slice(0, 19).replace("T", " ") }}
+                </td>
+                <td class="px-3 py-2 text-right">
+                  <Button variant="outline" size="sm" @click="deleteVaultSecret(sec.name)">Delete</Button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </section>
     </template>

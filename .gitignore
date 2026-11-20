@@ -22,3 +22,4 @@ graphify-out/
 benchmarks/*_results.json
 benchmarks/results.json
 benchmarks/subagent_mcp_trial.json
+dashboard-screenshots/

@@ -80,6 +80,13 @@ const draftAuthType = ref("none");
 const draftAudience = ref("");
 const draftScope = ref("");
 const draftSecretEnv = ref("");
+const draftSecretRef = ref("");
+const draftOAuthDialect = ref("");
+const draftOAuthAuthorizeEndpoint = ref("");
+const draftOAuthTokenEndpoint = ref("");
+const draftOAuthClientId = ref("");
+const draftOAuthClientSecretRef = ref("");
+const draftOAuthScopes = ref("");
 const draftApiKeyHeader = ref("X-API-Key");
 const draftRoles = ref("finance_analyst, ops_engineer, gateway_admin");
 const draftGroups = ref("");
@@ -120,10 +127,13 @@ const typeOptions = [
 ];
 
 const authOptions = [
+  { value: "delegated_token", label: "delegated_token (OBO / RFC 8693)" },
+  { value: "client_credentials", label: "client_credentials (OAuth M2M)" },
+  { value: "user_oauth", label: "user_oauth (Per-User OAuth PKCE)" },
+  { value: "user_api_key", label: "user_api_key (Per-User PAT / Key)" },
+  { value: "api_key", label: "api_key (Shared Service Key)" },
+  { value: "bearer_secret", label: "bearer_secret (Shared Bearer)" },
   { value: "none", label: "none" },
-  { value: "delegated_token", label: "delegated_token (OBO)" },
-  { value: "api_key", label: "api_key" },
-  { value: "bearer_secret", label: "bearer_secret" },
 ];
 
 const modeOptions = [
@@ -176,13 +186,22 @@ function toggleRole(role: string) {
 
 const authHelpText = computed(() => {
   if (draftAuthType.value === "delegated_token") {
-    return "Exchanges the caller's JWT via OBO/RFC 8693 for a downstream token scoped to this user.";
+    return "Exchanges the caller's JWT via Entra OBO or Keycloak RFC 8693 for a downstream token scoped to this user.";
+  }
+  if (draftAuthType.value === "client_credentials") {
+    return "Enforces user RBAC at the gateway, then fetches a machine-to-machine OAuth token via client_credentials.";
+  }
+  if (draftAuthType.value === "user_oauth") {
+    return "Prompts each user once to authorize via OAuth 2.0 PKCE and stores encrypted refresh tokens per user.";
+  }
+  if (draftAuthType.value === "user_api_key") {
+    return "Prompts each user to save their personal API key/PAT in the encrypted vault (never exposed to the LLM).";
   }
   if (draftAuthType.value === "api_key") {
-    return "Injects a secret API key from an environment variable on the gateway host (never exposed to Monty).";
+    return "Injects a shared API key resolved via secret_ref (env://, file://, vault://, akv://, hcv://) on the gateway host.";
   }
   if (draftAuthType.value === "bearer_secret") {
-    return "Sends a static service Bearer token from a host secret environment variable.";
+    return "Sends a shared service Bearer token resolved via secret_ref on the gateway host.";
   }
   return "No downstream credentials sent — suitable only for internal read-only sandboxes.";
 });
@@ -190,15 +209,26 @@ const authHelpText = computed(() => {
 const authRequestPreview = computed(() => {
   const host = draftUrl.value.trim() || "https://api.example.com";
   if (draftAuthType.value === "delegated_token") {
-    return `POST ${host}/...\\nAuthorization: Bearer <OBO_USER_SCOPED_JWT>\\nX-Forwarded-Sub: <caller_sub>`;
+    return `POST ${host}/...\nAuthorization: Bearer <OBO_OR_RFC8693_USER_JWT>`;
+  }
+  if (draftAuthType.value === "client_credentials") {
+    return `POST ${host}/...\nAuthorization: Bearer <CACHED_M2M_CLIENT_CREDENTIALS_JWT>`;
+  }
+  if (draftAuthType.value === "user_oauth") {
+    return `POST ${host}/...\nAuthorization: Bearer <USER_VAULT_OAUTH_TOKEN>`;
+  }
+  if (draftAuthType.value === "user_api_key") {
+    const hdr = draftApiKeyHeader.value.trim() || "X-API-Key";
+    return `GET ${host}/...\n${hdr}: <USER_VAULT_PERSONAL_KEY>`;
   }
   if (draftAuthType.value === "api_key") {
-    return `GET ${host}/...\\nX-API-Key: <HOST_ENV_SECRET_KEY>`;
+    const hdr = draftApiKeyHeader.value.trim() || "X-API-Key";
+    return `GET ${host}/...\n${hdr}: <HOST_RESOLVED_SECRET>`;
   }
   if (draftAuthType.value === "bearer_secret") {
-    return `GET ${host}/...\\nAuthorization: Bearer <HOST_ENV_SERVICE_TOKEN>`;
+    return `GET ${host}/...\nAuthorization: Bearer <HOST_RESOLVED_SECRET>`;
   }
-  return `GET ${host}/...\\n(No Authorization header injected)`;
+  return `GET ${host}/...\n(No Authorization header injected)`;
 });
 
 const sessionAdvice = computed(() => {
@@ -313,6 +343,18 @@ function buildUpstreamPayload() {
     resolvedType = "mcp_http";
   }
 
+  const oauthScopesList = draftOAuthScopes.value
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const hasOAuthFields =
+    Boolean(draftOAuthDialect.value.trim()) ||
+    Boolean(draftOAuthAuthorizeEndpoint.value.trim()) ||
+    Boolean(draftOAuthTokenEndpoint.value.trim()) ||
+    Boolean(draftOAuthClientId.value.trim()) ||
+    Boolean(draftOAuthClientSecretRef.value.trim()) ||
+    oauthScopesList.length > 0;
+
   return {
     name: draftName.value.trim(),
     type: resolvedType,
@@ -323,7 +365,18 @@ function buildUpstreamPayload() {
     downstream_audience: draftAudience.value.trim() || undefined,
     downstream_scope: draftScope.value.trim() || undefined,
     secret_env_var: draftSecretEnv.value.trim() || undefined,
+    secret_ref: draftSecretRef.value.trim() || undefined,
     api_key_header: draftApiKeyHeader.value.trim() || "X-API-Key",
+    oauth: hasOAuthFields
+      ? {
+          token_exchange_dialect: draftOAuthDialect.value.trim() || undefined,
+          authorize_endpoint: draftOAuthAuthorizeEndpoint.value.trim() || undefined,
+          token_endpoint: draftOAuthTokenEndpoint.value.trim() || undefined,
+          client_id: draftOAuthClientId.value.trim() || undefined,
+          client_secret_ref: draftOAuthClientSecretRef.value.trim() || undefined,
+          scopes: oauthScopesList,
+        }
+      : undefined,
     allowed_roles: roles,
     allowed_groups: groups,
     preferred_mode: draftPreferredMode.value,
@@ -851,13 +904,47 @@ async function copyPromptText() {
               <FieldLabel>Downstream Scope</FieldLabel>
               <Input v-model="draftScope" placeholder="mcp.tools" class="font-mono-data text-xs" />
             </Field>
-          </div>
-          <div v-else-if="draftAuthType === 'api_key' || draftAuthType === 'bearer_secret'" class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
             <Field>
-              <FieldLabel>Secret Env Variable</FieldLabel>
+              <FieldLabel>Dialect Override (optional)</FieldLabel>
+              <Input v-model="draftOAuthDialect" placeholder="entra_v2_obo or rfc8693" class="font-mono-data text-xs" />
+            </Field>
+            <Field>
+              <FieldLabel>Token Endpoint Override (optional)</FieldLabel>
+              <Input v-model="draftOAuthTokenEndpoint" placeholder="https://sso.company.internal/realms/ent/protocol/openid-connect/token" class="font-mono-data text-xs" />
+            </Field>
+          </div>
+          <div v-else-if="draftAuthType === 'client_credentials' || draftAuthType === 'user_oauth'" class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field v-if="draftAuthType === 'user_oauth'">
+              <FieldLabel>Authorize Endpoint</FieldLabel>
+              <Input v-model="draftOAuthAuthorizeEndpoint" placeholder="https://provider.example.com/oauth/authorize" class="font-mono-data text-xs" />
+            </Field>
+            <Field>
+              <FieldLabel>Token Endpoint</FieldLabel>
+              <Input v-model="draftOAuthTokenEndpoint" placeholder="https://provider.example.com/oauth/token" class="font-mono-data text-xs" />
+            </Field>
+            <Field>
+              <FieldLabel>Client ID</FieldLabel>
+              <Input v-model="draftOAuthClientId" placeholder="mcp-upstream-client" class="font-mono-data text-xs" />
+            </Field>
+            <Field>
+              <FieldLabel>Client Secret Ref</FieldLabel>
+              <Input v-model="draftOAuthClientSecretRef" placeholder="vault://my_client_secret or env://..." class="font-mono-data text-xs" />
+            </Field>
+            <Field class="sm:col-span-2">
+              <FieldLabel>OAuth Scopes</FieldLabel>
+              <Input v-model="draftOAuthScopes" placeholder="read write offline_access" class="font-mono-data text-xs" />
+            </Field>
+          </div>
+          <div v-else-if="draftAuthType === 'api_key' || draftAuthType === 'bearer_secret' || draftAuthType === 'user_api_key'" class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field v-if="draftAuthType !== 'user_api_key'">
+              <FieldLabel>Secret Reference (secret_ref)</FieldLabel>
+              <Input v-model="draftSecretRef" placeholder="vault://partner_key or env://PARTNER_API_KEY" class="font-mono-data text-xs" />
+            </Field>
+            <Field v-if="draftAuthType !== 'user_api_key'">
+              <FieldLabel>Legacy Secret Env Var (optional)</FieldLabel>
               <Input v-model="draftSecretEnv" placeholder="PARTNER_API_KEY" class="font-mono-data text-xs" />
             </Field>
-            <Field v-if="draftAuthType === 'api_key'">
+            <Field v-if="draftAuthType === 'api_key' || draftAuthType === 'user_api_key'">
               <FieldLabel>API Key Header</FieldLabel>
               <Input v-model="draftApiKeyHeader" placeholder="X-API-Key" class="font-mono-data text-xs" />
             </Field>

@@ -8,6 +8,7 @@ import binascii
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -48,10 +49,12 @@ from gateway.auth import (
     DEV_PERSONAS,
     AuthError,
     CallerIdentity,
+    ClientCredentialsProvider,
     DelegatedTokenExchanger,
     LocalDevKeyManager,
     OidcTokenValidator,
     PolicyEvaluator,
+    UserCredentialRequiredError,
 )
 from gateway.catalog import (
     ToolCatalog,
@@ -69,6 +72,7 @@ from gateway.config import (
     UpstreamConfig,
     UpstreamRegistry,
 )
+from gateway.crypto import EnvelopeCipher
 from gateway.demo_traffic import DemoTier, DemoTrafficRunner
 from gateway.discovery import DiscoveryEngine
 from gateway.dispatcher import (
@@ -101,6 +105,7 @@ from gateway.sandbox import (
     SandboxBackend,
     SandboxResult,
 )
+from gateway.secrets import CredentialVault, SecretResolver
 from gateway.state import (
     AuditStore,
     CacheBackend,
@@ -117,6 +122,7 @@ from gateway.upstream_clients import (
     inspect_upstream,
     validate_upstream_url,
 )
+from gateway.user_connect import create_user_connect_router
 
 _TRACER = trace.get_tracer("mcpcodeaway.server")
 
@@ -304,6 +310,29 @@ class GatewayRuntime:
         )
         self.process_stats = ProcessStatsCollector()
         self.admin_sessions = AdminSessionManager(self.settings)
+        self.cipher = EnvelopeCipher(
+            self.settings.credential_encryption_key,
+            allow_ephemeral=self.settings.app_env == "sandbox",
+        )
+        self.secret_resolver = SecretResolver(
+            settings=self.settings,
+            store=self.store,
+            cipher=self.cipher,
+            http_client=http_client,
+        )
+        self.credential_vault = CredentialVault(store=self.store, cipher=self.cipher)
+        self.client_credentials = ClientCredentialsProvider(
+            settings=self.settings,
+            cache=self.cache,
+            http_client=http_client,
+        )
+        self._connect_signing_key = (
+            self.cipher.derive_subkey("connect_ticket")
+            if self.cipher.is_configured
+            else hashlib.sha256(
+                (self.settings.admin_session_secret or "mcpcodeaway-dev-ticket").encode("utf-8")
+            ).digest()
+        )
         self._local_catalog_epoch: str = "0"
         self.catalog = ToolCatalog()
         self.discovery_engine = DiscoveryEngine(self.settings, http_client=discovery_http_client)
@@ -315,6 +344,11 @@ class GatewayRuntime:
             client_manager=self.client_manager,
             catalog=self.catalog,
             metrics=self.metrics,
+            secret_resolver=self.secret_resolver,
+            credential_vault=self.credential_vault,
+            client_credentials=self.client_credentials,
+            connect_signing_key=self._connect_signing_key,
+            http_client=http_client,
         )
         if sandbox_backend is not None:
             self.sandbox: SandboxBackend = sandbox_backend
@@ -1546,6 +1580,26 @@ def create_gateway_app(
     app.include_router(
         create_oauth_discovery_router(runtime.settings, runtime.dev_keys, runtime.validator)
     )
+
+    async def _resolve_session_identity(request: Request) -> CallerIdentity | None:
+        return runtime.admin_sessions.verify_session_token(
+            request.cookies.get("mcpcodeaway_admin_session")
+        )
+
+    app.include_router(
+        create_user_connect_router(
+            settings=runtime.settings,
+            registry=runtime.registry,
+            validator=runtime.validator,
+            policy=runtime.policy,
+            cache=runtime.cache,
+            vault=runtime.credential_vault,
+            secret_resolver=runtime.secret_resolver,
+            connect_signing_key=runtime._connect_signing_key,
+            http_client=runtime.client_manager._http_client,
+            session_resolver=_resolve_session_identity,
+        )
+    )
     features = runtime.settings.active_features
     if features.dashboard_ui or features.admin_read or features.audit_api:
         app.include_router(create_admin_auth_router(runtime))
@@ -2659,6 +2713,8 @@ def create_gateway_app(
                 headers, _, _ = await runtime.dispatcher.resolve_upstream_headers(caller, cfg)
             except AuthError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+            except UserCredentialRequiredError:
+                headers = {}
         elif cfg.auth_type != "none":
             dev_id = runtime._dev_discovery_identity()
             if cfg.auth_type == "delegated_token" and dev_id is not None:
@@ -3486,6 +3542,52 @@ def create_gateway_app(
                 "name": name,
                 "catalog_version": runtime.catalog.catalog_version,
             }
+
+        @app.get("/admin/secrets")
+        async def list_admin_secrets(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, allow_viewer=True
+            )
+            secrets = await runtime.store.list_gateway_secrets()
+            return {"secrets": secrets}
+
+        @app.put("/admin/secrets/{name}")
+        async def put_admin_secret(
+            name: str,
+            body: dict[str, Any],
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,128}", name):
+                raise HTTPException(status_code=400, detail="Invalid secret name")
+            actor = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            value = str(body.get("value") or "")
+            if not value:
+                raise HTTPException(status_code=400, detail="Secret value cannot be empty")
+            updated_by = actor.email or actor.sub if actor is not None else "admin"
+            await runtime.credential_vault.save_gateway_secret(name, value, updated_by=updated_by)
+            runtime.secret_resolver.invalidate(f"vault://{name}")
+            return {"saved": True, "name": name}
+
+        @app.delete("/admin/secrets/{name}")
+        async def delete_admin_secret(
+            name: str,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            deleted = await runtime.store.delete_gateway_secret(name)
+            runtime.secret_resolver.invalidate(f"vault://{name}")
+            if not deleted:
+                raise HTTPException(status_code=404, detail=f"Secret '{name}' not found")
+            return {"deleted": True, "name": name}
 
     if features.comparator:
 
