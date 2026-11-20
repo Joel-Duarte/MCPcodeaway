@@ -1562,10 +1562,14 @@ def create_gateway_app(
         finally:
             await runtime.shutdown()
 
+    is_prod = runtime.settings.app_env == "prod"
     app = FastAPI(
         title="MCPcodeaway Gateway",
         version=__version__,
         lifespan=lifespan,
+        docs_url=None if is_prod else "/docs",
+        redoc_url=None if is_prod else "/redoc",
+        openapi_url=None if is_prod else "/openapi.json",
     )
     app.state.runtime = runtime
     runtime.demo_traffic.bind_app(app)
