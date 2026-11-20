@@ -976,6 +976,29 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
             assert modern_admin_discovery.status_code == 200
             assert modern_admin_discovery.json()["result"]["supportedVersions"] == ["2026-07-28"]
 
+            modern_admin_tools = await gw.post(
+                "/admin/mcp",
+                headers={
+                    "Authorization": f"Bearer {adm_tok}",
+                    "MCP-Protocol-Version": "2026-07-28",
+                    "Mcp-Method": "tools/list",
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "admin-tools-list",
+                    "method": "tools/list",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        }
+                    },
+                },
+            )
+            assert modern_admin_tools.status_code == 200
+            assert modern_admin_tools.json()["result"]["ttlMs"] == 0
+            assert modern_admin_tools.json()["result"]["cacheScope"] == "private"
+
             burst = await gw.post(
                 "/admin/demo/traffic/burst?count=2",
                 headers={"Authorization": f"Bearer {adm_tok}"},

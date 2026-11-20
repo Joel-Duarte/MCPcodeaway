@@ -190,11 +190,14 @@ async def handle_admin_mcp_request(
         )
 
     if method == "tools/list":
+        tool_list_result: dict[str, Any] = {"tools": _ADMIN_MCP_TOOLS}
+        if modern_request:
+            tool_list_result.update({"ttlMs": 0, "cacheScope": "private"})
         return JSONResponse(
             {
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "result": _admin_mcp_result({"tools": _ADMIN_MCP_TOOLS}),
+                "result": _admin_mcp_result(tool_list_result),
             }
         )
 

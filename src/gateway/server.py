@@ -1902,6 +1902,9 @@ def create_gateway_app(
                         limit=params.get("limit"),
                         cursor=params.get("cursor"),
                     )
+                    if modern_request:
+                        listed.setdefault("ttlMs", 0)
+                        listed.setdefault("cacheScope", "private")
                     return _finish(_jsonrpc_ok(req_id, listed))
 
                 if method == "tools/call":

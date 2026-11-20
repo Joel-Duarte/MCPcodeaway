@@ -270,6 +270,21 @@ async def test_modern_mcp_metadata_headers_and_discovery_contract(tmp_path) -> N
                 == "mcpcodeaway"
             )
 
+            modern_tool_list = await client.post(
+                "/mcp",
+                headers={**headers, "Mcp-Method": "tools/list"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "modern-tools-list",
+                    "method": "tools/list",
+                    "params": {"_meta": metadata},
+                },
+            )
+            assert modern_tool_list.status_code == 200
+            modern_tool_list_result = modern_tool_list.json()["result"]
+            assert modern_tool_list_result["ttlMs"] == 0
+            assert modern_tool_list_result["cacheScope"] == "private"
+
             tool_headers = {**headers, "Mcp-Method": "tools/call", "Mcp-Name": "list_servers"}
             tool_response = await client.post(
                 "/mcp?mode=codemode",
