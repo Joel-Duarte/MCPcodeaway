@@ -28,7 +28,20 @@ interface AlertRules {
   custom_rules?: CustomAlertRule[];
 }
 
-const { apiFetch } = useAdminApi();
+const { apiFetch, session, authConfig, runtimeMeta, loadAuthState, setRuntimeMeta } = useAdminApi();
+type SettingsTab = "workspace" | "pricing" | "alerts" | "retention" | "routing" | "secrets";
+const activeSettingsTab = ref<SettingsTab>("workspace");
+const settingsTabs: { id: SettingsTab; label: string }[] = [
+  { id: "workspace", label: "Workspace & access" },
+  { id: "pricing", label: "Model pricing" },
+  { id: "alerts", label: "Alerts & webhooks" },
+  { id: "retention", label: "Audit & retention" },
+  { id: "routing", label: "Routing & calibration" },
+  { id: "secrets", label: "Vault secrets" },
+];
+function setSettingsTab(tab: SettingsTab) {
+  activeSettingsTab.value = tab;
+}
 
 const loading = ref(true);
 const statusMsg = ref("");
@@ -42,9 +55,6 @@ const modelPageSize = 8;
 const editingModel = ref<string | null>(null);
 const editInPrice = ref("");
 const editOutPrice = ref("");
-const customModelName = ref("");
-const customInPrice = ref("0.20");
-const customOutPrice = ref("0.60");
 const savingPricing = ref(false);
 
 // Alert Rules & Custom Rules
@@ -73,10 +83,26 @@ const archiveS3Bucket = ref("");
 const archiving = ref(false);
 const pruning = ref(false);
 const savingPolicy = ref(false);
+const retentionConfirmOpen = ref(false);
+const pendingRetentionAction = ref<"archive" | "prune" | null>(null);
+
+function requestRetentionAction(action: "archive" | "prune") {
+  pendingRetentionAction.value = action;
+  retentionConfirmOpen.value = true;
+}
+
+async function confirmRetentionAction() {
+  const action = pendingRetentionAction.value;
+  retentionConfirmOpen.value = false;
+  pendingRetentionAction.value = null;
+  if (action === "archive") await archiveAuditRuns(true);
+  if (action === "prune") await pruneAuditRuns();
+}
 
 async function loadSettings() {
   errorMsg.value = "";
   try {
+    await loadAuthState();
     const [p, r, pol] = await Promise.all([
       apiFetch<ModelPricingMap>("/admin/pricing/models"),
       apiFetch<AlertRules>("/admin/alerts/rules"),
@@ -84,6 +110,22 @@ async function loadSettings() {
         "/admin/audit/retention-policy"
       ),
     ]);
+    try {
+      const rt = await apiFetch<{ gateway?: { profile?: string; app_env?: string; catalog_version?: string } }>(
+        "/admin/telemetry/runtime",
+        {},
+        true
+      );
+      if (rt?.gateway) {
+        setRuntimeMeta({
+          profile: rt.gateway.profile || runtimeMeta.value.profile,
+          app_env: rt.gateway.app_env || runtimeMeta.value.app_env,
+          catalog_version: rt.gateway.catalog_version || runtimeMeta.value.catalog_version,
+        });
+      }
+    } catch {
+      // Optional runtime metadata fetch
+    }
     pricing.value = p;
     errorRateMax.value = String(r.error_rate_pct_max);
     p95LatencyMax.value = String(r.p95_latency_ms_max);
@@ -104,6 +146,9 @@ async function loadSettings() {
 const turnPenaltyPts = ref(8.0);
 const tokensPerPenaltyPt = ref(150);
 const calibrationRunsPerArm = ref(50);
+const calibrationPolicyLoaded = ref(false);
+const calibrationLoadError = ref("");
+const classicExtraTurnTokenEquivalent = computed(() => turnPenaltyPts.value * tokensPerPenaltyPt.value);
 const savingPenalty = ref(false);
 const penaltyNotice = ref("");
 
@@ -118,25 +163,38 @@ async function loadAbSettings() {
       if (typeof res.turn_penalty_pts === "number") turnPenaltyPts.value = res.turn_penalty_pts;
       if (typeof res.tokens_per_penalty_pt === "number") tokensPerPenaltyPt.value = res.tokens_per_penalty_pt;
       if (typeof res.calibration_runs_per_arm === "number") calibrationRunsPerArm.value = res.calibration_runs_per_arm;
+      calibrationPolicyLoaded.value = true;
     }
-  } catch {
-    // ignore if unavailable
+  } catch (err) {
+    calibrationLoadError.value = extractErrorMessage(err);
   }
 }
 
 async function saveAbPenalty() {
   savingPenalty.value = true;
   penaltyNotice.value = "";
+  errorMsg.value = "";
   try {
+    if (
+      !Number.isFinite(turnPenaltyPts.value) || turnPenaltyPts.value < 0 || turnPenaltyPts.value > 50 ||
+      !Number.isFinite(tokensPerPenaltyPt.value) || tokensPerPenaltyPt.value < 0 || tokensPerPenaltyPt.value > 2000 ||
+      !Number.isInteger(calibrationRunsPerArm.value) || calibrationRunsPerArm.value < 5 || calibrationRunsPerArm.value > 500
+    ) {
+      throw new Error("Check calibration values: penalty points 0–50, tokens per point 0–2,000, runs per arm 5–500.");
+    }
     await apiFetch("/admin/ab/settings", {
       method: "POST",
-      body: JSON.stringify({
+      body: {
         turn_penalty_pts: turnPenaltyPts.value,
         tokens_per_penalty_pt: tokensPerPenaltyPt.value,
         calibration_runs_per_arm: calibrationRunsPerArm.value,
-      }),
+      },
     });
+    calibrationPolicyLoaded.value = true;
+    calibrationLoadError.value = "";
     penaltyNotice.value = `Saved (${turnPenaltyPts.value} pts/turn × ${tokensPerPenaltyPt.value} tok/pt, ${calibrationRunsPerArm.value} runs/arm).`;
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err);
   } finally {
     savingPenalty.value = false;
   }
@@ -193,6 +251,7 @@ async function deleteVaultSecret(name: string) {
 }
 
 onMounted(() => {
+  void loadAuthState(true).catch((err) => { errorMsg.value = extractErrorMessage(err); });
   void loadSettings();
   void loadAbSettings();
   void loadVaultSecrets();
@@ -232,6 +291,12 @@ function startEditModel(name: string, input: number, output: number) {
 }
 
 async function saveInlineModel(name: string) {
+  const input = Number(editInPrice.value);
+  const output = Number(editOutPrice.value);
+  if (!Number.isFinite(input) || !Number.isFinite(output) || input < 0 || output < 0 || input > 1000 || output > 1000) {
+    errorMsg.value = "Model prices must be valid numbers between $0 and $1,000 per 1M tokens.";
+    return;
+  }
   savingPricing.value = true;
   errorMsg.value = "";
   statusMsg.value = "";
@@ -240,36 +305,12 @@ async function saveInlineModel(name: string) {
       method: "POST",
       body: {
         model_name: name,
-        input_per_1m_usd: Number(editInPrice.value) || 0,
-        output_per_1m_usd: Number(editOutPrice.value) || 0,
+        input_per_1m_usd: input,
+        output_per_1m_usd: output,
       },
     });
     editingModel.value = null;
     statusMsg.value = `Updated API token price for '${name}'.`;
-    await loadSettings();
-  } catch (err) {
-    errorMsg.value = extractErrorMessage(err);
-  } finally {
-    savingPricing.value = false;
-  }
-}
-
-async function addModelPrice() {
-  if (!customModelName.value.trim()) return;
-  savingPricing.value = true;
-  errorMsg.value = "";
-  statusMsg.value = "";
-  try {
-    await apiFetch("/admin/pricing/models", {
-      method: "POST",
-      body: {
-        model_name: customModelName.value.trim(),
-        input_per_1m_usd: Number(customInPrice.value) || 0,
-        output_per_1m_usd: Number(customOutPrice.value) || 0,
-      },
-    });
-    statusMsg.value = `Saved model pricing for '${customModelName.value.trim()}'.`;
-    customModelName.value = "";
     await loadSettings();
   } catch (err) {
     errorMsg.value = extractErrorMessage(err);
@@ -429,10 +470,10 @@ async function pruneAuditRuns() {
   <div class="space-y-6">
     <div>
       <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">
-        Gateway Settings, Alert Rules &amp; Compliance Retention
+        Gateway configuration
       </h1>
       <p class="mt-0.5 text-[13px] text-[#52525B]">
-        Manage verified API token pricing, custom SLA/security webhook alerts, and archive-before-purge compliance policies.
+        Administrator access, detected model pricing, alerts, routing policy, and audit retention.
       </p>
     </div>
 
@@ -456,13 +497,46 @@ async function pruneAuditRuns() {
     <div v-if="loading" class="h-64 animate-pulse rounded-lg border border-[#E4E4E7] bg-white" />
 
     <template v-else>
-      <!-- 1. API Token Cost Catalog -->
-      <section class="rounded-lg border border-[#E4E4E7] bg-white">
+      <nav aria-label="Settings sections" class="flex gap-1 overflow-x-auto border-b border-[#E4E4E7]" role="tablist">
+        <button v-for="tab in settingsTabs" :key="tab.id" type="button" role="tab" :aria-selected="activeSettingsTab === tab.id" :aria-controls="`settings-panel-${tab.id}`"
+          class="min-h-11 shrink-0 border-b-2 px-3 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
+          :class="activeSettingsTab === tab.id ? 'border-[#0F766E] text-[#0F766E]' : 'border-transparent text-[#71717A] hover:text-[#09090B]'"
+          @click="setSettingsTab(tab.id)">{{ tab.label }}</button>
+      </nav>
+
+      <section v-if="activeSettingsTab === 'workspace'" id="settings-panel-workspace" role="tabpanel" class="space-y-4">
+        <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
+          <h2 class="text-[15px] font-semibold text-[#09090B]">Administrator identity</h2>
+          <p class="mt-1 text-xs text-[#71717A]">Read-only details from the gateway's current admin session and authentication configuration.</p>
+          <dl class="mt-4 grid grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2 xl:grid-cols-3">
+            <div><dt class="text-xs text-[#71717A]">Signed-in identity</dt><dd class="mt-1 break-all text-sm font-medium text-[#09090B]">{{ session?.user?.email || session?.user?.sub || (session?.authenticated ? "Authenticated administrator" : "No authenticated user") }}</dd></div>
+            <div><dt class="text-xs text-[#71717A]">Admin access</dt><dd class="mt-1 text-sm font-medium text-[#09090B]">{{ session?.can_access_admin_console ? "Granted" : "Not granted" }}</dd></div>
+            <div><dt class="text-xs text-[#71717A]">Authentication mode</dt><dd class="mt-1 text-sm font-medium text-[#09090B]">{{ authConfig?.auth_mode || "Unavailable" }}</dd></div>
+            <div><dt class="text-xs text-[#71717A]">OIDC</dt><dd class="mt-1 break-all text-sm font-medium text-[#09090B]">{{ authConfig?.oidc_enabled ? `Enabled (${authConfig?.oidc_issuer || session?.user?.iss || "OIDC"})` : "Not enabled" }}</dd></div>
+            <div><dt class="text-xs text-[#71717A]">Gateway profile</dt><dd class="mt-1 text-sm font-medium text-[#09090B]">{{ runtimeMeta.profile || authConfig?.profile || "—" }}</dd></div>
+            <div><dt class="text-xs text-[#71717A]">Environment</dt><dd class="mt-1 text-sm font-medium text-[#09090B]">{{ runtimeMeta.app_env || "—" }}</dd></div>
+            <div><dt class="text-xs text-[#71717A]">Catalog version</dt><dd class="mt-1 text-sm font-medium text-[#09090B]">{{ runtimeMeta.catalog_version || "—" }}</dd></div>
+            <div><dt class="text-xs text-[#71717A]">Administrator role</dt><dd class="mt-1 text-sm font-medium text-[#09090B]">{{ session?.is_admin ? "Administrator" : (session?.user?.roles || []).join(", ") || "No role claim returned" }}</dd></div>
+            <div><dt class="text-xs text-[#71717A]">Tenant</dt><dd class="mt-1 break-all text-sm font-medium text-[#09090B]">{{ session?.user?.tenant_id || "—" }}</dd></div>
+          </dl>
+          <div class="mt-4 grid grid-cols-1 gap-4 border-t border-[#E4E4E7] pt-4 sm:grid-cols-2">
+            <div><h3 class="text-xs font-semibold text-[#52525B]">Groups</h3><p class="mt-1 text-xs text-[#71717A]">{{ (session?.user?.groups || []).join(", ") || "No group claims returned" }}</p></div>
+            <div><h3 class="text-xs font-semibold text-[#52525B]">Client groups</h3><p class="mt-1 text-xs text-[#71717A]">{{ (session?.user?.client_groups || []).join(", ") || "No client-group claims returned" }}</p></div>
+          </div>
+        </div>
+        <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
+          <h2 class="text-sm font-semibold text-[#09090B]">Workspace controls</h2>
+          <p class="mt-1 text-xs leading-5 text-[#52525B]">Authentication and role assignment are managed by the gateway's OIDC/admin-auth configuration. This console displays the active claims; it does not edit identity-provider policy.</p>
+        </div>
+      </section>
+
+      <!-- Detected model pricing -->
+      <section v-else-if="activeSettingsTab === 'pricing'" id="settings-panel-pricing" role="tabpanel" class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="flex flex-col gap-3 border-b border-[#E4E4E7] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <h2 class="text-[15px] font-semibold text-[#09090B]">API Token Cost Catalog ($ / 1M Tokens)</h2>
+            <h2 class="text-[15px] font-semibold text-[#09090B]">Detected model pricing</h2>
             <p class="mt-0.5 text-xs text-[#52525B]">
-              {{ pricing?.billing_note }} Edit any default or custom model rate inline.
+              {{ pricing?.billing_note }} Edit input/output rates for models the gateway has detected. Prices are per 1 million tokens.
             </p>
           </div>
           <div class="flex flex-wrap items-center gap-2">
@@ -478,40 +552,7 @@ async function pruneAuditRuns() {
         </div>
 
         <div class="p-4 space-y-4">
-          <div class="grid gap-3 rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3 sm:grid-cols-4 sm:items-end">
-            <div>
-              <label class="block text-xs font-medium text-[#52525B]">Add Model Name</label>
-              <input
-                v-model="customModelName"
-                type="text"
-                placeholder="e.g. llama-3.3-70b"
-                class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-[13px] text-[#09090B]"
-              />
-            </div>
-            <div>
-              <label class="block text-xs font-medium text-[#52525B]">Input $/1M</label>
-              <input
-                v-model="customInPrice"
-                type="number"
-                step="0.01"
-                min="0"
-                class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-[13px] text-[#09090B] tabular-nums"
-              />
-            </div>
-            <div>
-              <label class="block text-xs font-medium text-[#52525B]">Output $/1M</label>
-              <input
-                v-model="customOutPrice"
-                type="number"
-                step="0.01"
-                min="0"
-                class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-[13px] text-[#09090B] tabular-nums"
-              />
-            </div>
-            <Button data-variant="primary" :disabled="savingPricing || !customModelName.trim()" @click="addModelPrice">
-              {{ savingPricing ? "Saving..." : "Add Model" }}
-            </Button>
-          </div>
+          <p class="text-xs leading-5 text-[#52525B]">Models are populated from the detected model catalogue and configured defaults. Edit the input/output rates for a detected model below; there is no need to register model names manually here.</p>
 
           <div class="overflow-x-auto table-scroll rounded border border-[#E4E4E7]">
             <table class="w-full border-collapse text-left text-[13px]">
@@ -536,7 +577,7 @@ async function pruneAuditRuns() {
                       min="0"
                       class="w-24 rounded border border-[#0F766E] px-2 py-1 text-right text-xs"
                     />
-                    <span v-else>\${{ m.input.toFixed(2) }}</span>
+                    <span v-else>${{ m.input.toFixed(2) }}</span>
                   </td>
                   <td class="px-3 py-2 text-right tabular-nums">
                     <input
@@ -547,7 +588,7 @@ async function pruneAuditRuns() {
                       min="0"
                       class="w-24 rounded border border-[#0F766E] px-2 py-1 text-right text-xs"
                     />
-                    <span v-else>\${{ m.output.toFixed(2) }}</span>
+                    <span v-else>${{ m.output.toFixed(2) }}</span>
                   </td>
                   <td class="px-3 py-2 text-xs">
                     <span
@@ -577,12 +618,12 @@ async function pruneAuditRuns() {
                         Edit
                       </button>
                       <button
-                        v-if="m.isOverridden || m.isCustomOnly"
                         type="button"
                         class="text-xs font-medium text-[#DC2626] hover:underline"
-                        @click="deleteModelPrice(m.name, m.isDefault)"
+                        :title="`Deletes ${m.name} pricing, routing override and demo profile`"
+                        @click="deleteModelPrice(m.name, false)"
                       >
-                        {{ m.isDefault ? "Reset" : "Remove" }}
+                        Delete
                       </button>
                     </template>
                   </td>
@@ -601,12 +642,12 @@ async function pruneAuditRuns() {
         </div>
       </section>
 
-      <!-- 2. Monitoring, Custom Alert Rules & HTTPS Webhooks -->
-      <section class="rounded-lg border border-[#E4E4E7] bg-white">
+      <!-- Alert thresholds and webhook destinations -->
+      <section v-else-if="activeSettingsTab === 'alerts'" id="settings-panel-alerts" role="tabpanel" class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="border-b border-[#E4E4E7] px-4 py-3">
           <h2 class="text-[15px] font-semibold text-[#09090B]">Monitoring, Custom Alert Rules &amp; Webhooks</h2>
           <p class="mt-0.5 text-xs text-[#52525B]">
-            Built-in SLA rules plus custom metric triggers dispatched to SSRF-validated HTTPS webhooks.
+            Built-in SLA rules plus custom metric triggers. Configure one shared webhook URL, with an optional override on each custom rule.
           </p>
         </div>
 
@@ -691,7 +732,7 @@ async function pruneAuditRuns() {
           <!-- Custom Alert Rule Builder -->
           <div class="space-y-3 border-t border-[#E4E4E7] pt-4">
             <h3 class="text-xs font-semibold uppercase tracking-wide text-[#52525B]">Custom Alert Rules</h3>
-            <div class="grid gap-2 sm:grid-cols-6 sm:items-end">
+            <div class="grid gap-2 sm:grid-cols-8 sm:items-end">
               <div class="sm:col-span-2">
                 <label class="block text-xs text-[#52525B]">Rule Name</label>
                 <input
@@ -735,6 +776,15 @@ async function pruneAuditRuns() {
                   <option value="critical">Critical</option>
                 </select>
               </div>
+              <div class="sm:col-span-2">
+                <label class="block text-xs text-[#52525B]">Webhook override (optional)</label>
+                <input
+                  v-model="newRuleWebhook"
+                  type="url"
+                  placeholder="https://receiver.example.com/alerts"
+                  class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-2.5 py-1.5 text-xs font-mono-data"
+                />
+              </div>
               <Button :disabled="!newRuleName.trim()" @click="addCustomRule">Add Rule</Button>
             </div>
 
@@ -748,6 +798,7 @@ async function pruneAuditRuns() {
                   <input v-model="rule.enabled" type="checkbox" aria-label="Toggle rule" />
                   <span class="font-medium text-[#09090B]">{{ rule.name }}</span>
                   <span class="font-mono-data text-[#52525B]">{{ rule.metric }} {{ rule.operator }} {{ rule.threshold }}</span>
+                  <span class="text-[11px] text-[#71717A]">{{ rule.webhook_url ? "Rule webhook override" : "Shared webhook" }}</span>
                   <span
                     class="rounded border px-1.5 py-0.5 text-[11px]"
                     :class="
@@ -774,8 +825,8 @@ async function pruneAuditRuns() {
         </div>
       </section>
 
-      <!-- 3. Compliance Retention & Archive-Before-Purge -->
-      <section class="rounded-lg border border-[#E4E4E7] bg-white">
+      <!-- Audit retention and archive schedule -->
+      <section v-else-if="activeSettingsTab === 'retention'" id="settings-panel-retention" role="tabpanel" class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="border-b border-[#E4E4E7] px-4 py-3">
           <h2 class="text-[15px] font-semibold text-[#09090B]">Compliance Audit Archive &amp; Retention</h2>
           <p class="mt-0.5 text-xs text-[#52525B]">
@@ -828,32 +879,32 @@ async function pruneAuditRuns() {
             >
               {{ savingPolicy ? "Saving..." : "Save Schedule" }}
             </Button>
-            <Button data-variant="primary" :disabled="archiving" @click="archiveAuditRuns(true)">
-              {{ archiving ? "Archiving..." : "Archive & Purge Old Runs" }}
+            <Button data-variant="primary" :disabled="archiving" @click="requestRetentionAction('archive')">
+              Archive &amp; Purge Old Runs
             </Button>
             <Button :disabled="archiving" @click="archiveAuditRuns(false)">
               Export JSONL Only (Keep DB)
             </Button>
-            <Button data-variant="danger" :disabled="pruning" @click="pruneAuditRuns">
-              {{ pruning ? "Purging..." : "Purge Without Archive" }}
+            <Button data-variant="danger" :disabled="pruning" @click="requestRetentionAction('prune')">
+              Purge Without Archive
             </Button>
           </div>
         </div>
       </section>
 
-      <section class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
+      <section v-else-if="activeSettingsTab === 'routing'" id="settings-panel-routing" role="tabpanel" class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
         <div>
           <h2 class="text-sm font-semibold text-[#09090B]">
             Adaptive Mode Routing &amp; Calibration Policy
           </h2>
           <p class="mt-1 text-xs text-[#71717A]">
-            Because MCP does not expose internal LLM thinking tokens, each extra sequential round-trip (<code class="font-mono-data">turns &gt; 1</code>) in Classic MCP deducts <strong class="text-[#09090B]">Penalty pts/turn</strong> (where <strong class="text-[#09090B]">1 pt = X estimated reasoning tokens</strong>). During 50/50 calibration (<strong class="text-[#09090B]">N runs per arm</strong>), the gateway compares effective tokens (in + out + penalty) for each <code class="font-mono-data">(model, tool)</code>, locks in the lower-cost mode, and uses the higher-cost mode's average as the ROI savings baseline.
+            The configured turn penalty applies to Classic MCP only: each Classic turn after the first adds a modeled token-equivalent overhead. Code Mode remains measured-token usage. The comparison is scoped to each <code class="font-mono-data">(model, tool)</code> pair; this is a routing estimate, not additional billed tokens or a cash-saving measurement.
           </p>
         </div>
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <div>
             <label class="block text-xs font-medium text-[#52525B]" for="settings-turn-penalty">
-              Penalty (pts / extra turn)
+              Classic penalty (points / extra turn)
             </label>
             <Input
               id="settings-turn-penalty"
@@ -894,6 +945,11 @@ async function pruneAuditRuns() {
             />
           </div>
         </div>
+        <div class="rounded border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 text-xs text-[#52525B]">
+          <div><strong class="text-[#09090B]">Classic effective tokens</strong> = measured tokens + max(Classic turns − 1, 0) × {{ classicExtraTurnTokenEquivalent.toLocaleString("en-US") }} token-equivalents.</div>
+          <div class="mt-1">{{ calibrationPolicyLoaded ? `Gateway policy loaded: ${calibrationRunsPerArm} calibration runs per arm.` : "Preview from the values in this form; the active gateway policy has not been confirmed." }} This modeled overhead is not included in provider-billed token counts.</div>
+          <p v-if="calibrationLoadError" class="mt-1 text-[#92400E]">Could not load the active policy: {{ calibrationLoadError }}</p>
+        </div>
         <div class="flex items-center gap-3">
           <Button :disabled="savingPenalty" @click="saveAbPenalty">
             {{ savingPenalty ? "Saving..." : "Save Calibration Policy" }}
@@ -902,7 +958,7 @@ async function pruneAuditRuns() {
         </div>
       </section>
 
-      <section class="space-y-4 rounded-lg border border-[#E4E4E7] bg-white p-5">
+      <section v-else-if="activeSettingsTab === 'secrets'" id="settings-panel-secrets" role="tabpanel" class="space-y-4 rounded-lg border border-[#E4E4E7] bg-white p-5">
         <div>
           <h2 class="text-[0.9375rem] font-semibold text-[#09090B]">Vault Secrets (vault://)</h2>
           <p class="mt-1 text-xs text-[#52525B]">
@@ -964,6 +1020,28 @@ async function pruneAuditRuns() {
           </table>
         </div>
       </section>
+
+      <Dialog v-model:open="retentionConfirmOpen">
+        <DialogBackdrop />
+        <DialogContent>
+          <DialogTitle>{{ pendingRetentionAction === "archive" ? "Archive and purge old audit runs?" : "Purge old audit runs without an archive?" }}</DialogTitle>
+          <DialogDescription>
+            <template v-if="pendingRetentionAction === 'archive'">
+              The gateway will export runs older than {{ retentionDays }} days and then remove them from the active database. Verify the archive destination before continuing.
+            </template>
+            <template v-else>
+              This removes runs older than {{ retentionDays }} days from the active database without creating an archive. This action is destructive.
+            </template>
+          </DialogDescription>
+          <div class="flex flex-wrap justify-end gap-2 pt-2">
+            <DialogClose @click="pendingRetentionAction = null">Cancel</DialogClose>
+            <Button :data-variant="pendingRetentionAction === 'prune' ? 'danger' : 'primary'" @click="confirmRetentionAction">
+              {{ pendingRetentionAction === "archive" ? "Archive & Purge" : "Purge Without Archive" }}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
     </template>
   </div>
 </template>

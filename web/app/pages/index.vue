@@ -159,18 +159,23 @@ const workerStats = computed<ProcessStats | null>(() => {
   return runtimeData.value?.sandbox_worker?.stats || null;
 });
 
-const classicSharePct = computed(() => {
-  const total = analyticsData.value?.summary.total_runs || 0;
-  if (!total) return 0;
-  const cm = analyticsData.value?.summary.codemode_share_pct || 0;
-  return Math.max(0, Math.round((100 - cm) * 10) / 10);
-});
+const pairedModeRunCount = computed(() =>
+  (analyticsData.value?.summary.codemode_runs || 0) + (analyticsData.value?.summary.classic_runs || 0),
+);
+const otherModeRunCount = computed(() => Math.max(
+  0,
+  (analyticsData.value?.summary.total_runs || 0) - pairedModeRunCount.value,
+));
+const codemodeSharePct = computed(() => pairedModeRunCount.value
+  ? Math.round(((analyticsData.value?.summary.codemode_runs || 0) / pairedModeRunCount.value) * 1000) / 10
+  : 0);
+const classicSharePct = computed(() => pairedModeRunCount.value
+  ? Math.round(((analyticsData.value?.summary.classic_runs || 0) / pairedModeRunCount.value) * 1000) / 10
+  : 0);
 
-const codemodeSharePct = computed(() => {
-  const total = analyticsData.value?.summary.total_runs || 0;
-  if (!total) return 0;
-  return analyticsData.value?.summary.codemode_share_pct || 0;
-});
+const executionMixStyle = computed(() => ({
+  background: `conic-gradient(#0F766E 0 ${codemodeSharePct.value}%, #2563EB ${codemodeSharePct.value}% 100%)`,
+}));
 
 function formatInt(n: number | undefined): string {
   return Number(n || 0).toLocaleString("en-US");
@@ -301,7 +306,7 @@ function formatUsd(n: number | undefined): string {
       <!-- 4-column KPI strip -->
       <section aria-label="Gateway value summary" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-          <div class="text-xs font-medium text-[#52525B]">Total Tokens Saved</div>
+          <div class="text-xs font-medium text-[#52525B]">Gateway-reported token reduction</div>
           <div class="mt-1.5 text-2xl font-semibold text-[#09090B] tabular-nums">
             {{ formatInt(valueData?.efficiency.total_tokens_saved) }}
           </div>
@@ -311,7 +316,7 @@ function formatUsd(n: number | undefined): string {
         </div>
 
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-          <div class="text-xs font-medium text-[#52525B]">Est. LLM Cost Saved</div>
+          <div class="text-xs font-medium text-[#52525B]">Gateway-estimated LLM cost reduction</div>
           <div class="mt-1.5 text-2xl font-semibold text-[#0F766E] tabular-nums">
             {{ formatUsd(valueData?.efficiency.estimated_llm_cost_saved_usd) }}
           </div>
@@ -340,6 +345,7 @@ function formatUsd(n: number | undefined): string {
           </div>
         </div>
       </section>
+      <p class="-mt-3 text-[11px] leading-5 text-[#71717A]">Token reduction and USD reduction are gateway-reported estimates. USD uses configured model rates and is not reconciled against provider invoices.</p>
 
       <!-- Live Activity Stream (Summary metadata only — no raw payloads or PII) -->
       <section
@@ -370,7 +376,7 @@ function formatUsd(n: number | undefined): string {
                 <th class="px-3 py-2 whitespace-nowrap">Group</th>
                 <th class="px-3 py-2 whitespace-nowrap">Target / Tool</th>
                 <th class="px-3 py-2 whitespace-nowrap">Mode</th>
-                <th class="px-3 py-2 text-right whitespace-nowrap">Tokens Saved</th>
+                <th class="px-3 py-2 text-right whitespace-nowrap">Reported reduction</th>
                 <th class="px-3 py-2 text-right whitespace-nowrap">Latency</th>
                 <th class="px-3 py-2 whitespace-nowrap">Status</th>
               </tr>
@@ -560,40 +566,45 @@ function formatUsd(n: number | undefined): string {
         </div>
       </section>
 
-      <!-- Execution Mode Split Bar (strictly bound to API data) -->
-      <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-        <div class="flex flex-wrap items-center justify-between gap-2">
-          <h2 class="text-[15px] font-semibold text-[#09090B]">
-            Code Mode vs. Classic MCP Execution Mix
-          </h2>
-          <div class="flex items-center gap-4 text-xs tabular-nums">
-            <span class="flex items-center gap-1.5 text-[#0F766E] font-medium">
-              <span class="inline-block h-2.5 w-2.5 rounded-sm bg-[#0F766E]" />
-              Code Mode: {{ codemodeSharePct }}% ({{ formatInt(analyticsData?.summary.codemode_runs) }})
-            </span>
-            <span class="flex items-center gap-1.5 text-[#2563EB] font-medium">
-              <span class="inline-block h-2.5 w-2.5 rounded-sm bg-[#2563EB]" />
-              Classic: {{ classicSharePct }}% ({{ formatInt(analyticsData?.summary.classic_runs) }})
-            </span>
+      <!-- Execution mix + security/efficiency posture -->
+      <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
+          <div class="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h2 class="text-[15px] font-semibold text-[#09090B]">Execution mode distribution</h2>
+              <p class="mt-0.5 text-xs text-[#71717A]">Code Mode vs Classic share of observed requests (not calibration win rate).</p>
+            </div>
+            <span class="text-xs tabular-nums text-[#71717A]">{{ formatInt(pairedModeRunCount) }} requests</span>
           </div>
-        </div>
+          <div v-if="pairedModeRunCount" class="mt-4 flex items-center gap-5">
+            <div class="relative h-28 w-28 shrink-0 rounded-full" :style="executionMixStyle" role="img" :aria-label="`Code Mode ${codemodeSharePct}% and Classic ${classicSharePct}%`">
+              <div class="absolute inset-[14px] flex flex-col items-center justify-center rounded-full bg-white">
+                <strong class="text-lg font-semibold tabular-nums text-[#09090B]">{{ codemodeSharePct.toFixed(1) }}%</strong>
+                <span class="text-[10px] text-[#71717A]">Code Mode</span>
+              </div>
+            </div>
+            <div class="space-y-3">
+              <div class="flex items-start gap-2"><span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full bg-[#0F766E]" /><div><div class="text-xs font-medium text-[#52525B]">Code Mode MCP</div><div class="text-sm font-semibold tabular-nums">{{ formatInt(analyticsData?.summary.codemode_runs) }} <span class="text-xs font-normal text-[#71717A]">requests</span></div></div></div>
+              <div class="flex items-start gap-2"><span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full bg-[#2563EB]" /><div><div class="text-xs font-medium text-[#52525B]">Classic MCP</div><div class="text-sm font-semibold tabular-nums">{{ formatInt(analyticsData?.summary.classic_runs) }} <span class="text-xs font-normal text-[#71717A]">requests</span></div></div></div>
+            </div>
+          </div>
+          <p v-else class="mt-3 text-xs text-[#71717A]">No Code Mode or Classic MCP executions recorded yet. Send requests to <code class="font-mono-data">/mcp</code> or start Demo Control traffic.</p>
+          <p v-if="otherModeRunCount > 0" class="mt-3 text-[11px] text-[#71717A]">{{ formatInt(otherModeRunCount) }} other or Hybrid requests excluded.</p>
+        </section>
 
-        <div class="mt-3 flex h-3 w-full overflow-hidden rounded bg-[#F4F4F5]">
-          <div
-            v-if="codemodeSharePct > 0"
-            class="h-full bg-[#0F766E] transition-all"
-            :style="{ width: `${codemodeSharePct}%` }"
-          />
-          <div
-            v-if="classicSharePct > 0"
-            class="h-full bg-[#2563EB] transition-all"
-            :style="{ width: `${classicSharePct}%` }"
-          />
-        </div>
-        <p v-if="!analyticsData?.summary.total_runs" class="mt-2 text-xs text-[#71717A]">
-          No MCP executions recorded yet. Send requests to <code class="font-mono-data">/mcp</code> or run the Onboarding A/B Lab.
-        </p>
-      </section>
+        <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
+          <h2 class="text-[15px] font-semibold text-[#09090B]">Security &amp; efficiency posture</h2>
+          <p class="mt-0.5 text-xs text-[#71717A]">Governance actions and savings in the last {{ formatInt(valueData?.window_runs) }} runs.</p>
+          <dl class="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
+            <div><dt class="text-[#71717A]">ABAC rows filtered</dt><dd class="mt-0.5 text-lg font-semibold tabular-nums">{{ formatInt(valueData?.security_and_governance?.abac_rows_filtered) }}</dd></div>
+            <div><dt class="text-[#71717A]">PII / secrets redacted</dt><dd class="mt-0.5 text-lg font-semibold tabular-nums">{{ formatInt(valueData?.security_and_governance?.pii_secrets_redacted) }}</dd></div>
+            <div><dt class="text-[#71717A]">Grounded runs verified</dt><dd class="mt-0.5 text-lg font-semibold tabular-nums text-[#059669]">{{ formatInt(valueData?.security_and_governance?.grounded_runs_verified) }}</dd></div>
+            <div><dt class="text-[#71717A]">Grounding violations blocked</dt><dd class="mt-0.5 text-lg font-semibold tabular-nums text-[#DC2626]">{{ formatInt(valueData?.security_and_governance?.grounding_violations_blocked) }}</dd></div>
+            <div><dt class="text-[#71717A]">Payload reduction</dt><dd class="mt-0.5 text-lg font-semibold tabular-nums">{{ (valueData?.efficiency?.payload_reduction_pct ?? 0).toFixed(1) }}%</dd></div>
+            <div><dt class="text-[#71717A]">Tokens saved (reported)</dt><dd class="mt-0.5 text-lg font-semibold tabular-nums">{{ formatInt(valueData?.efficiency?.total_tokens_saved) }}</dd></div>
+          </dl>
+        </section>
+      </div>
 
       <!-- Recommendations -->
       <section v-if="valueData?.recommendations?.length" class="rounded-lg border border-[#FDE68A] bg-[#FFFBEB] p-4">

@@ -150,8 +150,8 @@ watch(wsEvents, (list) => {
     schema_tokens_saved: latest.schema_tokens_saved ?? 0,
     abac_rows_filtered: latest.abac_rows_filtered ?? 0,
     redactions_count: latest.redactions_count ?? 0,
+    grounding_blocked: latest.grounding_blocked,
     mode_decision_reason: latest.mode_decision_reason,
-    provenance: { grounded: !latest.grounding_blocked },
   };
   const pageCap = Number.parseInt(limitFilter.value || "25", 10) || 25;
   runs.value = [row, ...runs.value].slice(0, pageCap);
@@ -211,8 +211,25 @@ async function confirmPrune() {
   }
 }
 
+function reductionCredit(run: AuditRun): number {
+  if (!run.ok || run.grounding_blocked || run.provenance?.grounded !== true) return 0;
+  return Math.max(0, (run.estimated_tokens_saved || 0) + (run.schema_tokens_saved || 0));
+}
+
+function reductionCreditNote(run: AuditRun): string {
+  if (!run.ok) return "No reduction credit: this execution did not complete successfully.";
+  if (run.grounding_blocked) return "No reduction credit: grounding verification blocked this execution.";
+  if (!run.provenance) return "No reduction credit: this record does not include an affirmative provenance-verification result.";
+  if (run.provenance.grounded !== true) return "No reduction credit: provenance verification did not pass.";
+  return "Gateway-reported estimated token reduction (estimated_tokens_saved + schema_tokens_saved). Credited only for successful executions with affirmative provenance verification; this is not an independently verified billed-token delta or cash saving.";
+}
+
+const timelineTicks = [0, 25, 50, 75, 100];
+function timelineTickLabel(run: AuditRun, pct: number): string {
+  return `${((run.duration_ms * pct) / 100).toFixed(1)} ms`;
+}
+
 const route = useRoute();
-const inspectedSpan = ref<AuditRun["trace_spans"] extends (infer T)[] | undefined ? T | null : null>(null);
 
 function bottleneckSpan(run: AuditRun) {
   const spans = run.trace_spans || [];
@@ -235,10 +252,10 @@ onMounted(() => {
 });
 
 function spanBarStyle(span: { start_ms: number; duration_ms: number }, totalMs: number) {
-  const denom = Math.max(totalMs, 0.5);
-  const left = Math.min(96, Math.max(0, (span.start_ms / denom) * 100));
-  const width = Math.max(2, Math.min(100 - left, (span.duration_ms / denom) * 100));
-  return { left: `${left.toFixed(1)}%`, width: `${width.toFixed(1)}%` };
+  const denom = Math.max(totalMs, 0.001);
+  const left = Math.min(100, Math.max(0, (span.start_ms / denom) * 100));
+  const width = Math.max(0, Math.min(100 - left, (span.duration_ms / denom) * 100));
+  return { left: `${left.toFixed(2)}%`, width: `${width.toFixed(2)}%` };
 }
 
 function spanBarColor(stage: string, status: string) {
@@ -396,7 +413,7 @@ function spanBarColor(stage: string, status: string) {
               <th class="px-4 py-2.5 whitespace-nowrap">Caller / Groups</th>
               <th class="px-4 py-2.5 whitespace-nowrap">Status</th>
               <th class="px-4 py-2.5 whitespace-nowrap text-right">Subcalls</th>
-              <th class="px-4 py-2.5 whitespace-nowrap text-right">Tokens Saved</th>
+              <th class="px-4 py-2.5 whitespace-nowrap text-right">Estimated token reduction</th>
               <th class="px-4 py-2.5 whitespace-nowrap text-right">Duration</th>
               <th class="px-4 py-2.5 whitespace-nowrap text-right">Details</th>
             </tr>
@@ -428,8 +445,8 @@ function spanBarColor(stage: string, status: string) {
                 </span>
               </td>
               <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ r.subcall_count }}</td>
-              <td class="px-4 py-2.5 text-right tabular-nums text-[#0F766E] whitespace-nowrap">
-                {{ (r.estimated_tokens_saved + r.schema_tokens_saved).toLocaleString("en-US") }}
+              <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap" :class="reductionCredit(r) > 0 ? 'text-[#0F766E]' : 'text-[#71717A]'" :title="reductionCreditNote(r)">
+                {{ reductionCredit(r).toLocaleString("en-US") }}
               </td>
               <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ r.duration_ms.toFixed(1) }} ms</td>
               <td class="px-4 py-2.5 text-right whitespace-nowrap">
@@ -496,68 +513,59 @@ function spanBarColor(stage: string, status: string) {
           </DrawerClose>
         </div>
 
-        <div v-if="selectedRun" class="min-h-0 flex-1 space-y-4 overflow-y-auto p-5 text-xs">
-          <!-- KPI Strip -->
-          <div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            <div class="rounded-md border border-[#E4E4E7] bg-white p-2.5">
-              <div class="text-[11px] text-[#71717A]">Duration</div>
-              <div class="mt-0.5 text-sm font-semibold text-[#09090B] tabular-nums">
-                {{ selectedRun.duration_ms.toFixed(1) }} ms
-              </div>
+        <div v-if="selectedRun" class="min-h-0 flex-1 space-y-6 overflow-y-auto p-5 text-xs">
+          <!-- Compact summary strip: one shared surface, separated by rules. -->
+          <dl class="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4">
+            <div class="border-b border-[#E4E4E7] pb-2 sm:border-b-0 sm:border-r sm:pr-3">
+              <dt class="text-[11px] text-[#71717A]">Duration</dt>
+              <dd class="mt-1 text-sm font-semibold tabular-nums text-[#09090B]">{{ selectedRun.duration_ms.toFixed(1) }} ms</dd>
             </div>
-            <div class="rounded-md border border-[#E4E4E7] bg-white p-2.5">
-              <div class="text-[11px] text-[#71717A]">Tokens Used</div>
-              <div class="mt-0.5 text-sm font-semibold text-[#09090B] tabular-nums">
-                {{ (selectedRun.tokens_used_est ?? 0).toLocaleString("en-US") }}
-              </div>
+            <div class="border-b border-[#E4E4E7] pb-2 sm:border-b-0 sm:border-r sm:pr-3">
+              <dt class="text-[11px] text-[#71717A]">Estimated tokens used</dt>
+              <dd class="mt-1 text-sm font-semibold tabular-nums text-[#09090B]">{{ (selectedRun.tokens_used_est ?? 0).toLocaleString("en-US") }}</dd>
             </div>
-            <div class="rounded-md border border-[#E4E4E7] bg-white p-2.5">
-              <div class="text-[11px] text-[#71717A]">Tokens Saved</div>
-              <div class="mt-0.5 text-sm font-semibold text-[#0F766E] tabular-nums">
-                {{ (selectedRun.estimated_tokens_saved + selectedRun.schema_tokens_saved).toLocaleString("en-US") }}
-              </div>
+            <div class="border-b border-[#E4E4E7] pb-2 sm:border-b-0 sm:border-r sm:pr-3">
+              <dt class="text-[11px] text-[#71717A]">Estimated token reduction</dt>
+              <dd class="mt-1 text-sm font-semibold tabular-nums" :class="reductionCredit(selectedRun) > 0 ? 'text-[#0F766E]' : 'text-[#71717A]'">{{ reductionCredit(selectedRun).toLocaleString("en-US") }}</dd>
             </div>
-            <div class="rounded-md border border-[#E4E4E7] bg-white p-2.5">
-              <div class="text-[11px] text-[#71717A]">Subcalls</div>
-              <div class="mt-0.5 text-sm font-semibold text-[#09090B] tabular-nums">
-                {{ selectedRun.subcall_count }}
-              </div>
+            <div>
+              <dt class="text-[11px] text-[#71717A]">Subcalls</dt>
+              <dd class="mt-1 text-sm font-semibold tabular-nums text-[#09090B]">{{ selectedRun.subcall_count }}</dd>
             </div>
-          </div>
+          </dl>
 
-          <div
-            v-if="selectedRun.tokens_saved_by"
-            class="rounded-md border border-[#99F6E4] bg-[#F0FDFA] px-3 py-2 text-[11px] text-[#0F766E]"
-          >
-            <strong>Savings Attribution:</strong> {{ selectedRun.tokens_saved_by }}
-            <span v-if="selectedRun.monty_spawn_ms || selectedRun.monty_exec_ms" class="ml-2 text-[#52525B] tabular-nums">
-              · Monty spawn {{ (selectedRun.monty_spawn_ms ?? 0).toFixed(2) }}ms · exec {{ (selectedRun.monty_exec_ms ?? 0).toFixed(2) }}ms
-            </span>
-          </div>
+          <section class="space-y-1.5 border-t border-[#E4E4E7] pt-4">
+            <h3 class="font-semibold text-[#09090B]">Token reduction attribution</h3>
+            <p class="text-[11px] leading-5" :class="reductionCredit(selectedRun) > 0 ? 'text-[#0F766E]' : 'text-[#92400E]'">{{ reductionCreditNote(selectedRun) }}</p>
+            <p v-if="reductionCredit(selectedRun) > 0 && selectedRun.tokens_saved_by" class="text-[11px] leading-5 text-[#52525B]">{{ selectedRun.tokens_saved_by }}</p>
+            <p v-if="selectedRun.monty_spawn_ms || selectedRun.monty_exec_ms" class="text-[11px] text-[#52525B] tabular-nums">Monty spawn {{ (selectedRun.monty_spawn_ms ?? 0).toFixed(2) }} ms · execution {{ (selectedRun.monty_exec_ms ?? 0).toFixed(2) }} ms</p>
+          </section>
 
           <!-- Linear-style Waterfall Trace Timeline -->
-          <div v-if="selectedRun.trace_spans?.length" class="space-y-2 rounded-md border border-[#E4E4E7] bg-white p-3">
-            <div class="flex items-center justify-between">
-              <div class="font-semibold text-[#09090B]">Request Trace Timeline</div>
+          <section v-if="selectedRun.trace_spans?.length" class="space-y-3 border-t border-[#E4E4E7] pt-4">
+            <div class="flex items-center justify-between gap-3">
+              <h3 class="font-semibold text-[#09090B]">Request latency waterfall</h3>
               <div class="text-[11px] text-[#71717A] tabular-nums">Total {{ selectedRun.duration_ms.toFixed(1) }} ms</div>
             </div>
-            <div
-              v-if="bottleneckSpan(selectedRun)"
-              class="rounded border border-[#E4E4E7] bg-[#FAFAFA] px-2.5 py-1.5 text-[11px] text-[#52525B]"
-            >
-              <strong class="text-[#09090B]">Timeline Analyzer:</strong>
-              Bottleneck is <strong class="text-[#09090B]">{{ bottleneckSpan(selectedRun)!.span.label }}</strong>
-              ({{ bottleneckSpan(selectedRun)!.span.duration_ms.toFixed(2) }} ms · {{ bottleneckSpan(selectedRun)!.pct }}% of total). Hover or click a bar to inspect.
+            <p v-if="bottleneckSpan(selectedRun)" class="text-[11px] leading-5 text-[#52525B]">
+              Longest recorded stage: <strong class="text-[#09090B]">{{ bottleneckSpan(selectedRun)!.span.label }}</strong>
+              · {{ bottleneckSpan(selectedRun)!.span.duration_ms.toFixed(2) }} ms ({{ bottleneckSpan(selectedRun)!.pct }}% of request duration).
+            </p>
+            <div class="grid grid-cols-[7.5rem_1fr_4rem] sm:grid-cols-[11rem_1fr_4.5rem] items-center gap-2 text-[9px] text-[#71717A] tabular-nums">
+              <span>Elapsed time</span>
+              <div class="grid grid-cols-5">
+                <span v-for="tick in timelineTicks" :key="tick" :class="tick === 0 ? 'text-left' : tick === 100 ? 'text-right' : 'text-center'">{{ timelineTickLabel(selectedRun, tick) }}</span>
+              </div>
+              <span class="text-right">Duration</span>
             </div>
-            <div class="space-y-1.5">
+            <div class="space-y-2">
               <div
                 v-for="(sp, idx) in selectedRun.trace_spans"
                 :key="idx"
-                class="grid grid-cols-[7.5rem_1fr_4rem] sm:grid-cols-[11rem_1fr_4.5rem] items-center gap-2 rounded px-1 py-0.5 text-[11px] cursor-pointer hover:bg-[#FAFAFA]"
-                @mouseenter="inspectedSpan = sp"
-                @click="inspectedSpan = sp"
+                class="grid grid-cols-[7.5rem_1fr_4rem] sm:grid-cols-[11rem_1fr_4.5rem] items-center gap-2 py-1 text-[11px]"
+                :title="`${sp.label} (${sp.stage}) · start +${sp.start_ms.toFixed(2)}ms · duration ${sp.duration_ms.toFixed(2)}ms · status: ${sp.status}`"
               >
-                <div class="truncate font-medium text-[#09090B]" :title="sp.label">{{ sp.label }}</div>
+                <div class="truncate font-medium text-[#09090B]">{{ sp.label }}</div>
                 <div class="relative h-3 rounded bg-[#F4F4F5] overflow-hidden">
                   <div
                     class="absolute top-0 bottom-0 rounded"
@@ -570,24 +578,14 @@ function spanBarColor(stage: string, status: string) {
                 </div>
               </div>
             </div>
-            <div
-              v-if="inspectedSpan"
-              class="rounded border border-[#99F6E4] bg-[#F0FDFA] px-2.5 py-1.5 text-[11px] text-[#09090B]"
-            >
-              <strong class="text-[#0F766E]">{{ inspectedSpan.label }}</strong> ({{ inspectedSpan.stage }}) ·
-              start +{{ inspectedSpan.start_ms.toFixed(2) }}ms ·
-              duration {{ inspectedSpan.duration_ms.toFixed(2) }}ms ·
-              {{ selectedRun.duration_ms > 0 ? ((inspectedSpan.duration_ms / selectedRun.duration_ms) * 100).toFixed(1) : "0.0" }}% of total ·
-              status: {{ inspectedSpan.status }}
-            </div>
-          </div>
+          </section>
 
-          <!-- Metadata & Provenance Grid -->
-          <div class="grid grid-cols-2 gap-3 rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3">
+          <!-- Metadata & Provenance -->
+          <section class="grid grid-cols-2 gap-x-5 gap-y-4 border-t border-[#E4E4E7] pt-4">
             <div>
               <div class="text-[#71717A]">Grounded Provenance</div>
-              <div class="mt-0.5 font-semibold" :class="selectedRun.provenance?.grounded ? 'text-[#059669]' : 'text-[#52525B]'">
-                {{ selectedRun.provenance?.grounded ? "Verified HMAC" : "N/A / Unverified" }}
+              <div class="mt-0.5 font-semibold" :class="selectedRun.provenance?.grounded === true ? 'text-[#059669]' : selectedRun.provenance?.grounded === false ? 'text-[#DC2626]' : 'text-[#52525B]'">
+                {{ selectedRun.provenance?.grounded === true ? "Grounding verified" : selectedRun.provenance?.grounded === false ? "Verification failed" : "Not supplied" }}
               </div>
             </div>
             <div>
@@ -608,9 +606,9 @@ function spanBarColor(stage: string, status: string) {
                 ABAC: {{ selectedRun.abac_rows_filtered }} · PII: {{ selectedRun.redactions_count }}
               </div>
             </div>
-          </div>
+          </section>
 
-          <div v-if="selectedRun.error" class="space-y-1.5">
+          <section v-if="selectedRun.error" class="space-y-1.5 border-t border-[#E4E4E7] pt-4">
             <div class="font-semibold" :class="selectedRun.grounding_blocked ? 'text-[#92400E]' : 'text-[#DC2626]'">
               {{ selectedRun.grounding_blocked ? "Grounding Violation Blocked" : "Execution Error" }}
             </div>
@@ -622,14 +620,14 @@ function spanBarColor(stage: string, status: string) {
                   : 'border-[#FECACA] bg-[#FEF2F2] text-[#DC2626]'
               "
             >{{ selectedRun.error }}</pre>
-          </div>
+          </section>
 
-          <div v-if="selectedRun.code" class="space-y-1.5">
+          <section v-if="selectedRun.code" class="space-y-1.5 border-t border-[#E4E4E7] pt-4">
             <div class="font-semibold text-[#09090B]">Executed Monty Python</div>
             <pre class="overflow-x-auto rounded border border-[#E4E4E7] bg-[#FAFAFA] p-3 font-mono-data text-xs text-[#09090B]">{{ selectedRun.code }}</pre>
-          </div>
+          </section>
 
-          <div v-if="selectedRun.subcalls?.length" class="space-y-1.5">
+          <section v-if="selectedRun.subcalls?.length" class="space-y-1.5 border-t border-[#E4E4E7] pt-4">
             <div class="font-semibold text-[#09090B]">Upstream Subcalls ({{ selectedRun.subcalls.length }})</div>
             <div class="overflow-x-auto rounded border border-[#E4E4E7]">
               <table class="w-full border-collapse text-left text-xs">
@@ -649,11 +647,11 @@ function spanBarColor(stage: string, status: string) {
                 </tbody>
               </table>
             </div>
-          </div>
+          </section>
 
-          <details class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3">
+          <details class="border-t border-[#E4E4E7] pt-4">
             <summary class="cursor-pointer font-medium text-[#09090B]">Raw Audit JSON</summary>
-            <pre class="mt-2 max-h-64 overflow-auto rounded border border-[#E4E4E7] bg-white p-2.5 font-mono-data text-[11px] text-[#09090B]">{{ JSON.stringify(selectedRun, null, 2) }}</pre>
+            <pre class="mt-2 max-h-64 overflow-auto rounded border border-[#E4E4E7] bg-[#FAFAFA] p-3 font-mono-data text-[11px] text-[#09090B]">{{ JSON.stringify(selectedRun, null, 2) }}</pre>
           </details>
         </div>
       </DrawerContent>

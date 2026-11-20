@@ -7,7 +7,7 @@ const perfRows = ref<Array<{ model: string; server: string; tool: string; mode: 
 
 async function loadPerf() {
   try {
-    const res = await _apiFetch<{ rows: typeof perfRows.value }>("/admin/ab/model-performance");
+    const res = await _apiFetch<{ rows: typeof perfRows.value }>("/admin/ab/model-performance?window=all&limit=5000");
     if (res?.rows) perfRows.value = res.rows;
   } catch {
     // ignore
@@ -16,6 +16,22 @@ async function loadPerf() {
 
 function toggleExpandUpstream(name: string) {
   expandedUpstreamName.value = expandedUpstreamName.value === name ? null : name;
+}
+
+function normalizeRecommendationMode(mode: string | null | undefined): string {
+  const normalized = String(mode || "").trim().toLowerCase();
+  if (["codemode", "codemode_upfront", "code", "code_mode"].includes(normalized)) return "codemode";
+  if (["traditional", "traditional_discover", "classic", "classic_mcp"].includes(normalized)) return "traditional";
+  if (["", "—", "none", "unknown", "unavailable", "auto"].includes(normalized)) return "";
+  if (normalized === "hybrid") return "hybrid";
+  return normalized;
+}
+
+function recommendationModeLabel(mode: string): string {
+  if (mode === "codemode") return "Code Mode";
+  if (mode === "traditional") return "Classic MCP";
+  if (mode === "hybrid") return "Hybrid";
+  return mode;
 }
 
 function aggregatedToolsForUpstream(u: UpstreamEntry) {
@@ -37,9 +53,42 @@ function aggregatedToolsForUpstream(u: UpstreamEntry) {
         success_rate_pct: runs ? Math.round((okWeighted / runs) * 1000) / 10 : 0,
         avg_duration_ms: runs ? Math.round((msWeighted / runs) * 10) / 10 : 0,
         avg_tokens: runs ? Math.round(tokWeighted / runs) : 0,
-        recommended_mode: matching[0]?.recommended_mode || "—",
+        recommendation_modes: [...new Set(matching.map((r) => normalizeRecommendationMode(r.recommended_mode)).filter(Boolean))].sort(),
+        recommendation_by_model: [...new Set(matching.map((r) => r.model))].sort().map((model) => ({
+          model,
+          modes: [...new Set(matching.filter((r) => r.model === model).map((r) => normalizeRecommendationMode(r.recommended_mode)).filter(Boolean))].sort(),
+        })).filter((entry) => entry.modes.length > 0),
+        recommended_mode: (() => {
+          const modes = [...new Set(matching.map((r) => normalizeRecommendationMode(r.recommended_mode)).filter(Boolean))];
+          const hasMixedHistory = matching.some((row) => {
+            const modelModes = new Set(matching.filter((candidate) => candidate.model === row.model).map((candidate) => normalizeRecommendationMode(candidate.recommended_mode)).filter(Boolean));
+            return modelModes.size > 1;
+          });
+          if (!modes.length) return "none";
+          if (hasMixedHistory) return "mixed";
+          return modes.length === 1 ? modes[0] : "varies";
+        })(),
       };
     });
+}
+
+function recommendationLabel(tool: ReturnType<typeof aggregatedToolsForUpstream>[number]) {
+  if (tool.recommended_mode === "codemode") return "Code Mode";
+  if (tool.recommended_mode === "traditional") return "Classic MCP";
+  if (tool.recommended_mode === "hybrid") return "Hybrid";
+  if (tool.recommended_mode === "varies") return "Differs by model";
+  if (tool.recommended_mode === "mixed") return "Mixed calibration signal";
+  if (tool.recommended_mode === "none") return "No calibration yet";
+  return tool.recommended_mode;
+}
+
+function recommendationDetail(tool: ReturnType<typeof aggregatedToolsForUpstream>[number]) {
+  const byModel = tool.recommendation_by_model || [];
+  if (byModel.length > 1) {
+    return `By model: ${byModel.map(({ model, modes }) => `${model}: ${modes.map(recommendationModeLabel).join(" / ")}`).join(" · ")}.`;
+  }
+  if (tool.recommended_mode === "none") return "No eligible calibration result is available for this tool yet.";
+  return byModel[0] ? `${byModel[0].model}: ${byModel[0].modes.map(recommendationModeLabel).join(" / ")}.` : "No model-specific recommendation is available.";
 }
 
 function serverStats(u: UpstreamEntry) {
@@ -60,7 +109,7 @@ function serverStats(u: UpstreamEntry) {
 async function setUpstreamPreferredMode(u: UpstreamEntry, mode: string) {
   await _apiFetch(`/admin/upstreams/${encodeURIComponent(u.name)}/mode`, {
     method: "PATCH",
-    body: JSON.stringify({ preferred_mode: mode }),
+    body: { preferred_mode: mode },
   });
   u.preferred_mode = mode;
 }
@@ -68,7 +117,7 @@ async function setUpstreamPreferredMode(u: UpstreamEntry, mode: string) {
 async function setToolModeOverride(u: UpstreamEntry, toolName: string, mode: string) {
   const res = await _apiFetch<{ tool_mode_overrides: Record<string, string> }>(
     `/admin/upstreams/${encodeURIComponent(u.name)}/tools/${encodeURIComponent(toolName)}/mode`,
-    { method: "PATCH", body: JSON.stringify({ mode }) }
+    { method: "PATCH", body: { mode } }
   );
   if (res) {
     u.tool_mode_overrides = res.tool_mode_overrides;
@@ -120,7 +169,7 @@ onMounted(() => {
   _pollTimer = setInterval(() => {
     void loadPerf();
     void fetchData();
-  }, 3000);
+  }, 15000);
 });
 
 onUnmounted(() => {
@@ -419,7 +468,7 @@ onMounted(() => {
                 >
                   <td class="px-3 py-2">
                     <div class="flex items-center gap-1.5 font-mono-data font-medium text-[#09090B]">
-                      <span class="text-[10px] text-[#71717A]">{{ expandedUpstreamName === u.name ? "▼" : "▶" }}</span>
+                      <AppIcon :name="expandedUpstreamName === u.name ? 'chevron-down' : 'chevron-right'" :size="14" class="text-[#71717A]" />
                       <span class="max-w-[160px] truncate" :title="u.name">{{ u.name }}</span>
                     </div>
                     <div class="max-w-[160px] truncate text-[11px] text-[#71717A]" :title="u.url || 'stdio/inline'">
@@ -457,7 +506,6 @@ onMounted(() => {
                       <option value="auto">auto</option>
                       <option value="codemode">codemode</option>
                       <option value="traditional">traditional</option>
-                      <option value="hybrid">hybrid</option>
                     </select>
                   </td>
                   <td v-if="upstreamsData.dynamic_upstreams_permitted" class="w-10 px-2 py-2 text-right whitespace-nowrap" @click.stop>
@@ -478,6 +526,7 @@ onMounted(() => {
                       No tools discovered for this upstream yet.
                     </div>
                     <div v-else class="overflow-x-auto">
+                      <p class="mb-2 text-[11px] leading-4 text-[#71717A]">The calibration recommendation is model-specific. A manual override applies to this upstream tool across all models and takes precedence over Auto. Choose Inherit to return to the upstream default.</p>
                       <table class="w-full text-left text-xs tabular-nums">
                         <thead class="border-b border-[#E4E4E7] text-[#71717A]">
                           <tr>
@@ -486,8 +535,8 @@ onMounted(() => {
                             <th class="py-1.5 pr-3 font-medium text-right">Success</th>
                             <th class="py-1.5 pr-3 font-medium text-right">Avg Latency</th>
                             <th class="py-1.5 pr-3 font-medium text-right">Avg Tokens</th>
-                            <th class="py-1.5 pr-3 font-medium">Best Mode</th>
-                            <th class="py-1.5 font-medium">Override (All Models)</th>
+                            <th class="py-1.5 pr-3 font-medium">Calibration signal</th>
+                            <th class="py-1.5 font-medium">Tool override · all models</th>
                           </tr>
                         </thead>
                         <tbody class="divide-y divide-[#E4E4E7]">
@@ -497,18 +546,21 @@ onMounted(() => {
                             <td class="py-2 pr-3 text-right font-mono-data">{{ t.runs ? `${t.success_rate_pct}%` : "—" }}</td>
                             <td class="py-2 pr-3 text-right font-mono-data">{{ t.runs ? `${t.avg_duration_ms} ms` : "—" }}</td>
                             <td class="py-2 pr-3 text-right font-mono-data">{{ t.runs ? t.avg_tokens : "—" }}</td>
-                            <td class="py-2 pr-3 font-mono-data font-semibold text-[#0F766E]">{{ t.recommended_mode }}</td>
+                            <td class="py-2 pr-3">
+                              <span class="font-medium" :class="t.recommended_mode === 'codemode' ? 'text-[#0F766E]' : t.recommended_mode === 'traditional' ? 'text-[#1D4ED8]' : 'text-[#52525B]'">{{ recommendationLabel(t) }}</span>
+                              <span v-if="t.recommended_mode === 'varies' || t.recommended_mode === 'mixed' || t.recommended_mode === 'none' || (t.recommendation_by_model?.length || 0) > 1" class="mt-0.5 block max-w-[22rem] text-[10px] leading-4 text-[#71717A]">{{ recommendationDetail(t) }}</span>
+                            </td>
                             <td class="py-2">
                               <select
                                 :value="u.tool_mode_overrides?.[t.tool] || 'inherit'"
-                                aria-label="Tool mode override"
+                                 :aria-label="`Routing override for ${t.tool}`"
                                 class="rounded border border-[#D4D4D8] bg-white px-2 py-1 text-xs"
                                 @change="(e) => { const el = e.target as HTMLSelectElement; const next = el.value; el.value = u.tool_mode_overrides?.[t.tool] || 'inherit'; promptModeChange('tool', u, next, t.tool); }"
                               >
-                                <option value="inherit">Inherit Server Default</option>
-                                <option value="auto">auto</option>
-                                <option value="codemode">codemode</option>
-                                <option value="traditional">traditional</option>
+                                <option value="inherit">Inherit server default</option>
+                                <option value="auto">Auto · follow calibration</option>
+                                <option value="codemode">Force Code Mode</option>
+                                <option value="traditional">Force Classic MCP</option>
                               </select>
                             </td>
                           </tr>

@@ -8,14 +8,18 @@ import json
 import os
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import parse_qs, urlencode
 
 import httpx
 import jwt
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
 from jwt.algorithms import RSAAlgorithm
 from pydantic import BaseModel
 
+from gateway.auth import DEV_PERSONAS, LocalDevKeyManager, claims_to_identity
+from gateway.config import ClaimMappingConfig
 from gateway.mcp_protocol import (
     MCP_CLIENT_CAPABILITIES_META,
     MCP_PROTOCOL_VERSION,
@@ -239,10 +243,16 @@ class _DownstreamTokenVerifier:
         header = jwt.get_unverified_header(token)
         kid = header.get("kid")
         if self._cached_jwks is None:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(self._jwks_url)
-                resp.raise_for_status()
-                self._cached_jwks = resp.json()
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(self._jwks_url)
+                    resp.raise_for_status()
+                    self._cached_jwks = resp.json()
+            except httpx.HTTPError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"JWKS endpoint unavailable: {exc}",
+                ) from exc
         keys = (self._cached_jwks or {}).get("keys", [])
         match = next((k for k in keys if k.get("kid") == kid), keys[0] if len(keys) == 1 else None)
         if match is None:
@@ -988,6 +998,119 @@ def create_mock_backends_app(
             ],
         ),
     )
+
+    # Standalone Mock OIDC Provider mounted at /oidc on the mock test server (:8001)
+    mock_oidc_issuer = os.getenv("MOCK_OIDC_ISSUER", "http://127.0.0.1:8001/oidc").rstrip("/")
+    mock_oidc_keys = LocalDevKeyManager(issuer=mock_oidc_issuer)
+    mock_oidc_audience = os.getenv("MOCK_OIDC_AUDIENCE", "api://mcp-code-gateway")
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/oidc/.well-known/openid-configuration")
+    async def mock_oidc_openid_config() -> dict[str, Any]:
+        return {
+            "issuer": mock_oidc_issuer,
+            "authorization_endpoint": f"{mock_oidc_issuer}/authorize",
+            "token_endpoint": f"{mock_oidc_issuer}/token",
+            "userinfo_endpoint": f"{mock_oidc_issuer}/userinfo",
+            "jwks_uri": f"{mock_oidc_issuer}/jwks",
+            "response_types_supported": ["code"],
+            "grant_types_supported": [
+                "authorization_code",
+                "refresh_token",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+            "scopes_supported": [
+                "openid",
+                "profile",
+                "email",
+                "mcp.tools",
+                "mcp.admin",
+                "mcp.audit",
+            ],
+        }
+
+    @app.get("/oidc/jwks")
+    async def mock_oidc_jwks() -> dict[str, Any]:
+        return mock_oidc_keys.jwks()
+
+    @app.get("/oidc/authorize")
+    async def mock_oidc_authorize(
+        redirect_uri: str = Query(...),
+        state: str = Query(default=""),
+        persona: str = Query(default="gateway_admin"),
+    ) -> RedirectResponse:
+        chosen = persona if persona in DEV_PERSONAS else "gateway_admin"
+        sep = "&" if "?" in redirect_uri else "?"
+        q = urlencode({"code": f"mock-oidc-{chosen}", "state": state})
+        return RedirectResponse(url=f"{redirect_uri}{sep}{q}", status_code=302)
+
+    @app.post("/oidc/token")
+    async def mock_oidc_token(request: Request) -> dict[str, Any]:
+        persona = "gateway_admin"
+        content_type = (request.headers.get("content-type") or "").lower()
+        if "application/json" in content_type:
+            data = await request.json()
+            code = str(data.get("code") or "")
+            req_persona = str(data.get("persona") or "")
+        else:
+            raw = (await request.body()).decode("utf-8", errors="replace")
+            parsed = parse_qs(raw)
+            code = (parsed.get("code") or [""])[0]
+            req_persona = (parsed.get("persona") or [""])[0]
+        if req_persona in DEV_PERSONAS:
+            persona = req_persona
+        elif code.startswith("mock-oidc-") and code.removeprefix("mock-oidc-") in DEV_PERSONAS:
+            persona = code.removeprefix("mock-oidc-")
+
+        token = mock_oidc_keys.issue_user_token(
+            persona=persona,
+            audience=mock_oidc_audience,
+            ttl_seconds=3600,
+        )
+        return {
+            "access_token": token,
+            "id_token": token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "issuer": mock_oidc_issuer,
+            "persona": persona,
+        }
+
+    @app.get("/oidc/userinfo")
+    async def mock_oidc_userinfo(
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        if authorization and authorization.lower().startswith("bearer "):
+            raw_token = authorization.split(" ", 1)[1].strip()
+        else:
+            raw_token = mock_oidc_keys.issue_user_token(
+                persona="gateway_admin",
+                audience=mock_oidc_audience,
+                ttl_seconds=3600,
+            )
+        try:
+            claims = jwt.decode(
+                raw_token,
+                key=mock_oidc_keys.public_pem,
+                algorithms=["RS256"],
+                audience=mock_oidc_audience,
+                issuer=mock_oidc_issuer,
+                options={"require": ["exp", "sub"]},
+            )
+        except jwt.PyJWTError as exc:
+            raise HTTPException(status_code=401, detail=f"Invalid OIDC token: {exc}") from exc
+        identity = claims_to_identity(claims, ClaimMappingConfig(), raw_token=raw_token)
+        profile = identity.public_profile()
+        profile["iss"] = mock_oidc_issuer
+        return profile
 
     @app.get("/health")
     async def health() -> dict[str, str]:

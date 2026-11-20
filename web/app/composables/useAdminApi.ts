@@ -5,6 +5,7 @@ export interface AdminUserProfile {
   roles?: string[];
   groups?: string[];
   client_groups?: string[];
+  iss?: string;
 }
 
 export interface AdminSessionState {
@@ -20,6 +21,7 @@ export interface AdminAuthConfig {
   profile: string;
   admin_auth_required: boolean;
   oidc_enabled: boolean;
+  oidc_issuer?: string;
   dev_auth_enabled: boolean;
   token_login_enabled: boolean;
   dev_personas: string[];
@@ -35,6 +37,44 @@ function buildUrl(apiBase: string, path: string): string {
   const base = apiBase.replace(/\/+$/, "");
   const normalized = path.startsWith("/") ? path : `/${path}`;
   return base ? `${base}${normalized}` : normalized;
+}
+
+/**
+ * Fuzzy-match a user-typed model query against available model identifiers.
+ */
+export function resolveFuzzyModel(query: string, availableModels: string[]): string | null {
+  const q = query.trim().toLowerCase();
+  if (!q || !availableModels.length) return null;
+
+  const exact = availableModels.find((m) => m.toLowerCase() === q);
+  if (exact) return exact;
+
+  const prefix = availableModels
+    .filter((m) => m.toLowerCase().startsWith(q))
+    .sort((a, b) => a.length - b.length);
+  if (prefix.length) return prefix[0] ?? null;
+
+  const substring = availableModels
+    .filter((m) => m.toLowerCase().includes(q))
+    .sort((a, b) => {
+      const idxDiff = a.toLowerCase().indexOf(q) - b.toLowerCase().indexOf(q);
+      return idxDiff !== 0 ? idxDiff : a.length - b.length;
+    });
+  if (substring.length) return substring[0] ?? null;
+
+  const fuzzy = availableModels
+    .filter((m) => {
+      const hay = m.toLowerCase();
+      let pos = 0;
+      for (const ch of q) {
+        pos = hay.indexOf(ch, pos);
+        if (pos === -1) return false;
+        pos += 1;
+      }
+      return true;
+    })
+    .sort((a, b) => a.length - b.length);
+  return fuzzy[0] ?? null;
 }
 
 export function extractErrorMessage(err: unknown): string {
@@ -119,10 +159,54 @@ export function useAdminApi() {
     if (!force && session.value && authConfig.value) {
       return { session: session.value, authConfig: authConfig.value };
     }
-    const [cfgRes, sessRes] = await Promise.all([
+    const [cfgRes, initialSess] = await Promise.all([
       apiFetch<AdminAuthConfig>("/auth/admin/config", {}, true),
       apiFetch<AdminSessionState>("/auth/admin/session", {}, true),
     ]);
+    let sessRes = initialSess;
+    if (!sessRes.authenticated && cfgRes.dev_auth_enabled) {
+      const externalOidcBase = (cfgRes.oidc_issuer || "http://127.0.0.1:8001/oidc").replace(/\/+$/, "");
+      try {
+        const oidcToken = await $fetch<{ access_token: string }>(
+          `${externalOidcBase}/token`,
+          {
+            method: "POST",
+            body: { persona: "gateway_admin" },
+          }
+        );
+        if (oidcToken?.access_token) {
+          bearerToken.value = oidcToken.access_token;
+          await apiFetch(
+            "/auth/admin/token-login",
+            {
+              method: "POST",
+              body: { token: oidcToken.access_token },
+            },
+            true
+          );
+          const [verifiedSession, userInfo] = await Promise.all([
+            apiFetch<AdminSessionState>("/auth/admin/session", {}, true),
+            $fetch<AdminUserProfile>(`${externalOidcBase}/userinfo`, {
+              headers: { Authorization: `Bearer ${oidcToken.access_token}` },
+            }),
+          ]);
+          sessRes = {
+            ...verifiedSession,
+            user: {
+              ...(verifiedSession.user || {}),
+              ...userInfo,
+            },
+          };
+        }
+      } catch {
+        // Fallback to devLogin if external mock OIDC server is unreachable
+        try {
+          sessRes = await devLogin("gateway_admin");
+        } catch {
+          // Keep unauthenticated state
+        }
+      }
+    }
     authConfig.value = cfgRes;
     session.value = sessRes;
     runtimeMeta.value = {

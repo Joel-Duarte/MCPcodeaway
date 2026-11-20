@@ -1,329 +1,315 @@
 <script setup lang="ts">
-import type { IconName } from "~/components/AppIcon.vue";
+import { computed, onMounted, ref, watch } from "vue";
 
 const route = useRoute();
-const { session, runtimeMeta, authConfig, logout } = useAdminApi();
-const { pendingConfirm, webMcpActive, initAgentBridge, resolveConfirm } = useUiAgentBridge();
-const {
-  status: demoStatus,
-  busy: demoBusy,
-  refreshStatus: refreshDemoStatus,
-  startTraffic,
-  setTier,
-  stopTraffic,
-  runBurst,
-} = useDemoTraffic();
-const { connected: wsConnected, connect: connectWs, disconnect: disconnectWs } = useLiveTelemetry();
+const { session, loadAuthState, logout } = useAdminApi();
+const { initAgentBridge } = useUiAgentBridge();
+const { refreshStatus: refreshDemoStatus } = useDemoTraffic();
+const { connect: connectWs, disconnect: disconnectWs } = useLiveTelemetry();
+const mobileNavigationOpen = ref(false);
+const sessionReady = ref(false);
+const loggingOut = ref(false);
+const { selectedRange } = useReportRange();
+const isReportPage = computed(() => ["/analytics", "/optimization", "/model-performance"].includes(route.path));
 
-const navOpen = ref(false);
+const navigation = [
+  {
+    label: "Overview & Live Runtime",
+    to: "/",
+    group: "Operate",
+    icon: "overview",
+  },
+  {
+    label: "Gateway Usage",
+    to: "/analytics",
+    group: "Operate",
+    icon: "analytics",
+  },
+  {
+    label: "Traces & Timeline",
+    to: "/traces",
+    group: "Operate",
+    icon: "traces",
+  },
+  {
+    label: "Optimization & ROI",
+    to: "/optimization",
+    group: "Optimize",
+    icon: "optimization",
+  },
+  {
+    label: "Model Performance",
+    to: "/model-performance",
+    group: "Optimize",
+    icon: "models",
+  },
+  {
+    label: "Upstreams Catalog",
+    to: "/upstreams",
+    group: "Govern",
+    icon: "upstreams",
+  },
+  {
+    label: "Audit & Compliance",
+    to: "/audit",
+    group: "Govern",
+    icon: "audit",
+  },
+  {
+    label: "Onboarding",
+    to: "/onboarding",
+    group: "Configure",
+    icon: "onboarding",
+  },
+  {
+    label: "Settings & Alerts",
+    to: "/settings",
+    group: "Configure",
+    icon: "settings",
+  },
+  {
+    label: "Demo Control",
+    to: "/demo",
+    group: "Demo",
+    icon: "demo",
+  },
+] as const;
 
-onMounted(async () => {
-  initAgentBridge();
-  await refreshDemoStatus();
-  connectWs();
+const groupedNavigation = computed(() => {
+  const groups = ["Operate", "Optimize", "Govern", "Configure", "Demo"] as const;
+  return groups.map((group) => ({
+    name: group,
+    items: navigation.filter((item) => item.group === group),
+  }));
 });
 
-onBeforeUnmount(() => {
-  disconnectWs();
+const activeItem = computed(
+  () => navigation.find((item) => item.to === route.path) || navigation[0],
+);
+const isLoginRoute = computed(() => route.path === "/login");
+const adminIdentity = computed(() => {
+  const user = session.value?.user;
+  const value = user?.email || user?.sub || user?.tenant_id;
+  if (typeof value === "string" && value.trim()) return value;
+  if (session.value?.authenticated) return "Authenticated administrator";
+  return session.value?.admin_auth_required ? "Sign-in required" : "Local admin session";
+});
+const adminRole = computed(() => {
+  const roles = session.value?.user?.roles || [];
+  if (roles.some((role) => role.toLowerCase().includes("admin")) || session.value?.is_admin) return "Administrator";
+  if (roles.some((role) => role.toLowerCase().includes("viewer"))) return "Viewer";
+  if (roles.length) return roles.join(" · ");
+  return session.value?.can_access_admin_console ? "Console access" : "Development session";
 });
 
 watch(
   () => route.fullPath,
   () => {
-    navOpen.value = false;
-  }
+    mobileNavigationOpen.value = false;
+  },
 );
 
-const isLoginPage = computed(() => route.path === "/login");
-
-const navItems: { to: string; label: string; icon: IconName }[] = [
-  { to: "/", label: "Overview & Runtime", icon: "overview" },
-  { to: "/traces", label: "Traces & Timeline", icon: "audit" },
-  { to: "/analytics", label: "Gateway Usage", icon: "analytics" },
-  { to: "/optimization", label: "Optimization & ROI", icon: "upstreams" },
-  { to: "/model-performance", label: "Model Performance", icon: "analytics" },
-  { to: "/onboarding", label: "Onboarding", icon: "onboarding" },
-  { to: "/upstreams", label: "Upstreams Catalog", icon: "upstreams" },
-  { to: "/audit", label: "Audit & Compliance", icon: "audit" },
-  { to: "/settings", label: "Settings & Alerts", icon: "shield" },
-  { to: "/demo", label: "Demo Control", icon: "sliders" },
-];
-
-function isActiveRoute(to: string): boolean {
-  if (to === "/") {
-    return route.path === "/" || route.path === "";
-  }
-  return route.path.startsWith(to);
+function onKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") mobileNavigationOpen.value = false;
 }
 
-const adminLabel = computed(() => {
-  const user = session.value?.user;
-  if (!user) return "Local Admin";
-  return user.email || user.sub || "Admin";
+async function signOut() {
+  if (loggingOut.value) return;
+  loggingOut.value = true;
+  try {
+    await logout();
+  } finally {
+    loggingOut.value = false;
+  }
+}
+
+onMounted(async () => {
+  window.addEventListener("keydown", onKeydown);
+  initAgentBridge();
+  connectWs();
+  void refreshDemoStatus();
+  try {
+    await loadAuthState(true);
+  } finally {
+    sessionReady.value = true;
+  }
 });
 
-const adminRoleText = computed(() => {
-  const roles = session.value?.user?.roles;
-  if (!roles || roles.length === 0) return "open";
-  return roles[0];
+onBeforeUnmount(() => {
+  disconnectWs();
+  if (typeof window !== "undefined") window.removeEventListener("keydown", onKeydown);
 });
 </script>
 
 <template>
-  <div v-if="isLoginPage" class="min-h-dvh bg-[#FAFAFA] text-[#09090B]">
+  <div v-if="isLoginRoute" class="min-h-dvh bg-[#FAFAFA] text-[#09090B]">
     <slot />
   </div>
 
-  <div v-else class="min-h-dvh bg-[#FAFAFA] text-[#09090B] lg:flex">
-    <!-- Persistent desktop navigation rail (240px) -->
-    <aside
-      aria-label="Primary navigation"
-      class="hidden lg:flex lg:w-60 lg:shrink-0 lg:flex-col lg:border-r lg:border-[#E4E4E7] lg:bg-[#F4F4F5]"
-    >
-      <div class="flex h-14 items-center gap-2.5 border-b border-[#E4E4E7] px-4">
-        <span
-          class="inline-flex h-6 w-6 items-center justify-center rounded border border-[#99F6E4] bg-[#F0FDFA] text-xs font-semibold text-[#0F766E]"
-        >
-          M
-        </span>
-        <span class="text-sm font-semibold tracking-tight text-[#09090B]">
-          MCPcodeaway
-        </span>
-      </div>
-
-      <nav class="flex-1 space-y-1 p-3">
-        <NuxtLink
-          v-for="item in navItems"
-          :key="item.to"
-          :to="item.to"
-          class="no-underline flex items-center gap-2.5 rounded-md px-3 py-2 text-[13px] font-medium transition-colors"
-          :class="
-            isActiveRoute(item.to)
-              ? 'bg-[#F0FDFA] text-[#0F766E] border border-[#99F6E4]'
-              : 'text-[#52525B] border border-transparent hover:bg-[#E4E4E7]/60 hover:text-[#09090B]'
-          "
-        >
-          <AppIcon :name="item.icon" :size="16" />
-          <span>{{ item.label }}</span>
-        </NuxtLink>
-      </nav>
-
-      <div class="border-t border-[#E4E4E7] p-3 text-xs text-[#52525B]">
-        <div class="flex items-center justify-between gap-2">
-          <span>Auth Mode</span>
-          <span class="font-medium text-[#09090B]">
-            {{ authConfig?.auth_mode || "—" }}
-          </span>
+  <div v-else class="min-h-dvh bg-[#FAFAFA] text-[#09090B]">
+    <div class="min-h-dvh lg:grid lg:grid-cols-[15.25rem_minmax(0,1fr)]">
+      <aside class="hidden border-r border-[#E4E4E7] bg-white lg:sticky lg:top-0 lg:flex lg:h-dvh lg:flex-col">
+        <div class="flex h-16 items-center gap-3 border-b border-[#E4E4E7] px-5">
+          <span class="flex h-8 w-8 items-center justify-center rounded border border-[#99F6E4] bg-[#F0FDFA] text-sm font-semibold text-[#0F766E]">M</span>
+          <div class="min-w-0">
+            <div class="truncate text-sm font-semibold tracking-tight">MCPcodeaway</div>
+            <div class="text-[11px] text-[#71717A]">Admin control plane</div>
+          </div>
         </div>
-        <div class="mt-1.5 flex items-center justify-between gap-2">
-          <span>UI Agent Bridge</span>
-          <span class="font-medium text-[#0F766E]">
-            {{ webMcpActive ? "WebMCP Ready" : "UI-SDK Ready" }}
-          </span>
-        </div>
-      </div>
-    </aside>
 
-    <!-- Main column -->
-    <div class="flex min-w-0 flex-1 flex-col">
-      <!-- Top utility bar (56px) -->
-      <header
-        class="sticky top-0 z-30 flex h-14 items-center justify-between gap-3 border-b border-[#E4E4E7] bg-white px-4 lg:px-6"
-      >
-        <div class="flex min-w-0 items-center gap-2.5">
-          <!-- Mobile drawer trigger (< lg) -->
-          <div class="lg:hidden">
-            <Drawer v-model:open="navOpen" side="left">
-              <DrawerTrigger
-                aria-label="Open navigation menu"
-                class="min-h-11 min-w-11 px-2.5 text-[#09090B]"
+        <nav aria-label="Main navigation" class="min-h-0 flex-1 overflow-y-auto px-3 py-4">
+          <div v-for="group in groupedNavigation" :key="group.name" class="mb-5 last:mb-0">
+            <h2 class="mb-1.5 px-2 text-[11px] font-semibold text-[#71717A]">{{ group.name }}</h2>
+            <div class="space-y-0.5">
+              <NuxtLink
+                v-for="item in group.items"
+                :key="item.to"
+                :to="item.to"
+                class="group flex min-h-10 items-center gap-2.5 rounded-md px-2.5 py-2 text-[12px] font-medium no-underline transition-colors duration-150 hover:bg-[#F4F4F5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
+                :class="activeItem.to === item.to ? 'bg-[#F0FDFA] text-[#0F766E]' : 'text-[#52525B]'"
+                :aria-current="activeItem.to === item.to ? 'page' : undefined"
               >
-                <AppIcon name="menu" :size="18" />
-              </DrawerTrigger>
-              <DrawerBackdrop />
-              <DrawerContent class="w-72 max-w-[85vw] bg-[#F4F4F5] p-0">
-                <div class="flex h-14 items-center justify-between border-b border-[#E4E4E7] px-4">
-                  <DrawerTitle class="text-sm font-semibold text-[#09090B]">
-                    MCPcodeaway
-                  </DrawerTitle>
-                  <DrawerClose aria-label="Close navigation menu" class="min-h-10 px-2">
-                    <AppIcon name="x" :size="16" />
-                  </DrawerClose>
-                </div>
-                <DrawerDescription class="sr-only">
-                  Admin console navigation links
-                </DrawerDescription>
-                <nav class="flex-1 space-y-1 p-3" aria-label="Mobile navigation">
-                  <NuxtLink
-                    v-for="item in navItems"
-                    :key="item.to"
-                    :to="item.to"
-                    class="no-underline flex min-h-11 items-center gap-2.5 rounded-md px-3 py-2.5 text-sm font-medium transition-colors"
-                    :class="
-                      isActiveRoute(item.to)
-                        ? 'bg-[#F0FDFA] text-[#0F766E] border border-[#99F6E4]'
-                        : 'text-[#52525B] border border-transparent hover:bg-[#E4E4E7]/60 hover:text-[#09090B]'
-                    "
-                  >
-                    <AppIcon :name="item.icon" :size="18" />
-                    <span>{{ item.label }}</span>
-                  </NuxtLink>
-                </nav>
-                <div class="border-t border-[#E4E4E7] p-4 text-xs text-[#52525B] space-y-2">
-                  <div>Profile: <span class="font-medium text-[#09090B]">{{ runtimeMeta.profile }}</span></div>
-                  <div>Catalog: <span class="font-mono-data text-[#09090B]">{{ runtimeMeta.catalog_version }}</span></div>
-                  <div v-if="demoStatus.enabled" class="pt-1 flex flex-wrap items-center gap-1.5">
-                    <Button
-                      v-if="!demoStatus.running"
-                      class="px-2 py-1 text-xs"
-                      :disabled="demoBusy"
-                      @click="startTraffic()"
-                    >
-                      Start Demo Traffic
-                    </Button>
-                    <Button
-                      v-else
-                      data-variant="danger"
-                      class="px-2 py-1 text-xs"
-                      :disabled="demoBusy"
-                      @click="stopTraffic"
-                    >
-                      Stop Demo Traffic
-                    </Button>
-                    <Button
-                      class="px-2 py-1 text-xs"
-                      :disabled="demoBusy"
-                      @click="runBurst(8)"
-                    >
-                      Burst +8
-                    </Button>
-                  </div>
-                </div>
-              </DrawerContent>
-            </Drawer>
+                <svg v-if="item.icon === 'overview'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 18a8 8 0 1 1 16 0" /><path d="m12 14 4-4M7 18h10" />
+                </svg>
+                <svg v-else-if="item.icon === 'analytics'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 6h16M4 12h16M4 18h16" /><circle cx="7" cy="6" r="1" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="17" cy="18" r="1" fill="currentColor" stroke="none" />
+                </svg>
+                <svg v-else-if="item.icon === 'traces'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 6h5v5H4zM15 13h5v5h-5zM9 8h3a3 3 0 0 1 3 3v2M9 16h3" />
+                </svg>
+                <svg v-else-if="item.icon === 'optimization'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m4 17 6-6 4 4 6-8M14 7h6v6" />
+                </svg>
+                <svg v-else-if="item.icon === 'models'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m12 3 8 4.5v9L12 21l-8-4.5v-9zM12 3v18M4 7.5l8 4.5 8-4.5" />
+                </svg>
+                <svg v-else-if="item.icon === 'upstreams'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M7 7h10M7 17h10M5 5 3 7l2 2M19 15l2 2-2 2M12 7v10" />
+                </svg>
+                <svg v-else-if="item.icon === 'audit'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M6 3h9l4 4v14H6zM15 3v5h4M9 12h7M9 16h7" />
+                </svg>
+                <svg v-else-if="item.icon === 'onboarding'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
+                <svg v-else-if="item.icon === 'connections'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="7" cy="12" r="3"/><circle cx="17" cy="6" r="3"/><circle cx="17" cy="18" r="3"/><path d="m10 11 4-3M10 13l4 3" />
+                </svg>
+                <svg v-else-if="item.icon === 'settings'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.6 1.6-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5v.2h-2.3v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1-1.6-1.6.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H5v-2.3h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1 1.6-1.6.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.5V6h2.3v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1 1.6 1.6-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.5 1h.2v2.3h-.2a1.7 1.7 0 0 0-1.5.8Z" />
+                </svg>
+                <svg v-else aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m8 5 11 7-11 7z"/><path d="M4 4v16" />
+                </svg>
+                <span class="min-w-0 flex-1 truncate">{{ item.label }}</span>
+                <span v-if="item.group === 'Demo'" class="rounded border border-[#E4E4E7] px-1 py-0.5 text-[9px] font-semibold text-[#71717A]">SANDBOX</span>
+              </NuxtLink>
+            </div>
           </div>
+        </nav>
 
-          <span class="truncate text-sm font-semibold text-[#09090B] lg:hidden">
-            MCPcodeaway
-          </span>
-
-          <div class="hidden sm:flex items-center gap-2 text-xs text-[#52525B]">
-            <span class="rounded border border-[#E4E4E7] bg-[#F4F4F5] px-2 py-0.5 font-medium text-[#09090B]">
-              profile: {{ runtimeMeta.profile }}
-            </span>
-            <span class="rounded border border-[#E4E4E7] bg-[#F4F4F5] px-2 py-0.5 font-medium text-[#09090B]">
-              env: {{ runtimeMeta.app_env }}
-            </span>
-            <span class="hidden md:inline rounded border border-[#E4E4E7] bg-white px-2 py-0.5 font-mono-data text-[#52525B]">
-              {{ runtimeMeta.catalog_version }}
-            </span>
+        <div class="border-t border-[#E4E4E7] p-3">
+          <div class="flex items-center gap-2.5 rounded-md px-2 py-2">
+            <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#F4F4F5] text-xs font-semibold text-[#52525B]">{{ String(adminIdentity).slice(0, 1).toUpperCase() }}</span>
+            <div class="min-w-0 flex-1">
+              <div class="truncate text-xs font-semibold text-[#09090B]">{{ sessionReady ? adminIdentity : "Checking admin session…" }}</div>
+              <div class="text-[11px] text-[#71717A]">{{ adminRole }}</div>
+            </div>
+            <button
+              v-if="session?.authenticated"
+              type="button"
+              class="min-h-9 shrink-0 rounded-md border border-[#E4E4E7] px-2 text-[11px] font-medium text-[#52525B] hover:bg-[#F4F4F5] disabled:opacity-50"
+              :disabled="loggingOut"
+              @click="signOut"
+            >{{ loggingOut ? "Signing out…" : "Sign out" }}</button>
           </div>
         </div>
+      </aside>
 
-        <div class="flex shrink-0 items-center gap-2">
-          <span
-            class="hidden sm:inline-flex items-center gap-1.5 rounded border border-[#E4E4E7] bg-white px-2 py-0.5 text-[11px] font-medium text-[#52525B]"
-            :title="wsConnected ? 'WebSocket telemetry connected' : 'WebSocket reconnecting'"
-          >
-            <span
-              class="inline-block h-2 w-2 rounded-full"
-              :class="wsConnected ? 'bg-[#059669]' : 'bg-[#D97706]'"
-            />
-            <span>{{ wsConnected ? "Live WS" : "WS Offline" }}</span>
-          </span>
-          <div
-            v-if="demoStatus.enabled"
-            class="hidden md:flex items-center gap-1.5 rounded-md border border-[#E4E4E7] bg-[#F4F4F5] px-2 py-1 text-xs"
-          >
-            <span
-              class="inline-block h-2 w-2 rounded-full"
-              :class="demoStatus.running ? 'bg-[#059669] animate-pulse' : 'bg-[#71717A]'"
-            />
-            <span class="font-medium text-[#09090B] tabular-nums">
-              Demo {{ demoStatus.requests_sent }} reqs
-            </span>
-            <select
-              aria-label="Demo traffic tier"
-              :value="demoStatus.tier"
-              class="rounded border border-[#D4D4D8] bg-white px-1.5 py-0.5 text-[11px] font-medium text-[#09090B]"
-              @change="(e) => setTier((e.target as HTMLSelectElement).value as 'light' | 'enterprise' | 'stress')"
+      <div class="min-w-0">
+        <header class="sticky top-0 z-30 flex h-16 items-center justify-between border-b border-[#E4E4E7] bg-white px-4 sm:px-6 lg:px-8">
+          <div class="flex min-w-0 items-center gap-3">
+            <button
+              type="button"
+              class="inline-flex h-10 w-10 items-center justify-center rounded-md border border-[#E4E4E7] text-[#52525B] hover:bg-[#F4F4F5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E] lg:hidden"
+              aria-label="Open navigation"
+              :aria-expanded="mobileNavigationOpen"
+              @click="mobileNavigationOpen = true"
             >
-              <option value="light">Light (~0.5 rps)</option>
-              <option value="enterprise">Enterprise (~2 rps)</option>
-              <option value="stress">Stress (~5 rps)</option>
-            </select>
-            <Button
-              v-if="!demoStatus.running"
-              class="px-2 py-0.5 text-[11px]"
-              :disabled="demoBusy"
-              @click="startTraffic()"
-            >
-              Start Demo Traffic
-            </Button>
-            <Button
-              v-else
-              data-variant="danger"
-              class="px-2 py-0.5 text-[11px]"
-              :disabled="demoBusy"
-              @click="stopTraffic"
-            >
-              Stop Demo Traffic
-            </Button>
-            <Button
-              class="px-2 py-0.5 text-[11px]"
-              :disabled="demoBusy"
-              @click="runBurst(8)"
-            >
-              Burst +8
-            </Button>
+              <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+            </button>
+            <div class="min-w-0">
+              <div class="truncate text-sm font-semibold text-[#09090B]">{{ activeItem.label }}</div>
+              <div class="text-[11px] text-[#71717A]">MCPcodeaway Gateway</div>
+            </div>
           </div>
-          <div class="hidden sm:flex items-center gap-2 text-xs">
-            <span class="font-medium text-[#09090B] truncate max-w-[160px]">
-              {{ adminLabel }}
-            </span>
-            <span class="rounded border border-[#99F6E4] bg-[#F0FDFA] px-1.5 py-0.5 text-[11px] font-medium text-[#0F766E]">
-              {{ adminRoleText }}
+          <div class="flex items-center gap-2 text-[11px] text-[#52525B]">
+            <span class="hidden rounded border border-[#E4E4E7] bg-[#FAFAFA] px-2 py-1 font-medium lg:inline-flex">CONTROL PLANE</span>
+            <label v-if="isReportPage" title="All time covers the telemetry currently retained by the gateway." class="inline-flex min-w-0 items-center gap-1.5 rounded-md border border-[#E4E4E7] bg-white px-2 py-1.5 text-xs text-[#52525B] sm:gap-2 sm:px-2.5">
+              <span class="hidden sm:inline">Range</span>
+              <select v-model="selectedRange" aria-label="Report time range" class="min-w-0 max-w-[7rem] bg-transparent font-medium text-[#09090B] outline-none sm:max-w-none sm:min-w-[7.5rem]">
+                <option value="1h">Last hour</option>
+                <option value="24h">Last 24 hours</option>
+                <option value="7d">Last 7 days</option>
+                <option value="30d">Last 30 days</option>
+                <option value="all">All time</option>
+              </select>
+            </label>
+            <span class="hidden items-center gap-1.5 rounded border border-[#E4E4E7] px-2 py-1 sm:inline-flex">
+              <span class="h-1.5 w-1.5 rounded-full bg-[#0F766E]"></span>
+              {{ adminRole }}
             </span>
           </div>
-          <Button
-            v-if="session?.authenticated"
-            data-variant="ghost"
-            class="text-xs"
-            @click="logout"
-          >
-            <AppIcon name="logout" :size="15" />
-            <span>Sign out</span>
-          </Button>
-          <NuxtLink
-            v-else-if="session?.admin_auth_required"
-            to="/login"
-            class="no-underline inline-flex items-center gap-1.5 rounded-md border border-[#0F766E] bg-[#0F766E] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#115E59]"
-          >
-            <AppIcon name="lock" :size="14" />
-            <span>Sign in</span>
-          </NuxtLink>
-        </div>
-      </header>
+        </header>
 
-      <!-- Workspace content -->
-      <main class="mx-auto w-full max-w-7xl flex-1 p-4 sm:p-6">
-        <slot />
-      </main>
+        <main class="mx-auto w-full max-w-[1600px] p-4 sm:p-6 lg:p-8">
+          <slot />
+        </main>
+      </div>
     </div>
 
-    <!-- Human-in-the-loop confirmation dialog for data-agent-confirm actions -->
-    <Dialog :open="Boolean(pendingConfirm)" @update:open="(v) => { if (!v) resolveConfirm(false); }">
-      <DialogBackdrop />
-      <DialogContent class="sm:max-w-md w-[calc(100%-2rem)]">
-        <DialogTitle>Confirm UI Agent Action</DialogTitle>
-        <DialogDescription class="mt-2 text-sm text-[#52525B]">
-          {{ pendingConfirm?.message || "Approve this action requested by an agent?" }}
-        </DialogDescription>
-        <div class="mt-5 flex justify-end gap-2">
-          <Button @click="resolveConfirm(false)">Deny Action</Button>
-          <Button data-variant="primary" @click="resolveConfirm(true)">Approve Action</Button>
+    <div v-if="mobileNavigationOpen" class="fixed inset-0 z-50 lg:hidden" role="dialog" aria-modal="true" aria-label="Main navigation">
+      <button class="absolute inset-0 h-full w-full bg-black/20" aria-label="Close navigation" @click="mobileNavigationOpen = false"></button>
+      <aside class="relative flex h-full w-[min(19rem,88vw)] flex-col border-r border-[#E4E4E7] bg-white shadow-xl">
+        <div class="flex h-16 items-center justify-between border-b border-[#E4E4E7] px-4">
+          <div class="flex items-center gap-2.5">
+            <span class="flex h-8 w-8 items-center justify-center rounded border border-[#99F6E4] bg-[#F0FDFA] text-sm font-semibold text-[#0F766E]">M</span>
+            <span class="text-sm font-semibold">MCPcodeaway</span>
+          </div>
+          <button type="button" class="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#F4F4F5]" aria-label="Close navigation" @click="mobileNavigationOpen = false">
+            <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="m6 6 12 12M18 6 6 18" /></svg>
+          </button>
         </div>
-      </DialogContent>
-    </Dialog>
+        <nav aria-label="Mobile navigation" class="min-h-0 flex-1 overflow-y-auto px-3 py-4">
+          <div v-for="group in groupedNavigation" :key="group.name" class="mb-5 last:mb-0">
+            <h2 class="mb-1.5 px-2 text-[11px] font-semibold text-[#71717A]">{{ group.name }}</h2>
+            <div class="space-y-0.5">
+              <NuxtLink
+                v-for="item in group.items"
+                :key="item.to"
+                :to="item.to"
+                class="flex min-h-11 items-center gap-2.5 rounded-md px-2.5 py-2 text-[12px] font-medium no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
+                :class="activeItem.to === item.to ? 'bg-[#F0FDFA] text-[#0F766E]' : 'text-[#52525B] hover:bg-[#F4F4F5]'"
+              >
+                <span class="min-w-0 flex-1 truncate">{{ item.label }}</span>
+                <span v-if="item.group === 'Demo'" class="rounded border border-[#E4E4E7] px-1 py-0.5 text-[9px] font-semibold text-[#71717A]">SANDBOX</span>
+              </NuxtLink>
+            </div>
+          </div>
+        </nav>
+        <div class="border-t border-[#E4E4E7] p-3 text-xs">
+          <div class="break-all font-semibold text-[#09090B]">{{ adminIdentity }}</div>
+          <div class="mt-0.5 text-[#71717A]">{{ adminRole }}</div>
+          <button
+            v-if="session?.authenticated"
+            type="button"
+            class="mt-3 min-h-11 w-full rounded-md border border-[#E4E4E7] px-3 text-left text-xs font-medium text-[#52525B] hover:bg-[#F4F4F5] disabled:opacity-50"
+            :disabled="loggingOut"
+            @click="signOut"
+          >{{ loggingOut ? "Signing out…" : "Sign out" }}</button>
+        </div>
+      </aside>
+    </div>
   </div>
 </template>

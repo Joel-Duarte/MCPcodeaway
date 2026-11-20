@@ -91,28 +91,16 @@ const draftApiKeyHeader = ref("X-API-Key");
 const draftRoles = ref("finance_analyst, ops_engineer, gateway_admin");
 const draftGroups = ref("");
 const draftPreferredMode = ref("auto");
-const draftAbEnabled = ref(false);
-const draftAbExpId = ref("ab_inventory_v1");
-const draftAbSplitPct = ref("50");
 
 // Inspection output
 const inspectResult = ref<InspectResponse | null>(null);
 
 // A/B Lab controls
-const abSource = ref("draft");
-const abSelectedUpstream = ref("");
-const abTab = ref("replay");
 const abIntent = ref("reconcile inventory and summarize anomalies");
-const abDryRun = ref(true);
 const abSampleBytes = ref("12000");
 
-const llmEnabled = ref(false);
-const llmBaseUrl = ref("https://api.openai.com/v1");
-const llmModel = ref("gpt-4o-mini");
-const llmApiKey = ref("");
-const llmPrompt = ref("List active records and return a concise summary.");
-const llmExpected = ref("");
 const abResult = ref<AbTestResult | null>(null);
+const abBusy = ref(false);
 
 // Agent Prompt & JSON Import Dialogs
 const promptDialogOpen = ref(false);
@@ -137,11 +125,18 @@ const authOptions = [
 ];
 
 const modeOptions = [
-  { value: "auto", label: "Auto — Algorithmic Router (Recommended)" },
-  { value: "codemode", label: "Code Mode — Deferred Search & Sandbox" },
-  { value: "traditional_discover", label: "Classic MCP — Discover & Direct Calls" },
-  { value: "hybrid", label: "Hybrid — Code Mode Reads, Confirmed Writes" },
+  { value: "auto", label: "Auto — gateway picks per request / per tool (Recommended)" },
+  { value: "codemode", label: "Code Mode for the whole service" },
+  { value: "traditional_discover", label: "Classic MCP for the whole service" },
 ];
+const toolModeOptions = [
+  { value: "inherit", label: "Inherit service mode" },
+  { value: "auto", label: "Auto" },
+  { value: "codemode", label: "Code Mode" },
+  { value: "traditional_discover", label: "Classic MCP" },
+];
+const draftToolModes = ref<Record<string, string>>({});
+const availableGroups = ref<string[]>(["finance", "operations", "support", "audit", "platform-admins"]);
 
 const schemaVerified = ref(false);
 const testCallResult = ref<string>("");
@@ -156,9 +151,12 @@ const availableRoles = ref<string[]>([
 
 onMounted(async () => {
   try {
-    const res = await apiFetch<{ roles?: string[] }>("/admin/roles", {}, true);
+    const res = await apiFetch<{ roles?: string[]; groups?: string[] }>("/admin/roles", {}, true);
     if (res.roles && res.roles.length > 0) {
       availableRoles.value = res.roles;
+    }
+    if (res.groups && res.groups.length > 0) {
+      availableGroups.value = res.groups;
     }
   } catch {
     // Keep default role list if roles endpoint unavailable
@@ -173,6 +171,16 @@ const selectedRoleSet = computed(() => {
       .filter(Boolean)
   );
 });
+
+const selectedGroupSet = computed(
+  () => new Set(draftGroups.value.split(",").map((g) => g.trim()).filter(Boolean)),
+);
+function toggleGroup(group: string) {
+  const next = new Set(selectedGroupSet.value);
+  if (next.has(group)) next.delete(group);
+  else next.add(group);
+  draftGroups.value = Array.from(next).join(", ");
+}
 
 function toggleRole(role: string) {
   const next = new Set(selectedRoleSet.value);
@@ -230,28 +238,6 @@ const authRequestPreview = computed(() => {
   }
   return `GET ${host}/...\n(No Authorization header injected)`;
 });
-
-const sessionAdvice = computed(() => {
-  const count = inspectResult.value?.inspection.tool_count ?? 0;
-  return {
-    abHint:
-      count >= 10
-        ? `Recommended: ${count} tools detected — run a Live Traffic A/B Experiment to prove Code Mode token savings.`
-        : "Optional: small tool catalog (< 10 tools) works well in Auto or Classic Discover mode.",
-  };
-});
-
-function applyLocalLlmPreset(kind: "lmstudio" | "ollama") {
-  llmEnabled.value = true;
-  if (kind === "lmstudio") {
-    llmBaseUrl.value = "http://host.docker.internal:1234/v1";
-    llmModel.value = "qwen3.5-9b";
-  } else {
-    llmBaseUrl.value = "http://host.docker.internal:11434/v1";
-    llmModel.value = "qwen3:8b";
-  }
-  statusMessage.value = `Configured local ${kind === "lmstudio" ? "LM Studio" : "Ollama"} endpoint.`;
-}
 
 const onboardingStep = ref<1 | 2 | 3>(1);
 const promptTab = ref("prompt");
@@ -315,6 +301,15 @@ function buildSynthesizedSpec(): Record<string, unknown> {
   };
 }
 
+function toolOverridesPayload(): Record<string, string> {
+  const prefix = draftName.value.trim();
+  const out: Record<string, string> = {};
+  for (const [tool, mode] of Object.entries(draftToolModes.value)) {
+    if (mode && mode !== "inherit") out[`${prefix}__${tool}`] = mode;
+  }
+  return out;
+}
+
 function buildUpstreamPayload() {
   const roles = draftRoles.value
     .split(",")
@@ -324,7 +319,6 @@ function buildUpstreamPayload() {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  const splitNum = Math.min(100, Math.max(0, Number.parseInt(draftAbSplitPct.value || "50", 10) || 50));
 
   let resolvedType = draftType.value;
   let specUrl: string | undefined = undefined;
@@ -380,14 +374,9 @@ function buildUpstreamPayload() {
     allowed_roles: roles,
     allowed_groups: groups,
     preferred_mode: draftPreferredMode.value,
+    tool_mode_overrides: toolOverridesPayload(),
     enabled: true,
-    ab_experiment: draftAbEnabled.value
-      ? {
-          enabled: true,
-          experiment_id: draftAbExpId.value.trim() || `ab_${draftName.value.trim()}_v1`,
-          codemode_traffic_pct: splitNum,
-        }
-      : null,
+    ab_experiment: null,
   };
 }
 
@@ -403,23 +392,11 @@ const yamlPreview = computed(() => {
     `    preferred_mode: ${cfg.preferred_mode}`,
     `    allowed_roles: [${cfg.allowed_roles.join(", ")}]`,
   ].filter(Boolean);
-  if (cfg.ab_experiment) {
-    lines.push(
-      `    ab_experiment:`,
-      `      enabled: true`,
-      `      experiment_id: ${cfg.ab_experiment.experiment_id}`,
-      `      codemode_traffic_pct: ${cfg.ab_experiment.codemode_traffic_pct}`
-    );
+  const overrides = Object.entries(cfg.tool_mode_overrides);
+  if (overrides.length) {
+    lines.push(`    tool_mode_overrides:`, ...overrides.map(([k, v]) => `      ${k}: ${v}`));
   }
   return lines.join("\n");
-});
-
-const existingUpstreamOptions = computed(() => {
-  const base = [{ value: "draft", label: "Draft Configuration (left panel)" }];
-  for (const name of existingUpstreams.value) {
-    base.push({ value: name, label: `Registered: ${name}` });
-  }
-  return base;
 });
 
 onMounted(async () => {
@@ -430,9 +407,6 @@ onMounted(async () => {
     }>("/admin/upstreams");
     dynamicPermitted.value = res.dynamic_upstreams_permitted;
     existingUpstreams.value = res.upstreams.map((u) => u.name);
-    if (res.upstreams.length > 0) {
-      abSelectedUpstream.value = res.upstreams[0]?.name || "";
-    }
   } catch {
     // Error handled smoothly if user triggers action
   }
@@ -562,69 +536,29 @@ function applyImportedJson() {
 async function runAbTest() {
   errorMessage.value = "";
   statusMessage.value = "";
-  const body: Record<string, unknown> = {
-    intent: abIntent.value.trim() || undefined,
-    dry_run: abDryRun.value,
-    sample_payload_bytes: Math.max(0, Number.parseInt(abSampleBytes.value || "0", 10) || 0),
-  };
-  if (abSource.value === "draft") {
-    body.upstream = buildUpstreamPayload();
-  } else {
-    body.upstream_name = abSource.value;
-  }
-  if (llmEnabled.value) {
-    body.llm_config = {
-      base_url: llmBaseUrl.value.trim(),
-      model: llmModel.value.trim(),
-      api_key: llmApiKey.value,
-      prompt: llmPrompt.value.trim(),
-      expected_substrings: llmExpected.value
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean),
-    };
-  }
+  abBusy.value = true;
   try {
     abResult.value = await apiFetch<AbTestResult>("/admin/upstreams/ab-test", {
       method: "POST",
-      body,
+      body: {
+        upstream: buildUpstreamPayload(),
+        intent: abIntent.value.trim() || undefined,
+        dry_run: true,
+        sample_payload_bytes: Math.max(0, Number.parseInt(abSampleBytes.value || "0", 10) || 0),
+      },
     });
-    statusMessage.value = `A/B test completed for '${abResult.value.upstream_name}'. Recommendation: ${abResult.value.recommendation.recommended_mode}.`;
+    statusMessage.value = `Estimate complete for '${abResult.value.upstream_name}'. Suggested mode: ${abResult.value.recommendation.recommended_mode}.`;
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
+  } finally {
+    abBusy.value = false;
   }
 }
 
-function applyRecommendation(enableLiveSplit = false) {
+function applyRecommendation() {
   if (!abResult.value) return;
-  const patch = abResult.value.recommendation.ready_config_patch;
-  draftPreferredMode.value = patch.preferred_mode;
-  draftAbExpId.value = patch.ab_experiment.experiment_id;
-  draftAbSplitPct.value = String(patch.ab_experiment.codemode_traffic_pct);
-  draftAbEnabled.value = enableLiveSplit;
-  statusMessage.value = `Applied recommended mode '${patch.preferred_mode}' to draft form.`;
-}
-
-function applyQuickPreset(preset: "mock-eu" | "mock-snowflake") {
-  if (preset === "mock-eu") {
-    sourceKind.value = "openapi_url";
-    draftName.value = "billing_eu_sandbox";
-    draftType.value = "openapi";
-    draftUrl.value = "http://mock-backends:8001/billing-eu";
-    draftSpecUrl.value = "http://mock-backends:8001/billing-eu/openapi.json";
-    draftAuthType.value = "delegated_token";
-    draftRoles.value = "finance_analyst, billing_reader, gateway_admin";
-  } else {
-    sourceKind.value = "mcp_http";
-    draftName.value = "snowflake_sandbox";
-    draftType.value = "mcp_http";
-    draftUrl.value = "http://mock-backends:8001/snowflake/mcp";
-    draftSpecUrl.value = "";
-    draftAuthType.value = "delegated_token";
-    draftRoles.value = "finance_analyst, snowflake_reader, gateway_admin";
-  }
-  onboardingStep.value = 1;
-  statusMessage.value = `Loaded preset '${draftName.value}'. Click Inspect Schema to verify tools.`;
+  draftPreferredMode.value = abResult.value.recommendation.ready_config_patch.preferred_mode;
+  statusMessage.value = `Set service mode to '${draftPreferredMode.value}'.`;
 }
 
 async function copyPromptText() {
@@ -643,7 +577,7 @@ async function copyPromptText() {
           Onboarding
         </h1>
         <p class="mt-0.5 text-[13px] text-[#52525B]">
-          Inspect schemas, verify security hints, and A/B-test Classic vs. Code Mode before publishing an upstream.
+          Connect an API or MCP server, set who can use it and how it runs, then test and save it.
         </p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
@@ -699,11 +633,6 @@ async function copyPromptText() {
           3. Test &amp; Save
         </Button>
       </div>
-      <div class="flex flex-wrap items-center gap-2">
-        <span class="text-xs text-[#71717A]">Quick presets:</span>
-        <Button class="text-xs" @click="applyQuickPreset('mock-eu')">Mock OpenAPI</Button>
-        <Button class="text-xs" @click="applyQuickPreset('mock-snowflake')">Mock MCP HTTP</Button>
-      </div>
     </section>
 
     <!-- 3-Step Progressive Wizard Workspace -->
@@ -712,7 +641,7 @@ async function copyPromptText() {
         <div>
           <h2 class="text-[15px] font-semibold text-[#09090B]">Step 1 — Connect API or MCP Server</h2>
           <p class="text-xs text-[#52525B]">
-            Import an OpenAPI spec, define REST endpoints directly, or connect an existing MCP server.
+            Connect a normal REST API and generate MCP tools, import its OpenAPI document, or connect an existing MCP server.
           </p>
         </div>
         <span class="text-xs text-[#52525B]">
@@ -727,21 +656,21 @@ async function copyPromptText() {
           class="justify-start text-xs"
           @click="sourceKind = 'openapi_url'; draftType = 'openapi'"
         >
-          OpenAPI Spec URL
+          REST API + OpenAPI URL
         </Button>
         <Button
           :data-variant="sourceKind === 'openapi_inline' ? 'primary' : undefined"
           class="justify-start text-xs"
           @click="sourceKind = 'openapi_inline'; draftType = 'openapi'"
         >
-          Paste OpenAPI JSON
+          Paste OpenAPI document
         </Button>
         <Button
           :data-variant="sourceKind === 'rest_builder' ? 'primary' : undefined"
           class="justify-start text-xs"
           @click="sourceKind = 'rest_builder'; draftType = 'openapi'"
         >
-          Quick REST Builder
+          Define REST endpoints
         </Button>
         <Button
           :data-variant="sourceKind === 'mcp_http' ? 'primary' : undefined"
@@ -751,6 +680,8 @@ async function copyPromptText() {
           Existing MCP Server
         </Button>
       </div>
+
+      <p class="text-xs leading-5 text-[#52525B]">A regular HTTP REST API is enough: provide its base URL plus an OpenAPI document, or define endpoints with the REST builder. The gateway exposes those operations as MCP tools. The API does <strong>not</strong> need to be OpenAI-compatible;</p>
 
       <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <Field>
@@ -867,9 +798,9 @@ async function copyPromptText() {
     <!-- Step 2: Access & Guardrails -->
     <div v-else-if="onboardingStep === 2" class="rounded-lg border border-[#E4E4E7] bg-white p-5 space-y-5">
       <div class="border-b border-[#E4E4E7] pb-3">
-        <h2 class="text-[15px] font-semibold text-[#09090B]">Step 2 — Access Control &amp; Execution Mode</h2>
+        <h2 class="text-[15px] font-semibold text-[#09090B]">Step 2 — Access &amp; Execution</h2>
         <p class="text-xs text-[#52525B]">
-          Choose authentication, which roles can invoke these tools, and whether Code Mode runs automatically.
+          Choose authentication, who can call these tools, and how they execute.
         </p>
       </div>
 
@@ -951,97 +882,47 @@ async function copyPromptText() {
           </div>
         </Field>
 
-        <Field>
-          <FieldLabel>Preferred Execution Mode</FieldLabel>
-          <Select
-            :items="modeOptions"
-            :value="draftPreferredMode"
-            @value-change="(v) => { if (v) draftPreferredMode = String(v) }"
-          >
-            <SelectTrigger>
-              <SelectValue />
-              <AppIcon name="chevron-down" :size="14" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem v-for="m in modeOptions" :key="m.value" :value="m.value">
-                {{ m.label }}
-                <SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator>
-              </SelectItem>
-            </SelectContent>
-          </Select>
-          <div class="mt-2 space-y-1 rounded border border-[#E4E4E7] bg-[#FAFAFA] p-2.5 text-[11px] text-[#52525B]">
-            <div><strong class="text-[#09090B]">auto:</strong> Gateway picks Code Mode or Classic per request using tool count &amp; payload size.</div>
-            <div><strong class="text-[#0F766E]">codemode:</strong> Defers full schemas (<code class="font-mono-data">search_tools</code> on demand) so 100+ tools don't bloat prompts, and runs Python in Monty.</div>
-            <div><strong class="text-[#0F766E]">hybrid:</strong> Code Mode for read/aggregation + confirmed Classic MCP calls for mutating writes.</div>
-            <div><strong class="text-[#2563EB]">traditional:</strong> Classic MCP (<code class="font-mono-data">discover</code> + <code class="font-mono-data">tools/call</code>) for simple single-tool calls.</div>
-          </div>
-        </Field>
-
         <div class="sm:col-span-2 space-y-2">
-          <div class="text-xs font-medium text-[#09090B]">Allowed RBAC Roles (click to toggle)</div>
+          <div class="text-xs font-medium text-[#09090B]">Allowed RBAC roles (click to toggle)</div>
           <div class="flex flex-wrap gap-1.5">
-            <button
-              v-for="role in availableRoles"
-              :key="role"
-              type="button"
-              class="rounded border px-2.5 py-1 text-xs font-medium transition-colors"
-              :class="
-                selectedRoleSet.has(role)
-                  ? 'border-[#0F766E] bg-[#F0FDFA] text-[#0F766E]'
-                  : 'border-[#E4E4E7] bg-white text-[#52525B] hover:bg-[#F4F4F5]'
-              "
-              @click="toggleRole(role)"
-            >
-              {{ role }}
-            </button>
+            <button v-for="role in availableRoles" :key="role" type="button" class="rounded border px-2.5 py-1 text-xs font-medium transition-colors"
+              :class="selectedRoleSet.has(role) ? 'border-[#0F766E] bg-[#F0FDFA] text-[#0F766E]' : 'border-[#E4E4E7] bg-white text-[#52525B] hover:bg-[#F4F4F5]'"
+              @click="toggleRole(role)">{{ role }}</button>
           </div>
-          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <Field>
-              <FieldLabel>Custom / Selected Roles</FieldLabel>
-              <Input v-model="draftRoles" class="font-mono-data text-xs" />
-            </Field>
-            <Field>
-              <FieldLabel>Allowed Groups (comma-separated)</FieldLabel>
-              <Input v-model="draftGroups" placeholder="finance, platform" class="font-mono-data text-xs" />
-            </Field>
+          <div class="pt-1 text-xs font-medium text-[#09090B]">Allowed groups (click to toggle)</div>
+          <div class="flex flex-wrap gap-1.5">
+            <button v-for="g in availableGroups" :key="g" type="button" class="rounded border px-2.5 py-1 text-xs font-medium transition-colors"
+              :class="selectedGroupSet.has(g) ? 'border-[#0F766E] bg-[#F0FDFA] text-[#0F766E]' : 'border-[#E4E4E7] bg-white text-[#52525B] hover:bg-[#F4F4F5]'"
+              @click="toggleGroup(g)">{{ g }}</button>
           </div>
+          <p class="text-[11px] text-[#71717A]">Leave both empty to allow any authenticated caller. Selecting roles and groups restricts access to matching callers.</p>
         </div>
       </div>
 
-      <div class="rounded border border-[#99F6E4] bg-[#F0FDFA] p-3 text-xs text-[#09090B] space-y-1">
+      <!-- Execution mode: service-wide, auto, or per tool -->
+      <div class="space-y-3 rounded border border-[#E4E4E7] bg-[#FAFAFA] p-4">
         <div>
-          <strong class="text-[#0F766E]">Sessionless MCP:</strong>
-          Every request uses the current sessionless MCP protocol. Multi-step business workflows pass explicit resource IDs in tool arguments; cookie-based API sessions are unsupported.
+          <h3 class="text-sm font-semibold text-[#09090B]">Execution mode</h3>
+          <p class="text-xs text-[#52525B]">Pick one mode for the whole service, or leave it on Auto and the gateway decides per tool and per request. Tool overrides below are optional.</p>
         </div>
-        <div><strong class="text-[#0F766E]">A/B Advice:</strong> {{ sessionAdvice.abHint }}</div>
-      </div>
-
-      <details class="rounded border border-[#E4E4E7] bg-[#FAFAFA] p-3">
-        <summary class="cursor-pointer text-xs font-semibold text-[#09090B]">
-          Advanced A/B Settings (Optional)
-        </summary>
-        <div class="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <Field>
-            <div class="flex items-center justify-between gap-2">
-              <div>
-                <FieldLabel>Live Traffic A/B Experiment</FieldLabel>
-                <FieldDescription>Split traffic between Classic and Code Mode in /mcp</FieldDescription>
-              </div>
-              <Switch v-model:checked="draftAbEnabled">
-                <SwitchThumb />
-              </Switch>
+        <Select :items="modeOptions" :value="draftPreferredMode" @value-change="(v) => { if (v) draftPreferredMode = String(v) }">
+          <SelectTrigger><SelectValue /><AppIcon name="chevron-down" :size="14" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem v-for="m in modeOptions" :key="m.value" :value="m.value">{{ m.label }}<SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator></SelectItem>
+          </SelectContent>
+        </Select>
+        <details v-if="inspectResult" class="rounded border border-[#E4E4E7] bg-white p-3">
+          <summary class="cursor-pointer text-xs font-semibold text-[#09090B]">Per-tool overrides ({{ inspectResult.inspection.tool_count }} detected tools, {{ Object.values(draftToolModes).filter((m) => m && m !== 'inherit').length }} overridden)</summary>
+          <div class="mt-3 max-h-72 space-y-1.5 overflow-y-auto">
+            <div v-for="t in inspectResult.inspection.tools" :key="t.qualified_name" class="grid grid-cols-1 items-center gap-2 sm:grid-cols-[1fr_14rem]">
+              <div class="min-w-0"><div class="truncate font-mono-data text-xs text-[#09090B]">{{ t.name }}</div><div class="text-[11px] text-[#71717A]">{{ t.mutating ? "writes data" : "read-only" }}</div></div>
+              <select :value="draftToolModes[t.name] || 'inherit'" :aria-label="`Execution mode for ${t.name}`" class="rounded border border-[#D4D4D8] bg-white px-2 py-1.5 text-xs" @change="draftToolModes[t.name] = ($event.target as HTMLSelectElement).value">
+                <option v-for="m in toolModeOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
+              </select>
             </div>
-          </Field>
-          <Field v-if="draftAbEnabled">
-            <FieldLabel>Experiment ID</FieldLabel>
-            <Input v-model="draftAbExpId" class="font-mono-data text-xs" />
-          </Field>
-          <Field v-if="draftAbEnabled">
-            <FieldLabel>Code Mode Traffic Split (%)</FieldLabel>
-            <Input v-model="draftAbSplitPct" inputmode="numeric" />
-          </Field>
-        </div>
-      </details>
+          </div>
+        </details>
+      </div>
 
       <div class="flex flex-wrap items-center justify-between gap-2 border-t border-[#E4E4E7] pt-4">
         <Button @click="onboardingStep = 1">← Back: Connect</Button>
@@ -1049,135 +930,39 @@ async function copyPromptText() {
       </div>
     </div>
 
-    <!-- Step 3: Test & Publish -->
+    <!-- Step 3: Test & Save -->
     <div v-else class="grid grid-cols-1 gap-6 xl:grid-cols-12">
       <section class="space-y-5 rounded-lg border border-[#E4E4E7] bg-white p-5 xl:col-span-7">
         <div class="flex items-center gap-2 border-b border-[#E4E4E7] pb-3">
           <AppIcon name="flask" :size="16" class="text-[#0F766E]" />
-          <h2 class="text-[15px] font-semibold text-[#09090B]">
-            Step 3 — Onboarding A/B Test Lab &amp; Publish
-          </h2>
+          <h2 class="text-[15px] font-semibold text-[#09090B]">Step 3 — Test &amp; Save</h2>
         </div>
 
-        <Field>
-          <FieldLabel>Target Upstream to Evaluate</FieldLabel>
-          <Select
-            :items="existingUpstreamOptions"
-            :value="abSource"
-            @value-change="(v) => { if (v) abSource = String(v) }"
-          >
-            <SelectTrigger>
-              <SelectValue />
-              <AppIcon name="chevron-down" :size="14" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem v-for="opt in existingUpstreamOptions" :key="opt.value" :value="opt.value">
-                {{ opt.label }}
-                <SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator>
-              </SelectItem>
-            </SelectContent>
-          </Select>
-          <FieldDescription>
-            Select which registered service (or your current draft) receives the Classic vs. Code Mode evaluation probe.
-          </FieldDescription>
-        </Field>
+        <div class="space-y-2 rounded border border-[#E4E4E7] bg-[#FAFAFA] p-3 text-xs leading-5 text-[#52525B]">
+          <div><strong class="text-[#09090B]">What “Estimate Code Mode vs Classic” does:</strong> it measures the tool schemas of <span class="font-mono-data">{{ draftName }}</span> and the payload size you give below, then estimates how many context tokens the model would need in Classic MCP (every tool schema and result in the prompt) versus Code Mode (a short search and one script). It also suggests a mode.</div>
+          <div>No model is called and nothing is sent to the service. Real per-model results appear on <strong>Model Performance</strong> once traffic flows, and Auto mode keeps adjusting from those results. This step is optional; you can save without it.</div>
+        </div>
 
-        <Tabs v-model:value="abTab">
-          <TabsList aria-label="A/B evaluation modes">
-            <TabsTab value="replay">Algorithmic &amp; Replay</TabsTab>
-            <TabsTab value="llm">Live Admin LLM (Optional)</TabsTab>
-          </TabsList>
-
-          <TabsPanel value="replay" class="space-y-3">
-            <Field>
-              <FieldLabel>Workload Intent (optional)</FieldLabel>
-              <Input v-model="abIntent" placeholder="e.g. reconcile invoices and summarize deltas" />
-            </Field>
-            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <Field>
-                <FieldLabel>Estimated Payload Bytes</FieldLabel>
-                <Input v-model="abSampleBytes" inputmode="numeric" />
-              </Field>
-              <Field>
-                <div class="flex h-full items-center justify-between gap-2 pt-4">
-                  <FieldLabel>Dry-Run Estimate Only</FieldLabel>
-                  <Switch v-model:checked="abDryRun">
-                    <SwitchThumb />
-                  </Switch>
-                </div>
-              </Field>
-            </div>
-          </TabsPanel>
-
-          <TabsPanel value="llm" class="space-y-3">
-            <Field>
-              <div class="flex items-center justify-between gap-2">
-                <div>
-                  <FieldLabel>Enable Live OpenAI-Compatible A/B</FieldLabel>
-                  <FieldDescription>Runs both Classic &amp; Code Mode arms against the chosen model</FieldDescription>
-                </div>
-                <Switch v-model:checked="llmEnabled">
-                  <SwitchThumb />
-                </Switch>
-              </div>
-            </Field>
-            <div v-if="llmEnabled" class="space-y-3">
-              <div class="flex flex-wrap items-center gap-2 text-xs">
-                <span class="text-[#52525B]">Local LLM presets:</span>
-                <Button class="px-2 py-0.5 text-[11px]" @click="applyLocalLlmPreset('lmstudio')">
-                  LM Studio (:1234)
-                </Button>
-                <Button class="px-2 py-0.5 text-[11px]" @click="applyLocalLlmPreset('ollama')">
-                  Ollama (:11434)
-                </Button>
-              </div>
-              <p class="text-[11px] text-[#52525B]">
-                Running in Docker? Use <code class="font-mono-data">http://host.docker.internal:1234/v1</code> (LM Studio) or <code class="font-mono-data">http://host.docker.internal:11434/v1</code> (Ollama) with Local Network / CORS enabled.
-              </p>
-              <Field>
-                <FieldLabel>Base URL</FieldLabel>
-                <Input v-model="llmBaseUrl" class="font-mono-data text-xs" />
-              </Field>
-              <div class="grid grid-cols-2 gap-3">
-                <Field>
-                  <FieldLabel>Model</FieldLabel>
-                  <Input v-model="llmModel" class="font-mono-data text-xs" />
-                </Field>
-                <Field>
-                  <FieldLabel>API Key (optional for local)</FieldLabel>
-                  <Input v-model="llmApiKey" type="password" class="font-mono-data text-xs" />
-                </Field>
-              </div>
-              <Field>
-                <FieldLabel>Test Prompt</FieldLabel>
-                <Textarea v-model="llmPrompt" rows="2" />
-              </Field>
-              <Field>
-                <FieldLabel>Expected Substrings (comma-separated)</FieldLabel>
-                <Input v-model="llmExpected" placeholder="total, status" />
-              </Field>
-            </div>
-          </TabsPanel>
-        </Tabs>
+        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <Field>
+            <FieldLabel>Typical task (optional)</FieldLabel>
+            <Input v-model="abIntent" placeholder="e.g. reconcile invoices and summarize deltas" />
+          </Field>
+          <Field>
+            <FieldLabel>Typical result size (bytes)</FieldLabel>
+            <Input v-model="abSampleBytes" inputmode="numeric" />
+          </Field>
+        </div>
 
         <div class="flex flex-wrap items-center justify-between gap-2 border-t border-[#E4E4E7] pt-4">
           <Button @click="onboardingStep = 2">← Back: Policy</Button>
           <div class="flex flex-wrap items-center gap-2">
-            <Button
-              pending-announcement="Running A/B evaluation"
-              @click="runAbTest"
-            >
+            <Button :disabled="abBusy" pending-announcement="Estimating" @click="runAbTest">
               <AppIcon name="flask" :size="15" />
-              <span>Run A/B Evaluation</span>
+              <span>Estimate Code Mode vs Classic</span>
             </Button>
-            <Button
-              v-if="dynamicPermitted"
-              data-variant="primary"
-              data-agent-confirm="Register or update this upstream service in the gateway?"
-              pending-announcement="Registering upstream"
-              @click="handleRegister"
-            >
-              Register Upstream
+            <Button v-if="dynamicPermitted" data-variant="primary" data-agent-confirm="Register or update this upstream service in the gateway?" pending-announcement="Registering upstream" @click="handleRegister">
+              Save Upstream
             </Button>
             <Button @click="copyYaml">
               <AppIcon name="copy" :size="14" />
@@ -1187,77 +972,33 @@ async function copyPromptText() {
         </div>
       </section>
 
-      <!-- Right: A/B Results & GitOps YAML Preview -->
       <section class="space-y-4 rounded-lg border border-[#E4E4E7] bg-white p-5 xl:col-span-5">
-        <h3 class="text-sm font-semibold text-[#09090B]">Evaluation &amp; GitOps Preview</h3>
+        <h3 class="text-sm font-semibold text-[#09090B]">Configuration preview</h3>
         <pre class="max-h-56 overflow-auto rounded border border-[#E4E4E7] bg-[#F4F4F5] p-3 font-mono-data text-xs text-[#09090B]">{{ yamlPreview }}</pre>
 
-        <!-- A/B Evaluation Results -->
         <div v-if="abResult" class="space-y-4 border-t border-[#E4E4E7] pt-4">
           <div class="rounded-md border border-[#99F6E4] bg-[#F0FDFA] p-3">
             <div class="flex items-center justify-between gap-2">
-              <span class="text-xs font-medium text-[#0F766E]">Recommended Mode</span>
-              <span class="font-mono-data text-sm font-semibold text-[#09090B]">
-                {{ abResult.recommendation.recommended_mode }} ({{ abResult.recommendation.confidence }})
-              </span>
+              <span class="text-xs font-medium text-[#0F766E]">Suggested mode</span>
+              <span class="font-mono-data text-sm font-semibold text-[#09090B]">{{ abResult.recommendation.recommended_mode }} ({{ abResult.recommendation.confidence }})</span>
             </div>
             <p class="mt-1 text-xs text-[#52525B]">{{ abResult.algorithmic.reason }}</p>
-            <div class="mt-3 flex flex-wrap gap-2">
-              <Button data-variant="primary" class="text-xs" @click="applyRecommendation(false)">
-                Apply Preferred Mode
-              </Button>
-              <Button class="text-xs" @click="applyRecommendation(true)">
-                Apply + Enable 50/50 Split
-              </Button>
-            </div>
+            <div class="mt-3"><Button data-variant="primary" class="text-xs" @click="applyRecommendation">Use as service mode</Button></div>
           </div>
-
-          <Meter
-            :value="abResult.algorithmic.score"
-            :min="0"
-            :max="100"
-            :format="(v: number) => `${v.toFixed(1)} / 100`"
-          >
-            <MeterLabel>Code Mode Suitability Score</MeterLabel>
-            <MeterValue class="tabular-nums text-xs font-semibold" />
-            <MeterTrack>
-              <MeterIndicator />
-            </MeterTrack>
-          </Meter>
-
           <ul v-if="abResult.algorithmic.factors.length" class="space-y-1 text-xs text-[#52525B]">
             <li v-for="f in abResult.algorithmic.factors" :key="f.name" class="flex justify-between gap-2">
               <span>{{ f.detail }}</span>
-              <span
-                class="font-mono-data font-medium tabular-nums shrink-0"
-                :class="f.delta >= 0 ? 'text-[#0F766E]' : 'text-[#2563EB]'"
-              >
-                {{ f.delta >= 0 ? `+${f.delta}` : f.delta }}
-              </span>
+              <span class="shrink-0 font-mono-data font-medium tabular-nums" :class="f.delta >= 0 ? 'text-[#0F766E]' : 'text-[#2563EB]'">{{ f.delta >= 0 ? `+${f.delta}` : f.delta }}</span>
             </li>
           </ul>
-
-          <div v-if="abResult.replay_ab" class="border-t border-[#E4E4E7] pt-3 text-xs space-y-1.5">
+          <div v-if="abResult.replay_ab" class="space-y-1.5 border-t border-[#E4E4E7] pt-3 text-xs">
             <div class="flex items-center justify-between font-semibold text-[#09090B]">
-              <span>Replay Context Comparison</span>
-              <span class="text-[#0F766E] tabular-nums">
-                {{ abResult.replay_ab.deltas.context_token_savings_pct }}% saved ({{ abResult.replay_ab.winner }})
-              </span>
+              <span>Estimated context per task</span>
+              <span class="tabular-nums text-[#0F766E]">{{ abResult.replay_ab.deltas.context_token_savings_pct }}% fewer tokens with {{ abResult.replay_ab.winner }}</span>
             </div>
-            <div class="flex justify-between text-[#52525B] tabular-nums">
-              <span class="text-[#2563EB]">Classic context: {{ abResult.replay_ab.classic.total_context_tokens }} tok</span>
-              <span class="text-[#0F766E]">Code Mode context: {{ abResult.replay_ab.code_mode.total_context_tokens }} tok</span>
-            </div>
-          </div>
-
-          <div v-if="abResult.live_llm_ab" class="border-t border-[#E4E4E7] pt-3 text-xs space-y-1">
-            <div class="flex items-center justify-between font-semibold text-[#09090B]">
-              <span>Live LLM ({{ abResult.live_llm_ab.model }})</span>
-              <span class="text-[#0F766E]">{{ abResult.live_llm_ab.winner }} ({{ abResult.live_llm_ab.token_savings_pct }}% fewer tok)</span>
-            </div>
-            <div class="flex justify-between text-[#52525B] tabular-nums">
-              <span>Classic: {{ abResult.live_llm_ab.classic.total_tokens }} tok ({{ abResult.live_llm_ab.classic.turns }} turns)</span>
-              <span>Code Mode: {{ abResult.live_llm_ab.code_mode.total_tokens }} tok ({{ abResult.live_llm_ab.code_mode.turns }} turns)</span>
+            <div class="flex justify-between tabular-nums text-[#52525B]">
+              <span class="text-[#2563EB]">Classic: {{ abResult.replay_ab.classic.total_context_tokens }} tok</span>
+              <span class="text-[#0F766E]">Code Mode: {{ abResult.replay_ab.code_mode.total_context_tokens }} tok</span>
             </div>
           </div>
         </div>

@@ -198,17 +198,33 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
                 detail="Admin role required for control-plane UI access.",
             )
 
+    def _effective_oidc_endpoints() -> tuple[str, str, str]:
+        dev_enabled = bool(settings.auth_mode == "dev" and settings.active_features.dev_auth)
+        mock_oidc_base = "http://127.0.0.1:8001/oidc"
+        auth_ep = settings.admin_oidc_authorization_endpoint or (
+            f"{mock_oidc_base}/authorize" if dev_enabled else ""
+        )
+        token_ep = settings.oidc_token_endpoint or (
+            f"{mock_oidc_base}/token" if dev_enabled else ""
+        )
+        issuer = (
+            mock_oidc_base
+            if dev_enabled and not settings.admin_oidc_authorization_endpoint
+            else settings.oidc_issuer
+        )
+        return auth_ep, token_ep, issuer
+
     @router.get("/auth/admin/config")
     async def admin_auth_config() -> dict[str, Any]:
-        oidc_enabled = bool(
-            settings.admin_oidc_authorization_endpoint and settings.oidc_token_endpoint
-        )
         dev_enabled = bool(settings.auth_mode == "dev" and settings.active_features.dev_auth)
+        auth_ep, token_ep, issuer = _effective_oidc_endpoints()
+        oidc_enabled = bool(auth_ep and token_ep)
         return {
             "auth_mode": settings.auth_mode,
             "profile": settings.effective_profile_name,
             "admin_auth_required": settings.admin_auth_required,
             "oidc_enabled": oidc_enabled,
+            "oidc_issuer": issuer,
             "dev_auth_enabled": dev_enabled,
             "token_login_enabled": settings.app_env != "prod",
             "dev_personas": sorted(DEV_PERSONAS) if dev_enabled else [],
@@ -218,12 +234,13 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
     async def admin_oidc_login(
         next_url: str = Query(default="/dashboard/"),
     ) -> RedirectResponse:
-        if not (settings.admin_oidc_authorization_endpoint and settings.oidc_token_endpoint):
+        auth_ep, token_ep, _ = _effective_oidc_endpoints()
+        if not (auth_ep and token_ep):
             raise HTTPException(
                 status_code=400,
                 detail="admin_oidc_authorization_endpoint and oidc_token_endpoint required",
             )
-        _validate_oidc_url(settings, settings.admin_oidc_authorization_endpoint)
+        _validate_oidc_url(settings, auth_ep)
         verifier = secrets.token_urlsafe(48)
         state = secrets.token_urlsafe(24)
         redirect_uri = (
@@ -246,9 +263,9 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
                 "code_challenge_method": "S256",
             }
         )
-        sep = "&" if "?" in settings.admin_oidc_authorization_endpoint else "?"
+        sep = "&" if "?" in auth_ep else "?"
         return RedirectResponse(
-            url=f"{settings.admin_oidc_authorization_endpoint}{sep}{params}",
+            url=f"{auth_ep}{sep}{params}",
             status_code=302,
         )
 
@@ -262,9 +279,10 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
         if not raw_state:
             raise HTTPException(status_code=400, detail="Invalid or expired OIDC state")
         pkce_data = json.loads(raw_state)
-        if not settings.oidc_token_endpoint:
+        _, token_ep, _ = _effective_oidc_endpoints()
+        if not token_ep:
             raise HTTPException(status_code=500, detail="oidc_token_endpoint not configured")
-        _validate_oidc_url(settings, settings.oidc_token_endpoint)
+        _validate_oidc_url(settings, token_ep)
 
         redirect_uri = (
             settings.admin_oidc_redirect_uri
@@ -283,7 +301,7 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
 
         http = runtime.validator._http_client or runtime.client_manager._get_client()
         token_resp = await http.post(
-            settings.oidc_token_endpoint,
+            token_ep,
             data=form_data,
             follow_redirects=False,
         )

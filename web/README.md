@@ -9,7 +9,12 @@ Responsive Nuxt 4 + Vue 3.5+ + `@ui-sdk/vue` + Tailwind CSS v4 control-plane UI 
 
 ## Setup & Commands
 
+Use Node.js `22.22.3` or newer within the supported Nuxt engine range (`^22.22.3 || ^24.15.0 || >=26.0.0`). The repository includes `.nvmrc` for Node version managers.
+
 ```bash
+# Select the project runtime (with nvm)
+nvm use
+
 # Install dependencies cleanly
 npm ci
 

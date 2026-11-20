@@ -349,42 +349,58 @@ class OidcTokenValidator:
         base = self.settings.gateway_public_url.rstrip("/")
         return f'Bearer resource_metadata="{base}/.well-known/oauth-protected-resource"'
 
-    async def _fetch_jwks(self, force_refresh: bool = False) -> dict[str, Any]:
+    async def _fetch_jwks(
+        self, force_refresh: bool = False, jwks_uri_override: str | None = None
+    ) -> dict[str, Any]:
         if (
             not force_refresh
+            and not jwks_uri_override
             and self._jwks_cache is not None
             and time.monotonic() < self._jwks_expires_at
         ):
             return self._jwks_cache
-        if not self.settings.oidc_jwks_uri:
+        target_uri = jwks_uri_override or self.settings.oidc_jwks_uri
+        if not target_uri:
             raise AuthError(500, "OIDC JWKS URI is not configured")
         if self.settings.ssrf_protection_enabled:
             from gateway.upstream_clients import validate_upstream_url
 
             validate_upstream_url(
-                self.settings.oidc_jwks_uri,
+                target_uri,
                 app_env=self.settings.app_env,
                 block_private_ips_in_prod=self.settings.block_private_ips_in_prod,
                 allowed_hosts=self.settings.allowed_upstream_hosts,
             )
         if self._http_client is not None:
-            resp = await self._http_client.get(self.settings.oidc_jwks_uri, follow_redirects=False)
+            resp = await self._http_client.get(target_uri, follow_redirects=False)
         else:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(self.settings.oidc_jwks_uri, follow_redirects=False)
+                resp = await client.get(target_uri, follow_redirects=False)
         resp.raise_for_status()
-        self._jwks_cache = resp.json()
-        self._jwks_expires_at = time.monotonic() + 300
-        return self._jwks_cache
+        jwks = resp.json()
+        if not jwks_uri_override:
+            self._jwks_cache = jwks
+            self._jwks_expires_at = time.monotonic() + 300
+        return jwks
 
     async def _resolve_public_key(self, token: str) -> Any:
+        header = jwt.get_unverified_header(token)
+        kid = header.get("kid")
         if self.settings.auth_mode == "dev":
+            if self.dev_keys is not None and (kid is None or kid == self.dev_keys.kid):
+                return self.dev_keys.public_pem
+            # External test OIDC provider (e.g. mock_backends on :8001/oidc)
+            unverified = jwt.decode(token, options={"verify_signature": False})
+            iss = str(unverified.get("iss") or "")
+            if self.settings.app_env != "prod" and iss == "http://127.0.0.1:8001/oidc":
+                jwks = await self._fetch_jwks(jwks_uri_override="http://127.0.0.1:8001/oidc/jwks")
+                key = self._match_jwk(jwks, kid)
+                if key is not None:
+                    return RSAAlgorithm.from_jwk(json.dumps(key))
             if self.dev_keys is None:
                 raise AuthError(500, "Dev key manager not initialized")
             return self.dev_keys.public_pem
 
-        header = jwt.get_unverified_header(token)
-        kid = header.get("kid")
         jwks = await self._fetch_jwks()
         key = self._match_jwk(jwks, kid)
         if key is None:
@@ -413,12 +429,17 @@ class OidcTokenValidator:
         www_auth = self.www_authenticate_header()
         try:
             key = await self._resolve_public_key(token)
+            allowed_issuers: str | list[str] = (
+                [self.settings.oidc_issuer, "http://127.0.0.1:8001/oidc"]
+                if self.settings.auth_mode == "dev" and self.settings.app_env != "prod"
+                else self.settings.oidc_issuer
+            )
             claims = jwt.decode(
                 token,
                 key=key,
                 algorithms=["RS256"],
                 audience=self.settings.oidc_audience,
-                issuer=self.settings.oidc_issuer,
+                issuer=allowed_issuers,
                 options={"require": ["exp", "sub"]},
             )
         except AuthError:

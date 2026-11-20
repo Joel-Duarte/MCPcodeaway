@@ -36,9 +36,14 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     // 2b. Dedicated Optimization & Cost Savings page
     await page.getByRole("link", { name: /Optimization & ROI/i }).click();
     await expect(page.getByRole("heading", { name: /Optimization & Cost Savings/i })).toBeVisible();
-    await expect(page.getByText(/Upstreams Needing Optimization/i)).toBeVisible();
+    await expect(page.getByRole("heading", { name: /Automatic routing is configured per tool/i })).toBeVisible();
 
-    // 2c. Dedicated Traces & Latency Timeline page
+    // 2c. Paired model/tool performance view and raw arm observations
+    await page.getByRole("link", { name: /Model Performance/i }).click();
+    await expect(page.getByRole("heading", { name: /Model Performance/i })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /Paired model \/ tool comparison/i })).toBeVisible();
+
+    // 2d. Dedicated Traces & Latency Timeline page
     await page.getByRole("link", { name: /Traces & Timeline/i }).click();
     await expect(page.getByRole("heading", { name: /Traces & Latency Timeline/i })).toBeVisible();
     await expect(page.getByText(/Where Time Is Spent by Group/i)).toBeVisible();
@@ -55,13 +60,21 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     await expect(page.getByRole("button", { name: /Errors Only/i })).toBeVisible();
     await expect(page.locator("table tbody tr").first()).toBeVisible();
 
-    // 5. Settings & Alerts page renders Model Pricing, Custom Alert Rules & Compliance Archive
+    // 5. Settings starts with authenticated workspace details; pricing and alert policies are separate tabs
     await page.getByRole("link", { name: /Settings & Alerts/i }).click();
-    await expect(page.getByRole("heading", { name: /Gateway Settings, Alert Rules & Compliance Retention/i })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Gateway configuration", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Administrator identity", exact: true })).toBeVisible();
+    await page.getByRole("tab", { name: /Model pricing/i }).click();
     await expect(page.getByText("qwen3.5-9b")).toBeVisible();
+    await page.getByRole("tab", { name: /Alerts & webhooks/i }).click();
     await expect(page.getByRole("heading", { name: "Custom Alert Rules", exact: true })).toBeVisible();
 
-    // 6. Onboarding 3-Step Progressive Wizard (Step 2 locked until Inspect Schema)
+    // Demo controls are a real server traffic runner, not a browser simulation
+    await page.getByRole("link", { name: /Demo Control/i }).click();
+    await expect(page.getByRole("heading", { name: "Traffic generator", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Server-managed model profiles", exact: true })).toBeVisible();
+
+    // 7. Onboarding 3-Step Progressive Wizard (Step 2 locked until Inspect Schema)
     await page.getByRole("link", { name: /Onboarding & A\/B Lab/i }).click();
     await expect(page.getByText("Stateful MCP Session", { exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /2\. Policy & Mode/i })).toBeDisabled();
@@ -88,12 +101,35 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     page,
   }) => {
     await page.setViewportSize({ width: 375, height: 812 });
-    for (const path of ["/dashboard/", "/dashboard/traces", "/dashboard/analytics", "/dashboard/optimization", "/dashboard/onboarding", "/dashboard/upstreams", "/dashboard/audit", "/dashboard/settings"]) {
+    for (const path of ["/dashboard/", "/dashboard/traces", "/dashboard/analytics", "/dashboard/optimization", "/dashboard/model-performance", "/dashboard/onboarding", "/dashboard/upstreams", "/dashboard/audit", "/dashboard/settings", "/dashboard/demo", "/dashboard/connections"]) {
       await page.goto(`${BASE}${path}`, { waitUntil: "networkidle" });
       const overflow = await page.evaluate(
         () => document.documentElement.scrollWidth - document.documentElement.clientWidth
       );
       expect(overflow, `Horizontal overflow on 375px at ${path}: ${overflow}px`).toBeLessThanOrEqual(2);
+    }
+  });
+
+  test("tablet and wide desktop breakpoints: no document-level horizontal overflow", async ({ page }) => {
+    test.setTimeout(90_000);
+    const routes = [
+      "/dashboard/",
+      "/dashboard/analytics",
+      "/dashboard/model-performance",
+      "/dashboard/traces",
+      "/dashboard/upstreams",
+      "/dashboard/settings",
+      "/dashboard/demo",
+    ];
+    for (const viewport of [{ width: 768, height: 1024 }, { width: 1440, height: 900 }]) {
+      await page.setViewportSize(viewport);
+      for (const path of routes) {
+        await page.goto(`${BASE}${path}`, { waitUntil: "networkidle" });
+        const overflow = await page.evaluate(
+          () => document.documentElement.scrollWidth - document.documentElement.clientWidth
+        );
+        expect(overflow, `Horizontal overflow at ${viewport.width}px on ${path}: ${overflow}px`).toBeLessThanOrEqual(2);
+      }
     }
   });
 });

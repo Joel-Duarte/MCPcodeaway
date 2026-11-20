@@ -283,8 +283,20 @@ class DemoTrafficRunner:
             ),
         ]
 
-        # Probe all enabled upstreams and their non-mutating tools across demo models.
+        # Probe all enabled upstreams and their non-mutating tools across demo models and personas.
         profiles = self.model_profiles or [{"model": "claude-sonnet-4-5"}]
+        personas = [
+            "finance_analyst",
+            "ops_engineer",
+            "platform_engineer",
+            "readonly_auditor",
+            "sales_ops_analyst",
+            "support_agent",
+            "gateway_admin",
+            "eu_accountant",
+            "us_accountant",
+            "legal_counsel",
+        ]
         idx = 0
         dynamic_workloads: list[tuple[str, str, str, dict[str, Any], dict[str, str] | None]] = []
         for upstream in self.runtime.registry.list_upstreams():
@@ -309,20 +321,26 @@ class DemoTrafficRunner:
                         default_args[field] = "demo"
                 prof = profiles[idx % len(profiles)]
                 model_name = str(prof.get("model") or "claude-sonnet-4-5")
+                persona = personas[idx % len(personas)]
                 arm = "codemode" if idx % 2 == 0 else "traditional"
                 idx += 1
                 arg_str = ", ".join(f"{k}={v!r}" for k, v in default_args.items())
                 params: dict[str, Any] = (
                     {
                         "name": "execute_code",
-                        "arguments": {"code": f"await {safe_tool.qualified_name}({arg_str})"},
+                        "arguments": {
+                            "code": (
+                                f"res = await {safe_tool.qualified_name}({arg_str})\n"
+                                f"len(res) if isinstance(res, (list, dict)) else 1"
+                            )
+                        },
                     }
                     if arm == "codemode"
                     else {"name": safe_tool.qualified_name, "arguments": default_args}
                 )
                 dynamic_workloads.append(
                     (
-                        "gateway_admin",
+                        persona,
                         f"mode={arm}",
                         f"{upstream.name}:{safe_tool.name}:{arm}",
                         params,
@@ -388,7 +406,7 @@ class DemoTrafficRunner:
             transport=httpx.ASGITransport(app=self._app), base_url="http://demo.local"
         ) as client:
             for _ in range(max(1, min(count, 100))):
-                item = workloads[self._step % len(workloads)]
+                item = random.choice(workloads)
                 self._step += 1
                 sent += 1
                 if await self._dispatch_one(client, *item):
@@ -404,7 +422,7 @@ class DemoTrafficRunner:
             while True:
                 workloads = self._next_workloads()
                 if workloads:
-                    item = workloads[self._step % len(workloads)]
+                    item = random.choice(workloads)
                     self._step += 1
                     await self._dispatch_one(client, *item)
                 base_delay, jitter = _TIER_TIMING.get(self.tier, (0.5, 0.2))

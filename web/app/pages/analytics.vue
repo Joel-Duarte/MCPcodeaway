@@ -85,28 +85,24 @@ const loading = ref(true);
 const errorMessage = ref("");
 const activeTab = ref<string>("company-groups");
 const selectedModel = ref("qwen3.5-9b");
+const modelSearch = ref("");
+const companyGroupPage = ref(1);
+const userPage = ref(1);
+const clientPage = ref(1);
+const breakdownPageSize = 10;
 const groupFilter = ref("");
 const userFilter = ref("");
 const upstreamFilter = ref("");
 const analytics = ref<AnalyticsResponse | null>(null);
-const customModelNames = ref<string[]>([]);
 let liveDebounce: ReturnType<typeof setTimeout> | null = null;
 let filterDebounce: ReturnType<typeof setTimeout> | null = null;
+let analyticsRequestSequence = 0;
 
-async function fetchPricingModels() {
-  try {
-    const res = await apiFetch<{ custom_models?: string[] }>("/admin/pricing/models", {}, true);
-    customModelNames.value = res.custom_models || [];
-  } catch {
-    customModelNames.value = [];
-  }
-}
 
 function clearAllFilters() {
   groupFilter.value = "";
   userFilter.value = "";
   upstreamFilter.value = "";
-  void fetchAnalytics();
 }
 
 const activeFilterChips = computed(() => {
@@ -121,32 +117,58 @@ function clearChip(key: "group" | "user" | "upstream") {
   if (key === "group") groupFilter.value = "";
   if (key === "user") userFilter.value = "";
   if (key === "upstream") upstreamFilter.value = "";
-  void fetchAnalytics();
 }
 
-const selectedWindow = ref("24h");
+const { selectedRange: selectedWindow } = useReportRange();
 
 async function fetchAnalytics() {
+  const requestId = ++analyticsRequestSequence;
   errorMessage.value = "";
   const params = new URLSearchParams();
   params.set("model", selectedModel.value || "qwen3.5-9b");
-  if (selectedWindow.value !== "all") params.set("window", selectedWindow.value);
+  params.set("limit", "5000");
+  params.set("window", selectedWindow.value);
   if (groupFilter.value.trim()) params.set("group", groupFilter.value.trim());
   if (userFilter.value.trim()) params.set("user", userFilter.value.trim());
   if (upstreamFilter.value.trim()) params.set("upstream", upstreamFilter.value.trim());
 
   try {
-    analytics.value = await apiFetch<AnalyticsResponse>(`/audit/analytics?${params.toString()}`);
+    const response = await apiFetch<AnalyticsResponse>(`/audit/analytics?${params.toString()}`);
+    if (requestId !== analyticsRequestSequence) return;
+    const availableModels = response?.pricing?.available_models || [];
+    if (availableModels.length && !availableModels.includes(selectedModel.value)) {
+      const fallbackModel = response.pricing.model && availableModels.includes(response.pricing.model)
+        ? response.pricing.model
+        : availableModels[0];
+      selectedModel.value = fallbackModel;
+      params.set("model", fallbackModel);
+      const fallbackResponse = await apiFetch<AnalyticsResponse>(`/audit/analytics?${params.toString()}`);
+      if (requestId !== analyticsRequestSequence) return;
+      analytics.value = fallbackResponse;
+    } else {
+      analytics.value = response;
+    }
+    companyGroupPage.value = 1;
+    userPage.value = 1;
+    clientPage.value = 1;
   } catch (err) {
-    errorMessage.value = extractErrorMessage(err);
+    if (requestId === analyticsRequestSequence) errorMessage.value = extractErrorMessage(err);
   } finally {
-    loading.value = false;
+    if (requestId === analyticsRequestSequence) loading.value = false;
   }
 }
 
-watch([groupFilter, userFilter, upstreamFilter], () => {
+watch(selectedWindow, () => {
+  void fetchAnalytics();
+});
+
+watch([modelSearch, groupFilter, userFilter, upstreamFilter], () => {
   if (filterDebounce) clearTimeout(filterDebounce);
   filterDebounce = setTimeout(() => {
+    const matched = resolveFuzzyModel(modelSearch.value, availableModelsList.value);
+    if (matched && matched !== selectedModel.value) {
+      selectedModel.value = matched;
+    }
     void fetchAnalytics();
   }, 300);
 });
@@ -159,7 +181,7 @@ watch(totalRunsTick, () => {
 });
 
 onMounted(() => {
-  void Promise.all([fetchPricingModels(), fetchAnalytics()]);
+  void fetchAnalytics();
 });
 
 onBeforeUnmount(() => {
@@ -173,10 +195,62 @@ onBeforeUnmount(() => {
   }
 });
 
-const modelOptions = computed(() => {
-  const models = analytics.value?.pricing?.available_models || ["default"];
-  return models.map((m) => ({ value: m, label: m }));
+const availableModelsList = computed(() => analytics.value?.pricing?.available_models || ["default"]);
+
+const pairedModeRunCount = computed(() =>
+  (analytics.value?.summary.codemode_runs || 0) + (analytics.value?.summary.classic_runs || 0),
+);
+const otherModeRunCount = computed(() => Math.max(
+  0,
+  (analytics.value?.summary.total_runs || 0) - pairedModeRunCount.value,
+));
+const codemodeSharePct = computed(() => pairedModeRunCount.value
+  ? (analytics.value!.summary.codemode_runs / pairedModeRunCount.value) * 100
+  : 0);
+const companyGroupsSorted = computed(() =>
+  [...(analytics.value?.by_company_group || [])]
+    .map((group) => {
+      const pairedRuns = group.codemode_runs + group.classic_runs;
+      return { ...group, codemode_share_pct: pairedRuns ? (group.codemode_runs / pairedRuns) * 100 : 0 };
+    })
+    .sort((a, b) => b.runs - a.runs),
+);
+const companyGroupsChart = computed(() => {
+  const groups = companyGroupsSorted.value;
+  const top = groups.slice(0, 5);
+  const rest = groups.slice(5);
+  if (!rest.length) return top;
+  const otherRuns = rest.reduce((sum, g) => sum + g.runs, 0);
+  const otherCode = rest.reduce((sum, g) => sum + g.codemode_runs, 0);
+  const otherClassic = rest.reduce((sum, g) => sum + g.classic_runs, 0);
+  const otherTokens = rest.reduce((sum, g) => sum + g.tokens_saved, 0);
+  const otherCost = rest.reduce((sum, g) => sum + g.estimated_cost_saved_usd, 0);
+  return [...top, {
+    group: `Other ${rest.length} groups`, unique_users: 0, runs: otherRuns, subcalls: 0,
+    classic_runs: otherClassic, codemode_runs: otherCode,
+    codemode_share_pct: (otherCode + otherClassic) ? (otherCode / (otherCode + otherClassic)) * 100 : 0,
+    tokens_saved: otherTokens, estimated_cost_usd: 0, estimated_cost_saved_usd: otherCost,
+    abac_rows_filtered: 0, pii_redactions: 0,
+  }];
 });
+const pagedCompanyGroups = computed(() => {
+  const rows = companyGroupsSorted.value;
+  const start = (companyGroupPage.value - 1) * breakdownPageSize;
+  return rows.slice(start, start + breakdownPageSize);
+});
+const pagedUsers = computed(() => {
+  const rows = analytics.value?.by_user || [];
+  const start = (userPage.value - 1) * breakdownPageSize;
+  return rows.slice(start, start + breakdownPageSize);
+});
+const pagedClientGroups = computed(() => {
+  const rows = analytics.value?.by_client_group || [];
+  const start = (clientPage.value - 1) * breakdownPageSize;
+  return rows.slice(start, start + breakdownPageSize);
+});
+const companyGroupPages = computed(() => Math.max(1, Math.ceil(companyGroupsSorted.value.length / breakdownPageSize)));
+const userPages = computed(() => Math.max(1, Math.ceil((analytics.value?.by_user.length || 0) / breakdownPageSize)));
+const clientPages = computed(() => Math.max(1, Math.ceil((analytics.value?.by_client_group.length || 0) / breakdownPageSize)));
 
 function formatInt(n: number | undefined): string {
   return Number(n || 0).toLocaleString("en-US");
@@ -199,43 +273,12 @@ function formatUsd(n: number | undefined): string {
             class="inline-flex items-center gap-1 rounded-full border border-[#99F6E4] bg-[#F0FDFA] px-2 py-0.5 text-[11px] font-medium text-[#0F766E]"
           >
             <span class="h-1.5 w-1.5 rounded-full bg-[#0F766E]" />
-            3s
+            Live
           </span>
         </div>
         <p class="mt-0.5 text-[13px] text-[#52525B]">
-          Track overall MCP gateway traffic, top company groups, active users, and ABAC/PII governance.
+          Track gateway traffic, tenant and client-group usage, user activity, and ABAC/PII governance. Cost figures are gateway estimates based on the configured model price catalogue, not invoice-reconciled spend.
         </p>
-      </div>
-      <div class="flex flex-wrap items-center gap-2">
-        <div class="flex items-center gap-1">
-          <button
-            v-for="w in ['1h', '24h', '7d', '30d', 'all']"
-            :key="w"
-            type="button"
-            class="rounded border px-2 py-1 text-xs font-mono-data transition"
-            :class="
-              selectedWindow === w
-                ? 'border-[#0F766E] bg-[#F0FDFA] font-semibold text-[#0F766E]'
-                : 'border-[#E4E4E7] bg-white text-[#52525B] hover:bg-[#FAFAFA]'
-            "
-            @click="selectedWindow = w; void fetchAnalytics()"
-          >
-            {{ w }}
-          </button>
-        </div>
-        <NuxtLink
-          to="/optimization"
-          class="no-underline inline-flex items-center gap-1.5 rounded-md border border-[#99F6E4] bg-[#F0FDFA] px-3 py-1.5 text-xs font-medium text-[#0F766E] hover:bg-[#CCFBF1]"
-        >
-          <span>Optimization &amp; A/B ROI</span>
-        </NuxtLink>
-        <NuxtLink
-          to="/settings"
-          class="no-underline inline-flex items-center gap-1.5 rounded-md border border-[#D4D4D8] bg-white px-3 py-1.5 text-xs font-medium text-[#09090B] hover:bg-[#F4F4F5]"
-        >
-          <AppIcon name="shield" :size="14" />
-          <span>Model Pricing</span>
-        </NuxtLink>
       </div>
     </div>
 
@@ -243,30 +286,24 @@ function formatUsd(n: number | undefined): string {
     <section class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Field>
-          <FieldLabel>Model Pricing</FieldLabel>
-          <Select
-            :items="modelOptions"
-            :value="selectedModel"
-            @value-change="(v) => { if (v) { selectedModel = String(v); void fetchAnalytics(); } }"
-          >
-            <SelectTrigger>
-              <SelectValue />
-              <AppIcon name="chevron-down" :size="14" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem v-for="item in modelOptions" :key="item.value" :value="item.value">
-                {{ item.label }}
-                <SelectItemIndicator>
-                  <AppIcon name="check" :size="14" />
-                </SelectItemIndicator>
-              </SelectItem>
-            </SelectContent>
-          </Select>
+          <FieldLabel>Model</FieldLabel>
+          <Input
+            v-model="modelSearch"
+            list="analytics-detected-models"
+            placeholder="Search detected models..."
+            aria-label="Search detected models"
+          />
+          <datalist id="analytics-detected-models">
+            <option v-for="m in availableModelsList" :key="m" :value="m" />
+          </datalist>
+          <p v-if="selectedModel" class="text-[11px] font-mono-data text-[#71717A]">
+            Active: {{ selectedModel }}
+          </p>
         </Field>
 
         <Field>
-          <FieldLabel>Company Group (fuzzy)</FieldLabel>
-          <Input v-model="groupFilter" placeholder="e.g. fin -> finance" />
+          <FieldLabel>Tenant / Company Group</FieldLabel>
+          <Input v-model="groupFilter" placeholder="Search a group name..." />
         </Field>
 
         <Field>
@@ -275,8 +312,8 @@ function formatUsd(n: number | undefined): string {
         </Field>
 
         <Field>
-          <FieldLabel>Upstream Server</FieldLabel>
-          <Input v-model="upstreamFilter" placeholder="Filter by upstream" />
+          <FieldLabel>Upstream</FieldLabel>
+          <Input v-model="upstreamFilter" placeholder="Search upstream name..." />
         </Field>
       </div>
 
@@ -345,13 +382,14 @@ function formatUsd(n: number | undefined): string {
         </div>
 
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-          <div class="text-xs font-medium text-[#52525B]">Code Mode Share</div>
+          <div class="text-xs font-medium text-[#52525B]">Code Mode share · Code vs Classic</div>
           <div class="mt-1.5 text-2xl font-semibold text-[#0F766E] tabular-nums">
-            {{ analytics.summary.codemode_share_pct.toFixed(1) }}%
+            {{ codemodeSharePct.toFixed(1) }}%
           </div>
           <div class="mt-1 text-xs text-[#71717A] tabular-nums">
-            {{ formatInt(analytics.summary.total_tokens_saved) }} tokens saved
+            {{ formatInt(analytics.summary.codemode_runs) }} of {{ formatInt(pairedModeRunCount) }} Code / Classic runs
           </div>
+          <div v-if="otherModeRunCount > 0" class="mt-1 text-[11px] text-[#71717A]">{{ formatInt(otherModeRunCount) }} other / Hybrid runs excluded</div>
         </div>
 
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
@@ -367,7 +405,7 @@ function formatUsd(n: number | undefined): string {
         </div>
 
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-          <div class="text-xs font-medium text-[#52525B]">Estimated Cost Saved</div>
+          <div class="text-xs font-medium text-[#52525B]">Gateway-estimated LLM cost reduction</div>
           <div class="mt-1.5 text-2xl font-semibold text-[#059669] tabular-nums">
             {{ formatUsd(analytics.summary.estimated_cost_saved_usd) }}
           </div>
@@ -378,60 +416,6 @@ function formatUsd(n: number | undefined): string {
       </section>
 
       <!-- Group Savings Comparison Chart (SVG bars) -->
-      <section
-        v-if="analytics.by_company_group.length > 0"
-        aria-label="Company group mode and token comparison"
-        class="rounded-lg border border-[#E4E4E7] bg-white p-4"
-      >
-        <div class="flex flex-wrap items-center justify-between gap-2">
-          <h2 class="text-[15px] font-semibold text-[#09090B]">
-            Code Mode vs. Classic Volume by Company Group
-          </h2>
-          <div class="flex items-center gap-4 text-xs text-[#52525B]">
-            <span class="inline-flex items-center gap-1.5">
-              <span class="inline-block h-2.5 w-2.5 rounded-sm bg-[#0F766E]" />
-              Code Mode Runs
-            </span>
-            <span class="inline-flex items-center gap-1.5">
-              <span class="inline-block h-2.5 w-2.5 rounded-sm bg-[#2563EB]" />
-              Classic Runs
-            </span>
-          </div>
-        </div>
-        <div class="mt-3 space-y-2.5">
-          <div
-            v-for="g in analytics.by_company_group"
-            :key="g.group"
-            class="grid grid-cols-1 gap-1.5 sm:grid-cols-12 sm:items-center"
-          >
-            <div class="sm:col-span-3 text-xs font-medium text-[#09090B] truncate">
-              {{ g.group }}
-            </div>
-            <div class="sm:col-span-6">
-              <svg viewBox="0 0 100 8" class="h-3 w-full overflow-hidden rounded bg-[#F4F4F5]" role="img" :aria-label="`${g.group} run split`">
-                <rect
-                  x="0"
-                  y="0"
-                  :width="g.runs > 0 ? (g.codemode_runs / g.runs) * 100 : 0"
-                  height="8"
-                  fill="#0F766E"
-                />
-                <rect
-                  :x="g.runs > 0 ? (g.codemode_runs / g.runs) * 100 : 0"
-                  y="0"
-                  :width="g.runs > 0 ? (g.classic_runs / g.runs) * 100 : 0"
-                  height="8"
-                  fill="#2563EB"
-                />
-              </svg>
-            </div>
-            <div class="sm:col-span-3 text-right text-xs text-[#52525B] tabular-nums">
-              {{ formatInt(g.tokens_saved) }} tok · {{ formatUsd(g.estimated_cost_saved_usd) }}
-            </div>
-          </div>
-        </div>
-      </section>
-
       <!-- Segmented Tables via @ui-sdk/vue Tabs -->
       <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
         <Tabs v-model:value="activeTab">
@@ -453,25 +437,25 @@ function formatUsd(n: number | undefined): string {
                     <th class="px-3 py-2.5 whitespace-nowrap">Company Group</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Users</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Runs</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap min-w-[140px]">Mode Mix (Teal / Blue)</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Tokens Saved</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap min-w-[140px]">Code / Classic share</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Gateway-reported token reduction</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Est. Cost</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Est. Saved</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Gateway-est. cost reduction</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">ABAC / PII</th>
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-[#E4E4E7]">
-                  <tr v-for="g in analytics.by_company_group" :key="g.group" class="hover:bg-[#FAFAFA]">
+                  <tr v-for="g in pagedCompanyGroups" :key="g.group" class="hover:bg-[#FAFAFA]">
                     <td class="px-3 py-2.5 font-medium text-[#09090B] whitespace-nowrap">{{ g.group }}</td>
                     <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(g.unique_users) }}</td>
                     <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(g.runs) }}</td>
                     <td class="px-3 py-2.5 whitespace-nowrap">
                       <div class="flex items-center gap-2">
-                        <div class="flex h-2 w-24 overflow-hidden rounded bg-[#F4F4F5]">
-                          <div class="h-full bg-[#0F766E]" :style="{ width: `${g.codemode_share_pct}%` }" />
-                          <div class="h-full bg-[#2563EB]" :style="{ width: `${Math.max(0, 100 - g.codemode_share_pct)}%` }" />
+                        <div class="flex h-2 w-24 overflow-hidden rounded bg-[#F4F4F5]" :aria-label="`${g.codemode_runs} Code Mode and ${g.classic_runs} Classic runs out of ${g.runs} total`">
+                          <div class="h-full bg-[#0F766E]" :style="{ width: `${g.runs > 0 ? (g.codemode_runs / g.runs) * 100 : 0}%` }" />
+                          <div class="h-full bg-[#2563EB]" :style="{ width: `${g.runs > 0 ? (g.classic_runs / g.runs) * 100 : 0}%` }" />
                         </div>
-                        <span class="text-xs tabular-nums text-[#52525B]">{{ g.codemode_share_pct.toFixed(0) }}%</span>
+                        <span class="text-xs tabular-nums text-[#52525B]">{{ g.codemode_share_pct.toFixed(0) }}% Code</span>
                       </div>
                     </td>
                     <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(g.tokens_saved) }}</td>
@@ -483,6 +467,13 @@ function formatUsd(n: number | undefined): string {
                   </tr>
                 </tbody>
               </table>
+            </div>
+            <div v-if="companyGroupPages > 1" class="mt-3 flex items-center justify-between border-t border-[#E4E4E7] pt-3 text-xs text-[#52525B]">
+              <span>Showing {{ (companyGroupPage - 1) * breakdownPageSize + 1 }}–{{ Math.min(companyGroupPage * breakdownPageSize, analytics.by_company_group.length) }} of {{ analytics.by_company_group.length }} groups</span>
+              <div class="flex gap-2">
+                <Button :disabled="companyGroupPage <= 1" @click="companyGroupPage -= 1">Previous</Button>
+                <Button :disabled="companyGroupPage >= companyGroupPages" @click="companyGroupPage += 1">Next</Button>
+              </div>
             </div>
           </TabsPanel>
 
@@ -498,13 +489,13 @@ function formatUsd(n: number | undefined): string {
                     <th class="px-3 py-2.5 whitespace-nowrap">Groups</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Runs (CM / CL)</th>
                     <th class="px-3 py-2.5 whitespace-nowrap">Top Upstreams</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Tokens Saved</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Gateway-reported token reduction</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Est. Cost</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Est. Saved</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Gateway-est. cost reduction</th>
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-[#E4E4E7]">
-                  <tr v-for="u in analytics.by_user" :key="u.user_sub" class="hover:bg-[#FAFAFA]">
+                  <tr v-for="u in pagedUsers" :key="u.user_sub" class="hover:bg-[#FAFAFA]">
                     <td class="px-3 py-2.5 whitespace-nowrap">
                       <div class="font-medium text-[#09090B]">{{ u.user_email || u.user_sub }}</div>
                       <div class="font-mono-data text-[11px] text-[#71717A]">{{ u.user_sub }}</div>
@@ -523,6 +514,13 @@ function formatUsd(n: number | undefined): string {
                 </tbody>
               </table>
             </div>
+            <div v-if="userPages > 1" class="mt-3 flex items-center justify-between border-t border-[#E4E4E7] pt-3 text-xs text-[#52525B]">
+              <span>Showing {{ (userPage - 1) * breakdownPageSize + 1 }}–{{ Math.min(userPage * breakdownPageSize, analytics.by_user.length) }} of {{ analytics.by_user.length }} users</span>
+              <div class="flex gap-2">
+                <Button :disabled="userPage <= 1" @click="userPage -= 1">Previous</Button>
+                <Button :disabled="userPage >= userPages" @click="userPage += 1">Next</Button>
+              </div>
+            </div>
           </TabsPanel>
 
           <TabsPanel value="client-groups">
@@ -535,12 +533,12 @@ function formatUsd(n: number | undefined): string {
                   <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-xs font-medium text-[#52525B]">
                     <th class="px-3 py-2.5 whitespace-nowrap">Client Group</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Runs</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Tokens Saved</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Gateway-reported token reduction</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">ABAC Rows Filtered</th>
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-[#E4E4E7]">
-                  <tr v-for="cg in analytics.by_client_group" :key="cg.client_group" class="hover:bg-[#FAFAFA]">
+                  <tr v-for="cg in pagedClientGroups" :key="cg.client_group" class="hover:bg-[#FAFAFA]">
                     <td class="px-3 py-2.5 font-mono-data font-medium text-[#09090B] whitespace-nowrap">{{ cg.client_group }}</td>
                     <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(cg.runs) }}</td>
                     <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(cg.tokens_saved) }}</td>
@@ -548,6 +546,13 @@ function formatUsd(n: number | undefined): string {
                   </tr>
                 </tbody>
               </table>
+            </div>
+            <div v-if="clientPages > 1" class="mt-3 flex items-center justify-between border-t border-[#E4E4E7] pt-3 text-xs text-[#52525B]">
+              <span>Showing {{ (clientPage - 1) * breakdownPageSize + 1 }}–{{ Math.min(clientPage * breakdownPageSize, analytics.by_client_group.length) }} of {{ analytics.by_client_group.length }} client groups</span>
+              <div class="flex gap-2">
+                <Button :disabled="clientPage <= 1" @click="clientPage -= 1">Previous</Button>
+                <Button :disabled="clientPage >= clientPages" @click="clientPage += 1">Next</Button>
+              </div>
             </div>
           </TabsPanel>
 
@@ -563,7 +568,7 @@ function formatUsd(n: number | undefined): string {
                     <th class="px-3 py-2.5 whitespace-nowrap">Decision Attribution Reason</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Runs</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Avg Auto Score</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Avg Tokens Saved</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Avg Gateway-reported token reduction</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Avg Latency</th>
                   </tr>
                 </thead>

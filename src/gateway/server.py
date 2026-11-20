@@ -3137,6 +3137,18 @@ def create_gateway_app(
             deleted = False
             if hasattr(runtime.store, "delete_model_pricing"):
                 deleted = await runtime.store.delete_model_pricing(model_name)
+            if model_name in runtime.settings.model_pricing:
+                runtime.settings.model_pricing.pop(model_name, None)
+                deleted = True
+            if hasattr(runtime.store, "get_setting") and hasattr(runtime.store, "save_setting"):
+                scores = dict(await runtime.store.get_setting("model_routing_scores") or {})
+                if model_name in scores:
+                    scores.pop(model_name, None)
+                    await runtime.store.save_setting("model_routing_scores", scores)
+            if hasattr(runtime, "demo_traffic") and runtime.demo_traffic:
+                runtime.demo_traffic.model_profiles = [
+                    p for p in runtime.demo_traffic.model_profiles if p.get("model") != model_name
+                ]
             return {"deleted": deleted, "models": await runtime.merged_model_pricing()}
 
         @app.post("/admin/routing/models")

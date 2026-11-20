@@ -17,6 +17,7 @@ export type IconName =
   | "copy"
   | "trash"
   | "chevron-down"
+  | "chevron-right"
   | "lock";
 
 withDefaults(
@@ -50,14 +51,15 @@ withDefaults(
       <path d="M18 6 6 18M6 6l12 12" />
     </template>
     <template v-else-if="name === 'overview'">
-      <rect x="3" y="3" width="7" height="9" rx="1" />
-      <rect x="14" y="3" width="7" height="5" rx="1" />
-      <rect x="14" y="12" width="7" height="9" rx="1" />
-      <rect x="3" y="16" width="7" height="5" rx="1" />
+      <path d="M4 18a8 8 0 1 1 16 0" />
+      <path d="m12 14 4-4" />
+      <path d="M7 18h10" />
     </template>
     <template v-else-if="name === 'analytics'">
-      <path d="M3 3v18h18" />
-      <path d="M7 14l4-4 4 3 5-6" />
+      <path d="M3 20h18" />
+      <rect x="5" y="11" width="3" height="9" rx=".5" />
+      <rect x="10.5" y="6" width="3" height="14" rx=".5" />
+      <rect x="16" y="9" width="3" height="11" rx=".5" />
     </template>
     <template v-else-if="name === 'onboarding'">
       <path d="M12 5v14M5 12h14" />
@@ -110,6 +112,9 @@ withDefaults(
     </template>
     <template v-else-if="name === 'chevron-down'">
       <path d="m6 9 6 6 6-6" />
+    </template>
+    <template v-else-if="name === 'chevron-right'">
+      <path d="m9 6 6 6-6 6" />
     </template>
     <template v-else-if="name === 'lock'">
       <rect x="5" y="11" width="14" height="10" rx="2" />

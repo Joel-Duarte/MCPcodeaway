@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { onBeforeUnmount } from "vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
 
 interface TraceRun {
@@ -50,6 +51,7 @@ const runs = ref<TraceRun[]>([]);
 const timelineGroups = ref<TimelineGroup[]>([]);
 const runtime = ref<RuntimeTelemetry | null>(null);
 const liveUpdates = ref(true);
+let groupFilterTimer: ReturnType<typeof setTimeout> | null = null;
 
 async function fetchTraces() {
   errorMessage.value = "";
@@ -59,7 +61,7 @@ async function fetchTraces() {
       : "";
     const [r, a] = await Promise.all([
       apiFetch<{ runs: TraceRun[] }>("/audit/runs?limit=50"),
-      apiFetch<{ timeline_by_group?: TimelineGroup[] }>(`/audit/analytics${gq}`),
+      apiFetch<{ timeline_by_group?: TimelineGroup[] }>(`/audit/analytics?limit=5000${gq ? `&${gq.slice(1)}` : ""}`),
     ]);
     const allRuns = r.runs || [];
     const gf = groupFilter.value.trim().toLowerCase();
@@ -81,6 +83,15 @@ async function fetchTraces() {
 
 onMounted(() => {
   void fetchTraces();
+});
+
+watch(groupFilter, () => {
+  if (groupFilterTimer) clearTimeout(groupFilterTimer);
+  groupFilterTimer = setTimeout(() => void fetchTraces(), 300);
+});
+
+onBeforeUnmount(() => {
+  if (groupFilterTimer) clearTimeout(groupFilterTimer);
 });
 
 watch(totalRunsTick, () => {
@@ -105,10 +116,54 @@ const slowestRuns = computed(() =>
   [...runs.value].sort((a, b) => b.duration_ms - a.duration_ms).slice(0, 12)
 );
 
-function pct(part: number, total: number): string {
-  if (total <= 0) return "0%";
-  return `${Math.max(2, Math.round((part / total) * 100))}%`;
+const timelineGroupsChart = computed(() => {
+  const sorted = [...timelineGroups.value].sort((a, b) => b.runs - a.runs);
+  const top = sorted.slice(0, 5);
+  const rest = sorted.slice(5);
+  if (!rest.length) return top;
+  const runs = rest.reduce((sum, item) => sum + item.runs, 0);
+  const weighted = (key: keyof TimelineGroup) => runs
+    ? rest.reduce((sum, item) => sum + Number(item[key] || 0) * item.runs, 0) / runs
+    : 0;
+  return [...top, {
+    group: `Other ${rest.length} groups`,
+    runs,
+    avg_total_ms: weighted("avg_total_ms"),
+    avg_gateway_ms: weighted("avg_gateway_ms"),
+    avg_monty_spawn_ms: weighted("avg_monty_spawn_ms"),
+    avg_monty_exec_ms: weighted("avg_monty_exec_ms"),
+    avg_upstream_ms: weighted("avg_upstream_ms"),
+    avg_security_ms: weighted("avg_security_ms"),
+  }];
+});
+
+function stageMs(g: TimelineGroup) {
+  return {
+    gateway: g.avg_gateway_ms,
+    monty: g.avg_monty_spawn_ms + g.avg_monty_exec_ms,
+    upstream: g.avg_upstream_ms,
+    security: g.avg_security_ms,
+  };
 }
+
+const sharedTimelineScaleMs = computed(() => {
+  const largestObserved = timelineGroupsChart.value.reduce((largest, group) => {
+    const stages = stageMs(group);
+    const accounted = stages.gateway + stages.monty + stages.upstream + stages.security;
+    return Math.max(largest, group.avg_total_ms, accounted);
+  }, 0);
+  return Math.max(largestObserved, 0.001);
+});
+
+function stagePct(_group: TimelineGroup, stage: number): string {
+  return `${Math.min(100, Math.max(0, (stage / sharedTimelineScaleMs.value) * 100)).toFixed(1)}%`;
+}
+
+function otherStageMs(g: TimelineGroup): number {
+  const stages = stageMs(g);
+  return Math.max(0, g.avg_total_ms - stages.gateway - stages.monty - stages.upstream - stages.security);
+}
+
 </script>
 
 <template>
@@ -129,7 +184,6 @@ function pct(part: number, total: number): string {
           placeholder="Filter group (e.g. finance)..."
           aria-label="Filter traces by group"
           class="w-full sm:w-48 rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-xs text-[#09090B]"
-          @input="fetchTraces()"
         />
         <label class="flex items-center gap-2 rounded-md border border-[#E4E4E7] bg-white px-2.5 py-1.5 text-xs font-medium text-[#09090B] cursor-pointer">
           <Switch v-model:checked="liveUpdates">
@@ -189,31 +243,46 @@ function pct(part: number, total: number): string {
       <!-- Aggregated Group Timeline Bars -->
       <section class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="flex flex-wrap items-center justify-between gap-2 border-b border-[#E4E4E7] px-4 py-3">
-          <h2 class="text-[15px] font-semibold text-[#09090B]">Where Time Is Spent by Group</h2>
+          <div><h2 class="text-[15px] font-semibold text-[#09090B]">Where Time Is Spent by Group</h2><p class="mt-0.5 text-[11px] text-[#71717A]">Top five groups by run volume plus all remaining groups combined. Bars share a common 0–{{ sharedTimelineScaleMs.toFixed(1) }} ms scale; labels show average milliseconds.</p></div>
           <div class="flex flex-wrap items-center gap-3 text-[11px] text-[#52525B]">
             <span class="inline-flex items-center gap-1"><span class="h-2.5 w-2.5 rounded-sm bg-[#71717A]" /> Gateway</span>
             <span class="inline-flex items-center gap-1"><span class="h-2.5 w-2.5 rounded-sm bg-[#0F766E]" /> Monty</span>
             <span class="inline-flex items-center gap-1"><span class="h-2.5 w-2.5 rounded-sm bg-[#2563EB]" /> Upstream</span>
             <span class="inline-flex items-center gap-1"><span class="h-2.5 w-2.5 rounded-sm bg-[#D97706]" /> Security</span>
+            <span class="inline-flex items-center gap-1"><span class="h-2.5 w-2.5 rounded-sm bg-[#D4D4D8]" /> Other / overhead</span>
           </div>
         </div>
         <div v-if="timelineGroups.length === 0" class="p-6 text-center text-xs text-[#71717A]">
           No group timeline data recorded yet.
         </div>
-        <div v-else class="divide-y divide-[#E4E4E7]">
-          <div v-for="g in timelineGroups" :key="g.group" class="px-4 py-3 space-y-1.5">
+        <div v-else>
+          <div class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 pt-3 text-[10px] text-[#71717A] tabular-nums">
+            <div class="flex justify-between"><span>0 ms</span><span>{{ (sharedTimelineScaleMs / 2).toFixed(1) }} ms</span><span>{{ sharedTimelineScaleMs.toFixed(1) }} ms</span></div>
+            <span>Average total</span>
+          </div>
+          <div class="divide-y divide-[#E4E4E7]">
+          <div v-for="g in timelineGroupsChart" :key="g.group" class="px-4 py-3 space-y-1.5">
             <div class="flex items-center justify-between text-xs">
               <span class="font-semibold text-[#09090B]">{{ g.group }} <span class="font-normal text-[#71717A]">({{ g.runs }} runs)</span></span>
               <span class="font-mono-data text-[#52525B] tabular-nums">
                 avg {{ g.avg_total_ms.toFixed(1) }} ms
               </span>
             </div>
-            <div class="flex h-3 w-full overflow-hidden rounded bg-[#F4F4F5]">
-              <div class="bg-[#71717A]" :style="{ width: pct(g.avg_gateway_ms, g.avg_total_ms) }" :title="`Gateway: ${g.avg_gateway_ms} ms`" />
-              <div class="bg-[#0F766E]" :style="{ width: pct(g.avg_monty_spawn_ms + g.avg_monty_exec_ms, g.avg_total_ms) }" :title="`Monty: ${(g.avg_monty_spawn_ms + g.avg_monty_exec_ms).toFixed(2)} ms`" />
-              <div class="bg-[#2563EB]" :style="{ width: pct(g.avg_upstream_ms, g.avg_total_ms) }" :title="`Upstream: ${g.avg_upstream_ms} ms`" />
-              <div class="bg-[#D97706]" :style="{ width: pct(g.avg_security_ms, g.avg_total_ms) }" :title="`Security: ${g.avg_security_ms} ms`" />
+            <div class="flex h-3 w-full overflow-hidden rounded bg-[#F4F4F5]" :aria-label="`Stage durations on a shared zero to ${sharedTimelineScaleMs.toFixed(1)} ms scale; average total ${g.avg_total_ms.toFixed(1)} ms`">
+              <div class="bg-[#71717A]" :style="{ width: stagePct(g, g.avg_gateway_ms) }" :title="`Gateway: ${g.avg_gateway_ms.toFixed(2)} ms`" />
+              <div class="bg-[#0F766E]" :style="{ width: stagePct(g, g.avg_monty_spawn_ms + g.avg_monty_exec_ms) }" :title="`Monty: ${(g.avg_monty_spawn_ms + g.avg_monty_exec_ms).toFixed(2)} ms`" />
+              <div class="bg-[#2563EB]" :style="{ width: stagePct(g, g.avg_upstream_ms) }" :title="`Upstream: ${g.avg_upstream_ms.toFixed(2)} ms`" />
+              <div class="bg-[#D97706]" :style="{ width: stagePct(g, g.avg_security_ms) }" :title="`Security: ${g.avg_security_ms.toFixed(2)} ms`" />
+              <div class="bg-[#D4D4D8]" :style="{ width: stagePct(g, otherStageMs(g)) }" :title="`Other / unaccounted: ${otherStageMs(g).toFixed(2)} ms`" />
             </div>
+            <div class="flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-[#71717A] tabular-nums">
+              <span>Gateway {{ g.avg_gateway_ms.toFixed(2) }} ms</span>
+              <span>Monty {{ (g.avg_monty_spawn_ms + g.avg_monty_exec_ms).toFixed(2) }} ms</span>
+              <span>Upstream {{ g.avg_upstream_ms.toFixed(2) }} ms</span>
+              <span>Security {{ g.avg_security_ms.toFixed(2) }} ms</span>
+              <span v-if="otherStageMs(g) > 0">Other {{ otherStageMs(g).toFixed(2) }} ms</span>
+            </div>
+          </div>
           </div>
         </div>
       </section>
@@ -244,7 +313,7 @@ function pct(part: number, total: number): string {
                 <td class="px-4 py-2 text-right font-semibold tabular-nums">{{ r.duration_ms.toFixed(1) }} ms</td>
                 <td class="px-4 py-2 text-right">
                   <NuxtLink :to="`/audit?run_id=${encodeURIComponent(r.run_id)}`" class="text-xs font-medium text-[#0F766E] hover:underline">
-                    Inspect in Audit →
+                    Inspect trace
                   </NuxtLink>
                 </td>
               </tr>
