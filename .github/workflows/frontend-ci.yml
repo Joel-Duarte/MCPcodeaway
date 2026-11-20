@@ -103,7 +103,7 @@ jobs:
         run: npm run test:e2e
 
       - name: Run Antithesis Bombadil UI fuzzer
-        uses: antithesishq/bombadil-action@v2
+        uses: antithesishq/bombadil-action@v3
         with:
           driver: browser
           origin: http://127.0.0.1:8000/dashboard/
