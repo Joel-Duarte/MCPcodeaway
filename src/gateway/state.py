@@ -258,6 +258,24 @@ class SQLiteAuditStore:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tool_model_rollups (
+                bucket_hour TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                server TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                runs INTEGER NOT NULL DEFAULT 0,
+                ok_count INTEGER NOT NULL DEFAULT 0,
+                sum_duration_ms REAL NOT NULL DEFAULT 0,
+                sum_tokens INTEGER NOT NULL DEFAULT 0,
+                sum_turns REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (bucket_hour, tenant_id, model, server, tool, mode)
+            )
+            """
+        )
         conn.commit()
         self._conn = conn
         return conn
@@ -292,7 +310,103 @@ class SQLiteAuditStore:
                     payload,
                 ),
             )
+            self._upsert_rollup_sqlite(conn, run, created_at)
             conn.commit()
+
+    def _upsert_rollup_sqlite(
+        self, conn: sqlite3.Connection, run: dict[str, Any], created_at: str
+    ) -> None:
+        bucket_hour = created_at[:13] + ":00:00+00:00"
+        tenant_id = str(run.get("tenant_id") or "")
+        model = str(run.get("model_name") or "unknown")
+        raw_mode = str(run.get("ab_variant") or run.get("mode") or "traditional")
+        mode_family = (
+            "codemode" if raw_mode.startswith("codemode") or raw_mode == "hybrid" else "traditional"
+        )
+        subcalls = run.get("subcalls") if isinstance(run.get("subcalls"), list) else []
+        if run.get("tool_name") == "execute_code" and subcalls:
+            targets = list(
+                dict.fromkeys(
+                    (
+                        str(sc.get("server") or "gateway"),
+                        f"{sc.get('server')}__{sc.get('tool')}"
+                        if "__" not in str(sc.get("tool") or "") and sc.get("server")
+                        else str(sc.get("tool") or "execute_code"),
+                    )
+                    for sc in subcalls
+                    if isinstance(sc, dict) and sc.get("tool")
+                )
+            )
+            if not targets:
+                targets = [(str(run.get("server_name") or "gateway"), "execute_code")]
+        else:
+            tool = str(run.get("tool_name") or "unknown")
+            server = str(
+                run.get("server_name") or (tool.split("__", 1)[0] if "__" in tool else "gateway")
+            )
+            targets = [(server, tool)]
+        ok_inc = 1 if run.get("ok") else 0
+        dur = float(run.get("duration_ms") or 0.0)
+        tok = int(run.get("total_tokens") or run.get("tokens_used_est") or 0)
+        turns = float(run.get("turns") or 1.0)
+        for server, tool in targets:
+            conn.execute(
+                """
+                INSERT INTO tool_model_rollups
+                    (bucket_hour, tenant_id, model, server, tool, mode,
+                     runs, ok_count, sum_duration_ms, sum_tokens, sum_turns)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                ON CONFLICT(bucket_hour, tenant_id, model, server, tool, mode) DO UPDATE SET
+                    runs = runs + 1,
+                    ok_count = ok_count + excluded.ok_count,
+                    sum_duration_ms = sum_duration_ms + excluded.sum_duration_ms,
+                    sum_tokens = sum_tokens + excluded.sum_tokens,
+                    sum_turns = sum_turns + excluded.sum_turns
+                """,
+                (bucket_hour, tenant_id, model, server, tool, mode_family, ok_inc, dur, tok, turns),
+            )
+
+    async def query_tool_model_rollups(
+        self, *, tenant_id: str | None = None, hours: int = 24
+    ) -> list[dict[str, Any]]:
+        cutoff = (datetime.now(UTC) - timedelta(hours=max(1, hours))).isoformat()[
+            :13
+        ] + ":00:00+00:00"
+        async with self._lock:
+            conn = self._ensure_conn()
+            if tenant_id:
+                cur = conn.execute(
+                    """
+                    SELECT model, server, tool, mode,
+                           SUM(runs) AS runs,
+                           SUM(ok_count) AS ok_count,
+                           SUM(sum_duration_ms) AS sum_duration_ms,
+                           SUM(sum_tokens) AS sum_tokens,
+                           SUM(sum_turns) AS sum_turns
+                    FROM tool_model_rollups
+                    WHERE bucket_hour >= ? AND tenant_id = ?
+                    GROUP BY model, server, tool, mode
+                    ORDER BY runs DESC
+                    """,
+                    (cutoff, tenant_id),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    SELECT model, server, tool, mode,
+                           SUM(runs) AS runs,
+                           SUM(ok_count) AS ok_count,
+                           SUM(sum_duration_ms) AS sum_duration_ms,
+                           SUM(sum_tokens) AS sum_tokens,
+                           SUM(sum_turns) AS sum_turns
+                    FROM tool_model_rollups
+                    WHERE bucket_hour >= ?
+                    GROUP BY model, server, tool, mode
+                    ORDER BY runs DESC
+                    """,
+                    (cutoff,),
+                )
+            return [dict(row) for row in cur.fetchall()]
 
     async def list_runs(
         self, limit: int = 50, tenant_id: str | None = None

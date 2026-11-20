@@ -89,6 +89,7 @@ class UpstreamConfig(BaseModel):
     allowed_operations: list[str] = Field(default_factory=list)
     excluded_operations: list[str] = Field(default_factory=list)
     preferred_mode: GatewayMode | None = None
+    tool_mode_overrides: dict[str, GatewayMode] = Field(default_factory=dict)
     abac_rules: list[AbacRuleConfig] = Field(default_factory=list)
     pinned_schema_digest: str | None = None
     ab_experiment: AbExperimentConfig | None = None

@@ -1,12 +1,140 @@
 <script setup lang="ts">
 import { extractErrorMessage } from "~/composables/useAdminApi";
 
+const { apiFetch: _apiFetch } = useAdminApi();
+const expandedUpstreamName = ref<string | null>(null);
+const perfRows = ref<Array<{ model: string; server: string; tool: string; mode: string; runs: number; success_rate_pct: number; avg_duration_ms: number; avg_tokens: number; recommended_mode: string }>>([]);
+
+async function loadPerf() {
+  try {
+    const res = await _apiFetch<{ rows: typeof perfRows.value }>("/admin/ab/model-performance");
+    if (res?.rows) perfRows.value = res.rows;
+  } catch {
+    // ignore
+  }
+}
+
+function toggleExpandUpstream(name: string) {
+  expandedUpstreamName.value = expandedUpstreamName.value === name ? null : name;
+}
+
+function aggregatedToolsForUpstream(u: UpstreamEntry) {
+  const toolNames = new Set<string>(u.tools || []);
+  for (const r of perfRows.value) {
+    if (r.server === u.name) toolNames.add(r.tool);
+  }
+  return Array.from(toolNames)
+    .sort()
+    .map((tool) => {
+      const matching = perfRows.value.filter((r) => r.server === u.name && r.tool === tool);
+      const runs = matching.reduce((s, r) => s + r.runs, 0);
+      const okWeighted = matching.reduce((s, r) => s + (r.success_rate_pct / 100) * r.runs, 0);
+      const msWeighted = matching.reduce((s, r) => s + r.avg_duration_ms * r.runs, 0);
+      const tokWeighted = matching.reduce((s, r) => s + (r.avg_tokens || 0) * r.runs, 0);
+      return {
+        tool,
+        runs,
+        success_rate_pct: runs ? Math.round((okWeighted / runs) * 1000) / 10 : 0,
+        avg_duration_ms: runs ? Math.round((msWeighted / runs) * 10) / 10 : 0,
+        avg_tokens: runs ? Math.round(tokWeighted / runs) : 0,
+        recommended_mode: matching[0]?.recommended_mode || "—",
+      };
+    });
+}
+
+function serverStats(u: UpstreamEntry) {
+  const tools = aggregatedToolsForUpstream(u);
+  const runs = tools.reduce((s, t) => s + t.runs, 0);
+  const okWeighted = tools.reduce((s, t) => s + (t.success_rate_pct / 100) * t.runs, 0);
+  const msWeighted = tools.reduce((s, t) => s + t.avg_duration_ms * t.runs, 0);
+  const tokWeighted = tools.reduce((s, t) => s + t.avg_tokens * t.runs, 0);
+  return {
+    toolCount: tools.length,
+    runs,
+    success_rate_pct: runs ? Math.round((okWeighted / runs) * 1000) / 10 : 0,
+    avg_duration_ms: runs ? Math.round((msWeighted / runs) * 10) / 10 : 0,
+    avg_tokens: runs ? Math.round(tokWeighted / runs) : 0,
+  };
+}
+
+async function setUpstreamPreferredMode(u: UpstreamEntry, mode: string) {
+  await _apiFetch(`/admin/upstreams/${encodeURIComponent(u.name)}/mode`, {
+    method: "PATCH",
+    body: JSON.stringify({ preferred_mode: mode }),
+  });
+  u.preferred_mode = mode;
+}
+
+async function setToolModeOverride(u: UpstreamEntry, toolName: string, mode: string) {
+  const res = await _apiFetch<{ tool_mode_overrides: Record<string, string> }>(
+    `/admin/upstreams/${encodeURIComponent(u.name)}/tools/${encodeURIComponent(toolName)}/mode`,
+    { method: "PATCH", body: JSON.stringify({ mode }) }
+  );
+  if (res) {
+    u.tool_mode_overrides = res.tool_mode_overrides;
+  }
+}
+
+const modeDialogOpen = ref(false);
+const pendingModeChange = ref<{
+  kind: "server" | "tool";
+  upstream: UpstreamEntry;
+  tool?: string;
+  nextMode: string;
+} | null>(null);
+
+function promptModeChange(
+  kind: "server" | "tool",
+  upstream: UpstreamEntry,
+  nextMode: string,
+  tool?: string
+) {
+  pendingModeChange.value = { kind, upstream, tool, nextMode };
+  modeDialogOpen.value = true;
+}
+
+async function confirmModeChange() {
+  const pending = pendingModeChange.value;
+  if (!pending) return;
+  errorMessage.value = "";
+  try {
+    if (pending.kind === "server") {
+      await setUpstreamPreferredMode(pending.upstream, pending.nextMode);
+      statusMessage.value = `Updated '${pending.upstream.name}' preferred mode to '${pending.nextMode}'.`;
+    } else if (pending.tool) {
+      await setToolModeOverride(pending.upstream, pending.tool, pending.nextMode);
+      statusMessage.value = `Updated '${pending.tool}' override to '${pending.nextMode}'.`;
+    }
+    modeDialogOpen.value = false;
+    pendingModeChange.value = null;
+    await fetchData();
+  } catch (err) {
+    errorMessage.value = extractErrorMessage(err);
+  }
+}
+
+let _pollTimer: ReturnType<typeof setInterval> | null = null;
+
+onMounted(() => {
+  void loadPerf();
+  _pollTimer = setInterval(() => {
+    void loadPerf();
+    void fetchData();
+  }, 3000);
+});
+
+onUnmounted(() => {
+  if (_pollTimer) clearInterval(_pollTimer);
+});
+
 interface UpstreamEntry {
   name: string;
   type: string;
   url?: string | null;
   auth_type: string;
   preferred_mode?: string;
+  tool_mode_overrides?: Record<string, string>;
+  tools?: string[];
   allowed_groups?: string[];
   enabled: boolean;
   ab_experiment?: {
@@ -144,9 +272,17 @@ onMounted(() => {
   <div class="space-y-6">
     <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div>
-        <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">
-          Upstreams Service Catalog
-        </h1>
+        <div class="flex items-center gap-2">
+          <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">
+            Upstreams Service Catalog
+          </h1>
+          <span
+            class="inline-flex items-center gap-1 rounded-full border border-[#99F6E4] bg-[#F0FDFA] px-2 py-0.5 text-[11px] font-medium text-[#0F766E]"
+          >
+            <span class="h-1.5 w-1.5 rounded-full bg-[#0F766E]" />
+            3s
+          </span>
+        </div>
         <p class="mt-0.5 text-[13px] text-[#52525B]">
           Search, filter, and manage registered MCP/OpenAPI services and schema digests.
         </p>
@@ -256,45 +392,132 @@ onMounted(() => {
           No upstreams match the active filters.
         </div>
 
-        <div v-else class="overflow-x-auto table-scroll">
-          <table class="w-full border-collapse text-left text-[13px]">
+        <div v-else class="overflow-x-auto">
+          <table class="w-full border-collapse text-left text-xs">
             <thead>
-              <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-xs font-medium text-[#52525B]">
-                <th class="px-4 py-2.5 whitespace-nowrap">Name</th>
-                <th class="px-4 py-2.5 whitespace-nowrap">Type / Auth</th>
-                <th class="px-4 py-2.5 whitespace-nowrap">Groups</th>
-                <th class="px-4 py-2.5 whitespace-nowrap">Preferred Mode</th>
-                <th class="px-4 py-2.5 whitespace-nowrap">Digest</th>
-                <th v-if="upstreamsData.dynamic_upstreams_permitted" class="px-4 py-2.5 whitespace-nowrap text-right">
-                  Actions
+              <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] font-medium text-[#52525B]">
+                <th class="px-3 py-2">Name</th>
+                <th class="hidden lg:table-cell px-2.5 py-2">Type / Auth</th>
+                <th class="hidden xl:table-cell px-2.5 py-2">Groups</th>
+                <th class="px-2.5 py-2 text-right">Tools</th>
+                <th class="px-2.5 py-2 text-right">Runs</th>
+                <th class="px-2.5 py-2 text-right">Success</th>
+                <th class="hidden md:table-cell px-2.5 py-2 text-right">Latency</th>
+                <th class="hidden xl:table-cell px-2.5 py-2 text-right">Tokens</th>
+                <th class="px-2.5 py-2 text-center">Mode</th>
+                <th v-if="upstreamsData.dynamic_upstreams_permitted" class="w-10 px-2 py-2 text-right">
+                  <span class="sr-only">Actions</span>
                 </th>
               </tr>
             </thead>
             <tbody class="divide-y divide-[#E4E4E7]">
-              <tr v-for="u in upstreamsData.upstreams" :key="u.name" class="hover:bg-[#FAFAFA]">
-                <td class="px-4 py-2.5 whitespace-nowrap">
-                  <div class="font-mono-data font-medium text-[#09090B]">{{ u.name }}</div>
-                  <div class="max-w-[240px] truncate text-xs text-[#71717A]">{{ u.url || "stdio/inline" }}</div>
-                </td>
-                <td class="px-4 py-2.5 text-xs text-[#52525B] whitespace-nowrap">
-                  {{ u.type }} · {{ u.auth_type }}
-                </td>
-                <td class="px-4 py-2.5 text-xs text-[#52525B] whitespace-nowrap">
-                  {{ (u.allowed_groups || []).join(", ") || "open" }}
-                </td>
-                <td class="px-4 py-2.5 font-mono-data text-xs text-[#09090B] whitespace-nowrap">
-                  {{ u.preferred_mode || "codemode" }}
-                </td>
-                <td class="px-4 py-2.5 font-mono-data text-xs text-[#71717A] whitespace-nowrap">
-                  {{ (upstreamsData.digests_by_server[u.name] || "—").slice(0, 12) }}
-                </td>
-                <td v-if="upstreamsData.dynamic_upstreams_permitted" class="px-4 py-2.5 text-right whitespace-nowrap">
-                  <Button data-variant="danger" @click="promptDelete(u.name)">
-                    <AppIcon name="trash" :size="14" />
-                    <span>Remove</span>
-                  </Button>
-                </td>
-              </tr>
+              <template v-for="u in upstreamsData.upstreams" :key="u.name">
+                <tr
+                  class="cursor-pointer hover:bg-[#FAFAFA]"
+                  :class="expandedUpstreamName === u.name ? 'bg-[#F0FDFA]' : ''"
+                  @click="toggleExpandUpstream(u.name)"
+                >
+                  <td class="px-3 py-2">
+                    <div class="flex items-center gap-1.5 font-mono-data font-medium text-[#09090B]">
+                      <span class="text-[10px] text-[#71717A]">{{ expandedUpstreamName === u.name ? "▼" : "▶" }}</span>
+                      <span class="max-w-[160px] truncate" :title="u.name">{{ u.name }}</span>
+                    </div>
+                    <div class="max-w-[160px] truncate text-[11px] text-[#71717A]" :title="u.url || 'stdio/inline'">
+                      {{ u.url || "stdio/inline" }}
+                    </div>
+                  </td>
+                  <td class="hidden lg:table-cell px-2.5 py-2 text-[#52525B] whitespace-nowrap">
+                    {{ u.type }} · {{ u.auth_type }}
+                  </td>
+                  <td class="hidden xl:table-cell px-2.5 py-2 text-[#52525B] max-w-[140px] truncate" :title="(u.allowed_groups || []).join(', ') || 'open'">
+                    {{ (u.allowed_groups || []).join(", ") || "open" }}
+                  </td>
+                  <td class="px-2.5 py-2 text-right font-mono-data tabular-nums whitespace-nowrap">
+                    {{ serverStats(u).toolCount }}
+                  </td>
+                  <td class="px-2.5 py-2 text-right font-mono-data tabular-nums whitespace-nowrap">
+                    {{ serverStats(u).runs }}
+                  </td>
+                  <td class="px-2.5 py-2 text-right font-mono-data tabular-nums whitespace-nowrap">
+                    {{ serverStats(u).runs ? `${serverStats(u).success_rate_pct}%` : "—" }}
+                  </td>
+                  <td class="hidden md:table-cell px-2.5 py-2 text-right font-mono-data tabular-nums whitespace-nowrap">
+                    {{ serverStats(u).runs ? `${serverStats(u).avg_duration_ms} ms` : "—" }}
+                  </td>
+                  <td class="hidden xl:table-cell px-2.5 py-2 text-right font-mono-data tabular-nums whitespace-nowrap">
+                    {{ serverStats(u).runs ? serverStats(u).avg_tokens : "—" }}
+                  </td>
+                  <td class="px-2.5 py-2 text-center whitespace-nowrap" @click.stop>
+                    <select
+                      :value="u.preferred_mode || 'auto'"
+                      aria-label="Server preferred mode"
+                      class="rounded border border-[#D4D4D8] bg-white px-2 py-1 text-xs font-mono-data"
+                      @change="(e) => { const el = e.target as HTMLSelectElement; const next = el.value; el.value = u.preferred_mode || 'auto'; promptModeChange('server', u, next); }"
+                    >
+                      <option value="auto">auto</option>
+                      <option value="codemode">codemode</option>
+                      <option value="traditional">traditional</option>
+                      <option value="hybrid">hybrid</option>
+                    </select>
+                  </td>
+                  <td v-if="upstreamsData.dynamic_upstreams_permitted" class="w-10 px-2 py-2 text-right whitespace-nowrap" @click.stop>
+                    <Button
+                      data-variant="danger"
+                      class="px-2 py-1"
+                      aria-label="Remove upstream"
+                      title="Remove upstream"
+                      @click="promptDelete(u.name)"
+                    >
+                      <AppIcon name="trash" :size="14" />
+                    </Button>
+                  </td>
+                </tr>
+                <tr v-if="expandedUpstreamName === u.name" class="bg-[#FAFAFA]">
+                  <td :colspan="upstreamsData.dynamic_upstreams_permitted ? 10 : 9" class="px-6 py-3">
+                    <div v-if="aggregatedToolsForUpstream(u).length === 0" class="text-xs text-[#71717A]">
+                      No tools discovered for this upstream yet.
+                    </div>
+                    <div v-else class="overflow-x-auto">
+                      <table class="w-full text-left text-xs tabular-nums">
+                        <thead class="border-b border-[#E4E4E7] text-[#71717A]">
+                          <tr>
+                            <th class="py-1.5 pr-3 font-medium">Tool</th>
+                            <th class="py-1.5 pr-3 font-medium text-right">Runs</th>
+                            <th class="py-1.5 pr-3 font-medium text-right">Success</th>
+                            <th class="py-1.5 pr-3 font-medium text-right">Avg Latency</th>
+                            <th class="py-1.5 pr-3 font-medium text-right">Avg Tokens</th>
+                            <th class="py-1.5 pr-3 font-medium">Best Mode</th>
+                            <th class="py-1.5 font-medium">Override (All Models)</th>
+                          </tr>
+                        </thead>
+                        <tbody class="divide-y divide-[#E4E4E7]">
+                          <tr v-for="t in aggregatedToolsForUpstream(u)" :key="t.tool">
+                            <td class="py-2 pr-3 font-mono-data text-[#09090B]">{{ t.tool }}</td>
+                            <td class="py-2 pr-3 text-right font-mono-data">{{ t.runs }}</td>
+                            <td class="py-2 pr-3 text-right font-mono-data">{{ t.runs ? `${t.success_rate_pct}%` : "—" }}</td>
+                            <td class="py-2 pr-3 text-right font-mono-data">{{ t.runs ? `${t.avg_duration_ms} ms` : "—" }}</td>
+                            <td class="py-2 pr-3 text-right font-mono-data">{{ t.runs ? t.avg_tokens : "—" }}</td>
+                            <td class="py-2 pr-3 font-mono-data font-semibold text-[#0F766E]">{{ t.recommended_mode }}</td>
+                            <td class="py-2">
+                              <select
+                                :value="u.tool_mode_overrides?.[t.tool] || 'inherit'"
+                                aria-label="Tool mode override"
+                                class="rounded border border-[#D4D4D8] bg-white px-2 py-1 text-xs"
+                                @change="(e) => { const el = e.target as HTMLSelectElement; const next = el.value; el.value = u.tool_mode_overrides?.[t.tool] || 'inherit'; promptModeChange('tool', u, next, t.tool); }"
+                              >
+                                <option value="inherit">Inherit Server Default</option>
+                                <option value="auto">auto</option>
+                                <option value="codemode">codemode</option>
+                                <option value="traditional">traditional</option>
+                              </select>
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </td>
+                </tr>
+              </template>
             </tbody>
           </table>
         </div>
@@ -337,6 +560,23 @@ onMounted(() => {
             @click="confirmDelete"
           >
             Delete Upstream
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog v-model:open="modeDialogOpen">
+      <DialogContent>
+        <DialogTitle>Confirm Mode Change</DialogTitle>
+        <DialogDescription v-if="pendingModeChange">
+          Switch
+          <strong>{{ pendingModeChange.kind === 'server' ? pendingModeChange.upstream.name : pendingModeChange.tool }}</strong>
+          to <code class="font-mono-data">{{ pendingModeChange.nextMode }}</code>?
+        </DialogDescription>
+        <div class="flex justify-end gap-2 pt-2">
+          <DialogClose @click="pendingModeChange = null">Cancel</DialogClose>
+          <Button data-variant="primary" @click="confirmModeChange">
+            Confirm Change
           </Button>
         </div>
       </DialogContent>

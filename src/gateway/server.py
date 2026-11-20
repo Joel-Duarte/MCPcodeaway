@@ -1731,6 +1731,21 @@ def create_gateway_app(
                     eff_exec = "codemode"
                     effective_mode = "codemode"
                     mode_decision_reason = "auto:execute_code->codemode"
+                elif (
+                    not has_explicit_mode
+                    and method == "tools/call"
+                    and isinstance(params, dict)
+                    and "__" in str(params.get("name") or "")
+                ):
+                    _tname = str(params.get("name") or "")
+                    _scfg = runtime.registry.get(_tname.split("__", 1)[0])
+                    if _scfg is not None and _tname in _scfg.tool_mode_overrides:
+                        _ovr = _scfg.tool_mode_overrides[_tname]
+                        effective_mode = _ovr
+                        eff_exec = (
+                            "classic" if _ovr in ("traditional", "traditional_discover") else _ovr
+                        )
+                        mode_decision_reason = f"tool_override:{_ovr}"
                 request_meta = params.get("_meta", {}) if isinstance(params, dict) else {}
                 client_info = (
                     request_meta.get("io.modelcontextprotocol/clientInfo")
@@ -2285,6 +2300,7 @@ def create_gateway_app(
             user: str | None = Query(default=None),
             upstream: str | None = Query(default=None),
             model: str = Query(default="default"),
+            window: str | None = Query(default=None),
             authorization: str | None = Header(default=None),
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
@@ -2292,6 +2308,7 @@ def create_gateway_app(
                 authorization, mcpcodeaway_admin_session, require_admin_role=False
             )
             effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
+            window_hours = {"1h": 1, "24h": 24, "7d": 168, "30d": 720}.get(window or "")
             return await runtime.telemetry.analytics_report(
                 limit=limit,
                 tenant_id=effective_tenant,
@@ -2300,6 +2317,7 @@ def create_gateway_app(
                 upstream_filter=upstream,
                 model_name=model,
                 model_pricing=await runtime.merged_model_pricing(),
+                window_hours=window_hours,
             )
 
     if features.admin_read:
@@ -2531,7 +2549,15 @@ def create_gateway_app(
                 "catalog_version": runtime.catalog.catalog_version,
                 "digests_by_server": runtime.catalog.digests_by_server,
                 "drift_warnings": runtime.catalog.drift_warnings,
-                "upstreams": [u.model_dump(exclude={"openapi_spec"}) for u in page_items],
+                "upstreams": [
+                    {
+                        **u.model_dump(exclude={"openapi_spec"}),
+                        "tools": [
+                            t.qualified_name for t in runtime.catalog.get_server_tools(u.name)
+                        ],
+                    }
+                    for u in page_items
+                ],
                 "total": total,
                 "total_registered": len(all_upstreams),
                 "page": page,
@@ -3138,7 +3164,7 @@ def create_gateway_app(
 
         @app.post("/admin/demo/traffic/burst")
         async def admin_demo_traffic_burst(
-            count: int = Query(default=6, ge=1, le=24),
+            count: int = Query(default=6, ge=1, le=100),
             authorization: str | None = Header(default=None),
             mcpcodeaway_admin_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
@@ -3147,6 +3173,176 @@ def create_gateway_app(
             )
             _ensure_demo_traffic_allowed()
             return await runtime.demo_traffic.burst(count=count)
+
+        @app.get("/admin/demo/models")
+        async def admin_demo_models_list(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            _ensure_demo_traffic_allowed()
+            return {"models": runtime.demo_traffic.model_profiles}
+
+        @app.post("/admin/demo/models")
+        async def admin_demo_models_update(
+            payload: dict[str, Any],
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _ensure_demo_traffic_allowed()
+            models = payload.get("models")
+            if isinstance(models, list):
+                runtime.demo_traffic.model_profiles = models
+            return {"models": runtime.demo_traffic.model_profiles}
+
+        @app.get("/admin/ab/settings")
+        async def admin_ab_settings_get(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            pts = float(getattr(runtime, "ab_turn_penalty_pts", 8.0))
+            tok_per_pt = int(getattr(runtime, "ab_tokens_per_penalty_pt", 150))
+            runs_per_arm = int(getattr(runtime, "ab_calibration_runs_per_arm", 50))
+            return {
+                "turn_penalty_pts": pts,
+                "tokens_per_penalty_pt": tok_per_pt,
+                "calibration_runs_per_arm": runs_per_arm,
+            }
+
+        @app.post("/admin/ab/settings")
+        async def admin_ab_settings_update(
+            payload: dict[str, Any],
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            pts = max(0.0, min(50.0, float(payload.get("turn_penalty_pts", 8.0))))
+            tok_per_pt = max(0, min(2000, int(payload.get("tokens_per_penalty_pt", 150))))
+            runs_per_arm = max(5, min(500, int(payload.get("calibration_runs_per_arm", 50))))
+            runtime.ab_turn_penalty_pts = pts
+            runtime.ab_tokens_per_penalty_pt = tok_per_pt
+            runtime.ab_calibration_runs_per_arm = runs_per_arm
+            return {
+                "turn_penalty_pts": pts,
+                "tokens_per_penalty_pt": tok_per_pt,
+                "calibration_runs_per_arm": runs_per_arm,
+            }
+
+        @app.get("/admin/ab/model-performance")
+        async def admin_ab_model_performance(
+            window: str = Query(default="24h"),
+            limit: int = Query(default=1000, ge=1, le=5000),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            from gateway.ab_testing import summarize_model_tool_performance, summarize_rollups
+
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            effective_tenant = _resolve_audit_tenant_scope(identity, None)
+            pts = float(getattr(runtime, "ab_turn_penalty_pts", 8.0))
+            tok_per_pt = int(getattr(runtime, "ab_tokens_per_penalty_pt", 150))
+            window_hours = {"1h": 1, "24h": 24, "7d": 168, "30d": 720}.get(window, 24)
+            cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = getattr(
+                runtime, "_perf_cache", {}
+            )
+            if not hasattr(runtime, "_perf_cache"):
+                runtime._perf_cache = cache
+            ck = (effective_tenant or "*", window_hours, pts, tok_per_pt)
+            now = time.monotonic()
+            cached = cache.get(ck)
+            if cached is not None and (now - cached[0]) < 2.5:
+                return cached[1]
+
+            rows: list[dict[str, Any]] = []
+            if hasattr(runtime.store, "query_tool_model_rollups"):
+                rollups = await runtime.store.query_tool_model_rollups(
+                    tenant_id=effective_tenant, hours=window_hours
+                )
+                if rollups:
+                    rows = summarize_rollups(
+                        rollups, turn_penalty_pts=pts, tokens_per_penalty_pt=tok_per_pt
+                    )
+            if not rows:
+                runs = await runtime.store.list_runs(limit=limit, tenant_id=effective_tenant)
+                rows = summarize_model_tool_performance(
+                    runs, turn_penalty_pts=pts, tokens_per_penalty_pt=tok_per_pt
+                )
+
+            payload_out = {
+                "window": window if window in {"1h", "24h", "7d", "30d"} else "24h",
+                "turn_penalty_pts": pts,
+                "tokens_per_penalty_pt": tok_per_pt,
+                "rows": rows,
+            }
+            cache[ck] = (now, payload_out)
+            return payload_out
+
+        @app.patch("/admin/upstreams/{name}/mode")
+        async def admin_set_upstream_preferred_mode(
+            name: str,
+            payload: dict[str, Any],
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            cfg = runtime.registry.get(name)
+            if cfg is None:
+                raise HTTPException(status_code=404, detail=f"Upstream '{name}' not found")
+            mode_val = payload.get("preferred_mode") or "auto"
+            updated = cfg.model_copy(update={"preferred_mode": mode_val})
+            runtime.registry.upsert(updated)
+            if hasattr(runtime.store, "upsert_upstream"):
+                await runtime.store.upsert_upstream(updated.name, updated.model_dump())
+            return {"upstream": name, "preferred_mode": updated.preferred_mode}
+
+        @app.patch("/admin/upstreams/{name}/tools/{tool_name}/mode")
+        async def admin_set_tool_mode_override(
+            name: str,
+            tool_name: str,
+            payload: dict[str, Any],
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            cfg = runtime.registry.get(name)
+            if cfg is None:
+                raise HTTPException(status_code=404, detail=f"Upstream '{name}' not found")
+            mode_val = payload.get("mode")
+            overrides = dict(cfg.tool_mode_overrides)
+            if not mode_val or mode_val == "inherit":
+                overrides.pop(tool_name, None)
+            else:
+                overrides[tool_name] = mode_val
+            updated = cfg.model_copy(update={"tool_mode_overrides": overrides})
+            runtime.registry.upsert(updated)
+            if hasattr(runtime.store, "upsert_upstream"):
+                await runtime.store.upsert_upstream(updated.name, updated.model_dump())
+            return {"upstream": name, "tool": tool_name, "tool_mode_overrides": overrides}
 
         @app.post("/admin/mcp", response_model=None)
         async def admin_mcp_endpoint(

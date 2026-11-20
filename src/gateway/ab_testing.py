@@ -89,6 +89,7 @@ def compute_empirical_model_delta(
     model_name: str,
     *,
     target_tool: str | None = None,
+    turn_penalty_pts: float = 8.0,
 ) -> tuple[float, str] | None:
     """Derive a data-driven [-25, +25] Code Mode score delta from quality, speed & tokens."""
     m_norm = model_name.strip().lower()
@@ -144,6 +145,11 @@ def compute_empirical_model_delta(
             delta += 5.0
         elif cm_ms > cl_ms * 1.5:
             delta -= 5.0
+    # 4. Multi-turn reasoning-cost penalty on traditional MCP (-turn_penalty_pts/turn > 1)
+    if cl_n and turn_penalty_pts > 0:
+        cl_turns = sum(float(r.get("turns") or 1.0) for r in cl_runs) / cl_n
+        if cl_turns > 1.0:
+            delta += min(24.0, turn_penalty_pts * (cl_turns - 1.0))
 
     delta = max(-25.0, min(25.0, round(delta, 1)))
     if abs(delta) < 0.5:
@@ -157,6 +163,197 @@ def compute_empirical_model_delta(
             f"cm_ms={round(cm_ms, 1)})"
         ),
     )
+
+
+def evaluate_calibration_arm(
+    runs: list[dict[str, Any]],
+    model_name: str,
+    *,
+    target_tool: str | None = None,
+    threshold: int = 100,
+    turn_penalty_pts: float = 8.0,
+) -> tuple[str, str]:
+    """Run 50/50 traditional vs codemode for the first `threshold` calls, then lock winner."""
+    m_norm = model_name.strip().lower()
+    matching = [r for r in runs if str(r.get("model_name") or "").strip().lower() == m_norm]
+    if target_tool:
+        matching = [r for r in matching if _run_matches_tool(r, target_tool)]
+    count = len(matching)
+    if count < threshold:
+        arm = "traditional" if count % 2 == 0 else "codemode"
+        return arm, f"calibrating_50_50 ({count}/{threshold})"
+    learned = compute_empirical_model_delta(
+        matching, model_name, target_tool=target_tool, turn_penalty_pts=turn_penalty_pts
+    )
+    delta = learned[0] if learned is not None else 0.0
+    winner = "codemode" if delta >= 0.0 else "traditional"
+    return winner, f"calibrated_lock:{winner} ({count}/{threshold}, delta={delta:+.1f})"
+
+
+def summarize_model_tool_performance(
+    runs: list[dict[str, Any]],
+    *,
+    turn_penalty_pts: float = 8.0,
+    tokens_per_penalty_pt: int = 150,
+) -> list[dict[str, Any]]:
+    """Aggregate performance per (model, tool, mode_family) for the Model Performance UI."""
+    buckets: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for r in runs:
+        model = str(r.get("model_name") or "unknown")
+        raw_mode = str(r.get("ab_variant") or r.get("mode") or "traditional")
+        mode_family = (
+            "codemode" if raw_mode.startswith("codemode") or raw_mode == "hybrid" else "traditional"
+        )
+        subcalls = r.get("subcalls") if isinstance(r.get("subcalls"), list) else []
+        if r.get("tool_name") == "execute_code" and subcalls:
+            targets = list(
+                dict.fromkeys(
+                    (
+                        str(sc.get("server") or "gateway"),
+                        f"{sc.get('server')}__{sc.get('tool')}"
+                        if "__" not in str(sc.get("tool") or "") and sc.get("server")
+                        else str(sc.get("tool") or "execute_code"),
+                    )
+                    for sc in subcalls
+                    if isinstance(sc, dict) and sc.get("tool")
+                )
+            )
+            if not targets:
+                targets = [(str(r.get("server_name") or "gateway"), "execute_code")]
+        else:
+            tool = str(r.get("tool_name") or "unknown")
+            server = str(
+                r.get("server_name") or (tool.split("__", 1)[0] if "__" in tool else "gateway")
+            )
+            targets = [(server, tool)]
+
+        for server, tool in targets:
+            key = (model, tool, mode_family)
+            b = buckets.setdefault(
+                key,
+                {
+                    "model": model,
+                    "server": server,
+                    "tool": tool,
+                    "mode": mode_family,
+                    "runs": 0,
+                    "ok": 0,
+                    "ms": 0.0,
+                    "tok": 0,
+                    "turns": 0.0,
+                },
+            )
+            b["runs"] += 1
+            if r.get("ok"):
+                b["ok"] += 1
+            b["ms"] += float(r.get("duration_ms") or 0.0)
+            b["tok"] += int(r.get("total_tokens") or r.get("tokens_used_est") or 0)
+            b["turns"] += float(r.get("turns") or 1.0)
+
+    rows: list[dict[str, Any]] = []
+    for (model, tool, mode_family), b in sorted(
+        buckets.items(), key=lambda kv: kv[1]["runs"], reverse=True
+    ):
+        n = b["runs"]
+        learned = compute_empirical_model_delta(
+            runs, model, target_tool=tool, turn_penalty_pts=turn_penalty_pts
+        )
+        winner = "codemode" if (learned is None or learned[0] >= 0.0) else "traditional"
+        avg_tok = round(b["tok"] / n) if n else 0
+        avg_turns = (b["turns"] / n) if n else 1.0
+        penalty_tok = (
+            round(max(0.0, avg_turns - 1.0) * turn_penalty_pts * tokens_per_penalty_pt)
+            if mode_family == "traditional"
+            else 0
+        )
+        rows.append(
+            {
+                "model": model,
+                "server": b["server"],
+                "tool": tool,
+                "mode": mode_family,
+                "runs": n,
+                "success_rate_pct": round((b["ok"] / n) * 100.0, 1) if n else 0.0,
+                "avg_duration_ms": round(b["ms"] / n, 1) if n else 0.0,
+                "avg_tokens": avg_tok,
+                "effective_tokens": avg_tok + penalty_tok,
+                "recommended_mode": winner,
+            }
+        )
+    return rows
+
+
+def summarize_rollups(
+    rollup_rows: list[dict[str, Any]],
+    *,
+    turn_penalty_pts: float = 8.0,
+    tokens_per_penalty_pt: int = 150,
+) -> list[dict[str, Any]]:
+    """Compute Model x Tool x Mode performance from pre-aggregated DB rollup rows."""
+    by_pair: dict[tuple[str, str], dict[str, dict[str, float]]] = {}
+    for row in rollup_rows:
+        n = int(row.get("runs") or 0)
+        if n <= 0:
+            continue
+        model = str(row.get("model") or "unknown")
+        tool = str(row.get("tool") or "unknown")
+        mode = str(row.get("mode") or "traditional")
+        avg_tok = float(row.get("sum_tokens") or 0) / n
+        avg_turns = float(row.get("sum_turns") or n) / n
+        eff_tok = avg_tok + (
+            max(0.0, avg_turns - 1.0) * turn_penalty_pts * tokens_per_penalty_pt
+            if mode == "traditional"
+            else 0.0
+        )
+        ok_rate = float(row.get("ok_count") or 0) / n
+        by_pair.setdefault((model, tool), {})[mode] = {
+            "eff_tok": eff_tok,
+            "ok_rate": ok_rate,
+        }
+
+    out: list[dict[str, Any]] = []
+    for row in rollup_rows:
+        n = int(row.get("runs") or 0)
+        if n <= 0:
+            continue
+        model = str(row.get("model") or "unknown")
+        server = str(row.get("server") or "gateway")
+        tool = str(row.get("tool") or "unknown")
+        mode = str(row.get("mode") or "traditional")
+        avg_tok = round(float(row.get("sum_tokens") or 0) / n)
+        avg_turns = float(row.get("sum_turns") or n) / n
+        penalty_tok = (
+            round(max(0.0, avg_turns - 1.0) * turn_penalty_pts * tokens_per_penalty_pt)
+            if mode == "traditional"
+            else 0
+        )
+        pair = by_pair.get((model, tool), {})
+        cm = pair.get("codemode")
+        tr = pair.get("traditional")
+        if cm and tr:
+            if abs(cm["ok_rate"] - tr["ok_rate"]) >= 0.15:
+                winner = "codemode" if cm["ok_rate"] >= tr["ok_rate"] else "traditional"
+            else:
+                winner = "codemode" if cm["eff_tok"] <= tr["eff_tok"] else "traditional"
+        elif tr and not cm:
+            winner = "traditional" if tr["ok_rate"] >= 0.5 and avg_turns <= 1.2 else "codemode"
+        else:
+            winner = "codemode"
+        out.append(
+            {
+                "model": model,
+                "server": server,
+                "tool": tool,
+                "mode": mode,
+                "runs": n,
+                "success_rate_pct": round((float(row.get("ok_count") or 0) / n) * 100.0, 1),
+                "avg_duration_ms": round(float(row.get("sum_duration_ms") or 0) / n, 1),
+                "avg_tokens": avg_tok,
+                "effective_tokens": avg_tok + penalty_tok,
+                "recommended_mode": winner,
+            }
+        )
+    return out
 
 
 def evaluate_mode_algorithm(

@@ -101,8 +101,50 @@ async function loadSettings() {
   }
 }
 
+const turnPenaltyPts = ref(8.0);
+const tokensPerPenaltyPt = ref(150);
+const calibrationRunsPerArm = ref(50);
+const savingPenalty = ref(false);
+const penaltyNotice = ref("");
+
+async function loadAbSettings() {
+  try {
+    const res = await apiFetch<{
+      turn_penalty_pts: number;
+      tokens_per_penalty_pt: number;
+      calibration_runs_per_arm: number;
+    }>("/admin/ab/settings");
+    if (res) {
+      if (typeof res.turn_penalty_pts === "number") turnPenaltyPts.value = res.turn_penalty_pts;
+      if (typeof res.tokens_per_penalty_pt === "number") tokensPerPenaltyPt.value = res.tokens_per_penalty_pt;
+      if (typeof res.calibration_runs_per_arm === "number") calibrationRunsPerArm.value = res.calibration_runs_per_arm;
+    }
+  } catch {
+    // ignore if unavailable
+  }
+}
+
+async function saveAbPenalty() {
+  savingPenalty.value = true;
+  penaltyNotice.value = "";
+  try {
+    await apiFetch("/admin/ab/settings", {
+      method: "POST",
+      body: JSON.stringify({
+        turn_penalty_pts: turnPenaltyPts.value,
+        tokens_per_penalty_pt: tokensPerPenaltyPt.value,
+        calibration_runs_per_arm: calibrationRunsPerArm.value,
+      }),
+    });
+    penaltyNotice.value = `Saved (${turnPenaltyPts.value} pts/turn × ${tokensPerPenaltyPt.value} tok/pt, ${calibrationRunsPerArm.value} runs/arm).`;
+  } finally {
+    savingPenalty.value = false;
+  }
+}
+
 onMounted(() => {
   void loadSettings();
+  void loadAbSettings();
 });
 
 const allModelEntries = computed(() => {
@@ -745,6 +787,67 @@ async function pruneAuditRuns() {
               {{ pruning ? "Purging..." : "Purge Without Archive" }}
             </Button>
           </div>
+        </div>
+      </section>
+
+      <section class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
+        <div>
+          <h2 class="text-sm font-semibold text-[#09090B]">
+            Adaptive Mode Routing &amp; Calibration Policy
+          </h2>
+          <p class="mt-1 text-xs text-[#71717A]">
+            Because MCP does not expose internal LLM thinking tokens, each extra sequential round-trip (<code class="font-mono-data">turns &gt; 1</code>) in Classic MCP deducts <strong class="text-[#09090B]">Penalty pts/turn</strong> (where <strong class="text-[#09090B]">1 pt = X estimated reasoning tokens</strong>). During 50/50 calibration (<strong class="text-[#09090B]">N runs per arm</strong>), the gateway compares effective tokens (in + out + penalty) for each <code class="font-mono-data">(model, tool)</code>, locks in the lower-cost mode, and uses the higher-cost mode's average as the ROI savings baseline.
+          </p>
+        </div>
+        <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <div>
+            <label class="block text-xs font-medium text-[#52525B]" for="settings-turn-penalty">
+              Penalty (pts / extra turn)
+            </label>
+            <Input
+              id="settings-turn-penalty"
+              v-model.number="turnPenaltyPts"
+              type="number"
+              min="0"
+              max="50"
+              step="1"
+              class="mt-1 w-full font-mono-data text-xs"
+            />
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-[#52525B]" for="settings-tokens-per-pt">
+              Tokens per Penalty Point
+            </label>
+            <Input
+              id="settings-tokens-per-pt"
+              v-model.number="tokensPerPenaltyPt"
+              type="number"
+              min="0"
+              max="2000"
+              step="10"
+              class="mt-1 w-full font-mono-data text-xs"
+            />
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-[#52525B]" for="settings-runs-per-arm">
+              Calibration Runs per Arm (50/50)
+            </label>
+            <Input
+              id="settings-runs-per-arm"
+              v-model.number="calibrationRunsPerArm"
+              type="number"
+              min="5"
+              max="500"
+              step="5"
+              class="mt-1 w-full font-mono-data text-xs"
+            />
+          </div>
+        </div>
+        <div class="flex items-center gap-3">
+          <Button :disabled="savingPenalty" @click="saveAbPenalty">
+            {{ savingPenalty ? "Saving..." : "Save Calibration Policy" }}
+          </Button>
+          <span v-if="penaltyNotice" class="text-xs text-[#0F766E]">{{ penaltyNotice }}</span>
         </div>
       </section>
     </template>

@@ -41,10 +41,12 @@ const navItems: { to: string; label: string; icon: IconName }[] = [
   { to: "/traces", label: "Traces & Timeline", icon: "audit" },
   { to: "/analytics", label: "Gateway Usage", icon: "analytics" },
   { to: "/optimization", label: "Optimization & ROI", icon: "upstreams" },
-  { to: "/onboarding", label: "Onboarding & A/B Lab", icon: "onboarding" },
+  { to: "/model-performance", label: "Model Performance", icon: "analytics" },
+  { to: "/onboarding", label: "Onboarding", icon: "onboarding" },
   { to: "/upstreams", label: "Upstreams Catalog", icon: "upstreams" },
   { to: "/audit", label: "Audit & Compliance", icon: "audit" },
   { to: "/settings", label: "Settings & Alerts", icon: "shield" },
+  { to: "/demo", label: "Demo Control", icon: "sliders" },
 ];
 
 function isActiveRoute(to: string): boolean {

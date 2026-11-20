@@ -77,7 +77,7 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
     "Base / MCP Endpoint URL",
     "Inspect Schema",
     "Quick REST Builder",
-    "3. A/B Test & Save",
+    "3. Test & Save",
   ]) {
     expect(labels, `Missing control '${requiredLabel}' in agent snapshot`).toContain(requiredLabel);
   }
@@ -113,7 +113,7 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
 
   // Advance to Step 3 so Register Upstream mounts cleanly
   const navStep3 = await agent.act({
-    steps: [{ ref: "3. A/B Test & Save", action: "press" }],
+    steps: [{ ref: "3. Test & Save", action: "press" }],
   });
   expect(navStep3.ok, navStep3.error?.message).toBe(true);
   const step3Labels = agent

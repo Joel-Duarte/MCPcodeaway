@@ -587,7 +587,7 @@ async function copyPromptText() {
     <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div>
         <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">
-          HITL Onboarding &amp; A/B Test Lab
+          Onboarding
         </h1>
         <p class="mt-0.5 text-[13px] text-[#52525B]">
           Inspect schemas, verify security hints, and A/B-test Classic vs. Code Mode before publishing an upstream.
@@ -643,7 +643,7 @@ async function copyPromptText() {
           class="text-xs"
           @click="onboardingStep = 3"
         >
-          3. A/B Test &amp; Save
+          3. Test &amp; Save
         </Button>
       </div>
       <div class="flex flex-wrap items-center gap-2">

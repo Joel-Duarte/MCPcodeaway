@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import pytest
 from fastapi import FastAPI, Header
 
 from gateway.auth import LocalDevKeyManager

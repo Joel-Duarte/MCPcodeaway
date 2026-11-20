@@ -194,14 +194,21 @@ function formatUsd(n: number | undefined): string {
         </p>
       </div>
       <div class="flex flex-wrap items-center gap-3">
-        <span class="inline-flex items-center gap-1.5 rounded-md border border-[#E4E4E7] bg-white px-2.5 py-1 text-xs font-medium text-[#52525B]">
+        <span
+          class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium"
+          :class="
+            wsConnected
+              ? 'border-[#99F6E4] bg-[#F0FDFA] text-[#0F766E]'
+              : 'border-[#E4E4E7] bg-white text-[#52525B]'
+          "
+        >
           <span
-            class="inline-block h-2 w-2 rounded-full"
-            :class="wsConnected ? 'bg-[#059669] animate-pulse' : 'bg-[#D97706]'"
+            class="inline-block h-1.5 w-1.5 rounded-full"
+            :class="wsConnected ? 'bg-[#0F766E] animate-pulse' : 'bg-[#D97706]'"
           />
-          <span>{{ wsConnected ? "WebSocket Live" : "Connecting WS..." }}</span>
+          <span>{{ wsConnected ? "Live" : "Connecting..." }}</span>
         </span>
-        <Button data-variant="primary" pending-announcement="Refreshing metrics" @click="fetchOverview">
+        <Button v-if="!wsConnected" data-variant="primary" pending-announcement="Refreshing metrics" @click="fetchOverview">
           <AppIcon name="refresh" :size="15" />
           <span>Refresh</span>
         </Button>

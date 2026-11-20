@@ -124,10 +124,13 @@ function clearChip(key: "group" | "user" | "upstream") {
   void fetchAnalytics();
 }
 
+const selectedWindow = ref("24h");
+
 async function fetchAnalytics() {
   errorMessage.value = "";
   const params = new URLSearchParams();
   params.set("model", selectedModel.value || "qwen3.5-9b");
+  if (selectedWindow.value !== "all") params.set("window", selectedWindow.value);
   if (groupFilter.value.trim()) params.set("group", groupFilter.value.trim());
   if (userFilter.value.trim()) params.set("user", userFilter.value.trim());
   if (upstreamFilter.value.trim()) params.set("upstream", upstreamFilter.value.trim());
@@ -188,14 +191,38 @@ function formatUsd(n: number | undefined): string {
   <div class="space-y-6">
     <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div>
-        <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">
-          Gateway Usage, Groups &amp; Cost Attribution
-        </h1>
+        <div class="flex items-center gap-2">
+          <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">
+            Gateway Usage, Groups &amp; Cost Attribution
+          </h1>
+          <span
+            class="inline-flex items-center gap-1 rounded-full border border-[#99F6E4] bg-[#F0FDFA] px-2 py-0.5 text-[11px] font-medium text-[#0F766E]"
+          >
+            <span class="h-1.5 w-1.5 rounded-full bg-[#0F766E]" />
+            3s
+          </span>
+        </div>
         <p class="mt-0.5 text-[13px] text-[#52525B]">
           Track overall MCP gateway traffic, top company groups, active users, and ABAC/PII governance.
         </p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
+        <div class="flex items-center gap-1">
+          <button
+            v-for="w in ['1h', '24h', '7d', '30d', 'all']"
+            :key="w"
+            type="button"
+            class="rounded border px-2 py-1 text-xs font-mono-data transition"
+            :class="
+              selectedWindow === w
+                ? 'border-[#0F766E] bg-[#F0FDFA] font-semibold text-[#0F766E]'
+                : 'border-[#E4E4E7] bg-white text-[#52525B] hover:bg-[#FAFAFA]'
+            "
+            @click="selectedWindow = w; void fetchAnalytics()"
+          >
+            {{ w }}
+          </button>
+        </div>
         <NuxtLink
           to="/optimization"
           class="no-underline inline-flex items-center gap-1.5 rounded-md border border-[#99F6E4] bg-[#F0FDFA] px-3 py-1.5 text-xs font-medium text-[#0F766E] hover:bg-[#CCFBF1]"

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from opentelemetry import trace
@@ -470,6 +470,7 @@ class TelemetryRecorder:
         upstream_filter: str | None = None,
         model_name: str = "default",
         model_pricing: dict[str, dict[str, float]] | None = None,
+        window_hours: int | None = None,
     ) -> dict[str, Any]:
         """Aggregate usage, USD cost, mode decisions, and A/B experiments by group & user."""
         pricing_table = model_pricing or {"default": {"input": 3.0, "output": 15.0}}
@@ -489,7 +490,12 @@ class TelemetryRecorder:
         uf = (user_filter or "").strip().lower()
         sf = (upstream_filter or "").strip().lower()
         runs: list[dict[str, Any]] = []
+        cutoff_iso: str | None = None
+        if window_hours is not None and window_hours > 0:
+            cutoff_iso = (datetime.now(UTC) - timedelta(hours=window_hours)).isoformat()
         for run in all_runs:
+            if cutoff_iso is not None and str(run.get("created_at") or "") < cutoff_iso:
+                continue
             groups = [str(g) for g in (run.get("user_groups") or [])] or ["unassigned"]
             user_sub = str(run.get("user_sub") or "unknown")
             user_email = str(run.get("user_email") or "")

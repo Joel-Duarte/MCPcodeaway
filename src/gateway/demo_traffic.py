@@ -49,6 +49,32 @@ class DemoTrafficRunner:
         self.errors_count = 0
         self.last_target = ""
         self.last_error = ""
+        self.model_profiles: list[dict[str, Any]] = [
+            {
+                "model": "claude-sonnet-4-5",
+                "codemode_success_rate": 0.98,
+                "traditional_success_rate": 0.95,
+                "traditional_turns": 4,
+            },
+            {
+                "model": "gpt-4o",
+                "codemode_success_rate": 0.92,
+                "traditional_success_rate": 0.94,
+                "traditional_turns": 3,
+            },
+            {
+                "model": "gemini-2.5-pro",
+                "codemode_success_rate": 0.96,
+                "traditional_success_rate": 0.90,
+                "traditional_turns": 4,
+            },
+            {
+                "model": "llama-3.3-70b",
+                "codemode_success_rate": 0.45,
+                "traditional_success_rate": 0.88,
+                "traditional_turns": 2,
+            },
+        ]
 
     def bind_app(self, app: FastAPI) -> None:
         self._app = app
@@ -257,30 +283,53 @@ class DemoTrafficRunner:
             ),
         ]
 
-        # Probe any custom upstreams registered by the admin so they appear live in analytics.
+        # Probe all enabled upstreams and their non-mutating tools across demo models.
+        profiles = self.model_profiles or [{"model": "claude-sonnet-4-5"}]
+        idx = 0
+        dynamic_workloads: list[tuple[str, str, str, dict[str, Any], dict[str, str] | None]] = []
         for upstream in self.runtime.registry.list_upstreams():
-            if not upstream.enabled or upstream.name in _BUILTIN_SERVERS:
+            if not upstream.enabled:
                 continue
-            tools = self.runtime.catalog.get_server_tools(upstream.name)
-            safe_tool = next(
-                (t for t in tools if not t.mutating and not (t.input_schema or {}).get("required")),
-                None,
-            )
-            if safe_tool is None:
-                continue
-            workloads.append(
-                (
-                    "gateway_admin",
-                    "mode=codemode",
-                    f"custom:{safe_tool.qualified_name}",
+            for safe_tool in self.runtime.catalog.get_server_tools(upstream.name):
+                if safe_tool.mutating:
+                    continue
+                schema = safe_tool.input_schema or {}
+                props = schema.get("properties") or {}
+                req_fields = schema.get("required") or []
+                default_args: dict[str, Any] = {}
+                for field in req_fields:
+                    ftype = (props.get(field) or {}).get("type", "string")
+                    if ftype == "integer":
+                        default_args[field] = 1
+                    elif ftype == "number":
+                        default_args[field] = 10.0
+                    elif ftype == "boolean":
+                        default_args[field] = False
+                    else:
+                        default_args[field] = "demo"
+                prof = profiles[idx % len(profiles)]
+                model_name = str(prof.get("model") or "claude-sonnet-4-5")
+                arm = "codemode" if idx % 2 == 0 else "traditional"
+                idx += 1
+                arg_str = ", ".join(f"{k}={v!r}" for k, v in default_args.items())
+                params: dict[str, Any] = (
                     {
                         "name": "execute_code",
-                        "arguments": {"code": f"await {safe_tool.qualified_name}()"},
-                    },
-                    None,
+                        "arguments": {"code": f"await {safe_tool.qualified_name}({arg_str})"},
+                    }
+                    if arm == "codemode"
+                    else {"name": safe_tool.qualified_name, "arguments": default_args}
                 )
-            )
-        return workloads
+                dynamic_workloads.append(
+                    (
+                        "gateway_admin",
+                        f"mode={arm}",
+                        f"{upstream.name}:{safe_tool.name}:{arm}",
+                        params,
+                        {"X-Model-Name": model_name, "X-Admin-Force-Mode": arm},
+                    )
+                )
+        return dynamic_workloads + workloads
 
     async def _dispatch_one(
         self,
@@ -338,7 +387,7 @@ class DemoTrafficRunner:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=self._app), base_url="http://demo.local"
         ) as client:
-            for _ in range(max(1, min(count, 24))):
+            for _ in range(max(1, min(count, 100))):
                 item = workloads[self._step % len(workloads)]
                 self._step += 1
                 sent += 1

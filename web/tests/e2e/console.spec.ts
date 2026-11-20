@@ -71,7 +71,7 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     await page.getByRole("button", { name: /2\. Policy & Mode/i }).click();
     await expect(page.getByText(/Sessionless MCP/i)).toBeVisible();
     await expect(page.getByText(/Step 2 — Access Control/i)).toBeVisible();
-    await page.getByRole("button", { name: /3\. A\/B Test & Save/i }).click();
+    await page.getByRole("button", { name: /3\. Test & Save/i }).click();
     await expect(page.getByRole("button", { name: /Run A\/B Evaluation/i })).toBeVisible();
 
     await page.getByRole("button", { name: /Agent Onboarding Prompt/i }).click();

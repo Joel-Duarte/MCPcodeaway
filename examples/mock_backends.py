@@ -908,6 +908,18 @@ def create_mock_backends_app(
         async def list_items(limit: int = Query(default=25, ge=1, le=100)) -> dict[str, Any]:
             return {"items": rows[:limit], "count": len(rows[:limit])}
 
+        @sub.get("/summary", operation_id=f"{op_id}_summary")
+        async def get_summary() -> dict[str, Any]:
+            return {"service": title, "total_records": len(rows), "status": "ok"}
+
+        @sub.get("/health", operation_id=f"{op_id}_health")
+        async def get_health() -> dict[str, Any]:
+            return {"service": title, "healthy": True, "records": len(rows)}
+
+        @sub.get("/metrics", operation_id=f"{op_id}_metrics")
+        async def get_metrics() -> dict[str, Any]:
+            return {"service": title, "active_items": len(rows), "latency_p50_ms": 12.4}
+
         return sub
 
     app.mount(
