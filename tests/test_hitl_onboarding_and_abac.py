@@ -191,7 +191,21 @@ async def test_hitl_onboarding_guidance_curation_and_agent_prompt(tmp_path) -> N
                 assert reg.status_code == 200, reg.text
                 assert reg.json()["inspection"]["selected_operations"] == ["get_health"]
 
-                listed = await _post_mcp(gw, fin_token, "tools/list", query="mode=traditional")
+                listed_resp = await gw.post(
+                    "/mcp",
+                    headers={
+                        "Authorization": f"Bearer {fin_token}",
+                        "X-Admin-Force-Mode": "traditional",
+                        **request_headers("tools/list"),
+                    },
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/list",
+                        "params": {"_meta": request_meta()},
+                    },
+                )
+                listed = listed_resp.json()
                 tool_names = {t["name"] for t in listed["result"]["tools"]}
                 assert "curated_api__get_health" in tool_names
                 assert "curated_api__delete_order" not in tool_names

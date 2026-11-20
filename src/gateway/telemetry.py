@@ -213,6 +213,14 @@ class TelemetryRecorder:
                         }
                     )
 
+        inferred_server = (
+            subcalls[0].server
+            if subcalls
+            else (tool_name.split("__", 1)[0] if "__" in (tool_name or "") else "gateway")
+        )
+        eff_input_tokens = max(0, int(tokens_used_est))
+        eff_output_tokens = max(0, int(returned_tokens))
+        eff_total_tokens = eff_input_tokens + eff_output_tokens
         run = {
             "run_id": f"run_{uuid.uuid4().hex[:12]}",
             "created_at": datetime.now(UTC).isoformat(),
@@ -227,6 +235,11 @@ class TelemetryRecorder:
             "client_id": identity.client_id,
             "catalog_version": catalog_version,
             "tool_name": tool_name,
+            "server_name": inferred_server,
+            "input_tokens": eff_input_tokens,
+            "output_tokens": eff_output_tokens,
+            "total_tokens": eff_total_tokens,
+            "token_source": "estimated",
             "code": OutputRedactor.redact_text(code) if code else None,
             "stdout": OutputRedactor.redact_text(stdout) if stdout else "",
             "error": OutputRedactor.redact_text(error) if error else None,
@@ -768,6 +781,65 @@ class TelemetryRecorder:
             )
         ]
 
+        server_buckets: dict[str, dict[str, int]] = {}
+        tool_buckets: dict[str, dict[str, int]] = {}
+        overall_in = 0
+        overall_out = 0
+        overall_tot = 0
+        for r in runs:
+            r_in = int(r.get("input_tokens") or r.get("tokens_used_est") or 0)
+            r_out = int(r.get("output_tokens") or r.get("returned_tokens") or 0)
+            r_tot = int(r.get("total_tokens") or (r_in + r_out))
+            r_sav = int(r.get("estimated_tokens_saved") or 0)
+            overall_in += r_in
+            overall_out += r_out
+            overall_tot += r_tot
+            srv = str(r.get("server_name") or "gateway")
+            sb = server_buckets.setdefault(
+                srv,
+                {
+                    "runs": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "tokens_saved": 0,
+                },
+            )
+            sb["runs"] += 1
+            sb["input_tokens"] += r_in
+            sb["output_tokens"] += r_out
+            sb["total_tokens"] += r_tot
+            sb["tokens_saved"] += r_sav
+            tl = str(r.get("tool_name") or "unknown")
+            tb_item = tool_buckets.setdefault(
+                tl,
+                {
+                    "runs": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "tokens_saved": 0,
+                },
+            )
+            tb_item["runs"] += 1
+            tb_item["input_tokens"] += r_in
+            tb_item["output_tokens"] += r_out
+            tb_item["total_tokens"] += r_tot
+            tb_item["tokens_saved"] += r_sav
+
+        by_server = [
+            {"server": k, **v}
+            for k, v in sorted(
+                server_buckets.items(), key=lambda kv: kv[1]["total_tokens"], reverse=True
+            )
+        ]
+        by_tool = [
+            {"tool": k, **v}
+            for k, v in sorted(
+                tool_buckets.items(), key=lambda kv: kv[1]["total_tokens"], reverse=True
+            )
+        ]
+
         total_n = len(runs)
         return {
             "window_runs": total_n,
@@ -786,9 +858,14 @@ class TelemetryRecorder:
                     round((total_codemode / total_n) * 100, 1) if total_n else 0.0
                 ),
                 "total_tokens_saved": total_tokens_saved,
+                "input_tokens": overall_in,
+                "output_tokens": overall_out,
+                "total_tokens": overall_tot,
                 "estimated_cost_usd": round(total_cost_usd, 6),
                 "estimated_cost_saved_usd": round(total_cost_saved_usd, 6),
             },
+            "by_server": by_server,
+            "by_tool": by_tool,
             "by_company_group": by_company_group,
             "by_client_group": sorted(
                 client_group_buckets.values(), key=lambda x: x["runs"], reverse=True

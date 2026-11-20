@@ -1606,6 +1606,7 @@ def create_gateway_app(
         require_grounding: bool | None = Query(default=None),
         x_gateway_mode: str | None = Header(default=None),
         x_execution_mode: str | None = Header(default=None),
+        x_admin_force_mode: str | None = Header(default=None),
         x_discovery_mode: str | None = Header(default=None),
         x_discovery_backend: str | None = Header(default=None),
         x_mcp_servers: str | None = Header(default=None),
@@ -1676,18 +1677,29 @@ def create_gateway_app(
                 update_request_context(tenant_id=identity.tenant_id, user_sub=identity.sub)
                 mcp_span.set_attribute("tenant.id", identity.tenant_id)
 
+                forced_mode = (
+                    x_admin_force_mode.strip()
+                    if x_admin_force_mode
+                    and (
+                        runtime.settings.app_env != "prod"
+                        or any(r in runtime.settings.admin_roles for r in identity.roles)
+                    )
+                    else None
+                )
                 eff_exec, eff_disc_mode, effective_mode = _resolve_execution_and_discovery(
                     runtime.settings,
-                    query_mode=mode,
-                    header_mode=x_gateway_mode,
-                    query_execution=execution,
-                    header_execution=x_execution_mode,
+                    query_mode=forced_mode,
+                    header_mode=None,
+                    query_execution=None if forced_mode else "auto",
+                    header_execution=None,
                     query_discovery_mode=discovery_mode,
                     header_discovery_mode=x_discovery_mode,
                     x_intent=x_intent,
                 )
-                has_explicit_mode = bool(mode or x_gateway_mode or execution or x_execution_mode)
-                mode_decision_reason: str | None = f"explicit:{effective_mode}"
+                has_explicit_mode = bool(forced_mode)
+                mode_decision_reason: str | None = (
+                    f"admin_force:{effective_mode}" if forced_mode else f"auto:{effective_mode}"
+                )
                 mode_decision_score: float | None = None
                 experiment_id: str | None = None
                 ab_variant: str | None = None
@@ -1710,6 +1722,15 @@ def create_gateway_app(
                 req_id = payload.get("id")
                 method = payload.get("method")
                 params = payload.get("params") or {}
+                if (
+                    not has_explicit_mode
+                    and method == "tools/call"
+                    and isinstance(params, dict)
+                    and params.get("name") == "execute_code"
+                ):
+                    eff_exec = "codemode"
+                    effective_mode = "codemode"
+                    mode_decision_reason = "auto:execute_code->codemode"
                 request_meta = params.get("_meta", {}) if isinstance(params, dict) else {}
                 client_info = (
                     request_meta.get("io.modelcontextprotocol/clientInfo")

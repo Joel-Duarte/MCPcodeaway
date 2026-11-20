@@ -36,8 +36,8 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
         ) as gw:
             # 1. Code Mode tools/list returns ONLY list_servers, search_tools, and execute_code
             cm_list = await gw.post(
-                "/mcp?mode=codemode",
-                headers={"Authorization": f"Bearer {fin_token}"},
+                "/mcp",
+                headers={"X-Admin-Force-Mode": "codemode", "Authorization": f"Bearer {fin_token}"},
                 json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             )
             assert cm_list.status_code == 200
@@ -46,8 +46,8 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
 
             # 2. RBAC-filtered search_tools hides ops_ticketing from finance_analyst
             search = await gw.post(
-                "/mcp?mode=codemode",
-                headers={"Authorization": f"Bearer {fin_token}"},
+                "/mcp",
+                headers={"X-Admin-Force-Mode": "codemode", "Authorization": f"Bearer {fin_token}"},
                 json={
                     "jsonrpc": "2.0",
                     "id": 2,
@@ -82,8 +82,8 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
                 "mismatches"
             )
             cm_exec = await gw.post(
-                "/mcp?mode=codemode",
-                headers={"Authorization": f"Bearer {fin_token}"},
+                "/mcp",
+                headers={"X-Admin-Force-Mode": "codemode", "Authorization": f"Bearer {fin_token}"},
                 json={
                     "jsonrpc": "2.0",
                     "id": 3,
@@ -110,8 +110,11 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
 
             # 4. Traditional mode exposes all accessible tools directly and rejects execute_code
             trad_list = await gw.post(
-                "/mcp?mode=traditional",
-                headers={"Authorization": f"Bearer {fin_token}"},
+                "/mcp",
+                headers={
+                    "X-Admin-Force-Mode": "traditional",
+                    "Authorization": f"Bearer {fin_token}",
+                },
                 json={"jsonrpc": "2.0", "id": 4, "method": "tools/list"},
             )
             trad_names = {t["name"] for t in trad_list.json()["result"]["tools"]}
@@ -123,7 +126,7 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
                 "/mcp",
                 headers={
                     "Authorization": f"Bearer {fin_token}",
-                    "X-Gateway-Mode": "traditional",
+                    "X-Admin-Force-Mode": "traditional",
                 },
                 json={
                     "jsonrpc": "2.0",
@@ -140,8 +143,8 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
 
             # 5. Hybrid mode exposes mutating tool directly and keeps it out of execute_code
             hyb_list = await gw.post(
-                "/mcp?mode=hybrid",
-                headers={"Authorization": f"Bearer {ops_token}"},
+                "/mcp",
+                headers={"X-Admin-Force-Mode": "hybrid", "Authorization": f"Bearer {ops_token}"},
                 json={"jsonrpc": "2.0", "id": 6, "method": "tools/list"},
             )
             hyb_names = [t["name"] for t in hyb_list.json()["result"]["tools"]]
@@ -153,8 +156,8 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
             ]
 
             hyb_sandbox_write = await gw.post(
-                "/mcp?mode=hybrid",
-                headers={"Authorization": f"Bearer {ops_token}"},
+                "/mcp",
+                headers={"X-Admin-Force-Mode": "hybrid", "Authorization": f"Bearer {ops_token}"},
                 json={
                     "jsonrpc": "2.0",
                     "id": 7,
@@ -173,8 +176,8 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
             assert not hyb_sandbox_write.json()["result"]["structuredContent"]["ok"]
 
             hyb_direct_write = await gw.post(
-                "/mcp?mode=hybrid",
-                headers={"Authorization": f"Bearer {ops_token}"},
+                "/mcp",
+                headers={"X-Admin-Force-Mode": "hybrid", "Authorization": f"Bearer {ops_token}"},
                 json={
                     "jsonrpc": "2.0",
                     "id": 8,

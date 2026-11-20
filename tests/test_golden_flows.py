@@ -38,6 +38,10 @@ async def _mcp_call(
         **request_headers(method, tool_name=(params or {}).get("name")),
         **(headers or {}),
     }
+    if query:
+        for part in query.split("&"):
+            if part.startswith("mode="):
+                req_headers.setdefault("X-Admin-Force-Mode", part.split("=", 1)[1])
     return await client.post(
         url,
         headers=req_headers,

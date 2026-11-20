@@ -174,9 +174,10 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
 
             # Verify hot-reload into BOTH traditional tools/list and codemode search+execute
             trad_tools = await gw.post(
-                "/mcp?mode=traditional",
+                "/mcp",
                 headers={
                     "Authorization": f"Bearer {token}",
+                    "X-Admin-Force-Mode": "traditional",
                     **request_headers("tools/list"),
                 },
                 json={

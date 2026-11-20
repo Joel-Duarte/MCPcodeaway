@@ -48,6 +48,15 @@ async def _post_mcp(
     }
     if headers:
         req_headers.update(headers)
+    if "X-Execution-Mode" in req_headers:
+        exec_mode = req_headers["X-Execution-Mode"]
+        req_headers.setdefault(
+            "X-Admin-Force-Mode", "traditional" if exec_mode == "classic" else exec_mode
+        )
+    if query:
+        for part in query.split("&"):
+            if part.startswith(("mode=", "execution=")):
+                req_headers.setdefault("X-Admin-Force-Mode", part.split("=", 1)[1])
     resp = await client.post(
         url,
         headers=req_headers,

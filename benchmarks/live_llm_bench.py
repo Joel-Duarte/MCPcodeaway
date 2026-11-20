@@ -24,6 +24,7 @@ if str(_ROOT) not in sys.path:
 from examples.mock_backends import build_synthetic_tools, create_mock_backends_app
 from gateway.auth import LocalDevKeyManager
 from gateway.config import GatewaySettings
+from gateway.mcp_protocol import request_headers, request_meta
 from gateway.server import create_gateway_app
 from gateway.state import SQLiteAuditStore
 from gateway.upstream_clients import DiscoveredTool
@@ -232,14 +233,23 @@ async def _list_mcp_tools(
     discovery_backend: str = "bm25",
     x_intent: str | None = None,
 ) -> list[dict[str, Any]]:
-    _, query_part, _, _ = _parse_mode_spec(mode)
-    headers = {"Authorization": f"Bearer {gw_token}"}
+    _, _, resolved_mode, _ = _parse_mode_spec(mode)
+    headers = {
+        **request_headers("tools/list"),
+        "Authorization": f"Bearer {gw_token}",
+        "X-Admin-Force-Mode": resolved_mode,
+    }
     if x_intent:
         headers["X-Intent"] = x_intent
     resp = await gw.post(
-        f"/mcp?{query_part}&discovery={discovery_backend}",
+        f"/mcp?discovery={discovery_backend}",
         headers=headers,
-        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {"_meta": request_meta()},
+        },
     )
     resp.raise_for_status()
     return resp.json()["result"]["tools"]
@@ -255,15 +265,19 @@ async def _call_mcp_tool(
     *,
     discovery_backend: str = "bm25",
 ) -> dict[str, Any]:
-    _, query_part, _, _ = _parse_mode_spec(mode)
+    _, _, resolved_mode, _ = _parse_mode_spec(mode)
     resp = await gw.post(
-        f"/mcp?{query_part}&discovery={discovery_backend}",
-        headers={"Authorization": f"Bearer {gw_token}"},
+        f"/mcp?discovery={discovery_backend}",
+        headers={
+            **request_headers("tools/call", tool_name=name),
+            "Authorization": f"Bearer {gw_token}",
+            "X-Admin-Force-Mode": resolved_mode,
+        },
         json={
             "jsonrpc": "2.0",
             "id": req_id,
             "method": "tools/call",
-            "params": {"name": name, "arguments": args},
+            "params": {"_meta": request_meta(), "name": name, "arguments": args},
         },
     )
     resp.raise_for_status()
