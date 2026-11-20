@@ -2,6 +2,7 @@
 import { extractErrorMessage } from "~/composables/useAdminApi";
 
 const router = useRouter();
+const route = useRoute();
 const {
   authConfig,
   session,
@@ -15,6 +16,7 @@ const selectedPersona = ref<string>("gateway_admin");
 const bearerInput = ref("");
 const errorMessage = ref("");
 const initialLoading = ref(true);
+const accessDenied = computed(() => route.query.auth_error === "not_authorized");
 
 onMounted(async () => {
   try {
@@ -22,7 +24,7 @@ onMounted(async () => {
     if (cfg.dev_personas.length > 0 && !cfg.dev_personas.includes(selectedPersona.value)) {
       selectedPersona.value = cfg.dev_personas[0] || "gateway_admin";
     }
-    if (!sess.admin_auth_required || (sess.authenticated && sess.is_admin)) {
+    if (!sess.admin_auth_required || (sess.authenticated && sess.can_access_admin_console)) {
       await router.replace("/");
     }
   } catch (err) {
@@ -36,10 +38,10 @@ async function handleDevSignIn() {
   errorMessage.value = "";
   try {
     const res = await devLogin(selectedPersona.value);
-    if (res.authenticated && res.is_admin) {
+    if (res.authenticated && res.can_access_admin_console) {
       await router.push("/");
     } else {
-      errorMessage.value = "Selected persona lacks an admin role.";
+      errorMessage.value = "Selected persona lacks an admin or viewer role.";
     }
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
@@ -54,10 +56,11 @@ async function handleTokenSignIn() {
   }
   try {
     const res = await tokenLogin(bearerInput.value);
-    if (res.authenticated && res.is_admin) {
+    bearerInput.value = "";
+    if (res.authenticated && res.can_access_admin_console) {
       await router.push("/");
     } else {
-      errorMessage.value = "Token lacks required gateway admin role.";
+      errorMessage.value = "Token lacks a gateway admin or viewer role.";
     }
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
@@ -114,6 +117,14 @@ const personaItems = computed(() => {
           <span>{{ errorMessage }}</span>
         </div>
 
+        <div
+          v-if="accessDenied"
+          role="alert"
+          class="rounded-md border border-[#FDE68A] bg-[#FFFBEB] px-3 py-2.5 text-[13px] text-[#92400E]"
+        >
+          Your company account signed in, but it is not assigned access to this console. Ask your company administrator to grant the appropriate gateway role, then try again.
+        </div>
+
         <!-- OIDC Authorization Code + PKCE -->
         <div class="space-y-2">
           <Button
@@ -124,12 +135,12 @@ const personaItems = computed(() => {
             <template #render="{ props }">
               <a v-bind="props" :href="oidcLoginUrl()" class="no-underline w-full">
                 <AppIcon name="shield" :size="16" />
-                <span>Sign in with SSO (OIDC PKCE)</span>
+                <span>Sign in with company SSO</span>
               </a>
             </template>
           </Button>
           <p v-else class="text-xs text-[#71717A]">
-            OIDC SSO is not configured in this environment (`admin_oidc_authorization_endpoint` unset).
+            Company SSO is not configured for this deployment. Contact your gateway administrator.
           </p>
         </div>
 
@@ -177,9 +188,13 @@ const personaItems = computed(() => {
         </div>
 
         <!-- Bearer Token Exchange -->
-        <form class="space-y-3 border-t border-[#E4E4E7] pt-4" @submit.prevent="handleTokenSignIn">
+        <form
+          v-if="authConfig?.token_login_enabled"
+          class="space-y-3 border-t border-[#E4E4E7] pt-4"
+          @submit.prevent="handleTokenSignIn"
+        >
           <h2 class="text-[15px] font-semibold text-[#09090B]">
-            Admin Bearer JWT
+            Development token exchange
           </h2>
           <Field>
             <FieldLabel>Bearer Token</FieldLabel>

@@ -178,7 +178,6 @@ export interface LiveAlertItem {
 
 export function useLiveTelemetry() {
   const config = useRuntimeConfig();
-  const { bearerToken } = useAdminApi();
   const demoStatus = useState<DemoTrafficStatus>("demo-traffic-status");
 
   const connected = useState<boolean>("ws-telemetry-connected", () => false);
@@ -205,8 +204,7 @@ export function useLiveTelemetry() {
     } else {
       return "";
     }
-    const qs = bearerToken.value ? `?token=${encodeURIComponent(bearerToken.value)}` : "";
-    return `${base}/admin/ws/telemetry${qs}`;
+    return `${base}/admin/ws/telemetry`;
   }
 
   function connect(): void {

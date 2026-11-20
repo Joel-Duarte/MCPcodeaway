@@ -11,6 +11,7 @@ export interface AdminSessionState {
   authenticated: boolean;
   user: AdminUserProfile | null;
   is_admin: boolean;
+  can_access_admin_console: boolean;
   admin_auth_required: boolean;
 }
 
@@ -20,6 +21,7 @@ export interface AdminAuthConfig {
   admin_auth_required: boolean;
   oidc_enabled: boolean;
   dev_auth_enabled: boolean;
+  token_login_enabled: boolean;
   dev_personas: string[];
 }
 
@@ -53,7 +55,6 @@ export function extractErrorMessage(err: unknown): string {
 
 export function useAdminApi() {
   const config = useRuntimeConfig();
-  const route = useRoute();
   const router = useRouter();
 
   const session = useState<AdminSessionState | null>("admin-session", () => null);
@@ -96,12 +97,13 @@ export function useAdminApi() {
         !skipRedirect &&
         (status === 401 || status === 403) &&
         session.value?.admin_auth_required &&
-        route.path !== "/login"
+        router.currentRoute.value.path !== "/login"
       ) {
         session.value = {
           authenticated: false,
           user: null,
           is_admin: false,
+          can_access_admin_console: false,
           admin_auth_required: true,
         };
         await router.push("/login");
@@ -160,7 +162,7 @@ export function useAdminApi() {
       },
       true
     );
-    bearerToken.value = token.trim();
+    bearerToken.value = "";
     const updated = await apiFetch<AdminSessionState>("/auth/admin/session", {}, true);
     session.value = updated;
     return updated;
