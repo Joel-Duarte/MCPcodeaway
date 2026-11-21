@@ -59,6 +59,34 @@ This gives the router evidence to favor the faster or cheaper strategy for a par
 
 Use **cost per verified completion**. Add model input and output charges, upstream charges, and execution costs across all attempts, including failures and retries, then divide by verified completions. Compare against the existing workflow, including its usual recovery steps. If an arm has zero verified completions, report its spend and failure count. For local deployments, GPU time and energy per verified completion help translate token efficiency into operating cost. The results above report observed usage on mock workloads.
 
+## Upfront versus deferred workflow pilot
+
+### GPT-6 Luna at low reasoning
+
+We ran five matched pairs in fresh Codex CLI sessions against the same mock balance lookup. Both arms used Code Mode. Upfront supplied all authorized Python stubs at listing time, and deferred found the matching tool through BM25. We alternated arm order and added 50 synthetic tools to the expanded catalog. All ten runs passed the expected-answer and grounding checks.
+
+| Authorized tools | Pairs | Upfront median tokens (cached input) | Deferred median tokens (cached input) | Median wall time, upfront / deferred |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 3 | 46,797 (29,952) | 65,188 (46,592) | 6.9 s / 10.4 s |
+| 58 | 2 | 54,685 (33,920) | 69,929.5 (41,664) | 8.4 s / 8.6 s |
+
+Upfront used 28% fewer reported tokens at eight tools and 22% fewer at 58. Each deferred run added one search call. Both arms made one upstream call per workflow. The totals include Codex session overhead and cached input.
+
+The gateway estimated 867 upfront tool-definition tokens at eight tools and 3,614 at 58. Its 1,024-token budget would recommend deferred for the expanded catalog. This lookup favored upfront even there, so the policy starts in Observe. The pilot covers one task with two or three pairs per catalog size.
+
+### Local Qwen3.5 9B
+
+We ran one matched Qwen3.5 9B lookup pair per catalog size and execution mode in LM Studio. The finance caller could access eight tools in the small fixture and 58 in the expanded fixture. The table shows model-reported tokens and end-to-end wall time.
+
+| Authorized tools | Execution | Upfront | Deferred |
+| ---: | --- | --- | --- |
+| 8 | Classic MCP | 2,361 tokens, 6.8 s, incorrect answer | 5,633 tokens, 10.6 s, verified |
+| 8 | Code Mode | 3,372 tokens, 9.4 s, verified | 11,952 tokens, 23.2 s, audit evidence unverified |
+| 58 | Classic MCP | 13,868 tokens, 9.5 s, verified | 13,363 tokens, 14.8 s, verified |
+| 58 | Code Mode | 9,385 tokens, 10.1 s, verified | 8,288 tokens, 14.3 s, verified |
+
+Deferred used fewer tokens on both expanded-catalog pairs and took longer in each. The small-catalog pairs had different verification outcomes. The discovery policy defaults to Observe while repeated runs establish the cost and latency trade-off.
+
 ## Discovery at catalog scale
 
 The current gateway ships BM25 and keyword search. Workload routing picks how to run a job. Discovery ranks the tools available to the caller.

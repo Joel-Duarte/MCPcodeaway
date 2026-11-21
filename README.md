@@ -100,6 +100,12 @@ For ROI, compare **cost per verified completion** against the current workflow, 
 
 ### Discovery at scale
 
+Discovery controls when clients receive tool definitions. Upfront includes them in the initial listing. Deferred lets clients call `search_tools` to load relevant definitions. For automatic requests, the gateway estimates the complete listing after applying the caller's permissions and server scope. It recommends upfront if the listing fits within 1,024 estimated tokens and deferred for larger listings. Classic definitions and Code Mode stubs are sized independently. Set `GATEWAY_AUTO_DISCOVERY_TOKEN_BUDGET` to change the threshold.
+
+In [five matched GPT-6 Luna low Code Mode pairs](BENCHMARKS.md#upfront-versus-deferred-workflow-pilot) on a mock lookup, all ten answers verified. Upfront used 28% fewer reported tokens at eight authorized tools and 22% fewer at 58. Those totals include cached input. The expanded catalog exceeded the upfront budget, so this result is a reason to calibrate the policy on more workloads before enabling it.
+
+The policy defaults to Observe, which keeps the current discovery behavior and logs applied and recommended discovery in `mcp.discovery.decision` events. Estimates reported as lower bounds stop at the first tool that exceeds the budget. Use `GATEWAY_AUTO_DISCOVERY_POLICY=active` to apply recommendations, and `observe` to roll back. This setting controls discovery independently of adaptive execution.
+
 BM25 remains the default and ranks tools inside the gateway. In the latest synthetic run it found all expected tools for direct queries at 10,010 tools across 104 mock servers, with about 199 ms p95 gateway latency. Paraphrased queries were harder. The [discovery results](BENCHMARKS.md#discovery-at-catalog-scale) show the effect of a second query and summarize the earlier embedding and System 1 measurements.
 
 ### Adaptive Execution Intelligence
