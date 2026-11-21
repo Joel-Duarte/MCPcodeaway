@@ -53,7 +53,7 @@ jobs:
         run: npm run generate
 
       - name: Set up Python & uv for gateway SPA asset, Playwright E2E & Bombadil smoke
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d
 
       - name: Install backend & Playwright Chromium
         run: |
@@ -103,7 +103,7 @@ jobs:
         run: npm run test:e2e
 
       - name: Run Antithesis Bombadil UI fuzzer
-        uses: antithesishq/bombadil-action@v2
+        uses: antithesishq/bombadil-action@v3
         with:
           driver: browser
           origin: http://127.0.0.1:8000/dashboard/
