@@ -1145,6 +1145,17 @@ def create_mock_backends_app(
         "MOCK_OIDC_REDIRECT_URI", "http://localhost:8080/auth/admin/callback"
     )
     mock_oidc_codes: dict[str, dict[str, Any]] = {}
+    mock_oidc_supported_scopes = {
+        "openid",
+        "profile",
+        "email",
+        "mcp.tools",
+        "mcp.admin",
+        "mcp.audit",
+        "finance.read",
+        "ops.read",
+        "ops.write",
+    }
 
     app.add_middleware(
         CORSMiddleware,
@@ -1174,6 +1185,9 @@ def create_mock_backends_app(
                 "mcp.tools",
                 "mcp.admin",
                 "mcp.audit",
+                "finance.read",
+                "ops.read",
+                "ops.write",
             ],
         }
 
@@ -1204,6 +1218,8 @@ def create_mock_backends_app(
             raise HTTPException(status_code=400, detail="Only S256 PKCE is supported")
         if persona not in DEV_PERSONAS and persona not in _READINESS_OIDC_IDENTITIES:
             raise HTTPException(status_code=400, detail="Unknown local mock OIDC persona")
+        if not scopes <= mock_oidc_supported_scopes:
+            raise HTTPException(status_code=400, detail="Requested scope is not supported")
 
         now = time.time()
         for expired_code in [
@@ -1258,12 +1274,17 @@ def create_mock_backends_app(
 
         now = int(time.time())
         readiness_identity = _READINESS_OIDC_IDENTITIES.get(str(record["persona"]))
+        granted_access_scopes = [
+            item for item in record["scope"] if item not in {"openid", "profile", "email"}
+        ]
         access_token = mock_oidc_keys.issue_user_token(
             persona=None if readiness_identity else str(record["persona"]),
             audience=mock_oidc_audience,
             ttl_seconds=3600,
             overrides=(
-                readiness_identity if readiness_identity else {"client_id": mock_oidc_client_id}
+                {**readiness_identity, "scopes": granted_access_scopes}
+                if readiness_identity
+                else {"client_id": mock_oidc_client_id, "scopes": granted_access_scopes}
             ),
         )
         access_claims = jwt.decode(

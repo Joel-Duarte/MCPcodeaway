@@ -50,6 +50,12 @@ async def test_mock_oidc_authorization_code_pkce_and_one_time_use(
             "code_challenge_method": "S256",
             "persona": "readiness-finance",
         }
+        invalid_scope = await client.get(
+            "/oidc/authorize",
+            params={**auth_params, "scope": "openid scope.not-supported"},
+        )
+        assert invalid_scope.status_code == httpx.codes.BAD_REQUEST
+
         authorization = await client.get("/oidc/authorize", params=auth_params)
         assert authorization.status_code == httpx.codes.FOUND
         callback = parse_qs(urlparse(authorization.headers["location"]).query)
@@ -101,6 +107,7 @@ async def test_mock_oidc_authorization_code_pkce_and_one_time_use(
         assert access_claims["sub"] == "readiness-finance"
         assert access_claims["groups"] == ["finance"]
         assert access_claims["roles"] == ["finance_analyst"]
+        assert access_claims["scp"] == "mcp.tools"
         assert id_claims["nonce"] == "test-nonce"
         missing_userinfo_token = await client.get("/oidc/userinfo")
         assert missing_userinfo_token.status_code == httpx.codes.UNAUTHORIZED

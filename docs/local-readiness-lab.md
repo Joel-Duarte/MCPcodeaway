@@ -23,6 +23,8 @@ The gateway is at `http://localhost:8080`; the mock OIDC issuer is `http://local
 
 The identity check uses group claims in signed tokens, matching the gateway's current model: it authorizes from the caller's token claims and does not query a live directory for group membership. The REST mock exercises the configured HTTP contract for CRM and ticketing flows. Keep these fixtures representative of request/response schemas, authorization outcomes, and expected errors; a single copied happy-path response is not enough to validate those cases. Add another local mock only when a new integration contract needs exercising.
 
+CI runs `tests/test_mock_oidc_provider.py` for discovery, authorization code + PKCE, token/JWKS validation, userinfo, scope checks, and code replay/redirect failures. `tests/test_oidc_golden_flows.py` runs the complete gateway login redirect, callback, session, and non-admin denial against that provider. The Docker readiness smoke adds the multi-replica route, claim-to-RBAC checks, REST call, and shared approval lifecycle.
+
 For repeatable load runs, this overlay raises the per-user gateway rate limit to 6,000 requests/minute. The repository default is 120/minute. Record the effective setting with each run and agree the real per-user/per-tenant limits for the pilot; do not carry the lab override into production without that decision.
 
 Stop only this Compose project when finished (named volumes remain):
