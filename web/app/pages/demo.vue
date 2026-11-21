@@ -29,6 +29,10 @@ const newCodeSuccessRate = ref(0.95);
 const newTradSuccessRate = ref(0.90);
 const newTradTurns = ref(3);
 
+function readNumber(value: string, previous: number): number {
+  return value === "" ? previous : Number(value);
+}
+
 function addModelProfile() {
   const name = newModelName.value.trim();
   if (!name) return;
@@ -241,13 +245,13 @@ onMounted(() => {
             <tr v-for="m in models" :key="m.model">
               <td class="py-2 pr-3 font-mono-data font-medium text-[#09090B]">{{ m.model }}</td>
               <td class="py-2 pr-3">
-                <Input v-model.number="m.codemode_success_rate" type="number" step="0.05" min="0" max="1" class="w-28 font-mono-data text-xs" />
+                <Input :model-value="String(m.codemode_success_rate)" @update:model-value="m.codemode_success_rate = readNumber($event, m.codemode_success_rate)" type="number" step="0.05" min="0" max="1" class="w-28 font-mono-data text-xs" />
               </td>
               <td class="py-2 pr-3">
-                <Input v-model.number="m.traditional_success_rate" type="number" step="0.05" min="0" max="1" class="w-28 font-mono-data text-xs" />
+                <Input :model-value="String(m.traditional_success_rate)" @update:model-value="m.traditional_success_rate = readNumber($event, m.traditional_success_rate)" type="number" step="0.05" min="0" max="1" class="w-28 font-mono-data text-xs" />
               </td>
               <td class="py-2 pr-3">
-                <Input v-model.number="m.traditional_turns" type="number" min="1" max="12" class="w-24 font-mono-data text-xs" />
+                <Input :model-value="String(m.traditional_turns)" @update:model-value="m.traditional_turns = readNumber($event, m.traditional_turns)" type="number" min="1" max="12" class="w-24 font-mono-data text-xs" />
               </td>
               <td class="py-2 text-right">
                 <button type="button" class="text-xs font-medium text-[#DC2626] hover:underline" @click="removeModelProfile(m.model)">Delete</button>
@@ -258,9 +262,9 @@ onMounted(() => {
       </div>
       <form class="mt-4 flex flex-wrap items-end gap-3 border-t border-[#E4E4E7] pt-4" @submit.prevent="addModelProfile">
         <Field><FieldLabel>New model</FieldLabel><Input v-model="newModelName" placeholder="e.g. qwen3.5-9b" class="w-48 font-mono-data text-xs" /></Field>
-        <Field><FieldLabel>Code success</FieldLabel><Input v-model.number="newCodeSuccessRate" type="number" step="0.05" min="0" max="1" class="w-24 text-xs" /></Field>
-        <Field><FieldLabel>Classic success</FieldLabel><Input v-model.number="newTradSuccessRate" type="number" step="0.05" min="0" max="1" class="w-24 text-xs" /></Field>
-        <Field><FieldLabel>Classic turns</FieldLabel><Input v-model.number="newTradTurns" type="number" min="1" max="12" class="w-20 text-xs" /></Field>
+        <Field><FieldLabel>Code success</FieldLabel><Input :model-value="String(newCodeSuccessRate)" @update:model-value="newCodeSuccessRate = readNumber($event, newCodeSuccessRate)" type="number" step="0.05" min="0" max="1" class="w-24 text-xs" /></Field>
+        <Field><FieldLabel>Classic success</FieldLabel><Input :model-value="String(newTradSuccessRate)" @update:model-value="newTradSuccessRate = readNumber($event, newTradSuccessRate)" type="number" step="0.05" min="0" max="1" class="w-24 text-xs" /></Field>
+        <Field><FieldLabel>Classic turns</FieldLabel><Input :model-value="String(newTradTurns)" @update:model-value="newTradTurns = readNumber($event, newTradTurns)" type="number" min="1" max="12" class="w-20 text-xs" /></Field>
         <Button type="submit" data-variant="primary">Add model</Button>
       </form>
     </div>

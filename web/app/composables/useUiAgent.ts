@@ -25,10 +25,20 @@ export interface LiveTelemetryEvent {
   tool_name: string;
   company_group: string;
   user_sub: string;
+  tenant_id?: string | null;
+  user_email?: string | null;
+  user_groups?: string[];
   ok: boolean;
   grounding_blocked: boolean;
   duration_ms: number;
   tokens_saved: number;
+  subcall_count?: number;
+  raw_upstream_bytes?: number;
+  returned_bytes?: number;
+  estimated_tokens_saved?: number;
+  schema_tokens_saved?: number;
+  abac_rows_filtered?: number;
+  redactions_count?: number;
   mode_decision_reason?: string | null;
 }
 
@@ -49,7 +59,8 @@ export function useUiAgentBridge() {
 
     const agent = createAgent({
       allow: (step, { signal }) => {
-        if (!step.confirm) return true;
+        const message = step.confirm;
+        if (!message) return true;
         return new Promise<boolean>((resolve) => {
           const onAbort = () => {
             if (pendingConfirm.value?.resolve === resolve) {
@@ -63,7 +74,7 @@ export function useUiAgentBridge() {
           }
           signal?.addEventListener("abort", onAbort, { once: true });
           pendingConfirm.value = {
-            message: step.confirm,
+            message,
             resolve: (ok) => {
               signal?.removeEventListener("abort", onAbort);
               resolve(ok);
@@ -174,6 +185,10 @@ export interface LiveAlertItem {
   title: string;
   detail: string;
   observed_at: string;
+  affected_upstreams?: string[];
+  affected_users?: string[];
+  remediation?: string;
+  filter_status?: string;
 }
 
 export function useLiveTelemetry() {

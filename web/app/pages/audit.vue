@@ -231,13 +231,15 @@ function timelineTickLabel(run: AuditRun, pct: number): string {
 
 const route = useRoute();
 
-function bottleneckSpan(run: AuditRun) {
-  const spans = run.trace_spans || [];
-  if (!spans.length) return null;
-  const slowest = spans.reduce((a, b) => (b.duration_ms > a.duration_ms ? b : a), spans[0]);
+const bottleneck = computed(() => {
+  const run = selectedRun.value;
+  const spans = run?.trace_spans ?? [];
+  const [first] = spans;
+  if (!run || !first) return null;
+  const slowest = spans.reduce((a, b) => (b.duration_ms > a.duration_ms ? b : a), first);
   const pct = run.duration_ms > 0 ? Math.round((slowest.duration_ms / run.duration_ms) * 100) : 0;
   return { span: slowest, pct };
-}
+});
 
 onMounted(() => {
   const qStatus = String(route.query.status || "");
@@ -547,9 +549,9 @@ function spanBarColor(stage: string, status: string) {
               <h3 class="font-semibold text-[#09090B]">Request latency waterfall</h3>
               <div class="text-[11px] text-[#71717A] tabular-nums">Total {{ selectedRun.duration_ms.toFixed(1) }} ms</div>
             </div>
-            <p v-if="bottleneckSpan(selectedRun)" class="text-[11px] leading-5 text-[#52525B]">
-              Longest recorded stage: <strong class="text-[#09090B]">{{ bottleneckSpan(selectedRun)!.span.label }}</strong>
-              · {{ bottleneckSpan(selectedRun)!.span.duration_ms.toFixed(2) }} ms ({{ bottleneckSpan(selectedRun)!.pct }}% of request duration).
+            <p v-if="bottleneck" class="text-[11px] leading-5 text-[#52525B]">
+              Longest recorded stage: <strong class="text-[#09090B]">{{ bottleneck.span.label }}</strong>
+              · {{ bottleneck.span.duration_ms.toFixed(2) }} ms ({{ bottleneck.pct }}% of request duration).
             </p>
             <div class="grid grid-cols-[7.5rem_1fr_4rem] sm:grid-cols-[11rem_1fr_4.5rem] items-center gap-2 text-[9px] text-[#71717A] tabular-nums">
               <span>Elapsed time</span>

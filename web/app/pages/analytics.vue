@@ -136,10 +136,11 @@ async function fetchAnalytics() {
     const response = await apiFetch<AnalyticsResponse>(`/audit/analytics?${params.toString()}`);
     if (requestId !== analyticsRequestSequence) return;
     const availableModels = response?.pricing?.available_models || [];
-    if (availableModels.length && !availableModels.includes(selectedModel.value)) {
+    const [firstModel] = availableModels;
+    if (firstModel !== undefined && !availableModels.includes(selectedModel.value)) {
       const fallbackModel = response.pricing.model && availableModels.includes(response.pricing.model)
         ? response.pricing.model
-        : availableModels[0];
+        : firstModel;
       selectedModel.value = fallbackModel;
       params.set("model", fallbackModel);
       const fallbackResponse = await apiFetch<AnalyticsResponse>(`/audit/analytics?${params.toString()}`);

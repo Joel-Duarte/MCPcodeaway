@@ -105,14 +105,12 @@ watch(totalRunsTick, () => {
 
 const totalP50 = computed(() => {
   const vals = runs.value.map((r) => r.duration_ms).sort((a, b) => a - b);
-  if (!vals.length) return 0;
-  return vals[Math.min(vals.length - 1, Math.max(0, Math.floor(0.5 * vals.length)))];
+  return vals[Math.min(vals.length - 1, Math.max(0, Math.floor(0.5 * vals.length)))] ?? 0;
 });
 
 const totalP95 = computed(() => {
   const vals = runs.value.map((r) => r.duration_ms).sort((a, b) => a - b);
-  if (!vals.length) return 0;
-  return vals[Math.min(vals.length - 1, Math.max(0, Math.floor(0.95 * vals.length)))];
+  return vals[Math.min(vals.length - 1, Math.max(0, Math.floor(0.95 * vals.length)))] ?? 0;
 });
 
 const slowestRuns = computed(() =>
