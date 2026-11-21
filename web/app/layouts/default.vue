@@ -11,7 +11,8 @@ const mobileNavigationOpen = ref(false);
 const sessionReady = ref(false);
 const loggingOut = ref(false);
 const { selectedRange } = useReportRange();
-const isReportPage = computed(() => ["/analytics", "/model-performance"].includes(currentPath.value));
+const isReportPage = computed(() => currentPath.value === "/analytics" ||
+  (currentPath.value === "/model-performance" && route.query.tab !== "discovery"));
 
 const navigation = [
   {

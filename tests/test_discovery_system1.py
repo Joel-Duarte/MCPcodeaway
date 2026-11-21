@@ -583,7 +583,10 @@ async def test_discovery_benchmark_smoke(tmp_path) -> None:
     assert bm25_large["recall_at_5"] >= 0.7
 
 
-async def test_authorized_discovery_budget_observe_active_and_explicit_override(tmp_path) -> None:
+async def test_authorized_discovery_budget_observe_active_and_explicit_override(
+    tmp_path, caplog
+) -> None:
+    caplog.set_level("INFO", logger="mcpcodeaway")
     app, keys = _setup_gateway(tmp_path, settings_overrides={"auto_discovery_token_budget": 1})
     token = keys.issue_user_token(persona="finance_analyst")
     runtime = app.state.runtime
@@ -599,6 +602,15 @@ async def test_authorized_discovery_budget_observe_active_and_explicit_override(
                 client, token, "tools/call", {"name": "search_tools", "arguments": {}}
             )
             assert hydrated["result"]["structuredContent"]["tools"]
+            search_event = next(
+                record.fields
+                for record in caplog.records
+                if getattr(record, "fields", {}).get("discovery_operation") == "search"
+            )
+            assert search_event["definitions_returned"] > 0
+            assert search_event["estimated_discovery_tokens"] > 0
+            assert search_event["response_bytes"] > 0
+            assert search_event["discovery_search_ms"] >= 0
 
             runtime.settings.auto_discovery_token_budget = 10_000
             scope = "servers=billing_legacy_eu"
@@ -616,6 +628,19 @@ async def test_authorized_discovery_budget_observe_active_and_explicit_override(
             runtime.settings.auto_discovery_policy = "observe"
             rollback = await _mcp_post(client, token, "tools/list")
             assert rollback["result"]["tools"] == observed["result"]["tools"]
+
+            endpoint = "/admin/discovery/report"
+            viewer = keys.issue_user_token(overrides={"roles": ["operator_viewer"]})
+            response = await client.get(endpoint, headers={"Authorization": f"Bearer {viewer}"})
+            assert response.status_code == 200
+            report = response.json()
+            assert report["policy"] == "observe"
+            assert report["token_budget"] == 10_000
+            assert {row["operation"] for row in report["samples"]} == {"listing", "search"}
+            assert any(row.get("reason") == "over_budget" for row in report["samples"])
+            assert all("tenant" not in row for row in report["samples"])
+            denied = await client.get(endpoint, headers={"Authorization": f"Bearer {token}"})
+            assert denied.status_code == 403
 
 
 def test_discovery_budget_counts_rendered_guidance_and_stops_on_large_catalog() -> None:

@@ -12,6 +12,7 @@ import math
 import re
 import time
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -374,6 +375,7 @@ class GatewayRuntime:
                 (self.settings.admin_session_secret or "mcpcodeaway-dev-ticket").encode("utf-8")
             ).digest()
         )
+        self.discovery_samples: deque[dict[str, Any]] = deque(maxlen=1000)
         self._local_catalog_epoch: str = "0"
         self.catalog = ToolCatalog()
         self.discovery_engine = DiscoveryEngine(self.settings, http_client=discovery_http_client)
@@ -980,6 +982,7 @@ class GatewayRuntime:
         limit: int | None = None,
         cursor: str | None = None,
         auto_discovery: bool = False,
+        discovery_sample: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build tools/list response supporting X-Intent, upfront/deferred axes & pagination."""
         effective_ceiling = allowed_servers
@@ -1067,16 +1070,20 @@ class GatewayRuntime:
             recommended = "upfront" if upfront is not None else "deferred"
             if self.settings.auto_discovery_policy == "active":
                 eff_disc = recommended
-            log_event(
-                "mcp.discovery.decision",
-                execution=eff_exec,
-                applied_discovery=eff_disc,
-                recommended_discovery=recommended,
-                estimated_upfront_tokens=tokens,
-                estimate_is_lower_bound=reason == "over_budget",
-                decision_ms=round((time.perf_counter() - discovery_started) * 1000, 3),
-                reason=reason,
-            )
+            decision = {
+                "execution": eff_exec,
+                "applied_discovery": eff_disc,
+                "recommended_discovery": recommended,
+                "estimated_upfront_tokens": tokens,
+                "estimate_is_lower_bound": reason == "over_budget",
+                "decision_ms": round((time.perf_counter() - discovery_started) * 1000, 3),
+                "reason": reason,
+                "authorized_tools": len(accessible),
+                "token_budget": self.settings.auto_discovery_token_budget,
+            }
+            log_event("mcp.discovery.decision", **decision)
+            if discovery_sample is not None:
+                discovery_sample.update(decision)
             if eff_disc == "upfront":
                 tools = (
                     upfront
@@ -2079,7 +2086,13 @@ def create_gateway_app(
                 if effective_model_name:
                     mcp_span.set_attribute("mcp.model_name", effective_model_name)
 
-                def _finish(resp: JSONResponse, status_label: str = "ok") -> JSONResponse:
+                discovery_sample: dict[str, Any] = {}
+
+                def _finish(
+                    resp: JSONResponse,
+                    status_label: str = "ok",
+                    **discovery_metrics: Any,
+                ) -> JSONResponse:
                     dur_ms = round((time.perf_counter() - req_started) * 1000, 3)
                     runtime.metrics.inc_counter(
                         "gateway_mcp_requests_total",
@@ -2100,7 +2113,27 @@ def create_gateway_app(
                         model_name=effective_model_name,
                         status=status_label,
                         duration_ms=dur_ms,
+                        response_bytes=len(resp.body),
+                        **discovery_metrics,
                     )
+                    operation = discovery_metrics.get("discovery_operation")
+                    if operation or (
+                        method == "tools/call" and params.get("name") == "search_tools"
+                    ):
+                        runtime.discovery_samples.append(
+                            {
+                                "tenant": identity.tenant_id,
+                                "request_id": req_corr_id,
+                                "created_at": datetime.now(UTC).isoformat(),
+                                "duration_ms": dur_ms,
+                                "response_bytes": len(resp.body),
+                                "status": status_label,
+                                "operation": operation or "search",
+                                "applied_discovery": eff_disc_mode,
+                                **discovery_sample,
+                                **discovery_metrics,
+                            }
+                        )
                     resp.headers["X-Request-Id"] = req_corr_id
                     if mode_decision_reason:
                         resp.headers["X-Gateway-Mode-Decision"] = mode_decision_reason
@@ -2234,10 +2267,16 @@ def create_gateway_app(
                         limit=params.get("limit"),
                         cursor=params.get("cursor"),
                         auto_discovery=automatic_discovery,
+                        discovery_sample=discovery_sample,
                     )
                     listed.setdefault("ttlMs", 0)
                     listed.setdefault("cacheScope", "private")
-                    return _finish(_jsonrpc_ok(req_id, listed))
+                    return _finish(
+                        _jsonrpc_ok(req_id, listed),
+                        discovery_operation="listing",
+                        definitions_returned=len(listed["tools"]),
+                        estimated_discovery_tokens=estimate_tokens(listed["tools"]),
+                    )
 
                 if method == "tools/call":
                     tool_name = str(params.get("name") or "")
@@ -2311,7 +2350,11 @@ def create_gateway_app(
                                     "content": [{"type": "text", "text": json.dumps(res)}],
                                     "structuredContent": res,
                                 },
-                            )
+                            ),
+                            discovery_operation="search",
+                            definitions_returned=res["returned"],
+                            discovery_search_ms=res["latency_ms"],
+                            estimated_discovery_tokens=estimate_tokens(res),
                         )
 
                     if tool_name == "execute_code":
@@ -3721,6 +3764,31 @@ def create_gateway_app(
             }
             cache[ck] = (now, payload_out)
             return payload_out
+
+        @app.get("/admin/discovery/report")
+        async def admin_discovery_report(
+            limit: int = Query(default=100, ge=0, le=1000),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True, allow_viewer=True
+            )
+            tenant = (
+                identity.tenant_id
+                if identity
+                else (runtime.settings.allowed_tenants or ["tenant-acme-dev"])[0]
+            )
+            samples = [
+                {key: value for key, value in sample.items() if key != "tenant"}
+                for sample in reversed(runtime.discovery_samples)
+                if sample["tenant"] == tenant
+            ][:limit]
+            return {
+                "policy": runtime.settings.auto_discovery_policy,
+                "token_budget": runtime.settings.auto_discovery_token_budget,
+                "samples": samples,
+            }
 
         @app.get("/admin/adaptive-execution/report")
         async def admin_adaptive_execution_report(

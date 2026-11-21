@@ -70,10 +70,11 @@ async function load() {
 }
 onMounted(load);
 watch(selectedRange, load);
-const selectedTab = ref(route.query.tab === "efficiency" ? "efficiency" : "routing");
-watch(() => route.query.tab, (value) => { selectedTab.value = value === "efficiency" ? "efficiency" : "routing"; });
+const viewTab = (value: unknown) => value === "discovery" || value === "efficiency" ? value : "routing";
+const selectedTab = ref(viewTab(route.query.tab));
+watch(() => route.query.tab, (value) => { selectedTab.value = viewTab(value); });
 watch(selectedTab, (value) => {
-  const tab = value === "efficiency" ? "efficiency" : "routing";
+  const tab = viewTab(value);
   if (route.query.tab !== tab) void navigateTo({ query: { ...route.query, tab } }, { replace: true });
 });
 </script>
@@ -82,8 +83,9 @@ watch(selectedTab, (value) => {
   <div class="space-y-5">
     <header>
       <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">Model Performance</h1>
-      <p class="mt-1 text-[13px] text-[#52525B]">Paired workflow evidence by model and workload. Routing uses qualified 30-day evidence; reports can show all retained evidence.</p>
+      <p v-if="selectedTab !== 'discovery'" class="mt-1 text-[13px] text-[#52525B]">Paired workflow evidence by model and workload. Routing uses qualified 30-day evidence; reports can show all retained evidence.</p>
     </header>
+    <template v-if="selectedTab !== 'discovery'">
     <div v-if="error" role="alert" class="rounded-lg border border-[#FECACA] bg-[#FEF2F2] p-3 text-sm text-[#B91C1C]">{{ error }} <Button class="ml-2 min-h-11 rounded border border-[#D4D4D8] px-3 text-sm" @click="load">Retry report</Button></div>
     <div v-if="loading" aria-label="Loading workflow evidence" class="h-32 animate-pulse rounded-lg border border-[#E4E4E7] bg-white" />
     <p v-if="!loading" class="text-xs text-[#52525B]">Adaptive routing: {{ adaptiveMode === "active" ? "Active" : "Observe" }}. Reports distinguish sparse from qualified exact workload evidence.</p>
@@ -111,10 +113,12 @@ watch(selectedTab, (value) => {
             </SelectContent>
           </Select></div>
         </div>
+    </template>
     <Tabs v-model:value="selectedTab" class="space-y-4">
       <TabsList aria-label="Model performance views" class="flex min-h-11 gap-1 border-b border-[#E4E4E7]">
         <TabsTab value="routing" class="min-h-11 border-b-2 px-4 text-sm data-[selected]:border-[#0F766E] data-[selected]:font-semibold data-[selected]:text-[#0F766E]">Routing</TabsTab>
         <TabsTab value="efficiency" class="min-h-11 border-b-2 px-4 text-sm data-[selected]:border-[#0F766E] data-[selected]:font-semibold data-[selected]:text-[#0F766E]">Efficiency</TabsTab>
+        <TabsTab value="discovery" class="min-h-11 border-b-2 px-3 text-sm data-[selected]:border-teal-700 data-[selected]:font-semibold data-[selected]:text-teal-700">Discovery</TabsTab>
       </TabsList>
       <TabsPanel value="routing" class="space-y-4">
         <div v-if="!filtered.length" class="rounded-lg border border-[#E4E4E7] bg-white p-8 text-center text-sm text-[#52525B]">No matched workflow evidence in this range. Import paired benchmark evidence to populate routing reports.</div>
@@ -150,6 +154,7 @@ watch(selectedTab, (value) => {
         <p class="mt-1 text-sm text-[#52525B]">Signed differences below use Code Mode minus Classic. Positive cost, latency, calls, or recovery indicate a regression. Quality remains the routing priority.</p>
         <div class="mt-4 divide-y divide-[#E4E4E7]"><div v-for="row in filtered" :key="`${row.model}:${row.workload}:delta`" class="py-3 text-xs"><h3 class="font-medium text-[#09090B]">{{ row.model }} · {{ workloadLabel(row.workload) }} ({{ row.pairs }} pairs)</h3><dl class="mt-2 grid grid-cols-1 gap-2 tabular-nums sm:grid-cols-2 lg:grid-cols-5"><div><dt class="text-[#71717A]">Cost per completion (Code − Classic)</dt><dd>{{ row.traditional?.mean_cost_usd != null && row.codemode?.mean_cost_usd != null ? signedMoney(row.codemode.mean_cost_usd - row.traditional.mean_cost_usd) : row.traditional?.mean_provider_tokens != null && row.codemode?.mean_provider_tokens != null ? `${signed(row.codemode.mean_provider_tokens - row.traditional.mean_provider_tokens, 0)} tokens` : "Unknown" }}</dd></div><div><dt class="text-[#71717A]">Provider tokens / completion</dt><dd>{{ row.traditional?.mean_provider_tokens == null || row.codemode?.mean_provider_tokens == null ? "Unknown" : `${signed(row.codemode.mean_provider_tokens - row.traditional.mean_provider_tokens, 0)} tokens` }}</dd></div><div><dt class="text-[#71717A]">p95 wall time</dt><dd>{{ row.traditional?.p95_wall_ms == null || row.codemode?.p95_wall_ms == null ? "Unknown" : `${signed(row.codemode.p95_wall_ms - row.traditional.p95_wall_ms)} ms` }}</dd></div><div><dt class="text-[#71717A]">Upstream calls per completion</dt><dd>{{ row.traditional?.mean_upstream_calls == null || row.codemode?.mean_upstream_calls == null ? "Unknown" : signed(row.codemode.mean_upstream_calls - row.traditional.mean_upstream_calls) }}</dd></div><div><dt class="text-[#71717A]">Recovery count per completion</dt><dd>{{ row.traditional?.mean_recovery == null || row.codemode?.mean_recovery == null ? "Unknown" : signed(row.codemode.mean_recovery - row.traditional.mean_recovery) }}</dd></div></dl></div></div>
       </TabsPanel>
+      <TabsPanel value="discovery"><DiscoveryReport v-if="selectedTab === 'discovery'" /></TabsPanel>
     </Tabs>
   </div>
 </template>
