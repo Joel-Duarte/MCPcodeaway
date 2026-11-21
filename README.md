@@ -6,6 +6,7 @@
 
 - **Adaptive workflow routing:** Use Classic MCP for direct calls or Code Mode to bundle multiple tools, joins, and filtering in one sandbox execution. The gateway can recommend a strategy for each model and workload. See the [local and GPT-6 Luna results](BENCHMARKS.md#paired-pilot-results).
 - **Zero-Trust Enterprise Security:** Per-user OIDC JWT validation, RFC 8693 / OBO delegated token exchange, host-side ABAC row filtering, PII/secret redaction, SSRF guards, and HMAC provenance grounding verification.
+- **Requester Confirmation Gates:** Administrators can require a caller to confirm a specific tool call before the gateway sends it upstream. The gateway binds the confirmation to the caller, exact arguments, and current policy, and prevents reuse. This is a caller confirmation prompt, not approval by a manager or proof of the user's identity beyond the authenticated request.
 - **Sessionless MCP Design:** Every gateway and upstream MCP HTTP operation uses the current per-request protocol contract; the gateway never creates, stores, forwards, or depends on MCP session IDs, and upstream HTTP requests never retain or reuse cookies. Multi-step business operations pass explicit resource IDs through independently authorized tool calls.
 - **Full Operate Control Plane (`/dashboard`):** Nuxt 4 + `@ui-sdk/vue` console with real-time WebSocket telemetry, Linear-style Request Traces (`/traces`), Gateway Usage & Group Timeline Aggregation (`/analytics`), Model Performance and Efficiency (`/model-performance`), 3-step HITL Onboarding + A/B Lab (`/onboarding`), Audit & S3/JSONL Compliance Archival (`/audit`), and Custom Alert Rules (`/settings`).
 
@@ -31,7 +32,7 @@ Callers select execution and discovery strategies independently via query parame
 - **Sandbox Security & Response Grounding**: Monty blocks filesystem, environment variables, sockets, and imports; enforces `max_calls_per_execution`, timeouts, and per-user rate limits; and optionally requires HMAC-signed host tool provenance (`require_tool_grounding`, `provenance_signing_secret`).
 - **Composable Barebones-First Profiles (`GATEWAY_PROFILE`)**: Custom and built-in profiles in [config/profiles.yaml](config/profiles.yaml) build atop barebones `production` (which mounts only `/health`, `/ready`, `/.well-known/*`, `/auth/me`, `/mcp`, `/metrics`, tenant-isolated `/audit/*` + `/audit/value`, and read-only `/admin/upstreams`, returning `404` on `/dashboard`, `/compare/run`, `/benchmarks/latest`, `/dev/*`, and dynamic writes). `staging`, `demo`, and custom `extends:` profiles selectively layer onboarding/eval features on top, backed by multi-target builds (`gateway`, `sandbox-worker`, `gateway-demo`) in [Dockerfile](Dockerfile).
 - **HITL Onboarding & Control-Plane Hardening**:
-  - `GET /admin/upstreams/agent-prompt`, `POST /admin/upstreams/inspect`, `POST /admin/upstreams`, `DELETE /admin/upstreams/{name}`, and the browser `/dashboard` provide OpenAPI `securitySchemes` detection, Gateway/IdP/Backend checklists, `allowed_operations` / `excluded_operations` curation, and schema drift pinning.
+  - `GET /admin/upstreams/agent-prompt`, `POST /admin/upstreams/inspect`, `POST /admin/upstreams`, `DELETE /admin/upstreams/{name}`, and the browser `/dashboard` provide OpenAPI `securitySchemes` detection, Gateway/IdP/Backend checklists, `allowed_operations` / `excluded_operations` curation, schema drift pinning, and per-tool requester-confirmation settings during onboarding and editing.
   - Control-plane RBAC (`require_admin_auth`, default `True` in `auth_mode="oidc"`) restricts `/admin/*` to `admin_roles` (`gateway_admin`, `platform_admin`) and isolates `/audit/*` (`GET /audit/runs`, `/audit/runs/{run_id}`, `/audit/summary`) strictly by `tenant_id` for non-admin tokens.
   - SSRF URL guard (`validate_upstream_url`, `ssrf_protection_enabled`) blocks non-HTTP(S) schemes and cloud metadata hosts in all environments, and blocks loopback/private/internal hosts in `prod` unless allowlisted via `allowed_upstream_hosts`.
 - **4-Pillar Observability, Value Proof & Horizontal Scaling**:
@@ -77,6 +78,29 @@ uv run gateway compare --scenario reconcile_overdue --persona finance_analyst
 You can connect supported APIs directly by registering an OpenAPI spec. The gateway turns each allowed operation into a callable tool. In deferred Code Mode, start with `search_tools` to find matching operations across authorized upstreams, then use their Python stubs in `execute_code`. Use `list_servers` when you want to browse the upstreams.
 
 Use clear operation IDs and summaries, typed parameters, and JSON response schemas in the spec. Document details that affect a call, such as which ID to pass, units, and pagination. Configure credentials and tool access on the gateway.
+
+### Require confirmation before a tool call
+
+In the dashboard, inspect an upstream and open **Policy & Mode → Per-tool execution and confirmation**. Select **Ask caller before each call** for the operations that need an extra confirmation, then optionally enter a prompt message. After registration, the same setting is available from **Upstreams Catalog → tool → Requester confirmation**. Policy edits require a control-plane administrator. In GitOps or a profile where dynamic writes are disabled, configure the policy on the upstream instead:
+
+```yaml
+upstreams:
+  - name: inventory_api
+    type: mcp_http
+    url: https://inventory.example.com/mcp
+    auth_type: none
+    tool_approval_policies:
+      delete_item:
+        mode: requester_confirmation
+        version: 1
+        confirmation_message: "Confirm deleting this item."
+```
+
+When a caller invokes a protected operation, normal authentication and authorization still run first. The gateway then pauses the call and returns an MCP `input_required` response asking the connected client to collect confirmation. The client retries with its response; the gateway checks that the caller, tool arguments, and policy still match, and accepts the continuation only once. A decline, stale or changed request, reused confirmation, or missing client form-elicitation capability does not dispatch the protected tool. The policy version changes when an administrator edits the setting, which invalidates outstanding confirmations.
+
+These gates apply to individual, direct MCP tool calls. A tool that requires confirmation cannot be invoked from Code Mode; the callback is rejected before that upstream action. Code Mode scripts are not transactional, so ungated calls that ran earlier in a script are not undone if a later callback reaches a gated tool. Use separate direct calls when confirmation is required.
+
+The gateway cannot prove that a person physically clicked the prompt: it trusts the MCP client to present the request and return the answer. Do not use this feature as manager approval or to collect passwords, tokens, or other secrets. Manager approvals, multi-person quorum, durable approval queues, unattended-agent resumption, and model-based automatic approvals are future work; see the [approval gate design and roadmap](docs/approval-gate-enhancements.md).
 
 ## Benchmark results
 
@@ -126,7 +150,7 @@ Review **Model Performance → Routing** in Observe mode first. The router uses 
   - [frontend-ci.yml](.github/workflows/frontend-ci.yml): `npm ci`, `nuxt prepare`, `npm run generate`, and live `/dashboard/` + `_nuxt/` asset verification.
   - [qa-ci.yml](.github/workflows/qa-ci.yml): Golden E2E flow suite + locked offline benchmark verification (`--verify-thresholds`).
   - [security-ci.yml](.github/workflows/security-ci.yml) + [dependabot.yml](.github/dependabot.yml): CodeQL (`python`, `javascript-typescript`, `actions`), Dependency Review, Zizmor workflow audit, pinned Gitleaks (`.gitleaks.toml`), and scheduled `npm`/`uv` audits.
-- **Golden Flows & Locked Benchmarks:** Deterministic end-to-end policy/grounding flows live in [tests/golden/flows.json](tests/golden/flows.json) ([tests/test_golden_flows.py](tests/test_golden_flows.py)), and minimum/maximum benchmark bounds live in [benchmarks/thresholds.json](benchmarks/thresholds.json) ([tests/test_benchmark_regression.py](tests/test_benchmark_regression.py)).
+- **Golden Flows & Locked Benchmarks:** Deterministic end-to-end policy/grounding flows live in [tests/golden/flows.json](tests/golden/flows.json) ([tests/test_golden_flows.py](tests/test_golden_flows.py)); requester-confirmation journeys, including replay, policy-change, Code Mode, and concurrent-call cases, live in [tests/golden/approval_flows.json](tests/golden/approval_flows.json) ([tests/test_approval_golden.py](tests/test_approval_golden.py)). Minimum/maximum benchmark bounds live in [benchmarks/thresholds.json](benchmarks/thresholds.json) ([tests/test_benchmark_regression.py](tests/test_benchmark_regression.py)).
 - **Agent Navigation & Local Gates:** Follow [AGENTS.md](AGENTS.md) ([CLAUDE.md](CLAUDE.md)) for two-tier `ripwire` + `graphify` navigation, install git hooks via `pre-commit` (`.pre-commit-config.yaml`) or wire `hooks/agent-post-edit.sh`, and run `./scripts/pre-ci.sh`.
 
 ## Verification
