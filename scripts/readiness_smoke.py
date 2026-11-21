@@ -1,4 +1,4 @@
-"""Exercise the local Keycloak, gateway RBAC, and REST-backed MCP pilot."""
+"""Exercise the local mock OIDC issuer, gateway RBAC, and REST-backed MCP pilot."""
 
 from __future__ import annotations
 
@@ -19,42 +19,39 @@ _mcp_protocol = importlib.import_module("gateway.mcp_protocol")
 request_headers = _mcp_protocol.request_headers
 request_meta = _mcp_protocol.request_meta
 
-REALM = "mcp-readiness"
-CLIENT_ID = "mcp-readiness"
+
+def _gateway_url() -> str:
+    return os.environ.get("READINESS_GATEWAY_URL", "http://localhost:8080").rstrip("/")
 
 
-def _default_password() -> str:
-    return "readiness-local-only"
-
-
-def _readiness_settings() -> tuple[str, str]:
-    return (
-        os.environ.get("READINESS_IDP_URL", "http://localhost:8081").rstrip("/"),
-        os.environ.get("READINESS_GATEWAY_URL", "http://localhost:8080").rstrip("/"),
-    )
-
-
-async def _token(client: httpx.AsyncClient, idp_url: str, username: str) -> str:
+async def _token(
+    client: httpx.AsyncClient,
+    gateway_url: str,
+    *,
+    sub: str,
+    roles: list[str],
+    groups: list[str],
+    scopes: list[str],
+    tenant_id: str = "tenant-acme-dev",
+) -> str:
     response = await client.post(
-        f"{idp_url}/realms/{REALM}/protocol/openid-connect/token",
-        data={
-            "grant_type": "password",
-            "client_id": CLIENT_ID,
-            "scope": "gateway.access",
-            "username": username,
-            "password": os.environ.get("READINESS_PASSWORD", _default_password()),
+        f"{gateway_url}/dev/auth/token",
+        json={
+            "persona": None,
+            "sub": sub,
+            "tenant_id": tenant_id,
+            "roles": roles,
+            "groups": groups,
+            "scopes": scopes,
         },
     )
     if response.status_code != httpx.codes.OK:
-        error = response.json().get(
-            "error_description", response.json().get("error", "unknown error")
-        )
         raise RuntimeError(
-            f"Keycloak token request for {username!r} failed ({response.status_code}): {error}"
+            f"Local mock OIDC token request for {sub!r} failed ({response.status_code})"
         )
     access_token = response.json().get("access_token")
     if not isinstance(access_token, str) or not access_token:
-        raise RuntimeError("Keycloak token response did not contain an access token")
+        raise RuntimeError("Local mock OIDC response did not contain an access token")
     return access_token
 
 
@@ -68,19 +65,6 @@ async def _wait_for_gateway(client: httpx.AsyncClient, base_url: str) -> None:
             pass
         await asyncio.sleep(2)
     raise RuntimeError("Gateway did not become ready within 60 seconds")
-
-
-async def _wait_for_idp(client: httpx.AsyncClient, idp_url: str) -> None:
-    discovery_url = f"{idp_url}/realms/{REALM}/.well-known/openid-configuration"
-    for _ in range(30):
-        try:
-            response = await client.get(discovery_url, timeout=2.0)
-            if response.status_code == httpx.codes.OK:
-                return
-        except httpx.HTTPError:
-            pass
-        await asyncio.sleep(2)
-    raise RuntimeError("Local Keycloak did not become ready within 60 seconds")
 
 
 async def _require_status(
@@ -106,25 +90,74 @@ async def _require_status(
 
 
 async def run_readiness_smoke() -> dict[str, str]:
-    idp_url, gateway_url = _readiness_settings()
-    timeout = httpx.Timeout(15.0)
+    gateway_url = _gateway_url()
+    timeout = httpx.Timeout(60.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-        await _wait_for_idp(client, idp_url)
         await _wait_for_gateway(client, gateway_url)
 
-        admin_token = await _token(client, idp_url, "readiness-admin")
-        finance_token = await _token(client, idp_url, "readiness-finance")
-        ops_token = await _token(client, idp_url, "readiness-ops")
-        approver_token = await _token(client, idp_url, "readiness-approver")
-        viewer_token = await _token(client, idp_url, "readiness-viewer")
-        unassigned_token = await _token(client, idp_url, "readiness-unassigned")
-        other_tenant_token = await _token(client, idp_url, "readiness-other-tenant")
+        admin_token = await _token(
+            client,
+            gateway_url,
+            sub="readiness-admin",
+            roles=["gateway_admin"],
+            groups=["platform-admins"],
+            scopes=["mcp.tools", "mcp.admin", "mcp.audit"],
+        )
+        finance_token = await _token(
+            client,
+            gateway_url,
+            sub="readiness-finance",
+            roles=["finance_analyst"],
+            groups=["finance"],
+            scopes=["mcp.tools", "finance.read"],
+        )
+        ops_token = await _token(
+            client,
+            gateway_url,
+            sub="readiness-ops",
+            roles=["ops_engineer", "ticketing_writer", "tool_approver"],
+            groups=["operations", "operations-approvers"],
+            scopes=["mcp.tools", "ops.write"],
+        )
+        approver_token = await _token(
+            client,
+            gateway_url,
+            sub="readiness-approver",
+            roles=["tool_approver"],
+            groups=["operations-approvers"],
+            scopes=["mcp.tools"],
+        )
+        viewer_token = await _token(
+            client,
+            gateway_url,
+            sub="readiness-viewer",
+            roles=["operator_viewer"],
+            groups=["platform"],
+            scopes=["mcp.tools"],
+        )
+        unassigned_token = await _token(
+            client,
+            gateway_url,
+            sub="readiness-unassigned",
+            roles=[],
+            groups=[],
+            scopes=["mcp.tools"],
+        )
+        other_tenant_token = await _token(
+            client,
+            gateway_url,
+            sub="readiness-other-tenant",
+            roles=["finance_analyst"],
+            groups=["finance"],
+            scopes=["mcp.tools", "finance.read"],
+            tenant_id="mcp-other",
+        )
 
         admin_identity = await _require_status(
             client, "GET", f"{gateway_url}/auth/me", admin_token, httpx.codes.OK
         )
         if "gateway_admin" not in admin_identity.json().get("roles", []):
-            raise RuntimeError("Keycloak admin role was not mapped into the gateway identity")
+            raise RuntimeError("Mock OIDC admin role was not mapped into the gateway identity")
 
         await _require_status(
             client,
@@ -254,7 +287,14 @@ async def run_readiness_smoke() -> dict[str, str]:
         )
         if self_decision.status_code != httpx.codes.FORBIDDEN:
             raise RuntimeError("Requester was able to approve their own readiness action")
-        wrong_group_token = finance_token
+        wrong_group_token = await _token(
+            client,
+            gateway_url,
+            sub="readiness-wrong-group-approver",
+            roles=["tool_approver"],
+            groups=["finance"],
+            scopes=["mcp.tools"],
+        )
         wrong_group_decision = await client.post(
             decision_url,
             headers={"Authorization": f"Bearer {wrong_group_token}"},
@@ -292,9 +332,10 @@ async def run_readiness_smoke() -> dict[str, str]:
                 f"(HTTP {replay_response.status_code}; {replay_response.text[:500]})"
             )
 
+        discovery = await client.get(f"{gateway_url}/.well-known/oauth-authorization-server")
         return {
             "gateway": gateway_url,
-            "issuer": f"{idp_url}/realms/{REALM}",
+            "issuer": discovery.json().get("issuer", "local mock OIDC"),
             "authenticated_roles": ",".join(admin_identity.json().get("roles", [])),
             "rest_pilot": tool_name,
             "rbac": "admin allowed; viewer read-only; unassigned and other tenant denied",
@@ -313,7 +354,7 @@ def main() -> int:
         return 1
     for name, value in report.items():
         print(f"{name}: {value}")
-    print("Local Keycloak and REST-backed gateway smoke passed.")
+    print("Local mock OIDC and REST-backed gateway smoke passed.")
     return 0
 
 

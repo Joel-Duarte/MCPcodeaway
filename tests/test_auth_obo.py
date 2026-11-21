@@ -23,6 +23,25 @@ from gateway.oauth_discovery import create_oauth_discovery_router
 from gateway.state import InMemoryCacheBackend, SQLiteAuditStore
 
 
+def test_local_dev_key_manager_accepts_shared_rsa_private_key() -> None:
+    issuer = "http://gateway.test/dev/oidc"
+    issuer_keys = LocalDevKeyManager(issuer=issuer)
+    replica_keys = LocalDevKeyManager(issuer=issuer, private_key_pem=issuer_keys.private_pem)
+
+    token = issuer_keys.issue_user_token(persona="finance_analyst")
+    assert replica_keys.jwks() == issuer_keys.jwks()
+    assert (
+        jwt.decode(
+            token,
+            replica_keys.public_pem,
+            algorithms=["RS256"],
+            audience="api://mcp-code-gateway",
+            issuer=issuer,
+        )["sub"]
+        == "user-fin-01"
+    )
+
+
 @pytest.mark.parametrize(
     ("claims", "mapping", "expected"),
     [

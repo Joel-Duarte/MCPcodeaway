@@ -16,22 +16,10 @@ services:
   mock-backends:
     ports: !reset []
 
-  readiness-keycloak:
-    image: quay.io/keycloak/keycloak:26.8.2
-    command: ["start-dev", "--import-realm"]
-    environment:
-      KC_BOOTSTRAP_ADMIN_USERNAME: local-admin
-      KC_BOOTSTRAP_ADMIN_PASSWORD: local-only-readiness
-      KC_HOSTNAME: http://localhost:8081
-    ports:
-      - "127.0.0.1:8081:8080"
-    volumes:
-      - ./deploy/readiness/keycloak:/opt/keycloak/data/import:ro
-    networks:
-      - control_plane
-    profiles: ["scaled"]
-
   gateway-scaled:
+    volumes:
+      - ./deploy/readiness/upstreams.readiness.yaml:/app/config/upstreams.readiness.yaml:ro
+      - ${READINESS_DEV_OIDC_KEY_PATH:-./.readiness/dev-oidc-private.pem}:/run/readiness/dev-oidc-private.pem:ro
     depends_on:
       mock-backends:
         condition: service_started
@@ -41,24 +29,14 @@ services:
         condition: service_healthy
       sandbox-worker:
         condition: service_healthy
-      readiness-keycloak:
-        condition: service_started
     environment:
-      GATEWAY_PROFILE: staging
+      GATEWAY_PROFILE: demo
       GATEWAY_APP_ENV: uat
-      GATEWAY_AUTH_MODE: oidc
+      GATEWAY_AUTH_MODE: dev
+      GATEWAY_DEV_OIDC_PRIVATE_KEY_PATH: /run/readiness/dev-oidc-private.pem
       GATEWAY_PUBLIC_URL: http://localhost:8080
-      GATEWAY_OIDC_ISSUER: http://localhost:8081/realms/mcp-readiness
-      GATEWAY_OIDC_JWKS_URI: http://readiness-keycloak:8080/realms/mcp-readiness/protocol/openid-connect/certs
-      GATEWAY_OIDC_AUDIENCE: api://mcp-readiness
-      GATEWAY_OIDC_TOKEN_ENDPOINT: http://readiness-keycloak:8080/realms/mcp-readiness/protocol/openid-connect/token
-      GATEWAY_OIDC_CLIENT_ID: mcp-readiness
-      GATEWAY_ADMIN_OIDC_AUTHORIZATION_ENDPOINT: http://localhost:8081/realms/mcp-readiness/protocol/openid-connect/auth
-      GATEWAY_ADMIN_OIDC_REDIRECT_URI: http://localhost:8080/auth/admin/callback
-      GATEWAY_ADMIN_OIDC_SCOPES: openid
-      GATEWAY_ADMIN_OIDC_API_SCOPE: gateway.access
-      GATEWAY_ALLOWED_TENANTS: '["mcp-readiness"]'
-      GATEWAY_CLAIM_MAPPING: '{"tenant":"tenant","roles":"roles","groups":"groups"}'
+      GATEWAY_ALLOWED_TENANTS: '["tenant-acme-dev"]'
+      GATEWAY_CLAIM_MAPPING: '{"tenant":"tid","roles":"roles","groups":"groups"}'
       GATEWAY_ADMIN_ROLES: '["gateway_admin"]'
       GATEWAY_VIEWER_ROLES: '["operator_viewer"]'
       GATEWAY_APPROVAL_ROLES: '["tool_approver"]'

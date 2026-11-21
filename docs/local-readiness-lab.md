@@ -1,20 +1,27 @@
 # Local production-readiness lab
 
-This lab exercises the gateway against a real local OIDC issuer (Keycloak), the repository's REST mock, and a dedicated approval fixture. It is useful for validating integration wiring and gathering a repeatable local baseline. It does not validate a customer IdP, partner REST contract, production capacity, availability, or an SLO.
+This optional lab exercises the gateway against its built-in local mock OIDC issuer, the repository's REST mock, and a dedicated approval fixture. It is useful for validating identity claim mapping, authorization, integration wiring, recovery, and gathering a repeatable local baseline. It does not validate a customer IdP, partner REST contract, production capacity, availability, or an SLO.
+
+Normal development and pull-request CI use the existing local token, upstream, and approval fixtures; they do not start an external IdP or add vendor SDKs. The readiness upstream config is mounted into the local gateway only and is excluded from the production image. Local tokens are signed by the gateway's development issuer and can carry selected roles, groups, scopes, and tenant claims to test allow and deny paths. Provider-specific claim formats are covered by the in-process OIDC fixtures.
 
 ## Start and stop
 
-Prerequisites: Docker Compose v2, Python dependencies installed for this repository, and free host ports `8080` and `8081`. The mock backend is internal to the Compose network in this overlay; it does not claim host port `8001`.
+Prerequisites: Docker Compose v2, OpenSSL, Python dependencies installed for this repository, and free host port `8080`. The mock backend is internal to the Compose network in this overlay; it does not claim host port `8001`.
 
 ```sh
+mkdir -p .readiness
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out .readiness/dev-oidc-private.pem
+chmod 644 .readiness/dev-oidc-private.pem
 docker compose -f docker-compose.yml -f docker-compose.readiness.yml --profile scaled config -q
-docker compose -f docker-compose.yml -f docker-compose.readiness.yml --profile scaled up -d --scale gateway-scaled=2
-python scripts/readiness_smoke.py
+docker compose -f docker-compose.yml -f docker-compose.readiness.yml --profile scaled up -d --build --scale gateway-scaled=2
+uv run python scripts/readiness_smoke.py
 ```
 
-The gateway is at `http://localhost:8080`; Keycloak issuer is `http://localhost:8081/realms/mcp-readiness`. Use `readiness-admin`, `readiness-viewer`, `readiness-finance`, `readiness-ops`, `readiness-approver`, `readiness-unassigned`, or `readiness-other-tenant`. All fixture passwords are `readiness-local-only`. They and Keycloak `start-dev` are for this isolated lab only; never reuse them outside it. The UI uses the authorization-code flow with PKCE. The scripted checks use Keycloak's local-only password grant for repeatability.
+The gateway and local mock OIDC issuer are at `http://localhost:8080`. The scripted checks mint short-lived test identities directly from the local development token endpoint, including admin, viewer, finance, operations, unassigned, cross-tenant, and wrong-group approver identities. The local-only RSA key is shared by the gateway replicas so a token minted by one replica is accepted by another. It is ignored by Git and exists only to run this lab. This endpoint and signing-key option are for isolated development and are disabled in production profiles.
 
-`readiness_smoke.py` verifies OIDC claims and tenant/RBAC boundaries, read-only viewer behavior, a real generated REST-backed tool call, and the approval lifecycle. The requester confirms a high-impact action; self-approval and an approver outside the configured group are denied; an eligible approver sees and approves it; and the requester replays it. Every request goes through the load balancer; approval state is stored in the configured shared Postgres service. The unauthenticated approval fixture is reachable only on the internal Compose network and exists solely to exercise gateway approval controls; it is not an upstream security model.
+`readiness_smoke.py` verifies OIDC claims and tenant/RBAC boundaries, read-only viewer behavior, a generated REST-backed tool call, and the approval lifecycle. The requester confirms a high-impact action; self-approval and an approver outside the configured group are denied; an eligible approver sees and approves it; and the requester replays it. Every request goes through the load balancer; approval state is stored in the configured shared Postgres service. The unauthenticated approval fixture is reachable only on the internal Compose network and exists solely to exercise gateway approval controls; it is not an upstream security model.
+
+The identity check uses group claims in signed tokens, matching the gateway's current model: it authorizes from the caller's token claims and does not query a live directory for group membership. The REST mock exercises the same configured HTTP contract as a CRM or ticketing adapter. Keep these fixtures representative of request/response schemas, authorization outcomes, and expected errors; a single copied happy-path response is not enough to validate those cases. Add another local mock only when a new integration contract needs exercising.
 
 For repeatable load runs, this overlay raises the per-user gateway rate limit to 6,000 requests/minute. The repository default is 120/minute. Record the effective setting with each run and agree the real per-user/per-tenant limits for the pilot; do not carry the lab override into production without that decision.
 
@@ -26,12 +33,12 @@ docker compose -f docker-compose.yml -f docker-compose.readiness.yml --profile s
 
 ## Workload measurements
 
-Start with read-only workloads. Use a fresh JSON file for each run and keep the command, git revision, Compose configuration, and host details with the output:
+Start with read-only workloads. The current planning estimate is 500 people across 10 groups, with each agent making 3–5 MCP calls per hour. If those are individual MCP calls, that is about 0.42–0.69 calls/second on average; if each “use” is an agent workflow making 3–5 MCP calls, it is about 1.25–3.47 calls/second. These averages do not describe peak bursts, so first measure a short peak profile and a 15-minute soak rather than treating this estimate as an SLO. Use a fresh JSON file for each run and keep the command, git revision, Compose configuration, and host details with the output:
 
 ```sh
-python benchmarks/live_gateway_benchmark.py --mode traditional --requests 200 --concurrency 10 --warmup 20 --output /tmp/readiness-traditional-baseline.json
-python benchmarks/live_gateway_benchmark.py --mode traditional --requests 1000 --concurrency 25 --warmup 50 --output /tmp/readiness-traditional-burst.json
-python benchmarks/live_gateway_benchmark.py --mode codemode --requests 200 --concurrency 10 --warmup 20 --output /tmp/readiness-codemode-baseline.json
+uv run python benchmarks/live_gateway_benchmark.py --mode traditional --requests 200 --concurrency 10 --warmup 20 --output /tmp/readiness-traditional-baseline.json
+uv run python benchmarks/live_gateway_benchmark.py --mode traditional --requests 1000 --concurrency 25 --warmup 50 --output /tmp/readiness-traditional-burst.json
+uv run python benchmarks/live_gateway_benchmark.py --mode codemode --requests 200 --concurrency 10 --warmup 20 --output /tmp/readiness-codemode-baseline.json
 docker stats --no-stream
 ```
 

@@ -1,4 +1,4 @@
-"""Measure live gateway latency using the local OIDC and REST readiness pilot."""
+"""Measure live gateway latency using the local mock OIDC and REST readiness pilot."""
 
 from __future__ import annotations
 
@@ -33,28 +33,15 @@ def _percentile(samples: list[float], percentile: float) -> float:
     return round(ordered[index], 3)
 
 
-async def _access_token(
-    client: httpx.AsyncClient,
-    *,
-    token_url: str,
-    username: str,
-    password: str,
-    client_id: str,
-) -> str:
+async def _access_token(client: httpx.AsyncClient, gateway_url: str) -> str:
     response = await client.post(
-        token_url,
-        data={
-            "grant_type": "password",
-            "client_id": client_id,
-            "scope": "gateway.access",
-            "username": username,
-            "password": password,
-        },
+        f"{gateway_url}/dev/auth/token",
+        json={"persona": "finance_analyst"},
     )
     response.raise_for_status()
     token = response.json().get("access_token")
     if not isinstance(token, str) or not token:
-        raise RuntimeError("OIDC response did not contain an access token")
+        raise RuntimeError("Local mock OIDC response did not contain an access token")
     return token
 
 
@@ -79,14 +66,6 @@ async def run_live_benchmark(
     if requests < 1 or concurrency < 1 or warmup < 0:
         raise ValueError("requests/concurrency must be positive and warmup must not be negative")
     base_url = base_url.rstrip("/")
-    idp_url = os.environ.get("READINESS_IDP_URL", "http://localhost:8081").rstrip("/")
-    token_url = os.environ.get(
-        "READINESS_TOKEN_URL",
-        f"{idp_url}/realms/mcp-readiness/protocol/openid-connect/token",
-    )
-    username = os.environ.get("READINESS_USERNAME", "readiness-finance")
-    password = os.environ.get("READINESS_PASSWORD", "readiness-local-only")
-    client_id = os.environ.get("READINESS_CLIENT_ID", "mcp-readiness")
     tool_name = os.environ.get("READINESS_TOOL", "crm_accounts__list_crm_accounts")
     forced_mode = "traditional" if mode == "traditional" else "codemode"
     limits = httpx.Limits(
@@ -95,13 +74,7 @@ async def run_live_benchmark(
     )
     timeout = httpx.Timeout(timeout_seconds)
     async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-        token = await _access_token(
-            client,
-            token_url=token_url,
-            username=username,
-            password=password,
-            client_id=client_id,
-        )
+        token = await _access_token(client, base_url)
         request_tool, arguments = _request_payload(mode, tool_name)
         headers = {
             **request_headers("tools/call", tool_name=request_tool),

@@ -189,6 +189,7 @@ class GatewaySettings(BaseSettings):
 
     gateway_public_url: str = "http://127.0.0.1:8000"
     oidc_issuer: str = "http://127.0.0.1:8000/dev/oidc"
+    dev_oidc_private_key_path: str | None = None
     oidc_jwks_uri: str | None = None
     oidc_audience: str = "api://mcp-code-gateway"
     oidc_token_endpoint: str | None = None

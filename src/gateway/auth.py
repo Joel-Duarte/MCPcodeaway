@@ -184,9 +184,21 @@ DEV_PERSONAS: dict[str, dict[str, Any]] = {
 class LocalDevKeyManager:
     """Generates and manages an ephemeral RS256 keypair for offline OIDC & delegation testing."""
 
-    def __init__(self, issuer: str = "http://127.0.0.1:8000/dev/oidc") -> None:
+    def __init__(
+        self,
+        issuer: str = "http://127.0.0.1:8000/dev/oidc",
+        private_key_pem: str | None = None,
+    ) -> None:
         self.issuer = issuer
-        self._private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        if private_key_pem is None:
+            self._private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        else:
+            loaded_key = serialization.load_pem_private_key(
+                private_key_pem.encode("utf-8"), password=None
+            )
+            if not isinstance(loaded_key, rsa.RSAPrivateKey):
+                raise ValueError("Local dev OIDC signing key must be an RSA private key")
+            self._private_key = loaded_key
         self._public_key = self._private_key.public_key()
         self.private_pem = self._private_key.private_bytes(
             encoding=serialization.Encoding.PEM,

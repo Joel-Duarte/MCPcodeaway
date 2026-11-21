@@ -154,6 +154,13 @@ notification provider to the codebase before a customer selects one.
 - Shared-service drills: one gateway replica stopped with 100% smoke and 40/40 read-only requests; one worker stopped with 40/40 Code Mode requests; Redis loss returned `/ready` 503. Recovery first exposed stale Redis sockets causing 500s. Added Redis pool health checks and one safe retry for the idempotent rate-limit counter; after rebuilding, 40/40 calls passed following a Redis restart. Postgres loss returned 503 from readiness and MCP; after restart, readiness and approval smoke passed. The outage call failed before requester confirmation, so no mutation was authorized or dispatched.
 - Remaining release blockers: customer IdP/group mapping, partner sandbox or contract-faithful upstream, agreed workload/SLO/RTO/RPO targets, production hosting and egress boundary, managed shared-service configuration, backup restore and image rollback proof, customer approval hierarchy and retention/export policy, and sustained/representative load evidence.
 
+### Lean mock-only readiness path (2026-11-21)
+
+- Replaced the optional Keycloak container in the local lab with the gateway's built-in mock OIDC token issuer. Provider claim formats remain covered by in-process fixtures; the Docker lab mints test identities with selected roles, groups, scopes, and tenant claims.
+- Added an optional local signing-key file so both gateway replicas in the lab validate the same test tokens. The key path is only read when dev authentication is active; the generated key is ignored by Git. Added a regression test for signing-key reuse.
+- Moved the readiness upstream fixture under `deploy/readiness/`, mount it only in the local Compose overlay, and assert in CI that it is absent from the production gateway image. Existing pytest CI continues to check the auth/provider and approval fixtures without starting Docker or external IdPs.
+- The latest smoke passed through the two-replica route, including group-based approval authorization. A short local REST benchmark passed functionally but measured about 11.6 seconds p50 due to unrelated mock Snowflake/operations calls returning 503; do not treat it as a latency baseline until that mock routing/retry behavior is understood.
+
 ### Phase 1 review against the current project
 
 | Phase 1 item | Status | Project evidence / remaining work |

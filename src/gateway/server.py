@@ -364,7 +364,15 @@ class GatewayRuntime:
             self.store = SQLiteAuditStore(self.settings.sqlite_path)
         self.dev_keys = dev_keys
         if self.dev_keys is None and self.settings.auth_mode == "dev":
-            self.dev_keys = LocalDevKeyManager(issuer=self.settings.oidc_issuer)
+            private_key_pem = (
+                Path(self.settings.dev_oidc_private_key_path).read_text(encoding="utf-8")
+                if self.settings.dev_oidc_private_key_path
+                else None
+            )
+            self.dev_keys = LocalDevKeyManager(
+                issuer=self.settings.oidc_issuer,
+                private_key_pem=private_key_pem,
+            )
         self.validator = OidcTokenValidator(
             settings=self.settings, dev_keys=self.dev_keys, http_client=http_client
         )

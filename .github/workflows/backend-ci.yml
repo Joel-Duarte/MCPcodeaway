@@ -65,3 +65,4 @@ jobs:
           docker build --target gateway -t mcpcodeaway:ci-gateway .
           docker build --target sandbox-worker -t mcpcodeaway:ci-worker .
           docker build --target gateway-ui -t mcpcodeaway:ci-ui .
+          docker run --rm mcpcodeaway:ci-gateway sh -c 'test ! -e /app/config/upstreams.readiness.yaml && test ! -e /app/deploy/readiness'
