@@ -176,6 +176,12 @@ class AuditStore(Protocol):
 
     async def list_adaptive_evidence(self, tenant_id: str) -> list[dict[str, Any]]: ...
 
+    async def list_tool_guidance(self, tenant_id: str) -> dict[str, dict[str, Any]]: ...
+
+    async def save_tool_guidance(
+        self, tenant_id: str, tool_name: str, guidance: dict[str, Any] | None
+    ) -> None: ...
+
     async def list_runs(
         self, limit: int = 50, tenant_id: str | None = None
     ) -> list[dict[str, Any]]: ...
@@ -299,6 +305,11 @@ class SQLiteAuditStore:
             """CREATE TABLE IF NOT EXISTS adaptive_evidence (
                 tenant_id TEXT NOT NULL, evidence_id TEXT NOT NULL, created_at TEXT NOT NULL,
                 payload_json TEXT NOT NULL, PRIMARY KEY (tenant_id, evidence_id))"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS tool_guidance (
+                tenant_id TEXT NOT NULL, tool_name TEXT NOT NULL, payload_json TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, tool_name))"""
         )
         conn.execute(
             """
@@ -647,6 +658,37 @@ class SQLiteAuditStore:
             conn.commit()
             return cursor.rowcount > 0
 
+    async def list_tool_guidance(self, tenant_id: str) -> dict[str, dict[str, Any]]:
+        async with self._lock:
+            rows = (
+                self._ensure_conn()
+                .execute(
+                    "SELECT tool_name, payload_json FROM tool_guidance WHERE tenant_id = ?",
+                    (tenant_id,),
+                )
+                .fetchall()
+            )
+        return {row["tool_name"]: json.loads(row["payload_json"]) for row in rows}
+
+    async def save_tool_guidance(
+        self, tenant_id: str, tool_name: str, guidance: dict[str, Any] | None
+    ) -> None:
+        async with self._lock:
+            conn = self._ensure_conn()
+            if guidance is None:
+                conn.execute(
+                    "DELETE FROM tool_guidance WHERE tenant_id = ? AND tool_name = ?",
+                    (tenant_id, tool_name),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO tool_guidance (tenant_id, tool_name, payload_json)
+                       VALUES (?, ?, ?) ON CONFLICT (tenant_id, tool_name)
+                       DO UPDATE SET payload_json = excluded.payload_json""",
+                    (tenant_id, tool_name, json.dumps(guidance)),
+                )
+            conn.commit()
+
     async def get_setting(self, key: str) -> dict[str, Any] | None:
         async with self._lock:
             conn = self._ensure_conn()
@@ -882,6 +924,11 @@ class PostgresAuditStore:
 
     async def init(self) -> None:
         pool = await self._get_pool()
+        await pool.execute(
+            """CREATE TABLE IF NOT EXISTS tool_guidance (
+                tenant_id TEXT NOT NULL, tool_name TEXT NOT NULL, payload_json TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, tool_name))"""
+        )
         await pool.execute(
             """CREATE TABLE IF NOT EXISTS adaptive_evidence (
                 tenant_id TEXT NOT NULL, evidence_id TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -1160,6 +1207,33 @@ class PostgresAuditStore:
             return int(str(status).split()[-1]) > 0
         except (IndexError, ValueError):
             return bool(status)
+
+    async def list_tool_guidance(self, tenant_id: str) -> dict[str, dict[str, Any]]:
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            "SELECT tool_name, payload_json FROM tool_guidance WHERE tenant_id = $1", tenant_id
+        )
+        return {row["tool_name"]: self._decode_json(row["payload_json"]) for row in rows}
+
+    async def save_tool_guidance(
+        self, tenant_id: str, tool_name: str, guidance: dict[str, Any] | None
+    ) -> None:
+        pool = await self._get_pool()
+        if guidance is None:
+            await pool.execute(
+                "DELETE FROM tool_guidance WHERE tenant_id = $1 AND tool_name = $2",
+                tenant_id,
+                tool_name,
+            )
+        else:
+            await pool.execute(
+                """INSERT INTO tool_guidance (tenant_id, tool_name, payload_json)
+                   VALUES ($1, $2, $3) ON CONFLICT (tenant_id, tool_name)
+                   DO UPDATE SET payload_json = excluded.payload_json""",
+                tenant_id,
+                tool_name,
+                json.dumps(guidance),
+            )
 
     async def _ensure_settings_table(self, pool: Any) -> None:
         await pool.execute(

@@ -70,6 +70,7 @@ const dynamicPermitted = ref(true);
 const existingUpstreams = ref<string[]>([]);
 const errorMessage = ref("");
 const statusMessage = ref("");
+const registeredUpstream = ref("");
 
 // Draft upstream configuration
 const draftName = ref("inventory_api");
@@ -461,14 +462,17 @@ async function handleTestCall(toolName: string) {
 async function handleRegister() {
   errorMessage.value = "";
   statusMessage.value = "";
+  registeredUpstream.value = "";
   try {
+    const payload = buildUpstreamPayload();
     const res = await apiFetch<{ registered: boolean; catalog_version: string }>("/admin/upstreams", {
       method: "POST",
-      body: buildUpstreamPayload(),
+      body: payload,
     });
-    statusMessage.value = `Registered upstream '${draftName.value}' (catalog ${res.catalog_version}).`;
-    if (!existingUpstreams.value.includes(draftName.value.trim())) {
-      existingUpstreams.value.push(draftName.value.trim());
+    registeredUpstream.value = payload.name;
+    statusMessage.value = `Registered upstream '${payload.name}' (catalog ${res.catalog_version}).`;
+    if (!existingUpstreams.value.includes(payload.name)) {
+      existingUpstreams.value.push(payload.name);
     }
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
@@ -592,6 +596,13 @@ async function copyPromptText() {
       class="rounded-lg border border-[#99F6E4] bg-[#F0FDFA] px-4 py-2.5 text-[13px] text-[#0F766E]"
     >
       {{ statusMessage }}
+      <NuxtLink
+        v-if="registeredUpstream && statusMessage.startsWith('Registered upstream')"
+        :to="{ path: '/upstreams', query: { upstream: registeredUpstream } }"
+        class="ml-2 inline-flex min-h-11 items-center font-medium text-teal-800 underline sm:min-h-9"
+      >
+        Open tool catalog
+      </NuxtLink>
     </div>
 
     <div

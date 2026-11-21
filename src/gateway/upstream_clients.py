@@ -7,14 +7,14 @@ import ipaddress
 import json
 import re
 import socket
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote, urlparse
 
 import httpx
 import yaml
 from mcp import Client, StdioServerParameters
 from opentelemetry import propagate
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from gateway.config import UpstreamConfig
 from gateway.mcp_protocol import MCP_PROTOCOL_VERSION, request_headers, request_meta
@@ -145,6 +145,15 @@ _MUTATING_PREFIXES = (
 )
 
 
+class ToolGuidance(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    description: str = Field(default="", max_length=400)
+    parameter_hints: dict[str, Annotated[str, StringConstraints(max_length=160)]] = Field(
+        default_factory=dict, max_length=24
+    )
+
+
 class DiscoveredTool(BaseModel):
     """Normalized tool descriptor across MCP HTTP, MCP stdio, and OpenAPI backends."""
 
@@ -163,6 +172,7 @@ class DiscoveredTool(BaseModel):
     query_params: list[str] = Field(default_factory=list)
     has_body: bool = False
     annotations: dict[str, Any] = Field(default_factory=dict)
+    guidance: ToolGuidance | None = None
 
 
 def infer_mutating(

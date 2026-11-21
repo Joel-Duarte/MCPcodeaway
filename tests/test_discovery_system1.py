@@ -81,6 +81,74 @@ def _setup_gateway(
     return app, dev_keys
 
 
+async def test_tool_guidance_reaches_discovery_and_classic_tools_for_one_tenant(tmp_path) -> None:
+    app, keys = _setup_gateway(
+        tmp_path, settings_overrides={"allowed_tenants": ["tenant-acme-dev", "tenant-other"]}
+    )
+    admin = keys.issue_user_token(persona="gateway_admin")
+    viewer = keys.issue_user_token(overrides={"roles": ["operator_viewer"]})
+    finance = keys.issue_user_token(persona="finance_analyst")
+    other = keys.issue_user_token(
+        persona="finance_analyst", overrides={"tenant_id": "tenant-other"}
+    )
+    tool = "snowflake_ledger__get_customer_balance"
+    endpoint = f"/admin/upstreams/snowflake_ledger/tools/{tool}/guidance"
+    admin_headers = {"Authorization": f"Bearer {admin}"}
+    viewer_headers = {"Authorization": f"Bearer {viewer}"}
+    edits = {
+        "description": "Read the customer's accountsreceivable balance.",
+        "parameter_hints": {"customer_id": "Use the stable customer ID from the ledger."},
+    }
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            original = (await client.get(endpoint, headers=viewer_headers)).json()
+            assert original["can_edit"] is False
+            assert original["guidance"] is None
+            assert (
+                await client.put(endpoint, headers=viewer_headers, json=edits)
+            ).status_code == 403
+            invalid = await client.put(
+                endpoint, headers=admin_headers, json={"parameter_hints": {"unknown": "bad"}}
+            )
+            assert invalid.status_code == 422
+            saved = await client.put(endpoint, headers=admin_headers, json=edits)
+            assert saved.json()["guidance"] == edits
+            updated = (await client.get(endpoint, headers=viewer_headers)).json()
+            assert updated["guidance"] == edits
+            assert updated["input_schema"] == original["input_schema"]
+            assert updated["output_schema"] == original["output_schema"]
+
+            args = {"name": "search_tools", "arguments": {"query": "accountsreceivable"}}
+            search = await _mcp_post(client, finance, "tools/call", args, query="mode=codemode")
+            discovered = search["result"]["structuredContent"]["tools"]
+            assert discovered[0]["qualified_name"] == tool
+            assert edits["parameter_hints"]["customer_id"] in discovered[0]["stub"]
+            preloaded = await _mcp_post(
+                client,
+                finance,
+                "tools/list",
+                query="mode=codemode",
+                headers={"X-Intent": "accountsreceivable"},
+            )
+            execute = next(t for t in preloaded["result"]["tools"] if t["name"] == "execute_code")
+            assert edits["parameter_hints"]["customer_id"] in execute["description"]
+            isolated = await _mcp_post(client, other, "tools/call", args, query="mode=codemode")
+            assert isolated["result"]["structuredContent"]["tools"] == []
+
+            classic = await _mcp_post(client, finance, "tools/list", query="mode=traditional")
+            definition = next(t for t in classic["result"]["tools"] if t["name"] == tool)
+            assert definition["description"] == edits["description"]
+            parameter = definition["inputSchema"]["properties"]["customer_id"]
+            assert edits["parameter_hints"]["customer_id"] in parameter["description"]
+            reset = await client.put(endpoint, headers=admin_headers, json={})
+            assert reset.json()["guidance"] is None
+            classic = await _mcp_post(client, finance, "tools/list", query="mode=traditional")
+            definition = next(t for t in classic["result"]["tools"] if t["name"] == tool)
+            assert definition["description"] == original["description"]
+
+
 async def test_list_servers_ceiling_and_execute_code_scoping(tmp_path) -> None:
     app, dev_keys = _setup_gateway(tmp_path)
     fin_token = dev_keys.issue_user_token(persona="finance_analyst")

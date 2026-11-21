@@ -12,6 +12,7 @@ from gateway.config import DiscoveryBackendMode, UpstreamConfig, UpstreamRegistr
 from gateway.discovery import DiscoveryEngine
 from gateway.upstream_clients import (
     DiscoveredTool,
+    ToolGuidance,
     UpstreamClientManager,
     compute_schema_digest,
 )
@@ -110,18 +111,21 @@ def render_python_stub(tool: DiscoveredTool) -> str:
 
     sig = ", ".join(params)
     doc = " ".join(tool.description.split())
-    if len(doc) > 120:
+    if len(doc) > 120 and not (tool.guidance and tool.guidance.description):
         doc = f"{doc[:117]}..."
     tag = " [MUTATING]" if tool.mutating else ""
+    lines = [f"{doc}{tag}"]
+    if tool.guidance:
+        lines.extend(
+            f"{name}: {hint}"
+            for name, hint in tool.guidance.parameter_hints.items()
+            if name in props
+        )
     ret_type = _schema_return_type(tool.output_schema)
     if tool.output_schema:
-        shape = _format_schema_shape(tool.output_schema)
-        return (
-            f"async def {tool.qualified_name}({sig}) -> {ret_type}:\n"
-            f'    """{doc}{tag}\n'
-            f'    Returns: {shape}"""'
-        )
-    return f'async def {tool.qualified_name}({sig}) -> {ret_type}:\n    """{doc}{tag}"""'
+        lines.append(f"Returns: {_format_schema_shape(tool.output_schema)}")
+    stub_doc = "\n".join(lines).replace("\\", "\\\\").replace('"""', '\\"""')
+    return f'async def {tool.qualified_name}({sig}) -> {ret_type}:\n    """{stub_doc}"""'
 
 
 def to_mcp_tool_definition(tool: DiscoveredTool) -> dict[str, Any]:
@@ -135,6 +139,23 @@ def to_mcp_tool_definition(tool: DiscoveredTool) -> dict[str, Any]:
     if tool.output_schema:
         defn["outputSchema"] = tool.output_schema
     return defn
+
+
+def _apply_tool_guidance(tool: DiscoveredTool, guidance: ToolGuidance) -> DiscoveredTool:
+    properties = dict(tool.input_schema.get("properties") or {})
+    for name, hint in guidance.parameter_hints.items():
+        if isinstance(schema := properties.get(name), dict):
+            description = " ".join(part for part in (schema.get("description"), hint) if part)
+            properties[name] = {**schema, "description": description}
+    return tool.model_copy(
+        update={
+            "description": guidance.description or tool.description,
+            "input_schema": {**tool.input_schema, "properties": properties}
+            if guidance.parameter_hints
+            else tool.input_schema,
+            "guidance": guidance,
+        }
+    )
 
 
 class ToolCatalog:
@@ -269,6 +290,7 @@ class ToolCatalog:
         registry: UpstreamRegistry,
         *,
         allowed_servers: set[str] | None = None,
+        guidance: dict[str, dict[str, Any]] | None = None,
     ) -> list[DiscoveredTool]:
         """Return only tools authorized for this caller's roles, groups, client, and scopes."""
         accessible: list[DiscoveredTool] = []
@@ -279,7 +301,12 @@ class ToolCatalog:
                 continue
             for tool in self._tools_by_server.get(upstream.name, []):
                 if policy.can_execute_tool(identity, upstream, tool.name, tool.mutating)[0]:
-                    accessible.append(tool)
+                    entry = (guidance or {}).get(tool.qualified_name)
+                    accessible.append(
+                        _apply_tool_guidance(tool, ToolGuidance.model_validate(entry))
+                        if entry
+                        else tool
+                    )
         return accessible
 
     async def discover_tools_for_caller(
@@ -295,10 +322,11 @@ class ToolCatalog:
         backend: DiscoveryBackendMode | None = None,
         limit: int = 15,
         include_schemas: bool = False,
+        guidance: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """RBAC-first, ceiling-enforced pluggable tool discovery."""
         accessible = self.list_accessible_tools(
-            identity, policy, registry, allowed_servers=allowed_servers
+            identity, policy, registry, allowed_servers=allowed_servers, guidance=guidance
         )
         if servers:
             requested = set(servers)

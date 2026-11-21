@@ -125,6 +125,7 @@ from gateway.state import (
 from gateway.telemetry import TelemetryRecorder, configure_telemetry
 from gateway.upstream_clients import (
     DiscoveredTool,
+    ToolGuidance,
     UpstreamClientManager,
     build_agent_onboarding_prompt,
     inspect_upstream,
@@ -905,10 +906,11 @@ class GatewayRuntime:
         allowed_servers: set[str] | None = None,
         execution: ExecutionMode | None = None,
         discovery_mode: DiscoveryMode | None = None,
+        guidance: dict[str, dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the baseline MCP tools/list payload for Execution x Discovery."""
         accessible = self.catalog.list_accessible_tools(
-            identity, self.policy, self.registry, allowed_servers=allowed_servers
+            identity, self.policy, self.registry, allowed_servers=allowed_servers, guidance=guidance
         )
         base_exec, base_disc = _MODE_TO_AXES[mode]
         eff_exec = execution or base_exec
@@ -958,6 +960,11 @@ class GatewayRuntime:
         eff_exec = execution or base_exec
         eff_disc = discovery_mode or base_disc
 
+        guidance = (
+            {}
+            if eff_exec == "codemode" and eff_disc == "deferred" and not (intent or query)
+            else await self.store.list_tool_guidance(identity.tenant_id or "")
+        )
         filter_text = (intent or query or "").strip()
         if filter_text:
             top_k = min(limit or 10, 20)
@@ -971,6 +978,7 @@ class GatewayRuntime:
                 backend=discovery_backend,
                 limit=top_k,
                 include_schemas=(eff_exec == "classic"),
+                guidance=guidance,
             )
             if eff_exec == "classic":
                 if mode == "traditional" and eff_disc == "upfront":
@@ -993,7 +1001,11 @@ class GatewayRuntime:
                     )
                 else:
                     accessible = self.catalog.list_accessible_tools(
-                        identity, self.policy, self.registry, allowed_servers=effective_ceiling
+                        identity,
+                        self.policy,
+                        self.registry,
+                        allowed_servers=effective_ceiling,
+                        guidance=guidance,
                     )
                     direct_mutating = [to_mcp_tool_definition(t) for t in accessible if t.mutating]
                     tools = (
@@ -1008,6 +1020,7 @@ class GatewayRuntime:
                 allowed_servers=effective_ceiling,
                 execution=eff_exec,
                 discovery_mode=eff_disc,
+                guidance=guidance,
             )
 
         if cursor is not None or limit is not None:
@@ -2171,6 +2184,9 @@ def create_gateway_app(
                                 backend=effective_discovery,
                                 limit=int(arguments.get("limit", 15)),
                                 include_schemas=(eff_exec == "classic"),
+                                guidance=await runtime.store.list_tool_guidance(
+                                    identity.tenant_id or ""
+                                ),
                             )
                         return _finish(
                             _jsonrpc_ok(
@@ -2538,6 +2554,15 @@ def create_gateway_app(
                 window_hours=window_hours,
             )
 
+    async def _catalog_tool_for_admin(name: str, tool_name: str) -> DiscoveredTool:
+        await runtime.sync_catalog_if_stale()
+        tool = runtime.catalog.get_tool(tool_name)
+        if tool is None or tool.server != name or runtime.registry.get(name) is None:
+            raise HTTPException(
+                status_code=404, detail="Tool is no longer in this upstream's catalog."
+            )
+        return tool
+
     if features.admin_read:
 
         @app.get("/admin/pricing/models")
@@ -2789,6 +2814,32 @@ def create_gateway_app(
                 "comparison_audit": audit_catalog_comparison(runtime.catalog, runtime.registry),
             }
 
+        @app.get("/admin/upstreams/{name}/tools/{tool_name}/guidance")
+        async def get_admin_tool_guidance(
+            name: str,
+            tool_name: str,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            caller = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            tool = await _catalog_tool_for_admin(name, tool_name)
+            entries = await runtime.store.list_tool_guidance(
+                (caller.tenant_id or "") if caller else ""
+            )
+            return {
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+                "output_schema": tool.output_schema,
+                "guidance": entries.get(tool_name),
+                "can_edit": features.admin_write
+                and (caller is None or bool(set(caller.roles) & set(runtime.settings.admin_roles))),
+            }
+
         @app.get("/admin/telemetry/runtime")
         async def admin_runtime_telemetry(
             authorization: str | None = Header(default=None),
@@ -2903,6 +2954,31 @@ def create_gateway_app(
         return inspection, audit
 
     if features.admin_write:
+
+        @app.put("/admin/upstreams/{name}/tools/{tool_name}/guidance")
+        async def save_admin_tool_guidance(
+            name: str,
+            tool_name: str,
+            body: ToolGuidance,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            caller = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            tool = await _catalog_tool_for_admin(name, tool_name)
+            hints = {key: value for key, value in body.parameter_hints.items() if value}
+            if unknown := hints.keys() - (tool.input_schema.get("properties") or {}).keys():
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Unknown tool parameters: {', '.join(sorted(unknown))}",
+                )
+            guidance = {"description": body.description, "parameter_hints": hints}
+            saved = guidance if body.description or hints else None
+            await runtime.store.save_tool_guidance(
+                (caller.tenant_id or "") if caller else "", tool_name, saved
+            )
+            return {"guidance": saved}
 
         @app.get("/admin/upstreams/agent-prompt")
         async def admin_agent_onboarding_prompt(

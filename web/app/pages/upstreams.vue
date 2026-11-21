@@ -3,7 +3,11 @@ import { extractErrorMessage } from "~/composables/useAdminApi";
 import { summarizeUpstreamHealth } from "~/utils/upstream-health";
 
 const { apiFetch: _apiFetch } = useAdminApi();
-const expandedUpstreamName = ref<string | null>(null);
+const requestedUpstream = useRoute().query.upstream;
+const initialUpstream = typeof requestedUpstream === "string" ? requestedUpstream : "";
+const expandedUpstreamName = ref<string | null>(initialUpstream || null);
+const toolDrawerOpen = ref(false);
+const selectedTool = ref<{ upstream: string; tool: string; opener: HTMLElement } | null>(null);
 const healthRows = ref<Array<{ server: string; tool: string; count: number; bytes: number; mean_latency_ms: number | null; p95_latency_ms: number | null; errors: number | null; timeouts: number; invalid_arguments: number | null; schema_coverage_pct: number | null; read_calls: number | null; write_calls: number | null }>>([]);
 
 async function loadPerf() {
@@ -17,6 +21,12 @@ async function loadPerf() {
 
 function toggleExpandUpstream(name: string) {
   expandedUpstreamName.value = expandedUpstreamName.value === name ? null : name;
+}
+
+function openTool(upstream: string, tool: string, event: MouseEvent) {
+  if (!(event.currentTarget instanceof HTMLElement)) return;
+  selectedTool.value = { upstream, tool, opener: event.currentTarget };
+  toolDrawerOpen.value = true;
 }
 
 function aggregatedToolsForUpstream(u: UpstreamEntry) {
@@ -151,7 +161,7 @@ const deleteTarget = ref<string | null>(null);
 const deleteDialogOpen = ref(false);
 
 // 500-server scale search, filters & pagination
-const searchQuery = ref("");
+const searchQuery = ref(initialUpstream);
 const groupFilter = ref("");
 const authFilter = ref("");
 const modeFilter = ref("");
@@ -395,10 +405,15 @@ onMounted(() => {
                   @click="toggleExpandUpstream(u.name)"
                 >
                   <td class="px-3 py-2">
-                    <div class="flex items-center gap-1.5 font-mono-data font-medium text-[#09090B]">
+                    <Button
+                      data-variant="ghost"
+                      :aria-expanded="expandedUpstreamName === u.name"
+                      class="flex min-h-11 items-center gap-1.5 px-0 font-mono-data font-medium text-zinc-950 sm:min-h-9"
+                      @click.stop="toggleExpandUpstream(u.name)"
+                    >
                       <AppIcon :name="expandedUpstreamName === u.name ? 'chevron-down' : 'chevron-right'" :size="14" class="text-[#71717A]" />
                       <span class="max-w-[160px] truncate" :title="u.name">{{ u.name }}</span>
-                    </div>
+                    </Button>
                     <div class="max-w-[160px] truncate text-[11px] text-[#71717A]" :title="u.url || 'stdio/inline'">
                       {{ u.url || "stdio/inline" }}
                     </div>
@@ -449,9 +464,20 @@ onMounted(() => {
                   </td>
                 </tr>
                 <tr v-if="expandedUpstreamName === u.name" class="bg-[#FAFAFA]">
-                  <td :colspan="upstreamsData.dynamic_upstreams_permitted ? 10 : 9" class="px-6 py-3">
+                  <td :colspan="upstreamsData.dynamic_upstreams_permitted ? 10 : 9" class="px-3 py-3 sm:px-6">
+                    <section class="mb-3 max-w-[calc(100vw-4rem)] border-b border-zinc-200 pb-3 lg:max-w-none" aria-label="Tool catalog">
+                      <h3 class="mb-2 text-[0.9375rem] font-semibold text-zinc-950">Tool catalog</h3>
+                      <ul v-if="u.tools?.length" class="flex flex-wrap gap-2">
+                        <li v-for="tool in u.tools" :key="tool" class="min-w-0 max-w-full">
+                          <Button class="min-h-11 max-w-full whitespace-normal break-all text-left sm:min-h-9" @click="openTool(u.name, tool, $event)">
+                            {{ tool.startsWith(`${u.name}__`) ? tool.slice(u.name.length + 2) : tool }}
+                          </Button>
+                        </li>
+                      </ul>
+                      <p v-else class="text-xs text-zinc-600">No tools discovered for this upstream yet.</p>
+                    </section>
                     <div v-if="aggregatedToolsForUpstream(u).length === 0" class="text-xs text-[#71717A]">
-                      No tools discovered for this upstream yet.
+                      No calls recorded for this upstream yet.
                     </div>
                     <div v-else class="overflow-x-auto">
                       <p class="mb-2 text-[11px] leading-4 text-[#71717A]">Observed dispatcher subcalls, payload sizes, latency, failures, and known schema metadata. Historical fields that were not captured remain unknown.</p>
@@ -510,6 +536,14 @@ onMounted(() => {
         </div>
       </section>
     </template>
+
+    <ToolGuidanceDrawer
+      v-if="selectedTool"
+      v-model:open="toolDrawerOpen"
+      :upstream="selectedTool.upstream"
+      :tool="selectedTool.tool"
+      :opener="selectedTool.opener"
+    />
 
     <Dialog v-model:open="deleteDialogOpen">
       <DialogBackdrop />
