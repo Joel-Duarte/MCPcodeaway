@@ -22,7 +22,7 @@ GATEWAY_TOKEN_EXCHANGE_DIALECT=entra_v2_obo
 GATEWAY_GATEWAY_MODE=hybrid
 GATEWAY_READ_ONLY_PROD=true
 
-GATEWAY_GATEWAY_PUBLIC_URL=https://mcp-gateway.company.internal
+GATEWAY_PUBLIC_URL=https://mcp-gateway.company.internal
 GATEWAY_OIDC_ISSUER=https://login.microsoftonline.com/<TENANT_ID>/v2.0
 GATEWAY_OIDC_JWKS_URI=https://login.microsoftonline.com/<TENANT_ID>/discovery/v2.0/keys
 GATEWAY_OIDC_AUDIENCE=api://mcp-code-gateway
@@ -33,6 +33,11 @@ GATEWAY_ALLOWED_TENANTS='["<TENANT_ID>"]'
 ```
 
 ## 3. Common Copilot Studio Gotchas
+
+This is a configuration sketch, not a verified Copilot Studio connector. The
+repository's automated client evidence is currently based on its protocol
+tests and local mocks; validate the actual MCP host before selecting it for a
+pilot.
 
 - **RFC 9728 `resource` indicator alignment**: Ensure `GATEWAY_OIDC_AUDIENCE` matches the exact `resource` advertised at `GET /.well-known/oauth-protected-resource`.
 - **`HTTP 400` from `token.azure-apim.net`**: Usually indicates a scope format mismatch (`api://<APP_ID>/mcp.tools` vs bare `mcp.tools`) or missing offline_access/refresh token handling in the client registration.

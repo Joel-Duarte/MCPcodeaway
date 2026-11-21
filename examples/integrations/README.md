@@ -1,6 +1,6 @@
-# Multi-Provider Identity, Auto-Grouping & Non-SSO Harness Guide
+# Identity and Client Configuration Examples
 
-`MCPcodeaway` is **100% vendor-agnostic**. It uses standard **OIDC / OAuth 2.1 + RFC 9728 Protected Resource Metadata + Delegated Token Exchange (`entra_v2_obo` or `rfc8693`)**, plus configurable claim mapping ([`ClaimMappingConfig`](../../src/gateway/config.py)) so you can integrate **Microsoft Entra ID**, **AWS**, **Google Cloud**, **Okta**, **Keycloak**, or even **non-SSO CLI/local agent harnesses**.
+These files are starting points for configuring a single OIDC issuer and a client. They are examples, not evidence that every listed identity provider or MCP client has been tested with this gateway. The repeatable evidence is the repository OIDC mock and gateway tests; check the target provider's token shape and the target MCP client's login and confirmation behavior before a pilot. See [MVP readiness](../../docs/mvp-readiness.md).
 
 ---
 

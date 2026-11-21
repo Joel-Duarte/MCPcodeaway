@@ -19,7 +19,7 @@ profiles:
       dev_auth: false
 
   staging:
-    description: "Staging/onboarding gateway extending production with HITL wizard."
+    description: "Onboarding profile with admin writes and the dashboard enabled."
     extends: production
     app_env: uat
     auth_mode: oidc
@@ -30,7 +30,7 @@ profiles:
       dashboard_ui: true
 
   demo:
-    description: "Local demo gateway with zero-dep dev JWTs, mock personas, and comparator."
+    description: "Local demo with development login, mock personas, and comparison tools."
     extends: staging
     app_env: sandbox
     auth_mode: dev
@@ -43,7 +43,7 @@ profiles:
       benchmarks_api: true
 
   finance_strict:
-    description: "Strict finance production profile: Code Mode + grounding, hidden /admin/*."
+    description: "Production profile with Code Mode grounding and no admin endpoints."
     extends: production
     execution_mode: codemode
     require_tool_grounding: true

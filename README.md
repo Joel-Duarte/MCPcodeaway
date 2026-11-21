@@ -46,6 +46,9 @@ Callers select execution and discovery strategies independently via query parame
 
 ## Quickstart (Zero External Dependencies)
 
+For the current scope, test evidence, known limits, and the optional local
+OIDC/shared-service lab, see [MVP readiness](docs/mvp-readiness.md).
+
 ```bash
 # 1. Install dependencies (Python 3.12+ + uv)
 uv sync --extra dev
