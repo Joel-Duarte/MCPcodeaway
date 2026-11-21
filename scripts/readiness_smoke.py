@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import importlib
 import os
+import secrets
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -34,24 +38,63 @@ async def _token(
     scopes: list[str],
     tenant_id: str = "tenant-acme-dev",
 ) -> str:
-    response = await client.post(
-        f"{gateway_url}/dev/auth/token",
-        json={
-            "persona": None,
-            "sub": sub,
-            "tenant_id": tenant_id,
-            "roles": roles,
-            "groups": groups,
-            "scopes": scopes,
+    idp_url = os.environ.get("READINESS_IDP_URL", "http://localhost:8081/oidc").rstrip("/")
+    code_verifier = secrets.token_urlsafe(48)
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    state = secrets.token_urlsafe(24)
+    response = await client.get(
+        f"{idp_url}/authorize",
+        params={
+            "response_type": "code",
+            "client_id": "mcp-readiness",
+            "redirect_uri": "http://localhost:8080/auth/admin/callback",
+            "scope": " ".join(sorted(set(scopes) | {"openid"})),
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "persona": sub,
+        },
+        follow_redirects=False,
+    )
+    if response.status_code != httpx.codes.FOUND:
+        raise RuntimeError(
+            f"Local mock OIDC authorization for {sub!r} failed ({response.status_code})"
+        )
+    callback = urlparse(response.headers.get("location", ""))
+    query = parse_qs(callback.query)
+    code = (query.get("code") or [""])[0]
+    if not code or (query.get("state") or [None])[0] != state:
+        raise RuntimeError("Local mock OIDC authorization response had invalid code or state")
+    token_response = await client.post(
+        f"{idp_url}/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": "http://localhost:8080/auth/admin/callback",
+            "client_id": "mcp-readiness",
+            "code_verifier": code_verifier,
         },
     )
-    if response.status_code != httpx.codes.OK:
+    if token_response.status_code != httpx.codes.OK:
         raise RuntimeError(
-            f"Local mock OIDC token request for {sub!r} failed ({response.status_code})"
+            f"Local mock OIDC code exchange for {sub!r} failed ({token_response.status_code})"
         )
-    access_token = response.json().get("access_token")
+    access_token = token_response.json().get("access_token")
     if not isinstance(access_token, str) or not access_token:
         raise RuntimeError("Local mock OIDC response did not contain an access token")
+    if tenant_id == "tenant-acme-dev":
+        identity = await client.get(
+            f"{gateway_url}/auth/me", headers={"Authorization": f"Bearer {access_token}"}
+        )
+        if identity.status_code != httpx.codes.OK:
+            raise RuntimeError(f"Mock OIDC token for {sub!r} was rejected by the gateway")
+        mapped = identity.json()
+        if mapped.get("roles") != roles or mapped.get("groups") != groups:
+            raise RuntimeError(f"Mock OIDC fixture claims for {sub!r} did not match the scenario")
     return access_token
 
 
@@ -65,6 +108,27 @@ async def _wait_for_gateway(client: httpx.AsyncClient, base_url: str) -> None:
             pass
         await asyncio.sleep(2)
     raise RuntimeError("Gateway did not become ready within 60 seconds")
+
+
+async def _verify_admin_oidc_login(client: httpx.AsyncClient, gateway_url: str) -> None:
+    login = await client.get(
+        f"{gateway_url}/auth/admin/login?next_url=/admin", follow_redirects=False
+    )
+    if login.status_code != httpx.codes.FOUND:
+        raise RuntimeError(f"Gateway did not start OIDC login ({login.status_code})")
+    authorize = await client.get(login.headers["location"], follow_redirects=False)
+    if authorize.status_code != httpx.codes.FOUND:
+        raise RuntimeError(f"Mock OIDC provider rejected authorization ({authorize.status_code})")
+    callback = await client.get(authorize.headers["location"], follow_redirects=False)
+    if callback.status_code != httpx.codes.FOUND or "set-cookie" not in callback.headers:
+        raise RuntimeError(
+            f"Gateway OIDC callback did not create an admin session ({callback.status_code})"
+        )
+    session = await client.get(f"{gateway_url}/auth/admin/session")
+    if session.status_code != httpx.codes.OK or not session.json().get("authenticated"):
+        raise RuntimeError("OIDC callback session was not accepted by the gateway")
+    if "gateway_admin" not in session.json().get("user", {}).get("roles", []):
+        raise RuntimeError("OIDC admin login returned an identity without the admin role")
 
 
 async def _require_status(
@@ -94,6 +158,18 @@ async def run_readiness_smoke() -> dict[str, str]:
     timeout = httpx.Timeout(60.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
         await _wait_for_gateway(client, gateway_url)
+        idp_url = os.environ.get("READINESS_IDP_URL", "http://localhost:8081/oidc").rstrip("/")
+        provider_metadata = await client.get(f"{idp_url}/.well-known/openid-configuration")
+        if provider_metadata.status_code != httpx.codes.OK:
+            raise RuntimeError("Local OIDC provider metadata endpoint was not available")
+        metadata = provider_metadata.json()
+        if metadata.get("issuer") != "http://localhost:8081/oidc" or "S256" not in metadata.get(
+            "code_challenge_methods_supported", []
+        ):
+            raise RuntimeError(
+                "Local OIDC metadata does not advertise the expected issuer and PKCE"
+            )
+        await _verify_admin_oidc_login(client, gateway_url)
 
         admin_token = await _token(
             client,
@@ -226,6 +302,7 @@ async def run_readiness_smoke() -> dict[str, str]:
         approval_headers = {
             **request_headers("tools/call", tool_name=approval_name),
             "Authorization": f"Bearer {ops_token}",
+            "X-Admin-Force-Mode": "traditional",
         }
         approval_params: dict[str, Any] = {
             "name": approval_name,

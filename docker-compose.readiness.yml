@@ -14,7 +14,17 @@ services:
       retries: 20
 
   mock-backends:
-    ports: !reset []
+    ports: !override ["127.0.0.1:8081:8001"]
+    volumes:
+      - ${READINESS_DEV_OIDC_KEY_PATH:-./.readiness/dev-oidc-private.pem}:/run/readiness/dev-oidc-private.pem:ro
+    environment:
+      MOCK_OIDC_ISSUER: http://localhost:8081/oidc
+      MOCK_OIDC_PRIVATE_KEY_PATH: /run/readiness/dev-oidc-private.pem
+      MOCK_OIDC_CLIENT_ID: mcp-readiness
+      MOCK_OIDC_REDIRECT_URI: http://localhost:8080/auth/admin/callback
+      MOCK_OIDC_AUDIENCE: api://mcp-readiness
+      GATEWAY_TOKEN_ISSUER: http://localhost:8081/oidc
+      GATEWAY_JWKS_URL: http://mock-backends:8001/oidc/jwks
 
   gateway-scaled:
     volumes:
@@ -30,11 +40,21 @@ services:
       sandbox-worker:
         condition: service_healthy
     environment:
-      GATEWAY_PROFILE: demo
+      GATEWAY_PROFILE: staging
       GATEWAY_APP_ENV: uat
-      GATEWAY_AUTH_MODE: dev
+      GATEWAY_AUTH_MODE: oidc
+      GATEWAY_TOKEN_EXCHANGE_DIALECT: dev_local
       GATEWAY_DEV_OIDC_PRIVATE_KEY_PATH: /run/readiness/dev-oidc-private.pem
       GATEWAY_PUBLIC_URL: http://localhost:8080
+      GATEWAY_OIDC_ISSUER: http://localhost:8081/oidc
+      GATEWAY_OIDC_JWKS_URI: http://mock-backends:8001/oidc/jwks
+      GATEWAY_OIDC_AUDIENCE: api://mcp-readiness
+      GATEWAY_OIDC_TOKEN_ENDPOINT: http://mock-backends:8001/oidc/token
+      GATEWAY_OIDC_CLIENT_ID: mcp-readiness
+      GATEWAY_ADMIN_OIDC_AUTHORIZATION_ENDPOINT: http://localhost:8081/oidc/authorize
+      GATEWAY_ADMIN_OIDC_REDIRECT_URI: http://localhost:8080/auth/admin/callback
+      GATEWAY_ADMIN_OIDC_SCOPES: openid mcp.admin
+      GATEWAY_ADMIN_OIDC_API_SCOPE: mcp.admin
       GATEWAY_ALLOWED_TENANTS: '["tenant-acme-dev"]'
       GATEWAY_CLAIM_MAPPING: '{"tenant":"tid","roles":"roles","groups":"groups"}'
       GATEWAY_ADMIN_ROLES: '["gateway_admin"]'

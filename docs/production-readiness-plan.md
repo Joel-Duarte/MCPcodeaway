@@ -156,10 +156,10 @@ notification provider to the codebase before a customer selects one.
 
 ### Lean mock-only readiness path (2026-11-21)
 
-- Replaced the optional Keycloak container in the local lab with the gateway's built-in mock OIDC token issuer. Provider claim formats remain covered by in-process fixtures; the Docker lab mints test identities with selected roles, groups, scopes, and tenant claims.
-- Added an optional local signing-key file so both gateway replicas in the lab validate the same test tokens. The key path is only read when dev authentication is active; the generated key is ignored by Git. Added a regression test for signing-key reuse.
+- Replaced the optional Keycloak container in the local lab with the repository's OIDC provider in the existing mock-backends service. The local OIDC mock now exercises discovery, JWKS, authorization code + PKCE, signed access/ID tokens, nonce, userinfo, one-time codes, exact client/redirect checks, and role/group/tenant claims.
+- Added an optional local signing-key file shared by the mock provider and gateway replicas for local downstream delegation. The key path is only read for a non-production local exchange profile; the generated key is ignored by Git. Added a regression test for signing-key reuse.
 - Moved the readiness upstream fixture under `deploy/readiness/`, mount it only in the local Compose overlay, and assert in CI that it is absent from the production gateway image. Existing pytest CI continues to check the auth/provider and approval fixtures without starting Docker or external IdPs.
-- The latest smoke passed through the two-replica route, including group-based approval authorization. A short local REST benchmark passed functionally but measured about 11.6 seconds p50 due to unrelated mock Snowflake/operations calls returning 503; do not treat it as a latency baseline until that mock routing/retry behavior is understood.
+- The latest smoke passed through the two-replica route against the repository OIDC mock, including group-based approval authorization and successful delegated calls to the mock APIs. A five-request benchmark sanity run passed at 100% (p50 11.438 ms, p95 45.774 ms, 55.954 RPS); this small run validates the harness only and is not a latency baseline or capacity claim.
 
 ### Phase 1 review against the current project
 

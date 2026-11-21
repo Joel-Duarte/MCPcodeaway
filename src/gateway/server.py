@@ -363,7 +363,14 @@ class GatewayRuntime:
         else:
             self.store = SQLiteAuditStore(self.settings.sqlite_path)
         self.dev_keys = dev_keys
-        if self.dev_keys is None and self.settings.auth_mode == "dev":
+        shared_local_signing_key_enabled = (
+            self.settings.dev_oidc_private_key_path is not None
+            and self.settings.app_env != "prod"
+            and self.settings.token_exchange_dialect.endswith("_local")
+        )
+        if self.dev_keys is None and (
+            self.settings.auth_mode == "dev" or shared_local_signing_key_enabled
+        ):
             private_key_pem = (
                 Path(self.settings.dev_oidc_private_key_path).read_text(encoding="utf-8")
                 if self.settings.dev_oidc_private_key_path

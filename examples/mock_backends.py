@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import os
+import secrets
+import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode
 
@@ -58,6 +62,82 @@ class CustomerRecord(BaseModel):
     region: str
     contact_email: str
     tier: str
+
+
+_READINESS_OIDC_IDENTITIES: dict[str, dict[str, Any]] = {
+    "readiness-admin": {
+        "sub": "readiness-admin",
+        "tenant_id": "tenant-acme-dev",
+        "email": "readiness-admin@example.test",
+        "client_id": "mcp-readiness",
+        "roles": ["gateway_admin"],
+        "groups": ["platform-admins"],
+        "scopes": ["openid", "mcp.tools", "mcp.admin", "mcp.audit"],
+    },
+    "readiness-finance": {
+        "sub": "readiness-finance",
+        "tenant_id": "tenant-acme-dev",
+        "email": "readiness-finance@example.test",
+        "client_id": "mcp-readiness",
+        "roles": ["finance_analyst"],
+        "groups": ["finance"],
+        "scopes": ["openid", "mcp.tools", "finance.read"],
+    },
+    "readiness-ops": {
+        "sub": "readiness-ops",
+        "tenant_id": "tenant-acme-dev",
+        "email": "readiness-ops@example.test",
+        "client_id": "mcp-readiness",
+        "roles": ["ops_engineer", "ticketing_writer", "tool_approver"],
+        "groups": ["operations", "operations-approvers"],
+        "scopes": ["openid", "mcp.tools", "ops.write"],
+    },
+    "readiness-approver": {
+        "sub": "readiness-approver",
+        "tenant_id": "tenant-acme-dev",
+        "email": "readiness-approver@example.test",
+        "client_id": "mcp-readiness",
+        "roles": ["tool_approver"],
+        "groups": ["operations-approvers"],
+        "scopes": ["openid", "mcp.tools"],
+    },
+    "readiness-viewer": {
+        "sub": "readiness-viewer",
+        "tenant_id": "tenant-acme-dev",
+        "email": "readiness-viewer@example.test",
+        "client_id": "mcp-readiness",
+        "roles": ["operator_viewer"],
+        "groups": ["platform"],
+        "scopes": ["openid", "mcp.tools"],
+    },
+    "readiness-unassigned": {
+        "sub": "readiness-unassigned",
+        "tenant_id": "tenant-acme-dev",
+        "email": "readiness-unassigned@example.test",
+        "client_id": "mcp-readiness",
+        "roles": [],
+        "groups": [],
+        "scopes": ["openid", "mcp.tools"],
+    },
+    "readiness-other-tenant": {
+        "sub": "readiness-other-tenant",
+        "tenant_id": "mcp-other",
+        "email": "readiness-other@example.test",
+        "client_id": "mcp-readiness",
+        "roles": ["finance_analyst"],
+        "groups": ["finance"],
+        "scopes": ["openid", "mcp.tools", "finance.read"],
+    },
+    "readiness-wrong-group-approver": {
+        "sub": "readiness-wrong-group-approver",
+        "tenant_id": "tenant-acme-dev",
+        "email": "readiness-wrong-group@example.test",
+        "client_id": "mcp-readiness",
+        "roles": ["tool_approver"],
+        "groups": ["finance"],
+        "scopes": ["openid", "mcp.tools"],
+    },
+}
 
 
 def _seed_enterprise_data() -> tuple[
@@ -443,17 +523,20 @@ async def _handle_mcp_rpc(
 
 def create_mock_backends_app(
     public_key_pem: str | Callable[[], str] | None = None,
-    expected_issuer: str = "http://127.0.0.1:8000/dev/oidc",
+    expected_issuer: str | None = None,
     jwks_url: str | None = None,
 ) -> FastAPI:
     """Create isolated mock enterprise MCP and OpenAPI services for demos and tests."""
     resolved_jwks_url = jwks_url or os.getenv(
         "GATEWAY_JWKS_URL", "http://127.0.0.1:8000/dev/oidc/jwks"
     )
+    resolved_expected_issuer = expected_issuer or os.getenv(
+        "GATEWAY_TOKEN_ISSUER", "http://127.0.0.1:8000/dev/oidc"
+    )
     verifier = _DownstreamTokenVerifier(
         public_key_pem=public_key_pem,
         jwks_url=resolved_jwks_url,
-        expected_issuer=expected_issuer,
+        expected_issuer=resolved_expected_issuer,
     )
     debt_ledger, trial_balance, invoices_by_region, customers_by_region, incidents = (
         _seed_enterprise_data()
@@ -1046,8 +1129,22 @@ def create_mock_backends_app(
     )
 
     mock_oidc_issuer = os.getenv("MOCK_OIDC_ISSUER", "http://127.0.0.1:8001/oidc").rstrip("/")
-    mock_oidc_keys = LocalDevKeyManager(issuer=mock_oidc_issuer)
+    mock_oidc_private_key_path = os.getenv("MOCK_OIDC_PRIVATE_KEY_PATH")
+    mock_oidc_private_key = (
+        Path(mock_oidc_private_key_path).read_text(encoding="utf-8")
+        if mock_oidc_private_key_path
+        else None
+    )
+    mock_oidc_keys = LocalDevKeyManager(
+        issuer=mock_oidc_issuer,
+        private_key_pem=mock_oidc_private_key,
+    )
     mock_oidc_audience = os.getenv("MOCK_OIDC_AUDIENCE", "api://mcp-code-gateway")
+    mock_oidc_client_id = os.getenv("MOCK_OIDC_CLIENT_ID", "mcp-readiness")
+    mock_oidc_redirect_uri = os.getenv(
+        "MOCK_OIDC_REDIRECT_URI", "http://localhost:8080/auth/admin/callback"
+    )
+    mock_oidc_codes: dict[str, dict[str, Any]] = {}
 
     app.add_middleware(
         CORSMiddleware,
@@ -1065,13 +1162,11 @@ def create_mock_backends_app(
             "userinfo_endpoint": f"{mock_oidc_issuer}/userinfo",
             "jwks_uri": f"{mock_oidc_issuer}/jwks",
             "response_types_supported": ["code"],
-            "grant_types_supported": [
-                "authorization_code",
-                "refresh_token",
-                "urn:ietf:params:oauth:grant-type:token-exchange",
-            ],
+            "grant_types_supported": ["authorization_code"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "code_challenge_methods_supported": ["S256"],
             "scopes_supported": [
                 "openid",
                 "profile",
@@ -1088,59 +1183,137 @@ def create_mock_backends_app(
 
     @app.get("/oidc/authorize")
     async def mock_oidc_authorize(
+        response_type: str = Query(...),
+        client_id: str = Query(...),
         redirect_uri: str = Query(...),
-        state: str = Query(default=""),
+        state: str = Query(..., min_length=1),
+        scope: str = Query(...),
+        code_challenge: str = Query(..., min_length=43, max_length=43),
+        code_challenge_method: str = Query(...),
+        nonce: str | None = Query(default=None),
         persona: str = Query(default="gateway_admin"),
     ) -> RedirectResponse:
-        chosen = persona if persona in DEV_PERSONAS else "gateway_admin"
+        if response_type != "code":
+            raise HTTPException(status_code=400, detail="response_type must be code")
+        if client_id != mock_oidc_client_id or redirect_uri != mock_oidc_redirect_uri:
+            raise HTTPException(status_code=400, detail="Unregistered OIDC client or redirect URI")
+        scopes = set(scope.split())
+        if "openid" not in scopes:
+            raise HTTPException(status_code=400, detail="scope must include openid")
+        if code_challenge_method != "S256":
+            raise HTTPException(status_code=400, detail="Only S256 PKCE is supported")
+        if persona not in DEV_PERSONAS and persona not in _READINESS_OIDC_IDENTITIES:
+            raise HTTPException(status_code=400, detail="Unknown local mock OIDC persona")
+
+        now = time.time()
+        for expired_code in [
+            saved_code
+            for saved_code, saved_record in mock_oidc_codes.items()
+            if saved_record["expires_at"] <= now
+        ]:
+            mock_oidc_codes.pop(expired_code, None)
+        code = secrets.token_urlsafe(32)
+        mock_oidc_codes[code] = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_challenge": code_challenge,
+            "persona": persona,
+            "scope": sorted(scopes),
+            "nonce": nonce,
+            "expires_at": time.time() + 120,
+        }
         sep = "&" if "?" in redirect_uri else "?"
-        q = urlencode({"code": f"mock-oidc-{chosen}", "state": state})
+        q = urlencode({"code": code, "state": state})
         return RedirectResponse(url=f"{redirect_uri}{sep}{q}", status_code=302)
 
     @app.post("/oidc/token")
     async def mock_oidc_token(request: Request) -> dict[str, Any]:
-        persona = "gateway_admin"
         content_type = (request.headers.get("content-type") or "").lower()
-        if "application/json" in content_type:
-            data = await request.json()
-            code = str(data.get("code") or "")
-            req_persona = str(data.get("persona") or "")
-        else:
-            raw = (await request.body()).decode("utf-8", errors="replace")
-            parsed = parse_qs(raw)
-            code = (parsed.get("code") or [""])[0]
-            req_persona = (parsed.get("persona") or [""])[0]
-        if req_persona in DEV_PERSONAS:
-            persona = req_persona
-        elif code.startswith("mock-oidc-") and code.removeprefix("mock-oidc-") in DEV_PERSONAS:
-            persona = code.removeprefix("mock-oidc-")
+        if not content_type.startswith("application/x-www-form-urlencoded"):
+            raise HTTPException(status_code=415, detail="Token requests must be form encoded")
+        raw = (await request.body()).decode("utf-8", errors="replace")
+        form = {key: values[-1] for key, values in parse_qs(raw).items()}
+        if form.get("grant_type") != "authorization_code":
+            raise HTTPException(status_code=400, detail="grant_type must be authorization_code")
+        code = str(form.get("code") or "")
+        record = mock_oidc_codes.pop(code, None)
+        if record is None or record["expires_at"] < time.time():
+            raise HTTPException(status_code=400, detail="Invalid or expired authorization code")
+        if (
+            form.get("client_id") != record["client_id"]
+            or form.get("client_id") != mock_oidc_client_id
+            or form.get("redirect_uri") != record["redirect_uri"]
+        ):
+            raise HTTPException(status_code=400, detail="Authorization code client mismatch")
+        verifier = str(form.get("code_verifier") or "")
+        if not (
+            43 <= len(verifier) <= 128
+            and all(char.isascii() and (char.isalnum() or char in "-._~") for char in verifier)
+        ):
+            raise HTTPException(status_code=400, detail="Invalid PKCE code_verifier")
+        digest = hashlib.sha256(verifier.encode("ascii", errors="strict")).digest()
+        challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        if not secrets.compare_digest(challenge, record["code_challenge"]):
+            raise HTTPException(status_code=400, detail="PKCE code_verifier mismatch")
 
-        token = mock_oidc_keys.issue_user_token(
-            persona=persona,
+        now = int(time.time())
+        readiness_identity = _READINESS_OIDC_IDENTITIES.get(str(record["persona"]))
+        access_token = mock_oidc_keys.issue_user_token(
+            persona=None if readiness_identity else str(record["persona"]),
             audience=mock_oidc_audience,
             ttl_seconds=3600,
+            overrides=(
+                readiness_identity if readiness_identity else {"client_id": mock_oidc_client_id}
+            ),
+        )
+        access_claims = jwt.decode(
+            access_token,
+            key=mock_oidc_keys.public_pem,
+            algorithms=["RS256"],
+            audience=mock_oidc_audience,
+            issuer=mock_oidc_issuer,
+        )
+        id_claims = {
+            key: access_claims[key]
+            for key in ("iss", "sub", "email", "groups", "roles", "tid", "azp")
+            if key in access_claims
+        }
+        id_claims.update(
+            {
+                "aud": mock_oidc_client_id,
+                "iat": now,
+                "exp": now + 3600,
+                "auth_time": now,
+            }
+        )
+        if record.get("nonce"):
+            id_claims["nonce"] = record["nonce"]
+        id_token = jwt.encode(
+            id_claims,
+            mock_oidc_keys.private_pem,
+            algorithm="RS256",
+            headers={"kid": mock_oidc_keys.kid},
         )
         return {
-            "access_token": token,
-            "id_token": token,
+            "access_token": access_token,
+            "id_token": id_token,
             "token_type": "Bearer",
             "expires_in": 3600,
             "issuer": mock_oidc_issuer,
-            "persona": persona,
+            "persona": record["persona"],
         }
 
     @app.get("/oidc/userinfo")
     async def mock_oidc_userinfo(
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        if authorization and authorization.lower().startswith("bearer "):
-            raw_token = authorization.split(" ", 1)[1].strip()
-        else:
-            raw_token = mock_oidc_keys.issue_user_token(
-                persona="gateway_admin",
-                audience=mock_oidc_audience,
-                ttl_seconds=3600,
+        if not authorization or not authorization.lower().startswith("bearer "):
+            raise HTTPException(
+                status_code=401,
+                detail="A valid bearer access token is required",
+                headers={"WWW-Authenticate": "Bearer"},
             )
+        raw_token = authorization.split(" ", 1)[1].strip()
         try:
             claims = jwt.decode(
                 raw_token,

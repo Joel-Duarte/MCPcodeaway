@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
 import importlib
 import json
 import os
+import secrets
 import sys
 import time
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -34,12 +38,47 @@ def _percentile(samples: list[float], percentile: float) -> float:
 
 
 async def _access_token(client: httpx.AsyncClient, gateway_url: str) -> str:
-    response = await client.post(
-        f"{gateway_url}/dev/auth/token",
-        json={"persona": "finance_analyst"},
+    del gateway_url
+    idp_url = os.environ.get("READINESS_IDP_URL", "http://localhost:8081/oidc").rstrip("/")
+    verifier = secrets.token_urlsafe(48)
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
     )
-    response.raise_for_status()
-    token = response.json().get("access_token")
+    state = secrets.token_urlsafe(24)
+    authorization = await client.get(
+        f"{idp_url}/authorize",
+        params={
+            "response_type": "code",
+            "client_id": "mcp-readiness",
+            "redirect_uri": "http://localhost:8080/auth/admin/callback",
+            "scope": "openid mcp.tools finance.read",
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "persona": "readiness-finance",
+        },
+        follow_redirects=False,
+    )
+    if authorization.status_code != httpx.codes.FOUND:
+        raise RuntimeError(f"Local mock OIDC authorization failed ({authorization.status_code})")
+    callback = parse_qs(urlparse(authorization.headers.get("location", "")).query)
+    code = (callback.get("code") or [""])[0]
+    if not code or (callback.get("state") or [None])[0] != state:
+        raise RuntimeError("Local mock OIDC authorization response had invalid code or state")
+    token_response = await client.post(
+        f"{idp_url}/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": "http://localhost:8080/auth/admin/callback",
+            "client_id": "mcp-readiness",
+            "code_verifier": verifier,
+        },
+    )
+    token_response.raise_for_status()
+    token = token_response.json().get("access_token")
     if not isinstance(token, str) or not token:
         raise RuntimeError("Local mock OIDC response did not contain an access token")
     return token

@@ -1,12 +1,12 @@
 # Local production-readiness lab
 
-This optional lab exercises the gateway against its built-in local mock OIDC issuer, the repository's REST mock, and a dedicated approval fixture. It is useful for validating identity claim mapping, authorization, integration wiring, recovery, and gathering a repeatable local baseline. It does not validate a customer IdP, partner REST contract, production capacity, availability, or an SLO.
+This optional lab exercises the gateway in OIDC mode against the repository's mock OIDC provider, CRM/ticketing REST mocks, and a dedicated approval fixture. The OIDC provider runs inside the existing mock-backends service; it adds no container or third-party IdP. The lab validates OIDC wiring, identity claim mapping, authorization, recovery, and repeatable local measurements. It does not validate a customer IdP, partner REST contract, production capacity, availability, or an SLO.
 
-Normal development and pull-request CI use the existing local token, upstream, and approval fixtures; they do not start an external IdP or add vendor SDKs. The readiness upstream config is mounted into the local gateway only and is excluded from the production image. Local tokens are signed by the gateway's development issuer and can carry selected roles, groups, scopes, and tenant claims to test allow and deny paths. Provider-specific claim formats are covered by the in-process OIDC fixtures.
+Normal development and pull-request CI use in-process token, OIDC protocol, upstream, and approval fixtures; they do not start the optional readiness stack or add vendor SDKs. The readiness upstream config is mounted into the local gateway only and is excluded from the production image. The mock provider issues signed access and ID tokens, publishes discovery metadata and JWKS, and uses authorization code with PKCE. Provider-specific claim formats are also covered by the in-process OIDC fixtures.
 
 ## Start and stop
 
-Prerequisites: Docker Compose v2, OpenSSL, Python dependencies installed for this repository, and free host port `8080`. The mock backend is internal to the Compose network in this overlay; it does not claim host port `8001`.
+Prerequisites: Docker Compose v2, OpenSSL, Python dependencies installed for this repository, and free host ports `8080` and `8081`. The mock backend stays internal on port `8001`; the mock OIDC provider is published on loopback port `8081` for the local authorization redirect.
 
 ```sh
 mkdir -p .readiness
@@ -17,11 +17,11 @@ docker compose -f docker-compose.yml -f docker-compose.readiness.yml --profile s
 uv run python scripts/readiness_smoke.py
 ```
 
-The gateway and local mock OIDC issuer are at `http://localhost:8080`. The scripted checks mint short-lived test identities directly from the local development token endpoint, including admin, viewer, finance, operations, unassigned, cross-tenant, and wrong-group approver identities. The local-only RSA key is shared by the gateway replicas so a token minted by one replica is accepted by another. It is ignored by Git and exists only to run this lab. This endpoint and signing-key option are for isolated development and are disabled in production profiles.
+The gateway is at `http://localhost:8080`; the mock OIDC issuer is `http://localhost:8081/oidc`. The smoke follows the gateway's admin login redirect and also obtains test identities through authorization code + PKCE, including admin, viewer, finance, operations, unassigned, cross-tenant, and wrong-group approver claims. The mock provider and gateway share a local-only RSA key so the gateway can issue mock downstream delegation tokens and both mock APIs can verify them. The key is ignored by Git and used only in this isolated lab. The mock issuer and local signing-key option are not part of production deployment.
 
 `readiness_smoke.py` verifies OIDC claims and tenant/RBAC boundaries, read-only viewer behavior, a generated REST-backed tool call, and the approval lifecycle. The requester confirms a high-impact action; self-approval and an approver outside the configured group are denied; an eligible approver sees and approves it; and the requester replays it. Every request goes through the load balancer; approval state is stored in the configured shared Postgres service. The unauthenticated approval fixture is reachable only on the internal Compose network and exists solely to exercise gateway approval controls; it is not an upstream security model.
 
-The identity check uses group claims in signed tokens, matching the gateway's current model: it authorizes from the caller's token claims and does not query a live directory for group membership. The REST mock exercises the same configured HTTP contract as a CRM or ticketing adapter. Keep these fixtures representative of request/response schemas, authorization outcomes, and expected errors; a single copied happy-path response is not enough to validate those cases. Add another local mock only when a new integration contract needs exercising.
+The identity check uses group claims in signed tokens, matching the gateway's current model: it authorizes from the caller's token claims and does not query a live directory for group membership. The REST mock exercises the configured HTTP contract for CRM and ticketing flows. Keep these fixtures representative of request/response schemas, authorization outcomes, and expected errors; a single copied happy-path response is not enough to validate those cases. Add another local mock only when a new integration contract needs exercising.
 
 For repeatable load runs, this overlay raises the per-user gateway rate limit to 6,000 requests/minute. The repository default is 120/minute. Record the effective setting with each run and agree the real per-user/per-tenant limits for the pilot; do not carry the lab override into production without that decision.
 
