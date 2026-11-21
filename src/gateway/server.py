@@ -2647,6 +2647,21 @@ def create_gateway_app(
                                 and isinstance(confirmation.get("content"), dict)
                                 and confirmation["content"].get("confirm") is False
                             ):
+                                consumed = await runtime.store.consume_request_state_nonce(
+                                    state_payload["nonce"],
+                                    datetime.fromtimestamp(
+                                        state_payload["expires_at"], UTC
+                                    ).isoformat(),
+                                )
+                                if not consumed:
+                                    return _finish(
+                                        _jsonrpc_err(
+                                            req_id,
+                                            -32602,
+                                            "This confirmation has already been used.",
+                                        ),
+                                        status_label="error",
+                                    )
                                 log_event(
                                     "approval.requester_confirmation",
                                     outcome="declined" if action == "decline" else "cancelled",

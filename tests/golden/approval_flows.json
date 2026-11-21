@@ -1,0 +1,15 @@
+{
+  "version": "1.0",
+  "description": "Wire-level approval gate journeys through the stateless MCP gateway and a mock upstream.",
+  "flows": [
+    { "id": "requester_accepts_once", "kind": "accept" },
+    { "id": "requester_declines_and_state_closes", "kind": "decline_replay" },
+    { "id": "changed_arguments_cannot_reuse_prompt", "kind": "argument_tamper" },
+    { "id": "another_caller_cannot_reuse_prompt", "kind": "identity_mismatch" },
+    { "id": "policy_edit_invalidates_prompt", "kind": "policy_change" },
+    { "id": "client_without_form_input_fails_closed", "kind": "missing_capability" },
+    { "id": "code_mode_cannot_dispatch_confirmed_tool", "kind": "code_mode" },
+    { "id": "concurrent_confirmation_dispatches_once", "kind": "concurrent_accept" },
+    { "id": "policy_editor_requires_admin", "kind": "admin_rbac" }
+  ]
+}
