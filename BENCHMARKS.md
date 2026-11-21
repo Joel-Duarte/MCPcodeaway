@@ -1,142 +1,99 @@
-# MCPcodeaway Benchmarks: Classic MCP vs. Code Mode Across 6 Enterprise Workloads
+# MCPcodeaway Benchmarks
 
-This document reports live benchmarks of **MCPcodeaway** ([`src/gateway/server.py`](src/gateway/server.py)) against fake enterprise MCP and OpenAPI servers ([`examples/mock_backends.py`](examples/mock_backends.py): `snowflake_ledger`, `billing_legacy_eu`, `billing_legacy_us`, `ops_ticketing`).
+## External benchmarks
 
-We benchmarked **two very different model tiers** across **6 distinct MCP workload types** (from 1-call point lookups to 200-row joins, batch financial compute, and 5-step Sentry -> GitHub -> Jira -> Slack incident triage):
-1. **Small Local Non-Reasoning Model:** `qwen/qwen3.5-9b` (`reasoning_effort=none`, concurrency 3 in LM Studio) — [benchmarks/live_llm_results.json](benchmarks/live_llm_results.json)
-2. **Capable Frontier Coding Agent:** `antigravity_flash_mcp` (Gemini Flash subagent) — [benchmarks/subagent_flash_results.json](benchmarks/subagent_flash_results.json)
+Cloudflare published two comparisons of upfront MCP tool-definition tokens with server-side Code Mode.
 
----
+- **MCP Server Portal.** The definitions of 52 tools across four internal MCP servers took about 9,400 tokens. The portal exposed two tools in Code Mode, which took about 600 tokens. [Cloudflare MCP Server Portals](https://blog.cloudflare.com/enterprise-mcp/#code-mode-with-mcp-server-portals-reduces-costs)
+- **Cloudflare API MCP server.** The two Code Mode tool definitions took about 1,000 tokens. Cloudflare estimated 1.17 million tokens to expose the full API as individual tools. [Cloudflare API MCP server](https://blog.cloudflare.com/code-mode-mcp/)
 
-## 1. What Are the 6 Benchmark Workloads?
+### What this suggests for the gateway and MCP servers
 
-To reflect how enterprises actually use MCP servers (**Data Warehouse / SQL**, **REST Billing APIs**, **Financial Compute**, **Sentry**, **GitHub**, **Jira/Ticketing**, and **Slack**), the suite tests 6 concrete workload shapes:
+- **Gateway.** Benchmark current Auto and adaptive Auto on held-out workloads against forced Classic and Code Mode. Keep the model, discovery settings, and accessible tools fixed. Include short lookups, parallel reads with large results, and dependent calls. Track upfront tool-definition tokens separately from end-to-end usage so changes in discovery and execution are visible. Compare verified completion rate, cost per verified completion, p95 latency, and upstream calls.
+- **Upstream MCP servers.** Start with frequently used tools that lack an `outputSchema`. Return structured results that match it, with stable field names and compact defaults. Add filters, field selection, or summary operations where clients regularly fetch records just to discard most of them. The gateway already uses output schemas to show return shapes in Code Mode stubs. [MCP Python SDK structured output](https://py.sdk.modelcontextprotocol.io/v2/servers/structured-output/)
 
-| # | Workload ID | Category | What the Agent Has to Do | Upstream Tool Calls Required |
-| :-: | :--- | :--- | :--- | :--- |
-| **1** | **`reconcile_bulk_200`**<br>*(Bulk 200-Row Join)* | **High-Volume Data Warehouse Join** | Fetch **200 overdue debt ledger rows** from Snowflake (`dataset="bulk"`), **100 EU invoices**, and **100 US invoices** (`~200 KB` raw JSON total), join them by `customer_id`, and return the **3 customers** whose ledger balance differs from their invoice amount (`CUST-2041: +615`, `CUST-2118: -480`, `CUST-2199: +1250`). | **3 bulk reads** across 3 servers (`400` total records joined) |
-| **2** | **`reconcile_overdue`**<br>*(Medium 30-Row Join)* | **Cross-System Table Join** | Same cross-system reconciliation across `snowflake_ledger`, `billing_legacy_eu`, and `billing_legacy_us` on the standard **30-customer dataset** (`10` overdue rows, `~14 KB` raw JSON), returning the **2 discrepancies** (`CUST-1003: +450`, `CUST-1024: -320`). | **3 list reads** across 3 servers |
-| **3** | **`compute_batch_penalties`**<br>*(6-Call Batch Compute)* | **Data Fetch + Per-Row Financial Compute** | Query overdue rows from Snowflake (`query_debt_ledger`), filter to the **5 overdue EU customers**, and call `compute_interest_penalty(principal, days_past_due, annual_rate_pct=18.0)` for each of the 5 customers to compute individual late fees and their exact sum (**`399.08 EUR`**). | **1 list read + 5 compute calls** (`6` subcalls total) |
-| **4** | **`mutating_ticket_workflow`**<br>*(5-Step Incident Triage Chain)* | **Sequential Multi-Tool Action Chain (Sentry -> GitHub -> Ticketing -> Slack)** | 1) List open payment terminal incidents (`list_terminal_incidents`) and find the `high` severity outage (`TERM-EU-44`, `CUST-1003`).<br>2) Query **Sentry** (`search_sentry_errors`) for that terminal's failing `release_sha` (`sha-9f4c21a`).<br>3) Query **GitHub** (`get_github_release_commit`) for the PR number (`#412`) and author (`alice-sre`).<br>4) Create an escalation case (`create_collection_case` -> `CASE-0001`).<br>5) Post the alert summary to **Slack** (`post_slack_incident_alert` -> `#ops-incidents`). | **3 dependent reads + 2 mutating writes** (`5` sequential steps) |
-| **5** | **`trial_balance_audit`**<br>*(4-Call N+1 Fan-Out)* | **1-to-N Record Enrichment** | Fetch trial balance lines with non-zero variance (`get_trial_balance_lines(only_variances=True)` -> 3 rows), then route each customer by account code (`-EU-` vs `-US-`) to `get_eu_customer` or `get_us_customer` to look up their `contact_email`. | **1 list read + 3 point lookups** (`4` subcalls total) |
-| **6** | **`single_lookup`**<br>*(1-Call Point Lookup)* | **Simple Point Read** | Fetch a single customer's debt ledger balance (`get_customer_balance(customer_id="CUST-1003")`) and report `1825.0 EUR`. | **1 point lookup** |
+## Paired pilot results
 
----
+The paired pilot compared Classic MCP and Code Mode with upfront discovery on deterministic mock Snowflake and EU/US billing services. A verified completion passed the expected-answer and grounding checks.
 
-## 2. Win #1 — SOTA Discovery Saves 71%–99% of Initial Schema Tokens (In BOTH Modes)
+### GPT-6 Luna at low reasoning
 
-Before an agent runs any tool, MCPcodeaway's deferred `BM25` discovery (`list_servers` + `search_tools`—or zero-round-trip `X-Intent` on first connect) avoids loading the entire enterprise tool catalog on every turn:
+We ran one pair per workload in fresh Codex CLI sessions. Both arms used the same mock data and a read-only stdio adapter to the gateway. Codex reported input and output tokens for the full turn, including session overhead. Cached input is included in the total and shown separately. Wall time covers the CLI invocation.
 
-| Enterprise Catalog Size | Standard Upfront MCP (`tools/list`) | MCPcodeaway Deferred Surface (3 Meta-Tools) | Schema Tokens Saved |
-| :--- | :---: | :---: | :---: |
-| **16 tools** (4 servers) | ~1,600 tokens | **~463 tokens** | **71.1% saved** |
-| **66 tools** (+50 synthetic) | ~5,073 tokens | **~463 tokens** | **90.9% saved** |
-| **500 tools** (Enterprise scale) | ~50,726 tokens | **~463 tokens** | **99.1% saved** |
+| Workload | Classic tokens (cached input) | Code Mode tokens (cached input) | Wall time, Classic / Code | Gateway calls, Classic / Code | Upstream calls, Classic / Code |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Single lookup | 46,673 (43,776) | 46,802 (29,952) | 7.5 s / 7.6 s | 1 / 1 | 1 / 1 |
+| Standard reconciliation | 49,374 (30,336) | 64,937 (38,784) | 17.3 s / 11.1 s | 3 / 1 | 3 / 3 |
+| Bulk reconciliation | 88,179 (58,496) | 47,272 (30,208) | 17.3 s / 12.7 s | 6 / 1 | 6 / 3 |
 
----
+All six runs verified. The single lookup had nearly equal token totals. Code Mode bundled standard reconciliation into one gateway call and finished faster while using 31.5% more tokens. In the bulk pair, Code Mode called the three upstream tools concurrently with `asyncio.gather`, joined the data in the sandbox, and returned the discrepancies. It used 46.4% fewer reported tokens in that pair.
 
-## 3. Win #2 — Classic MCP vs. Code Mode (Side-by-Side Across All 6 Workloads)
+### Local Qwen models
 
-### A. Capable Coding Model (`flash` Subagent)
+We ran 30 workflow executions in LM Studio. The table shows selected results using input and output tokens reported by the local model endpoint. The 9B lookup averages five pairs, and the 1.5B row totals three pairs. Each remaining row shows one pair. The 4B rows use the rerun with MTP enabled, a 32,768-token context, and one request at a time. The local runner and Codex have different session overhead, so compare token totals within each setup.
 
-| Workload | Classic MCP | Code Mode (`execute_code`) | Winner & Why |
-| :--- | :--- | :--- | :--- |
-| **1. Bulk 200-Row Join**<br>*(`reconcile_bulk_200`: ~200 KB)* | `49,955 tok` (`199.8 KB`)<br>`23.8 ms` · `4` HTTP trips · ✅ | **`3,149 tok` (`12.6 KB`)**<br>`28.9 ms` · **`3` HTTP trips** · ✅ | **Code Mode Wins Big**<br>**93.7% fewer tokens** (`46,806` tokens saved by filtering 200 rows in Monty) |
-| **2. Medium 30-Row Join**<br>*(`reconcile_overdue`: 3 servers)* | `3,550 tok` (`14.2 KB`)<br>`112.8 ms` · `4` HTTP trips · ✅ | **`3,123 tok` (`12.5 KB`)**<br>**`25.7 ms`** · **`3` HTTP trips** · ✅ | **Code Mode Wins**<br>**4.4x faster** (`-12.0%` tokens, parallel `asyncio.gather`) |
-| **3. Batch Financial Compute**<br>*(`compute_batch_penalties`: 6 calls)* | `3,216 tok` (`12.9 KB`)<br>`63.5 ms` · `7` HTTP trips · ✅ | **`2,484 tok` (`9.9 KB`)**<br>**`28.9 ms`** · **`3` HTTP trips** · ✅ | **Code Mode Wins**<br>**22.8% fewer tokens**, **2.2x faster**, and **saves 4 HTTP round-trips** |
-| **4. 5-Step Incident Triage Chain**<br>*(`mutating_ticket_workflow`: Sentry->GH->Ticket->Slack)* | **`1,756 tok` (`7.0 KB`)**<br>`49.6 ms` · `6` HTTP trips · ✅ | `2,856 tok` (`11.4 KB`)<br>**`17.7 ms`** · **`3` HTTP trips** · ✅ | **Code Mode 2.8x Faster (-3 HTTP trips)**<br>Chains 5 dependent steps in 1 Monty script (Classic uses slightly fewer wire bytes because upfront mode skips `search_tools`) |
-| **5. Small 4-Call Fan-Out**<br>*(`trial_balance_audit`: `<9 KB`)* | **`2,235 tok` (`8.9 KB`)**<br>`15.1 ms` · `5` HTTP trips · ✅ | `2,866 tok` (`11.5 KB`)<br>**`13.6 ms`** · **`3` HTTP trips** · ✅ | **Tie**<br>Code Mode saves **2 HTTP trips**; Classic saves `631` stub discovery tokens |
-| **6. Single Point Lookup**<br>*(`single_lookup`: 1 contract)* | **`1,619 tok` (`6.5 KB`)**<br>**`4.7 ms`** · **`2` HTTP trips** · ✅ | `2,383 tok` (`9.5 KB`)<br>`8.2 ms` · `3` HTTP trips · ✅ | **Classic Wins**<br>**1.5x fewer tokens** & **1 fewer trip** (no Python script needed for 1 read) |
+| Model and workload | Classic MCP | Code Mode |
+| --- | --- | --- |
+| Qwen2.5 Coder 1.5B, three workloads | 0/3 verified, 2,861 tokens spent | 0/3 verified, 4,475 tokens spent |
+| Qwen3.5 4B MTP, single lookup | 2,307 tokens, verified | 5,298 tokens, failed grounding |
+| Qwen3.5 4B MTP, standard reconciliation | 13,200 tokens, failed grounding, 6 upstream calls | 4,636 tokens, verified, 31 upstream calls |
+| Qwen3.5 9B, single lookup | 2,287 tokens per verified completion, 5/5 verified | 3,160 tokens per verified completion, 5/5 verified |
+| Qwen3.5 9B, standard reconciliation | 39,332 tokens, incorrect answer | 4,194 tokens, verified |
+| Qwen3.5 9B, bulk reconciliation | 39,615 tokens, verified | 62,297 tokens, incorrect answer |
 
----
+Classic used 27.6% fewer tokens per verified 9B lookup. The same model produced the only verified output in Code Mode on standard reconciliation and in Classic on bulk reconciliation. The 1.5B made no tool calls in these attempts. The 4B standard run shows why we track upstream calls alongside model tokens.
 
-### B. Small Local Non-Reasoning Model (`qwen/qwen3.5-9b`, `reasoning_effort=none`, Concurrency 3)
+## Why bundle tools in Code Mode?
 
-| Workload | Classic MCP (LLM Tokens / Time / Accuracy) | Code Mode (LLM Tokens / Time / Accuracy) | Winner & Why |
-| :--- | :--- | :--- | :--- |
-| **1. Bulk 200-Row Join**<br>*(`reconcile_bulk_200`: ~200 KB)* | `39,230 tok`<br>`62.0 s` · `2` turns · **❌ FAILED** *(lost in 200-row JSON dump)* | **`7,336 tok`**<br>**`45.7 s`** · `3` turns · **✅ PASSED** (`0` retries) | **Code Mode Wins Decisively**<br>**81.3% fewer tokens**, **26.3% faster**, and **prevents 9B context collapse** |
-| **2. 5-Step Incident Triage Chain**<br>*(`mutating_ticket_workflow`: Sentry->GH->Ticket->Slack)* | `9,268 tok`<br>`25.2 s` · **`6` LLM turns** (`5` sequential tool turns) · ✅ | **`6,907 tok`**<br>**`23.3 s`** · **`3` LLM turns** (`1` Monty script chains all 5 steps) · ✅ | **Code Mode Wins**<br>**25.5% fewer LLM tokens** and **cuts LLM turns in half (`6 -> 3`)** because sequential chains re-send growing chat history on every Classic turn! |
-| **3. Batch Financial Compute**<br>*(`compute_batch_penalties`: 6 calls)* | **`5,783 tok`**<br>`30.5 s` · `3` turns (`6` OBO hops) · ✅ | `5,908 tok`<br>**`29.4 s`** · `3` turns (**`1` OBO hop**, `0` retries) · ✅ | **Tie (`~5.8k` tokens, `~29.5s`)**<br>9B writes a clean Monty loop (`0` retries) and cuts downstream OBO token exchanges from `6 -> 1` |
-| **4. Medium 30-Row Join**<br>*(`reconcile_overdue`: 3 servers)* | **`10,968 tok`**<br>**`95.6 s`** · `3` turns · ✅ | `47,373 tok`<br>`179.3 s` · `10` turns · ✅ *(4 Python dict-key retries)* | **Classic Wins**<br>**4.3x fewer tokens** (non-reasoning 9B guessed wrong dict keys 4 times before succeeding) |
-| **5. Small 4-Call Fan-Out**<br>*(`trial_balance_audit`: `<9 KB`)* | **`4,304 tok`**<br>**`16.2 s`** · `3` turns · ✅ | `10,323 tok`<br>`34.5 s` · `3` turns · ✅ | **Classic Wins**<br>**2.4x fewer tokens** & **2.1x faster** on small fan-outs |
-| **6. Single Point Lookup**<br>*(`single_lookup`: 1 contract)* | **`2,065 tok`**<br>**`6.6 s`** · `2` turns · ✅ | `4,866 tok`<br>`10.0 s` · `3` turns · ✅ | **Classic Wins**<br>**2.4x fewer tokens** & **1.5x faster** on 1-call point reads |
+A single `execute_code` call can invoke several distinct tools on one MCP server or span multiple servers. For example, a script could fetch user details and accounts concurrently, then pass both results to a calculation tool. The completed reconciliation runs exercised the multi-server case.
 
----
+In Classic MCP, the client invokes each tool separately and can submit independent calls in parallel. Code Mode can also handle dependent steps inside the script, reducing model round trips and keeping intermediate results in the sandbox. The benefit depends on payload size, script generation, retries, and upstream calls. The Luna standard and bulk pairs show different tradeoffs.
 
-## 4. What the 6 Workloads Prove (And Why Per-Tool + Per-Model Learning Works)
+## Why we moved from tool scores to workload scores
 
-Look at what the 6 workloads reveal across both models:
-1. **Large Data Joins (`reconcile_bulk_200`):** **Code Mode wins on EVERY model** (`81.3%` token savings + fixing accuracy failure on `qwen3.5-9b`; `93.7%` token savings on `flash`).
-2. **Multi-Step Sequential Action Chains (`mutating_ticket_workflow`: Sentry -> GitHub -> Jira -> Slack):** **Code Mode wins on BOTH models!** Because step 2 depends on step 1's output, step 3 depends on step 2, etc., Classic MCP forces the LLM to run **6 sequential turns** (re-billing the entire conversation history on every turn = `9,268` tokens on 9B), whereas Code Mode chains `await search_sentry_errors(...) -> await get_github_release_commit(...) -> await create_collection_case(...) -> await post_slack_incident_alert(...)` in **1 single Monty execution** (`6,907` tokens on 9B = **25.5% cheaper**, and **2.8x faster** on `flash`).
-3. **Batch Compute Loops (`compute_batch_penalties`):** **Code Mode wins on `flash` (-22.8% tokens, 2.2x faster, -4 HTTP trips)** and **ties on `qwen3.5-9b`** (`29.4 s` vs `30.5 s`) while cutting OBO token exchanges from `6 -> 1`.
-4. **Single Point Lookups (`single_lookup`):** **Classic MCP wins on EVERY model** (`1.5x–2.4x` cheaper and faster).
+The previous learner scored each model and tool together. In a three-tool workflow, attributing the full model spend to each tool could count it three times. It also mixed different workflows that happened to share a tool. The current learner compares **model × workload** and counts the model spend, retries, and verified outcome once for the workflow. Each upstream tool keeps its own call counts, bytes, latency, and failures.
 
-Because MCPcodeaway's programmatic A/B learner ([`src/gateway/ab_testing.py`](src/gateway/ab_testing.py)) tracks **Quality (`ok`)**, **Token Savings**, and **Speed (`duration_ms`)** per **`(model_name, server__tool)`**, `?execution=auto` automatically routes each model and tool to its winning column without any hardcoded model lists.
+This gives the router evidence to favor the faster or cheaper strategy for a particular job while checking completion quality. A model can favor Classic on a lookup and Code Mode on a join. Routing starts in Observe mode. In Active mode, eligible read-only Auto requests can use a recommendation based on recent matched evidence, with at least five pairs and a 90% verified-completion floor. At equal verified quality, the router requires at least 5% lower cost per verified completion within its latency, upstream-call, and recovery limits. This pilot compared the execution strategies. A held-out comparison with the previous routing policy would measure the incremental effect of adaptive routing.
 
----
+## Measuring ROI
 
-<details>
-<summary><strong>Appendix A: Full Raw Telemetry Tables (All 6 Workloads)</strong></summary>
+Use **cost per verified completion**. Add model input and output charges, upstream charges, and execution costs across all attempts, including failures and retries, then divide by verified completions. Compare against the existing workflow, including its usual recovery steps. If an arm has zero verified completions, report its spend and failure count. For local deployments, GPU time and energy per verified completion help translate token efficiency into operating cost. The results above report observed usage on mock workloads.
 
-### Raw Table 1 — `qwen/qwen3.5-9b` (`reasoning_effort=none`, Concurrency 3 in LM Studio)
+## Discovery at catalog scale
 
-| Workload | Mode | Turns | MCP Calls | Subcalls | OBO Token Hops | Total LLM Tokens | Wall Time | Python Retries | Grounded | Correct |
-| :--- | :--- | :---: | :---: | :---: | :---: | ---: | ---: | :---: | :---: | :---: |
-| `reconcile_bulk_200` | `traditional` | 2 | 3 | 3 | 3 | 39,230 | 62.03 s | 0 | — | ❌ |
-| `reconcile_bulk_200` | `codemode` | **3** | **2** | **3** | 3 | **7,336** | **45.70 s** | **0** | ✅ | ✅ |
-| `mutating_ticket_workflow` | `traditional` | 6 | 5 | 5 | 5 | 9,268 | 25.18 s | 0 | — | ✅ |
-| `mutating_ticket_workflow` | `codemode` | **3** | **2** | 5 | **1** | **6,907** | **23.26 s** | **0** | ✅ | ✅ |
-| `compute_batch_penalties` | `traditional` | 3 | 6 | 6 | 6 | **5,783** | 30.52 s | 0 | — | ✅ |
-| `compute_batch_penalties` | `codemode` | 3 | **2** | 6 | **1** | 5,908 | **29.41 s** | **0** | ✅ | ✅ |
-| `reconcile_overdue` | `traditional` | **3** | 12 | 12 | 12 | **10,968** | **95.64 s** | **0** | — | ✅ |
-| `reconcile_overdue` | `codemode` | 10 | 9 | 7 | 7 | 47,373 | 179.25 s | 4 | ✅ | ✅ |
-| `trial_balance_audit` | `traditional` | **3** | 4 | 4 | 4 | **4,304** | **16.21 s** | **0** | — | ✅ |
-| `trial_balance_audit` | `codemode` | 3 | 4 | 4 | 3 | 10,323 | 34.52 s | 0 | ✅ | ✅ |
-| `single_lookup` | `traditional` | **2** | **1** | 1 | 1 | **2,065** | **6.59 s** | **0** | — | ✅ |
-| `single_lookup` | `codemode` | 3 | 2 | 1 | 1 | 4,866 | 10.04 s | 0 | ✅ | ✅ |
+The current gateway ships BM25 and keyword search. Workload routing picks how to run a job. Discovery ranks the tools available to the caller.
 
-### Raw Table 2 — `flash` Subagent (`antigravity_flash_mcp`)
+The latest runs used the current gateway's `search_tools` endpoint and mock MCP servers that advertised their tools. Recall@5 is the average share of expected tools found in the first five results. The small catalog used 20 queries, and each scaled catalog used 36. Gateway latency includes authorization, ranking, and response handling in an in-process run.
 
-| Workload | Mode | HTTP Trips | MCP Calls | Subcalls | Wire Bytes | Est. Context Tokens | Gateway Latency | Grounded | Correct |
-| :--- | :--- | :---: | :---: | :---: | ---: | ---: | ---: | :---: | :---: |
-| `reconcile_bulk_200` | `traditional` | 4 | 3 | 3 | 199,817 B | 49,955 | 23.84 ms | — | ✅ |
-| `reconcile_bulk_200` | `codemode` | **3** | **2** | 3 | **12,593 B** | **3,149** | **28.88 ms** | ✅ | ✅ |
-| `reconcile_overdue` | `traditional` | 4 | 3 | 3 | 14,199 B | 3,550 | 112.81 ms | — | ✅ |
-| `reconcile_overdue` | `codemode` | **3** | **2** | 3 | **12,491 B** | **3,123** | **25.73 ms** | ✅ | ✅ |
-| `compute_batch_penalties` | `traditional` | 7 | 6 | 6 | 12,863 B | 3,216 | 63.53 ms | — | ✅ |
-| `compute_batch_penalties` | `codemode` | **3** | **2** | 6 | **9,934 B** | **2,484** | **28.89 ms** | ✅ | ✅ |
-| `mutating_ticket_workflow` | `traditional` | 6 | 5 | 5 | **7,023 B** | **1,756** | 49.58 ms | — | ✅ |
-| `mutating_ticket_workflow` | `codemode` | **3** | **2** | 5 | 11,421 B | 2,856 | **17.71 ms** | ✅ | ✅ |
-| `trial_balance_audit` | `traditional` | 5 | 4 | 4 | **8,937 B** | **2,235** | 15.08 ms | — | ✅ |
-| `trial_balance_audit` | `codemode` | **3** | **2** | 4 | 11,464 B | 2,866 | **13.62 ms** | ✅ | ✅ |
-| `single_lookup` | `traditional` | **2** | **1** | 1 | **6,474 B** | **1,619** | **4.68 ms** | — | ✅ |
-| `single_lookup` | `codemode` | 3 | 2 | 1 | 9,529 B | 2,383 | 8.15 ms | ✅ | ✅ |
+| Mock servers / tools | Search method | Direct recall@5 | Paraphrase recall@5 | Gateway p95 |
+| --- | --- | ---: | ---: | ---: |
+| 4 / 10 | Keyword | 100% | 46.7% | 3.0 ms |
+| 4 / 10 | BM25 | 100% | 66.7% | 3.1 ms |
+| 36 / 778 | Keyword | 100% | 0% | 6.0 ms |
+| 36 / 778 | BM25 | 100% | 37.0% | 15.5 ms |
+| 104 / 10,010 | Keyword | 94.4% | 0% | 56.9 ms |
+| 104 / 10,010 | BM25 | 100% | 37.0% | 199.4 ms |
 
-</details>
+**BM25 remains the default.** It ranks locally without a separate model service and found all expected tools on the direct queries in this fixture. Keyword search was faster at larger sizes, and BM25 found more tools on paraphrased requests. BM25 scans the catalog on each search, so its latency grows with the number of tools available to the caller.
 
----
+A second BM25 search can help when the first query has vague wording. At 778 tools, scripted rewrites using tool names and server terms recovered all expected tools for the 18 paraphrases. The two gateway searches together took 27.7 ms at p95, rising to 331.8 ms at 10,010 tools. These times cover the searches. An agent's ability to supply a useful rewrite and the cost of generating it depend on the client.
 
-<details>
-<summary><strong>Appendix B: Why MCPcodeaway Uses Zero-Dependency BM25 for Discovery (vs. Embeddings & System 1 Sidecars)</strong></summary>
+### Historical embedding and System 1 results
 
-We benchmarked our in-process Okapi **`bm25`** discovery engine against local LM Studio vector **`embedding`** (`text-embedding-qwen3-embedding-0.6b`) and **`system1`** (`laya` `/v1/systemone` single-call `type: "choice"` probability distribution) across 10, 60, and 160 tools:
+These saved figures are from the earlier 10–160-tool discovery benchmark. Both methods had 100% direct recall@5 on that fixture. The latency column reports mean search time from the earlier harness. The current table reports gateway p95 at different catalog sizes.
 
-| Catalog Size | Discovery Backend | Direct Keyword Recall@5 | Paraphrased Semantic Recall@5 | Overall Recall@5 | Mean Latency | External GPU / Sidecar Cost |
-| ---: | :--- | ---: | ---: | ---: | ---: | :--- |
-| **10 tools** | **`bm25` (Default)** | **100.0%** | 66.7% | 83.3% | **0.09 ms** | **0 (stdlib CPU-only)** |
-| **10 tools** | `embedding` (`qwen3-0.6b`) | 100.0% | 91.7% | 95.8% | 63.16 ms | Requires embedding server |
-| **10 tools** | `hybrid_system1` (`laya` `choice`) | 100.0% | 80.0% | 90.0% | 71.06 ms | Requires `/v1/systemone` LLM |
-| **60 tools** | **`bm25` (Default)** | **100.0%** | 60.0% | 80.0% | **0.50 ms** | **0 (stdlib CPU-only)** |
-| **60 tools** | `embedding` (`qwen3-0.6b`) | 100.0% | 85.0% | 92.5% | 95.89 ms | Requires embedding server |
-| **60 tools** | `hybrid_system1` (`laya` `choice`) | 100.0% | 68.3% | 84.2% | 83.84 ms | Requires `/v1/systemone` LLM |
-| **160 tools** | **`bm25` (Default)** | **100.0%** | 60.0% | 80.0% | **1.40 ms** | **0 (stdlib CPU-only)** |
-| **160 tools** | `embedding` (`qwen3-0.6b`) | 100.0% | 85.0% | 92.5% | 162.21 ms | Requires embedding server |
-| **160 tools** | `hybrid_system1` (`laya` `choice`) | 100.0% | 65.0% | 82.5% | 86.01 ms | Requires `/v1/systemone` LLM |
+| Tools | Embedding paraphrase recall@5 | Embedding mean | Hybrid System 1 paraphrase recall@5 | Hybrid System 1 mean |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 91.7% | 63.16 ms | 80.0% | 71.06 ms |
+| 60 | 85.0% | 95.89 ms | 68.3% | 83.84 ms |
+| 160 | 85.0% | 162.21 ms | 65.0% | 86.01 ms |
 
-### Why `BM25` Is the Right Production Choice (and Why Sidecar Models Are Unnecessary Overhead)
+The embedding results used Qwen3 Embedding 0.6B. It recovered more paraphrased queries in the earlier fixture and needed a model service and catalog vectors. Hybrid System 1 used the stock `laya` model served by LM Studio at `/v1/systemone`, with no project-specific fine-tuning. It routed servers first, then scored candidate tools. The historical figures give context for the latency and recall trade-off alongside today's built-in methods.
 
-1. **100x Faster (`0.09–1.40 ms` vs. `83–162 ms`):** `bm25` runs in-memory in pure Python stdlib with **zero network hops, zero GPU memory, and zero token cost**.
-2. **`100%` Recall on Agent Queries:** When an LLM agent calls `search_tools`, it translates the user's request into domain keywords (e.g. `query="overdue invoices snowflake"` or `"sentry github slack incident"`), where `bm25` achieves **`100.0%` recall**.
-3. **Even a Retry Is Faster Than a Sidecar:** In the rare case where an agent's first search is too broad and it issues a second `search_tools` call, two `1 ms` `bm25` calls still take **`< 3 ms` total**—far faster and simpler than operating a dedicated embedding or System 1 sidecar container on every turn.
+## Workload fixtures
 
-</details>
+| Workload | Task |
+| --- | --- |
+| Single lookup | Fetch one customer's exact Snowflake ledger balance. |
+| Standard reconciliation | Read the overdue ledger and EU/US invoices, join by customer ID, and return only discrepancies. |
+| Bulk reconciliation | Run the same join on the bulk fixture, using the debt ledger and both regional invoice lists. |

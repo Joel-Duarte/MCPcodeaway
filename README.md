@@ -4,10 +4,10 @@
 
 ## Why MCPcodeaway? (Platform Value Proposition)
 
-- **Up to 93.7% Multi-Step Payload Token Savings & Adaptive Classic vs. Code Mode Routing:** Exposes a constant 3-tool deferred discovery + `execute_code` surface and executes joins/filters inside Monty before returning compact grounded results—while letting smaller models or single-tool lookups use Classic MCP when direct calls are cheaper. See [BENCHMARKS.md](BENCHMARKS.md) for live benchmarks comparing local `qwen/qwen3.5-9b` (`reasoning_effort=none`, concurrency 3 in LM Studio) against an Antigravity `flash` agent.
+- **Adaptive workflow routing:** Use Classic MCP for direct calls or Code Mode to bundle multiple tools, joins, and filtering in one sandbox execution. The gateway can recommend a strategy for each model and workload. See the [local and GPT-6 Luna results](BENCHMARKS.md#paired-pilot-results).
 - **Zero-Trust Enterprise Security:** Per-user OIDC JWT validation, RFC 8693 / OBO delegated token exchange, host-side ABAC row filtering, PII/secret redaction, SSRF guards, and HMAC provenance grounding verification.
 - **Sessionless MCP Design:** Every gateway and upstream MCP HTTP operation uses the current per-request protocol contract; the gateway never creates, stores, forwards, or depends on MCP session IDs, and upstream HTTP requests never retain or reuse cookies. Multi-step business operations pass explicit resource IDs through independently authorized tool calls.
-- **Full Operate Control Plane (`/dashboard`):** Nuxt 4 + `@ui-sdk/vue` console with real-time WebSocket telemetry, Linear-style Request Traces (`/traces`), Gateway Usage & Group Timeline Aggregation (`/analytics`), 1-click Mode Optimization (`/optimization`), 3-step HITL Onboarding + A/B Lab (`/onboarding`), Audit & S3/JSONL Compliance Archival (`/audit`), and Custom Alert Rules (`/settings`).
+- **Full Operate Control Plane (`/dashboard`):** Nuxt 4 + `@ui-sdk/vue` console with real-time WebSocket telemetry, Linear-style Request Traces (`/traces`), Gateway Usage & Group Timeline Aggregation (`/analytics`), Model Performance and Efficiency (`/model-performance`), 3-step HITL Onboarding + A/B Lab (`/onboarding`), Audit & S3/JSONL Compliance Archival (`/audit`), and Custom Alert Rules (`/settings`).
 
 ## Architecture
 
@@ -74,53 +74,39 @@ uv run gateway add-mcp \
 uv run gateway compare --scenario reconcile_overdue --persona finance_analyst
 ```
 
-## Proof of Performance (Measured Results)
+You can connect supported APIs directly by registering an OpenAPI spec. The gateway turns each allowed operation into a callable tool. In deferred Code Mode, start with `search_tools` to find matching operations across authorized upstreams, then use their Python stubs in `execute_code`. Use `list_servers` when you want to browse the upstreams.
+
+Use clear operation IDs and summaries, typed parameters, and JSON response schemas in the spec. Document details that affect a call, such as which ID to pass, units, and pagination. Configure credentials and tool access on the gateway.
+
+## Benchmark results
+
+See [Cloudflare's external benchmarks](BENCHMARKS.md#external-benchmarks) for the upfront cost in tokens of exposing MCP tools directly or through server-side Code Mode.
+
+These pilot runs used mock Snowflake and EU/US billing services. A verified result passed the answer and grounding checks.
+
+| Model and workload | Classic MCP | Code Mode |
+| --- | --- | --- |
+| GPT-6 Luna low, bulk reconciliation | 88,179 tokens, verified | 47,272 tokens, verified |
+| GPT-6 Luna low, standard reconciliation | 49,374 tokens, 17.3 s, verified | 64,937 tokens, 11.1 s, verified |
+| Local Qwen3.5 9B, single lookup | 2,287 tokens per verified completion, 5/5 verified | 3,160 tokens per verified completion, 5/5 verified |
+
+In the Luna bulk pair, Code Mode used **46.4% fewer reported tokens** and made one gateway tool call versus six. In standard reconciliation, it was faster and used **31.5% more tokens**. Classic used **27.6% fewer tokens** in the five local 9B lookup pairs. The [full benchmark results](BENCHMARKS.md#paired-pilot-results) include the local 1.5B and 4B MTP runs, token accounting, and sample sizes.
+
+### Why routing learns by workload
+
+We previously scored each model and tool together. A workflow can call several tools while incurring one shared model cost, so attributing the full spend to each tool inflated per-tool totals. Now the gateway compares complete workflows by **model and workload**, counts model usage once, and records calls, bytes, latency, and failures for each tool. That lets the same model favor different strategies for a point lookup and a reconciliation job.
+
+For ROI, compare **cost per verified completion** against the current workflow, including failed attempts and retries. Use actual input and output prices, cache pricing where applicable, and upstream charges. For local models, measure GPU time and energy per verified completion. These pilots report token use and outcomes.
+
+### Discovery at scale
+
+BM25 remains the default and ranks tools inside the gateway. In the latest synthetic run it found all expected tools for direct queries at 10,010 tools across 104 mock servers, with about 199 ms p95 gateway latency. Paraphrased queries were harder. The [discovery results](BENCHMARKS.md#discovery-at-catalog-scale) show the effect of a second query and summarize the earlier embedding and System 1 measurements.
 
 ### Adaptive Execution Intelligence
 
 Run the live benchmark in at least five distinct invocations with the same model, workload, fixture, runner settings, and discovery configuration to build five matched repeats; save each report to a different file. For example: `python -m benchmarks.live_llm_bench --provider openai_compatible --base-url http://127.0.0.1:1234/v1 --models qwen/qwen3.5-9b --tasks standard --synthetic-tools 0,50 --output /tmp/workflow-1.json` and repeat with `/tmp/workflow-2.json`. Each report includes a versioned `adaptive_evidence` array with correctness, grounding, provider usage where reported, latency, call/recovery counts, and stable matching metadata; prompts and answers are excluded. Merge report arrays with `jq -s '{"evidence": map(.adaptive_evidence[]) }' /tmp/workflow-*.json > /tmp/adaptive-evidence.json`, configure model input/output prices in **Settings → Model pricing**, then POST that JSON to `/admin/adaptive-execution/evidence` with an admin bearer token. Imports are idempotent and scoped to the signed-in admin tenant. This admin endpoint is a trusted operator import for verified benchmark runner artifacts: it validates the versioned evidence shape, timestamps (allowing at most five minutes of clock skew), and nonnegative finite metrics, but it does not provide cryptographic provenance attestation across databases. Do not treat arbitrary client-submitted evidence as verified benchmark output.
 
 Review **Model Performance → Routing** in Observe mode first. The router uses recent qualified evidence only after five matched pairs and a 90% jointly correct and grounded floor; Active can then be enabled under **Settings → Routing & calibration**. Active routing applies only to Auto requests with an explicitly supplied or deterministically inferred workload and entirely read-only accessible tools. Return to Observe at any time to roll back adaptive decisions.
-
-Full breakdowns and raw telemetry live in [BENCHMARKS.md](BENCHMARKS.md) ([benchmarks/live_llm_results.json](benchmarks/live_llm_results.json) and [benchmarks/subagent_flash_results.json](benchmarks/subagent_flash_results.json)).
-
-### Win #1: SOTA Discovery Saves 71%–99% of Initial Schema Tokens (In BOTH Modes)
-
-Before an agent executes any tool, deferred discovery (`list_servers` + `search_tools` with `0.1–1.4 ms` `BM25`—or zero-round-trip `X-Intent` on initial connect) keeps the initial prompt surface constant at 3 meta-tools (`~463` tokens):
-
-| Enterprise Catalog Size | Standard Upfront MCP (`tools/list`) | MCPcodeaway Deferred Surface (3 Meta-Tools) | Schema Tokens Saved |
-| :--- | :---: | :---: | :---: |
-| **16 tools** (4 servers) | ~1,600 tokens | **~463 tokens** | **71.1% saved** |
-| **66 tools** (+50 synthetic) | ~5,073 tokens | **~463 tokens** | **90.9% saved** |
-| **500 tools** (Enterprise scale) | ~50,726 tokens | **~463 tokens** | **99.1% saved** |
-
-### Win #2: Classic MCP vs. Code Mode (Side-by-Side Across 6 Enterprise Workloads)
-
-See [BENCHMARKS.md](BENCHMARKS.md#1-what-are-the-6-benchmark-workloads) for full explanations of each workload (**Snowflake** data warehouse joins, **Financial Compute** loops, **Sentry -> GitHub -> Jira -> Slack** 5-step incident triage chains, and point lookups).
-
-#### A. Capable Coding Model (`flash` Subagent)
-
-| Workload | Classic MCP | Code Mode (`execute_code`) | Winner & Why |
-| :--- | :--- | :--- | :--- |
-| **1. Bulk 200-Row Join**<br>*(`reconcile_bulk_200`: ~200 KB)* | `49,955 tok` · `23.8 ms` · `4` trips · ✅ | **`3,149 tok`** · `28.9 ms` · **`3` trips** · ✅ | **Code Mode (-93.7% tokens)** — filters 200 KB in Monty sandbox |
-| **2. Medium 30-Row Join**<br>*(`reconcile_overdue`: 3 servers)* | `3,550 tok` · `112.8 ms` · `4` trips · ✅ | **`3,123 tok`** · **`25.7 ms`** · **`3` trips** · ✅ | **Code Mode (4.4x faster)** — parallel `asyncio.gather` in 1 script |
-| **3. Batch Financial Compute**<br>*(`compute_batch_penalties`: 6 calls)* | `3,216 tok` · `63.5 ms` · `7` trips · ✅ | **`2,484 tok`** · **`28.9 ms`** · **`3` trips** · ✅ | **Code Mode (-22.8% tokens, 2.2x faster, -4 HTTP trips)** |
-| **4. 5-Step Incident Triage Chain**<br>*(`mutating_ticket_workflow`: Sentry->GH->Ticket->Slack)* | **`1,756 tok`** · `49.6 ms` · `6` trips · ✅ | `2,856 tok` · **`17.7 ms`** · **`3` trips** · ✅ | **Code Mode (2.8x faster, -3 HTTP trips)** — chains 5 steps in 1 script |
-| **5. Small 4-Call Fan-Out**<br>*(`trial_balance_audit`: `<9 KB`)* | **`2,235 tok`** · `15.1 ms` · `5` trips · ✅ | `2,866 tok` · **`13.6 ms`** · **`3` trips** · ✅ | **Tie** — Code Mode saves 2 HTTP trips; Classic saves 631 stub tokens |
-| **6. Single Point Lookup**<br>*(`single_lookup`: 1 contract)* | **`1,619 tok`** · **`4.7 ms`** · **`2` trips** · ✅ | `2,383 tok` · `8.2 ms` · `3` trips · ✅ | **Classic (-32% tokens)** — direct JSON-RPC call needs no script |
-
-#### B. Small Local Non-Reasoning Model (`qwen/qwen3.5-9b`, `reasoning_effort=none`, Concurrency 3)
-
-| Workload | Classic MCP | Code Mode (`execute_code`) | Winner & Why |
-| :--- | :--- | :--- | :--- |
-| **1. Bulk 200-Row Join**<br>*(`reconcile_bulk_200`: ~200 KB)* | `39,230 tok` · `62.0 s` · **❌ FAIL** | **`7,336 tok`** · **`45.7 s`** · **✅ PASS** | **Code Mode (-81.3% tokens)** — prevents 9B context/math collapse |
-| **2. 5-Step Incident Triage Chain**<br>*(`mutating_ticket_workflow`: Sentry->GH->Ticket->Slack)* | `9,268 tok` · `25.2 s` · **`6` turns** · ✅ | **`6,907 tok`** · **`23.3 s`** · **`3` turns** · ✅ | **Code Mode (-25.5% tokens, 6 -> 3 turns)** — avoids 5 sequential LLM turns |
-| **3. Batch Financial Compute**<br>*(`compute_batch_penalties`: 6 calls)* | **`5,783 tok`** · `30.5 s` (`6` OBO hops) · ✅ | `5,908 tok` · **`29.4 s`** (**`1` OBO hop**) · ✅ | **Tie (`~5.8k` tok, `~29.5s`)** — 9B writes 0-retry loop & saves 5 OBO hops |
-| **4. Medium 30-Row Join**<br>*(`reconcile_overdue`: 3 servers)* | **`10,968 tok`** · **`95.6 s`** · ✅ | `47,373 tok` · `179.3 s` · ✅ *(4 retries)* | **Classic (4.3x cheaper)** — non-reasoning 9B fumbles Python dict keys |
-| **5. Small 4-Call Fan-Out**<br>*(`trial_balance_audit`: `<9 KB`)* | **`4,304 tok`** · **`16.2 s`** · ✅ | `10,323 tok` · `34.5 s` · ✅ | **Classic (2.4x cheaper & 2.1x faster)** |
-| **6. Single Point Lookup**<br>*(`single_lookup`: 1 contract)* | **`2,065 tok`** · **`6.6 s`** · ✅ | `4,866 tok` · `10.0 s` · ✅ | **Classic (2.4x cheaper & 1.5x faster)** |
-
-> **Programmatic Per-Tool & Per-Model Learning (`?execution=auto`):** MCPcodeaway does **not** hardcode model names. Agents identify their model via `X-Model-Name` (or `clientInfo.model`), and [`src/gateway/ab_testing.py`](src/gateway/ab_testing.py) learns from live A/B runs (`ok` quality, tokens saved, and `duration_ms` speed) per `(model_name, server__tool)` to auto-switch each model and tool to its winning mode (with optional admin overrides at `/admin/routing/models`).
 
 ## Vendor-Agnostic Integrations & Scaling
 
