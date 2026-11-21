@@ -13,6 +13,10 @@
 
 ## Architecture
 
+For an agent-oriented map of caller, authentication, execution, approval,
+operator, and runtime journeys, start with the [Gateway Flow Map](docs/gateway-flow-map.md).
+Detailed lifecycle transitions are in [Application State Machines](docs/state-machines.md).
+
 ### Decoupled Execution × Discovery Matrix
 
 Callers select execution and discovery strategies independently via query parameters or HTTP headers (`?execution=...&discovery_mode=...`, `X-Execution-Mode`, `X-Discovery-Mode`, `X-Intent`) or legacy `?mode=` presets (`traditional`, `traditional_discover`, `codemode`, `codemode_upfront`, `hybrid`):

@@ -6,6 +6,10 @@ handles, query parameters, and combinations of page flags. It is a navigation
 aid for maintainers and agents: the owning module remains the source of truth
 for each transition.
 
+For the end-to-end user, agent, operator, and runtime journeys, see the
+[Gateway Flow Map](gateway-flow-map.md). This file remains the detailed
+reference for state transitions and state ownership.
+
 ## Gateway process lifecycle
 
 Implemented as `GatewayLifecycleState` in `gateway.server`.
