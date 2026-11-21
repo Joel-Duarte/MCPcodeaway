@@ -1245,6 +1245,7 @@ class GatewayRuntime:
         observed_tool_outputs: list[Any] = []
         observed_tool_shapes: dict[str, Any] = {}
         external_functions: dict[str, Callable[..., Any]] = {}
+        execution_cancelled = False
 
         for tool in accessible:
             if eff_exec == "hybrid" and tool.mutating:
@@ -1306,6 +1307,15 @@ class GatewayRuntime:
                             f"{self.settings.execution_wall_timeout_seconds:g} seconds."
                         ),
                         error_type="ExecutionTimeoutError",
+                    )
+                except asyncio.CancelledError:
+                    # Preserve an audit record for a caller disconnect or task
+                    # cancellation, then propagate cancellation after recording.
+                    execution_cancelled = True
+                    sandbox_res = SandboxResult(
+                        ok=False,
+                        error="Execution was cancelled before completion.",
+                        error_type="ExecutionCancelledError",
                     )
             span.set_attribute("sandbox.ok", sandbox_res.ok)
             span.set_attribute("sandbox.subcalls", len(subcalls))
@@ -1426,6 +1436,8 @@ class GatewayRuntime:
         payload["raw_upstream_bytes"] = run["raw_upstream_bytes"]
         payload["returned_bytes"] = run["returned_bytes"]
         payload["estimated_tokens_saved"] = run["estimated_tokens_saved"]
+        if execution_cancelled:
+            raise asyncio.CancelledError
         return payload
 
     async def call_direct_tool_for_identity(

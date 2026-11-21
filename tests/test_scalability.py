@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import socket
 from typing import Any
 
@@ -232,7 +233,10 @@ async def test_remote_monty_worker_reverse_rpc_isolation(tmp_path) -> None:
         await server_task
 
 
-async def test_concurrent_multi_user_cache_isolation_and_rate_limit(tmp_path) -> None:
+@pytest.mark.parametrize("schedule_seed", [7, 29, 101], ids=lambda seed: f"schedule-{seed}")
+async def test_concurrent_multi_user_cache_isolation_and_rate_limit(
+    tmp_path, schedule_seed: int
+) -> None:
     import jwt
     import yaml
 
@@ -332,6 +336,8 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(tmp_path) ->
         cache=shared_cache,
     )
     request_slots = asyncio.Semaphore(4)
+    schedule_rng = random.Random(schedule_seed)
+    launch_delays = [schedule_rng.uniform(0.0, 0.02) for _ in range(20)]
 
     async with (
         app.router.lifespan_context(app),
@@ -347,6 +353,7 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(tmp_path) ->
         ):
 
             async def _run_user(idx: int) -> tuple[str, str, dict[str, Any]]:
+                await asyncio.sleep(launch_delays[idx])
                 tenant = "tenant-alpha" if idx % 2 == 0 else "tenant-beta"
                 # Reuse one subject in different tenants to catch cache/session
                 # keys that accidentally omit the tenant component.

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import httpx
+import pytest
 
 from examples.mock_backends import create_mock_backends_app
-from gateway.auth import LocalDevKeyManager
+from gateway.auth import CallerIdentity, LocalDevKeyManager
 from gateway.config import GatewaySettings
 from gateway.dispatcher import SubcallRecord
 from gateway.sandbox import LocalMontyBackend, SandboxResult
@@ -66,6 +68,110 @@ async def test_gateway_wall_timeout_cancels_the_sandbox_backend(tmp_path) -> Non
         assert result["error_type"] == "ExecutionTimeoutError"
         assert "wall-clock limit" in result["error"]
         assert backend.cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_audit_and_live_telemetry_keep_owner_for_all_execution_outcomes(tmp_path) -> None:
+    class OutcomeSandbox:
+        def __init__(self) -> None:
+            self.cancel_started = asyncio.Event()
+
+        async def execute(
+            self,
+            code: str,
+            *,
+            external_functions: dict,
+            timeout_seconds: float,
+            max_output_bytes: int = 32768,
+        ) -> SandboxResult:
+            _ = (external_functions, timeout_seconds, max_output_bytes)
+            if code == "success":
+                return SandboxResult(ok=True, result={"completed": True})
+            if code == "failure":
+                return SandboxResult(
+                    ok=False, error="deliberate failure", error_type="ExecutionError"
+                )
+            if code == "timeout":
+                await asyncio.sleep(1.0)
+            if code == "cancel":
+                self.cancel_started.set()
+                await asyncio.Event().wait()
+            raise AssertionError(f"unexpected sandbox input: {code}")
+
+        async def close(self) -> None:
+            return None
+
+    settings = GatewaySettings(
+        auth_mode="dev",
+        execution_wall_timeout_seconds=0.03,
+        sqlite_path=str(tmp_path / "outcome-ownership.db"),
+        upstreams_config_path=str(tmp_path / "missing.yaml"),
+    )
+    backend = OutcomeSandbox()
+    app = create_gateway_app(
+        settings=settings,
+        store=SQLiteAuditStore(settings.sqlite_path),
+        sandbox_backend=backend,
+        preloaded_tools={},
+    )
+    runtime = app.state.runtime
+    events = runtime.cache.subscribe_events("mcpcodeaway:telemetry")
+
+    async def _next_event() -> asyncio.Task[str]:
+        task = asyncio.create_task(events.__anext__())
+        # Let the async generator register its subscriber before execution.
+        await asyncio.sleep(0)
+        return task
+
+    async with app.router.lifespan_context(app):
+        owners = {
+            outcome: CallerIdentity(sub=f"user-{outcome}", tenant_id=f"tenant-{outcome}")
+            for outcome in ("success", "failure", "timeout", "cancel")
+        }
+        observed: dict[str, dict] = {}
+
+        for outcome in ("success", "failure", "timeout"):
+            event_task = await _next_event()
+            result = await runtime.execute_code_for_identity(owners[outcome], outcome)
+            observed[outcome] = json.loads(await event_task)
+            assert result["ok"] is (outcome == "success")
+
+        event_task = await _next_event()
+        cancelled = asyncio.create_task(
+            runtime.execute_code_for_identity(owners["cancel"], "cancel")
+        )
+        await asyncio.wait_for(backend.cancel_started.wait(), timeout=1.0)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        observed["cancel"] = json.loads(await event_task)
+
+        expected_errors = {
+            "success": None,
+            "failure": "deliberate failure",
+            "timeout": "gateway wall-clock limit",
+            "cancel": "cancelled before completion",
+        }
+        runs = await runtime.store.list_runs(limit=20)
+        assert len(runs) == len(expected_errors)
+        by_owner = {(row["tenant_id"], row["user_sub"]): row for row in runs}
+
+        for outcome, owner in owners.items():
+            row = by_owner[(owner.tenant_id, owner.sub)]
+            assert row["ok"] is (outcome == "success")
+            if expected_errors[outcome] is None:
+                assert row["error"] is None
+            else:
+                assert expected_errors[outcome] in row["error"]
+            event = observed[outcome]
+            assert event["tenant_id"] == owner.tenant_id
+            assert event["user_sub"] == owner.sub
+            assert event["run_id"] == row["run_id"]
+            assert event["ok"] is (outcome == "success")
+            summary = await runtime.telemetry.summary(tenant_id=owner.tenant_id)
+            assert summary["total_runs"] == 1
+
+    await events.aclose()
 
 
 async def test_oversized_code_is_rejected_before_sandbox_execution(tmp_path) -> None:
