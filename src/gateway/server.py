@@ -174,6 +174,38 @@ def _execute_code_with_stubs(
     return exec_copy
 
 
+def _budget_upfront_listing(
+    tools: list[DiscoveredTool], execution: ExecutionMode, budget: int
+) -> tuple[list[dict[str, Any]] | None, int | None, str]:
+    if not tools:
+        return None, 0, "empty_catalog"
+    if execution == "codemode" and len(tools) > 100:
+        return None, None, "stub_cap"
+
+    definitions: list[dict[str, Any]] = []
+    stubs: list[str] = []
+    size = 2
+    if execution == "codemode":
+        definition = dict(EXECUTE_CODE_DEF)
+        definition["description"] += "\n\nAuthorized tool stubs:"
+        size = len(json.dumps([definition], separators=(",", ":")))
+    for tool in tools:
+        if execution == "classic":
+            definition = to_mcp_tool_definition(tool)
+            size += len(json.dumps(definition, separators=(",", ":"))) + bool(definitions)
+            definitions.append(definition)
+        else:
+            stub = ("\n\n" if stubs else "\n") + render_python_stub(tool)
+            size += len(json.dumps(stub)) - 2
+            stubs.append(stub)
+        if size > budget * 4:
+            return None, math.ceil(size / 4), "over_budget"
+    if stubs:
+        definition["description"] += "".join(stubs)
+        definitions.append(definition)
+    return definitions, math.ceil(size / 4), "fits_budget"
+
+
 LIST_SERVERS_DEF: dict[str, Any] = {
     "name": "list_servers",
     "description": (
@@ -947,6 +979,7 @@ class GatewayRuntime:
         requested_servers: list[str] | None = None,
         limit: int | None = None,
         cursor: str | None = None,
+        auto_discovery: bool = False,
     ) -> dict[str, Any]:
         """Build tools/list response supporting X-Intent, upfront/deferred axes & pagination."""
         effective_ceiling = allowed_servers
@@ -960,9 +993,15 @@ class GatewayRuntime:
         eff_exec = execution or base_exec
         eff_disc = discovery_mode or base_disc
 
+        budget_eligible = (
+            auto_discovery and eff_exec in {"classic", "codemode"} and not (intent or query)
+        )
         guidance = (
             {}
-            if eff_exec == "codemode" and eff_disc == "deferred" and not (intent or query)
+            if eff_exec == "codemode"
+            and eff_disc == "deferred"
+            and not (intent or query)
+            and not budget_eligible
             else await self.store.list_tool_guidance(identity.tenant_id or "")
         )
         filter_text = (intent or query or "").strip()
@@ -1013,6 +1052,45 @@ class GatewayRuntime:
                         if eff_disc == "upfront"
                         else [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, exec_copy, *direct_mutating]
                     )
+        elif budget_eligible:
+            discovery_started = time.perf_counter()
+            accessible = self.catalog.list_accessible_tools(
+                identity,
+                self.policy,
+                self.registry,
+                allowed_servers=effective_ceiling,
+                guidance=guidance,
+            )
+            upfront, tokens, reason = _budget_upfront_listing(
+                accessible, eff_exec, self.settings.auto_discovery_token_budget
+            )
+            recommended = "upfront" if upfront is not None else "deferred"
+            if self.settings.auto_discovery_policy == "active":
+                eff_disc = recommended
+            log_event(
+                "mcp.discovery.decision",
+                execution=eff_exec,
+                applied_discovery=eff_disc,
+                recommended_discovery=recommended,
+                estimated_upfront_tokens=tokens,
+                estimate_is_lower_bound=reason == "over_budget",
+                decision_ms=round((time.perf_counter() - discovery_started) * 1000, 3),
+                reason=reason,
+            )
+            if eff_disc == "upfront":
+                tools = (
+                    upfront
+                    if upfront is not None
+                    else (
+                        [to_mcp_tool_definition(tool) for tool in accessible]
+                        if eff_exec == "classic"
+                        else [_execute_code_with_stubs(accessible)]
+                    )
+                )
+            else:
+                tools = [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF]
+                if eff_exec == "codemode":
+                    tools.append(EXECUTE_CODE_DEF)
         else:
             tools = self.tools_for_mode(
                 identity,
@@ -1905,6 +1983,7 @@ def create_gateway_app(
                     header_discovery_mode=x_discovery_mode,
                     x_intent=x_intent,
                 )
+                requested_discovery = eff_disc_mode
                 has_explicit_mode = bool(forced_mode)
                 mode_decision_reason: str | None = (
                     f"admin_force:{effective_mode}" if forced_mode else f"auto:{effective_mode}"
@@ -2109,6 +2188,23 @@ def create_gateway_app(
                 if experiment_id:
                     mcp_span.set_attribute("mcp.ab_experiment", experiment_id)
 
+                if not experiment_id and (
+                    discovery_mode or x_discovery_mode or runtime.settings.discovery_mode
+                ):
+                    eff_disc_mode = requested_discovery
+                    effective_mode = _axis_to_gateway_mode(eff_exec, eff_disc_mode)
+
+                automatic_discovery = (
+                    not has_explicit_mode
+                    and not experiment_id
+                    and not (discovery_mode or x_discovery_mode or runtime.settings.discovery_mode)
+                    and not effective_intent
+                    and eff_disc_mode != "x_intent"
+                    and not (mode_decision_reason or "").startswith(
+                        ("model_profile_override:", "tool_override:")
+                    )
+                )
+
                 if method == "tools/list":
                     req_srvs = params.get("servers")
                     if not req_srvs and params.get("server"):
@@ -2125,6 +2221,7 @@ def create_gateway_app(
                         requested_servers=req_srvs,
                         limit=params.get("limit"),
                         cursor=params.get("cursor"),
+                        auto_discovery=automatic_discovery,
                     )
                     listed.setdefault("ttlMs", 0)
                     listed.setdefault("cacheScope", "private")
@@ -2158,7 +2255,14 @@ def create_gateway_app(
                         )
 
                     if tool_name == "search_tools":
-                        if eff_exec == "classic" and eff_disc_mode == "upfront":
+                        if (
+                            eff_exec == "classic"
+                            and eff_disc_mode == "upfront"
+                            and not (
+                                automatic_discovery
+                                and runtime.settings.auto_discovery_policy == "active"
+                            )
+                        ):
                             return _finish(
                                 _jsonrpc_err(
                                     req_id,

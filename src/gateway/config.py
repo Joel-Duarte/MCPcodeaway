@@ -156,6 +156,8 @@ class GatewaySettings(BaseSettings):
     gateway_mode: GatewayMode = "codemode"
     execution_mode: ExecutionMode | None = None
     discovery_mode: DiscoveryMode | None = None
+    auto_discovery_policy: Literal["observe", "active"] = "observe"
+    auto_discovery_token_budget: int = Field(default=1024, ge=1)
     read_only_prod: bool = True
     allow_dynamic_upstreams: bool = True
 

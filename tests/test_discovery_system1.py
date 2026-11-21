@@ -581,3 +581,67 @@ async def test_discovery_benchmark_smoke(tmp_path) -> None:
     kw_large = by_key[max(k[0] for k in by_key if k[1] == "keyword"), "keyword"]
     assert bm25_large["semantic_recall_at_5"] >= kw_large["semantic_recall_at_5"]
     assert bm25_large["recall_at_5"] >= 0.7
+
+
+async def test_authorized_discovery_budget_observe_active_and_explicit_override(tmp_path) -> None:
+    app, keys = _setup_gateway(tmp_path, settings_overrides={"auto_discovery_token_budget": 1})
+    token = keys.issue_user_token(persona="finance_analyst")
+    runtime = app.state.runtime
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            observed = await _mcp_post(client, token, "tools/list")
+            runtime.settings.auto_discovery_policy = "active"
+            deferred = await _mcp_post(client, token, "tools/list")
+            assert "search_tools" in {t["name"] for t in deferred["result"]["tools"]}
+            hydrated = await _mcp_post(
+                client, token, "tools/call", {"name": "search_tools", "arguments": {}}
+            )
+            assert hydrated["result"]["structuredContent"]["tools"]
+
+            runtime.settings.auto_discovery_token_budget = 10_000
+            scope = "servers=billing_legacy_eu"
+            listing = await _mcp_post(client, token, "tools/list", query=scope)
+            assert "search_tools" not in {t["name"] for t in listing["result"]["tools"]}
+            assert "ops_ticketing" not in str(listing)
+            page = await _mcp_post(client, token, "tools/list", {"limit": 1}, query=scope)
+            assert page["result"]["tools"] == listing["result"]["tools"][:1]
+            assert page["result"].get("nextCursor")
+            forced = await _mcp_post(
+                client, token, "tools/list", query=f"{scope}&discovery_mode=deferred"
+            )
+            assert "search_tools" in {t["name"] for t in forced["result"]["tools"]}
+
+            runtime.settings.auto_discovery_policy = "observe"
+            rollback = await _mcp_post(client, token, "tools/list")
+            assert rollback["result"]["tools"] == observed["result"]["tools"]
+
+
+def test_discovery_budget_counts_rendered_guidance_and_stops_on_large_catalog() -> None:
+    from gateway.catalog import estimate_tokens
+    from gateway.server import _budget_upfront_listing
+    from gateway.upstream_clients import ToolGuidance
+
+    tool = DiscoveredTool(server="finance", name="lookup", qualified_name="finance__lookup")
+    for mode in ("classic", "codemode"):
+        listing, tokens, reason = _budget_upfront_listing([tool], mode, 1024)
+        assert reason == "fits_budget"
+        assert tokens == estimate_tokens(listing)
+        description = "tenant guidance " * 20
+        larger = tool.model_copy(
+            update={"description": description, "guidance": ToolGuidance(description=description)}
+        )
+        assert _budget_upfront_listing([larger], mode, tokens)[2] == "over_budget"
+        wide = tool.model_copy(
+            update={
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string", "enum": ["x" * 6000]}},
+                }
+            }
+        )
+        if mode == "classic":
+            assert _budget_upfront_listing([wide], mode, 1024)[2] == "over_budget"
+    assert _budget_upfront_listing([tool] * 101, "codemode", 1024)[2] == "stub_cap"
+    assert _budget_upfront_listing([], "classic", 1024)[2] == "empty_catalog"
