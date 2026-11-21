@@ -195,6 +195,10 @@ async def test_traditional_discover_server_discover_and_pagination(tmp_path) -> 
             assert disc_res["cacheScope"] == "private"
 
             assert disc_res["ttlMs"] > 0
+            assert disc_res["instructions"].startswith(
+                "For deferred discovery, start with search_tools"
+            )
+            assert "list_servers for optional browsing" in disc_res["instructions"]
 
             # traditional_discover exposes ONLY list_servers + search_tools upfront
             td_list = await _mcp_post(

@@ -176,8 +176,8 @@ def _execute_code_with_stubs(
 LIST_SERVERS_DEF: dict[str, Any] = {
     "name": "list_servers",
     "description": (
-        "List RBAC-authorized upstream MCP servers and OpenAPI services available to you, "
-        "including tool counts and sample tool names."
+        "Browse authorized upstream MCP servers and OpenAPI services, including tool counts "
+        "and sample tool names. Use search_tools to find tools for a task."
     ),
     "inputSchema": {
         "type": "object",
@@ -195,9 +195,9 @@ LIST_SERVERS_DEF: dict[str, Any] = {
 SEARCH_TOOLS_DEF: dict[str, Any] = {
     "name": "search_tools",
     "description": (
-        "Search authorized upstream MCP tools and OpenAPI endpoints across one or more "
-        "servers, returning compact typed Python stubs (or full JSON Schemas in "
-        "traditional_discover mode)."
+        "Start here to find tools for a task. Searches all authorized upstream MCP servers and "
+        "OpenAPI services by default. Returns upstream names and typed Python stubs, with full "
+        "JSON Schemas in Classic with deferred discovery."
     ),
     "inputSchema": {
         "type": "object",
@@ -2020,9 +2020,12 @@ def create_gateway_app(
                                 "ttlMs": 30000,
                                 "cacheScope": "private",
                                 "instructions": (
-                                    "Stateless multi-MCP gateway. Call list_servers then "
-                                    "search_tools (or pass X-Intent / ?servers=...) before "
-                                    "calling execute_code or hydrated tools."
+                                    "For deferred discovery, start with search_tools to find "
+                                    "tools across authorized upstreams. In Code Mode, use the "
+                                    "returned Python stubs with execute_code. Use list_servers "
+                                    "for optional browsing. In Classic, call available tools "
+                                    "directly. Pass X-Intent on tools/list to preload matches, "
+                                    "or use ?servers=... to scope the request."
                                 ),
                             },
                         )
