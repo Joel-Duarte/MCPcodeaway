@@ -28,6 +28,10 @@ def _gateway_url() -> str:
     return os.environ.get("READINESS_GATEWAY_URL", "http://localhost:8080").rstrip("/")
 
 
+def _mock_backends_url() -> str:
+    return os.environ.get("READINESS_BACKENDS_URL", "http://localhost:8081").rstrip("/")
+
+
 async def _token(
     client: httpx.AsyncClient,
     gateway_url: str,
@@ -51,7 +55,7 @@ async def _token(
         params={
             "response_type": "code",
             "client_id": "mcp-readiness",
-            "redirect_uri": "http://localhost:8080/auth/admin/callback",
+            "redirect_uri": f"{gateway_url}/auth/admin/callback",
             "scope": " ".join(sorted(set(scopes) | {"openid"})),
             "state": state,
             "code_challenge": challenge,
@@ -74,7 +78,7 @@ async def _token(
         data={
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": "http://localhost:8080/auth/admin/callback",
+            "redirect_uri": f"{gateway_url}/auth/admin/callback",
             "client_id": "mcp-readiness",
             "code_verifier": code_verifier,
         },
@@ -153,6 +157,185 @@ async def _require_status(
     return response
 
 
+async def _set_readiness_crm_health(client: httpx.AsyncClient, *, available: bool) -> None:
+    response = await client.post(
+        f"{_mock_backends_url()}/readiness/test/upstream-health",
+        json={"available": available},
+    )
+    if response.status_code != httpx.codes.OK or response.json().get("available") is not available:
+        raise RuntimeError(
+            "Could not change readiness CRM fixture health "
+            f"(HTTP {response.status_code}; {response.text[:300]})"
+        )
+
+
+async def _call_readiness_crm(
+    client: httpx.AsyncClient, gateway_url: str, token: str
+) -> dict[str, Any]:
+    tool_name = "crm_accounts__list_crm_accounts"
+    response = await client.post(
+        f"{gateway_url}/mcp",
+        headers={
+            **request_headers("tools/call", tool_name=tool_name),
+            "Authorization": f"Bearer {token}",
+            "X-Admin-Force-Mode": "traditional",
+        },
+        json={
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": {"limit": 5},
+                "_meta": request_meta(client_name="readiness-recovery-smoke"),
+            },
+        },
+    )
+    if response.status_code != httpx.codes.OK:
+        raise RuntimeError(f"Recovery CRM call returned HTTP {response.status_code}")
+    return response.json().get("result", {}).get("structuredContent", {})
+
+
+async def _call_reconciliation_tool(
+    client: httpx.AsyncClient,
+    gateway_url: str,
+    token: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    response = await client.post(
+        f"{gateway_url}/mcp?mode=traditional&servers=idempotency_api",
+        headers={
+            **request_headers("tools/call", tool_name=tool_name),
+            "Authorization": f"Bearer {token}",
+            "X-Admin-Force-Mode": "traditional",
+        },
+        json={
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments,
+                "_meta": request_meta(client_name="readiness-reconciliation-smoke"),
+            },
+        },
+    )
+    if response.status_code != httpx.codes.OK:
+        raise RuntimeError(
+            f"Reconciliation MCP call {tool_name} returned HTTP {response.status_code}"
+        )
+    result = response.json().get("result", {}).get("structuredContent", {})
+    if not isinstance(result, dict):
+        raise RuntimeError(f"Reconciliation MCP call {tool_name} returned no structured result")
+    return result
+
+
+async def _verify_idempotency_reconciliation(
+    client: httpx.AsyncClient, gateway_url: str, token: str
+) -> None:
+    metrics_tool = "idempotency_api__get_idempotent_operation_metrics"
+    create_tool = "idempotency_api__create_idempotent_operation"
+    status_tool = "idempotency_api__get_idempotent_operation_status"
+    before = await _call_reconciliation_tool(client, gateway_url, token, metrics_tool, {})
+    if before.get("ok") is not True:
+        raise RuntimeError("API-key protected reconciliation metrics were not accessible")
+
+    idempotency_key = f"readiness-{secrets.token_urlsafe(12)}"
+    uncertain = await _call_reconciliation_tool(
+        client,
+        gateway_url,
+        token,
+        create_tool,
+        {
+            "idempotency_key": idempotency_key,
+            "item_id": "readiness-invoice-001",
+            "simulate_lost_response": True,
+        },
+    )
+    if (
+        uncertain.get("ok") is not False
+        or uncertain.get("outcome_unknown") is not True
+        or uncertain.get("retry_attempts") != 0
+    ):
+        raise RuntimeError("Lost write response was not reported as an unknown, unreplayed outcome")
+
+    status = await _call_reconciliation_tool(
+        client,
+        gateway_url,
+        token,
+        status_tool,
+        {"idempotency_key": idempotency_key},
+    )
+    replay = await _call_reconciliation_tool(
+        client,
+        gateway_url,
+        token,
+        create_tool,
+        {"idempotency_key": idempotency_key, "item_id": "readiness-invoice-001"},
+    )
+    after = await _call_reconciliation_tool(client, gateway_url, token, metrics_tool, {})
+    if (
+        status.get("ok") is not True
+        or status.get("result", {}).get("status") != "committed"
+        or replay.get("ok") is not True
+        or replay.get("result", {}).get("replayed") is not True
+        or replay.get("result", {}).get("operation_id")
+        != status.get("result", {}).get("operation_id")
+        or after.get("result", {}).get("side_effect_count")
+        != before.get("result", {}).get("side_effect_count", 0) + 1
+    ):
+        raise RuntimeError("Idempotency replay or status readback did not preserve one side effect")
+
+
+async def _wait_for_crm_circuit(
+    client: httpx.AsyncClient,
+    gateway_url: str,
+    admin_token: str,
+    *,
+    unhealthy: bool,
+) -> None:
+    expected_alert = "upstream_health:crm_accounts"
+    for _ in range(45):
+        response = await client.get(
+            f"{gateway_url}/admin/alerts",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        if response.status_code == httpx.codes.OK:
+            alerts = response.json().get("alerts", [])
+            has_alert = any(alert.get("id") == expected_alert for alert in alerts)
+            if has_alert is unhealthy:
+                return
+        await asyncio.sleep(1)
+    state = "unhealthy" if unhealthy else "recovered"
+    raise RuntimeError(f"Scaled readiness lab did not report CRM circuit {state}")
+
+
+async def _wait_for_crm_call_state(
+    client: httpx.AsyncClient,
+    gateway_url: str,
+    token: str,
+    *,
+    expected_error_type: str | None,
+) -> dict[str, Any]:
+    matching_responses = 0
+    latest_result: dict[str, Any] = {}
+    for _ in range(45):
+        result = await _call_readiness_crm(client, gateway_url, token)
+        latest_result = result
+        matches = (
+            result.get("ok") is True
+            if expected_error_type is None
+            else result.get("error_type") == expected_error_type
+        )
+        matching_responses = matching_responses + 1 if matches else 0
+        if matching_responses >= 6:
+            return latest_result
+        await asyncio.sleep(1)
+    expected = expected_error_type or "successful CRM result"
+    raise RuntimeError(f"Scaled readiness lab did not reach {expected}")
+
+
 async def run_readiness_smoke() -> dict[str, str]:
     gateway_url = _gateway_url()
     timeout = httpx.Timeout(60.0)
@@ -163,7 +346,7 @@ async def run_readiness_smoke() -> dict[str, str]:
         if provider_metadata.status_code != httpx.codes.OK:
             raise RuntimeError("Local OIDC provider metadata endpoint was not available")
         metadata = provider_metadata.json()
-        if metadata.get("issuer") != "http://localhost:8081/oidc" or "S256" not in metadata.get(
+        if metadata.get("issuer") != idp_url or "S256" not in metadata.get(
             "code_challenge_methods_supported", []
         ):
             raise RuntimeError(
@@ -297,6 +480,30 @@ async def run_readiness_smoke() -> dict[str, str]:
         if not isinstance(result, dict) or result.get("isError"):
             raise RuntimeError("REST-backed MCP call did not return a successful tool result")
 
+        await _verify_idempotency_reconciliation(client, gateway_url, ops_token)
+
+        await _set_readiness_crm_health(client, available=False)
+        await _wait_for_crm_circuit(client, gateway_url, admin_token, unhealthy=True)
+        blocked = await _wait_for_crm_call_state(
+            client,
+            gateway_url,
+            finance_token,
+            expected_error_type="upstream_unhealthy",
+        )
+        if blocked.get("ok") is not False:
+            raise RuntimeError("Unhealthy CRM circuit did not block the caller tool")
+        ready_during_outage = await client.get(f"{gateway_url}/ready")
+        if ready_during_outage.status_code != httpx.codes.OK:
+            raise RuntimeError("Gateway readiness failed during an upstream-only outage")
+
+        await _set_readiness_crm_health(client, available=True)
+        await _wait_for_crm_circuit(client, gateway_url, admin_token, unhealthy=False)
+        recovered = await _wait_for_crm_call_state(
+            client, gateway_url, finance_token, expected_error_type=None
+        )
+        if recovered.get("ok") is not True:
+            raise RuntimeError("CRM call did not recover after the health probe succeeded")
+
         approval_name = "readiness_approvals__create_approval_case"
         approval_arguments = {"customer_id": "CUST-READINESS", "reason": "local smoke"}
         approval_headers = {
@@ -415,6 +622,14 @@ async def run_readiness_smoke() -> dict[str, str]:
             "issuer": discovery.json().get("issuer", "local mock OIDC"),
             "authenticated_roles": ",".join(admin_identity.json().get("roles", [])),
             "rest_pilot": tool_name,
+            "reconciliation": (
+                "API key accepted; ambiguous write status read back as committed; duplicate key "
+                "replayed the same operation with exactly one side effect"
+            ),
+            "upstream_recovery": (
+                "six consecutive load-balanced calls were circuit-blocked during outage, then "
+                "six succeeded after recovery; gateway remained ready"
+            ),
             "rbac": "admin allowed; viewer read-only; unassigned and other tenant denied",
             "approval": (
                 "requester confirmation, shared record, self/wrong-group denial, "

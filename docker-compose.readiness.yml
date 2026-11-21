@@ -23,6 +23,8 @@ services:
       MOCK_OIDC_CLIENT_ID: mcp-readiness
       MOCK_OIDC_REDIRECT_URI: http://localhost:8080/auth/admin/callback
       MOCK_OIDC_AUDIENCE: api://mcp-readiness
+      MOCK_ENABLE_READINESS_FAILURE_CONTROLS: "true"
+      MOCK_IDEMPOTENCY_API_KEY: readiness-mock-idempotency-key
       GATEWAY_TOKEN_ISSUER: http://localhost:8081/oidc
       GATEWAY_JWKS_URL: http://mock-backends:8001/oidc/jwks
 
@@ -67,4 +69,5 @@ services:
       GATEWAY_ADMIN_SESSION_SECRET: local-only-readiness-admin-session-key
       GATEWAY_PROVENANCE_SIGNING_SECRET: local-only-readiness-provenance-key
       GATEWAY_UPSTREAMS_CONFIG_PATH: config/upstreams.readiness.yaml
+      MOCK_IDEMPOTENCY_API_KEY: readiness-mock-idempotency-key
     profiles: ["scaled"]

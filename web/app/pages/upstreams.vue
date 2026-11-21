@@ -8,15 +8,17 @@ const initialUpstream = typeof requestedUpstream === "string" ? requestedUpstrea
 const expandedUpstreamName = ref<string | null>(initialUpstream || null);
 const toolDrawerOpen = ref(false);
 const selectedTool = ref<{ upstream: string; tool: string; opener: HTMLElement } | null>(null);
-const healthRows = ref<Array<{ server: string; tool: string; count: number; bytes: number; mean_latency_ms: number | null; p95_latency_ms: number | null; errors: number | null; timeouts: number; invalid_arguments: number | null; schema_coverage_pct: number | null; read_calls: number | null; write_calls: number | null }>>([]);
+const healthRows = ref<Array<{ server: string; tool: string; count: number; bytes: number; mean_latency_ms: number | null; p95_latency_ms: number | null; errors: number | null; error_types: Record<string, number>; timeouts: number; invalid_arguments: number | null; schema_coverage_pct: number | null; read_calls: number | null; write_calls: number | null }>>([]);
+const activeHealth = ref<Array<{ server: string; status: string; checked_at: string; error_type?: string | null; error?: string | null; consecutive_failures: number }>>([]);
 const performanceError = ref("");
 const performanceLoading = ref(true);
 
 async function loadPerf() {
   performanceError.value = "";
   try {
-    const res = await _apiFetch<{ rows: typeof healthRows.value }>("/admin/adaptive-execution/tool-health?window=all");
+    const res = await _apiFetch<{ rows: typeof healthRows.value; upstream_health: typeof activeHealth.value }>("/admin/adaptive-execution/tool-health?window=all");
     if (res?.rows) healthRows.value = res.rows;
+    activeHealth.value = res?.upstream_health || [];
   } catch (err) {
     performanceError.value = extractErrorMessage(err);
   } finally {
@@ -36,6 +38,10 @@ function openTool(upstream: string, tool: string, event: MouseEvent) {
 
 function aggregatedToolsForUpstream(u: UpstreamEntry) {
   return healthRows.value.filter((row) => row.server === u.name).sort((a, b) => a.tool.localeCompare(b.tool));
+}
+
+function healthForUpstream(name: string) {
+  return activeHealth.value.find((item) => item.server === name);
 }
 
 function serverStats(u: UpstreamEntry) {
@@ -129,6 +135,10 @@ interface UpstreamEntry {
   tools?: string[];
   allowed_groups?: string[];
   enabled: boolean;
+  request_timeout_seconds?: number;
+  max_requests_per_minute?: number | null;
+  max_concurrent_calls?: number | null;
+  health_check?: { enabled: boolean; interval_seconds: number; url?: string | null };
   ab_experiment?: {
     enabled: boolean;
     experiment_id?: string | null;
@@ -425,6 +435,12 @@ onMounted(() => {
                     <div class="max-w-[160px] truncate text-[11px] text-[#71717A]" :title="u.url || 'stdio/inline'">
                       {{ u.url || "stdio/inline" }}
                     </div>
+                    <div class="text-[10px] tabular-nums text-[#71717A]">
+                      {{ u.request_timeout_seconds ?? 15 }}s · {{ u.max_requests_per_minute ?? "unlimited" }}/min · {{ u.max_concurrent_calls ?? "unlimited" }} in flight
+                    </div>
+                    <div v-if="u.health_check?.enabled" class="mt-1 text-[11px]" :class="healthForUpstream(u.name)?.status === 'healthy' ? 'text-[#059669]' : healthForUpstream(u.name)?.status === 'unhealthy' ? 'text-[#DC2626]' : 'text-[#71717A]'">
+                      Probe: {{ healthForUpstream(u.name)?.status || "waiting" }}<span v-if="healthForUpstream(u.name)?.checked_at"> · {{ new Date(healthForUpstream(u.name)!.checked_at).toLocaleTimeString() }}</span>
+                    </div>
                   </td>
                   <td class="hidden lg:table-cell px-2.5 py-2 text-[#52525B] whitespace-nowrap">
                     {{ u.type }} · {{ u.auth_type }}
@@ -484,6 +500,12 @@ onMounted(() => {
                       </ul>
                       <p v-else class="text-xs text-zinc-600">No tools discovered for this upstream yet.</p>
                     </section>
+                    <div v-if="healthForUpstream(u.name)" class="mb-3 border-b border-[#E4E4E7] pb-3 text-xs" role="status">
+                      <span class="font-medium text-[#09090B]">Active probe: {{ healthForUpstream(u.name)?.status }}</span>
+                      <span class="ml-2 text-[#52525B]">Checked {{ healthForUpstream(u.name)?.checked_at ? new Date(healthForUpstream(u.name)!.checked_at).toLocaleString() : "not yet" }}</span>
+                      <span v-if="healthForUpstream(u.name)?.error_type" class="ml-2 font-mono-data text-[#DC2626]">{{ healthForUpstream(u.name)?.error_type }} ({{ healthForUpstream(u.name)?.consecutive_failures }} consecutive failures)</span>
+                      <p v-if="healthForUpstream(u.name)?.error" class="mt-1 text-[#52525B]">{{ healthForUpstream(u.name)?.error }}</p>
+                    </div>
                     <div v-if="aggregatedToolsForUpstream(u).length === 0" class="text-xs text-[#71717A]">
                       No calls recorded for this upstream yet.
                     </div>
@@ -497,6 +519,7 @@ onMounted(() => {
                             <th class="py-1.5 pr-3 font-medium text-right">Bytes</th>
                             <th class="py-1.5 pr-3 font-medium text-right">Mean / p95 latency</th>
                             <th class="py-1.5 pr-3 font-medium text-right">Errors / timeouts</th>
+                            <th class="py-1.5 pr-3 font-medium">Error categories</th>
                             <th class="py-1.5 pr-3 font-medium">Schema coverage</th>
                             <th class="py-1.5 pr-3 font-medium">Read / write calls</th>
                             <th class="py-1.5 font-medium">Invalid arguments</th>
@@ -509,6 +532,7 @@ onMounted(() => {
                             <td class="py-2 pr-3 text-right font-mono-data tabular-nums">{{ t.bytes.toLocaleString() }}</td>
                             <td class="py-2 pr-3 text-right font-mono-data tabular-nums">{{ t.mean_latency_ms == null ? "Unknown" : `${t.mean_latency_ms} / ${t.p95_latency_ms ?? "Unknown"} ms` }}</td>
                             <td class="py-2 pr-3 text-right font-mono-data tabular-nums">{{ t.errors }} / {{ t.timeouts }}</td>
+                            <td class="py-2 pr-3 text-[#52525B]">{{ Object.entries(t.error_types || {}).map(([kind, count]) => `${kind}: ${count}`).join(", ") || "None recorded" }}</td>
                             <td class="py-2 pr-3 tabular-nums">{{ t.schema_coverage_pct == null ? "Unknown" : `${t.schema_coverage_pct}%` }}</td>
                             <td class="py-2 pr-3 tabular-nums">{{ t.read_calls == null ? "Unknown" : `${t.read_calls} / ${t.write_calls}` }}</td>
                             <td class="py-2 tabular-nums">{{ t.invalid_arguments == null ? "Unknown" : t.invalid_arguments }}</td>

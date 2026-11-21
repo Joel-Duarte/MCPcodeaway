@@ -7,8 +7,10 @@ import hashlib
 import hmac
 import json
 import logging
+import random
 import re
 import time
+import uuid
 from typing import Any
 from urllib.parse import quote
 
@@ -27,6 +29,12 @@ from gateway.auth import (
 from gateway.catalog import ToolCatalog, render_python_stub
 from gateway.config import GatewaySettings, ToolApprovalPolicy, UpstreamConfig, UpstreamRegistry
 from gateway.crypto import sign_connect_ticket
+from gateway.errors import (
+    UpstreamCapacityExceeded,
+    UpstreamCircuitOpen,
+    UpstreamFailure,
+    classify_upstream_error,
+)
 from gateway.observability import MetricsRegistry, log_event
 from gateway.secrets import CredentialVault, SecretResolver
 from gateway.state import CacheBackend
@@ -136,6 +144,11 @@ class SubcallRecord(BaseModel):
     abac_rows_filtered: int = 0
     redactions_count: int = 0
     error: str | None = None
+    error_type: str | None = None
+    retryable: bool = False
+    retry_attempts: int = 0
+    outcome_unknown: bool = False
+    upstream_status_code: int | None = None
     schema_covered: bool | None = None
     is_mutating: bool | None = None
     invalid_arguments: int | None = None
@@ -422,6 +435,7 @@ class HostDispatcher:
         self.exchanger = exchanger
         self.cache = cache
         self.client_manager = client_manager
+        self.health_monitor: Any = None
         self.catalog = catalog
         self.registry = registry
         self.metrics = metrics
@@ -763,7 +777,16 @@ class HostDispatcher:
 
             cache_hit = False
             audience: str | None = None
+            retry_attempts = 0
             try:
+                if (
+                    upstream.health_check.enabled
+                    and self.health_monitor is not None
+                    and self.health_monitor.is_circuit_open(upstream.name)
+                ):
+                    raise UpstreamCircuitOpen(
+                        f"Configured health check failed for '{upstream.name}'"
+                    )
                 auth_headers, cache_hit, audience = await self.resolve_upstream_headers(
                     identity, upstream
                 )
@@ -793,14 +816,100 @@ class HostDispatcher:
                         execution="codemode" if code_mode_hints else "direct",
                     )
                     raise PermissionError(reason)
-                raw_result = await self.client_manager.call_tool(
-                    upstream,
-                    tool,
-                    scoped_args,
-                    auth_headers=auth_headers,
+                operation_is_read = upstream.tool_effects.get(tool.name) == "read" or (
+                    tool.name not in upstream.tool_effects and not tool.mutating
                 )
+                permit_key = f"upstream_concurrency:{upstream.name}"
+                permit_token = uuid.uuid4().hex
+                permit_acquired = False
+                if current_upstream.max_concurrent_calls is not None:
+                    permit_acquired = await self.cache.acquire_permit(
+                        permit_key,
+                        capacity=current_upstream.max_concurrent_calls,
+                        lease_seconds=int(current_upstream.request_timeout_seconds * 2) + 15,
+                        token=permit_token,
+                    )
+                    if not permit_acquired:
+                        raise UpstreamCapacityExceeded(
+                            f"Upstream '{upstream.name}' reached its concurrent call limit; "
+                            "retry later."
+                        )
+
+                async def check_upstream_rate() -> None:
+                    limit = current_upstream.max_requests_per_minute
+                    if limit is None:
+                        return
+                    request_count = await self.cache.increment_window(
+                        f"upstream_rate:{upstream.name}", window_seconds=60
+                    )
+                    if request_count > limit:
+                        raise UpstreamCapacityExceeded(
+                            f"Upstream '{upstream.name}' reached its request rate limit; "
+                            "retry later."
+                        )
+
+                try:
+                    await check_upstream_rate()
+                    raw_result = await self.client_manager.call_tool(
+                        upstream,
+                        tool,
+                        scoped_args,
+                        auth_headers=auth_headers,
+                    )
+                except Exception as first_error:
+                    first_failure = classify_upstream_error(
+                        first_error, operation_is_read=operation_is_read
+                    )
+                    if not first_failure.retryable or isinstance(
+                        first_error, UpstreamCapacityExceeded
+                    ):
+                        raise
+                    retry_attempts = 1
+                    retry_after = 0.0
+                    response = getattr(first_error, "response", None)
+                    if response is not None:
+                        try:
+                            retry_after = float(response.headers.get("Retry-After", "0"))
+                        except ValueError:
+                            retry_after = 0.0
+                    await asyncio.sleep(
+                        min(max(retry_after, 0.0), 2.0) + random.uniform(0.05, 0.25)
+                    )
+                    await check_upstream_rate()
+                    raw_result = await self.client_manager.call_tool(
+                        upstream,
+                        tool,
+                        scoped_args,
+                        auth_headers=auth_headers,
+                    )
+                finally:
+                    if permit_acquired:
+                        try:
+                            await self.cache.release_permit(permit_key, permit_token)
+                        except Exception as release_error:
+                            log_event(
+                                "upstream.capacity_permit_release_failed",
+                                level=logging.ERROR,
+                                server=upstream.name,
+                                error_type=type(release_error).__name__,
+                            )
             except Exception as exc:
                 duration_ms = round((time.perf_counter() - started) * 1000, 3)
+                failure = (
+                    UpstreamFailure(
+                        error_type="user_credential_required",
+                        message=str(exc),
+                    )
+                    if isinstance(exc, UserCredentialRequiredError)
+                    else classify_upstream_error(
+                        exc,
+                        operation_is_read=(
+                            upstream.tool_effects.get(tool.name) == "read"
+                            or (tool.name not in upstream.tool_effects and not tool.mutating)
+                        ),
+                    )
+                )
+                safe_error = OutputRedactor.redact_text(failure.message)
                 record = SubcallRecord(
                     tool=tool.qualified_name,
                     server=upstream.name,
@@ -810,7 +919,12 @@ class HostDispatcher:
                     auth_type=upstream.auth_type,
                     token_cache_hit=cache_hit,
                     downstream_audience=audience,
-                    error=str(exc),
+                    error=safe_error,
+                    error_type=failure.error_type,
+                    retryable=failure.retryable,
+                    retry_attempts=retry_attempts,
+                    outcome_unknown=failure.outcome_unknown,
+                    upstream_status_code=failure.status_code,
                     schema_covered=tool.input_schema is not None and tool.output_schema is not None,
                     is_mutating=bool(tool.mutating),
                 )
@@ -821,6 +935,7 @@ class HostDispatcher:
                             "server": upstream.name,
                             "tool": tool.qualified_name,
                             "status": "error",
+                            "error_type": failure.error_type,
                         },
                     )
                 log_event(
@@ -829,10 +944,19 @@ class HostDispatcher:
                     server=upstream.name,
                     tool=tool.qualified_name,
                     duration_ms=duration_ms,
-                    error=str(exc),
+                    error_type=failure.error_type,
+                    retry_attempts=record.retry_attempts,
                 )
+                span.set_attribute("upstream.error_type", failure.error_type)
                 span.record_exception(exc)
-                return {"_dispatch_error": str(exc)}, record
+                return {
+                    "_dispatch_error": safe_error,
+                    "error_type": failure.error_type,
+                    "retryable": failure.retryable,
+                    "retry_attempts": record.retry_attempts,
+                    "outcome_unknown": failure.outcome_unknown,
+                    "upstream_status_code": failure.status_code,
+                }, record
 
             raw_encoded = json.dumps(raw_result, default=str).encode("utf-8")
             raw_bytes = len(raw_encoded)
@@ -897,6 +1021,11 @@ class HostDispatcher:
                 )
 
             duration_ms = round((time.perf_counter() - started) * 1000, 3)
+            if retry_attempts and self.metrics is not None:
+                self.metrics.inc_counter(
+                    "gateway_upstream_retries_total",
+                    labels={"server": upstream.name, "tool": tool.qualified_name},
+                )
             record = SubcallRecord(
                 tool=tool.qualified_name,
                 server=upstream.name,
@@ -909,6 +1038,7 @@ class HostDispatcher:
                 output_sha256=output_sha256,
                 abac_rows_filtered=abac_rows_filtered,
                 redactions_count=redactions_count,
+                retry_attempts=retry_attempts,
                 schema_covered=tool.input_schema is not None and tool.output_schema is not None,
                 is_mutating=bool(tool.mutating),
             )

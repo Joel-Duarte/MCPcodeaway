@@ -109,6 +109,39 @@ def test_openapi_import_rejects_cookie_session_requirements() -> None:
         manager._discover_openapi_from_spec(upstream, spec)
 
 
+@pytest.mark.asyncio
+async def test_upstream_call_timeout_is_enforced_per_upstream() -> None:
+    applied_timeouts: list[float | None] = []
+
+    async def response(request: httpx.Request) -> httpx.Response:
+        timeout_config = request.extensions.get("timeout", {})
+        applied_timeouts.append(timeout_config.get("read"))
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    client = httpx.AsyncClient(timeout=0.01, transport=httpx.MockTransport(response))
+    manager = UpstreamClientManager(http_client=client)
+    upstream = UpstreamConfig(
+        name="slow_api",
+        type="openapi",
+        url="https://slow.example",
+        auth_type="none",
+        request_timeout_seconds=0.2,
+    )
+    tool = manager._discover_openapi_from_spec(
+        upstream,
+        {
+            "openapi": "3.1.0",
+            "paths": {"/status": {"get": {"operationId": "get_status", "responses": {"200": {}}}}},
+        },
+    )[0]
+    try:
+        result = await manager.call_tool(upstream, tool, {})
+        assert result["ok"] is True
+        assert applied_timeouts == [0.2]
+    finally:
+        await client.aclose()
+
+
 def test_upstream_config_rejects_legacy_mcp_session_setting() -> None:
     with pytest.raises(ValueError, match="stateful_session is not supported"):
         UpstreamConfig(

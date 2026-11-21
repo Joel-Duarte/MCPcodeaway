@@ -102,6 +102,7 @@ from gateway.mcp_protocol import (
     MCP_PROTOCOL_VERSION_META,
     MCP_SERVER_INFO_META,
 )
+from gateway.monitoring import UpstreamHealthMonitor
 from gateway.oauth_discovery import create_oauth_discovery_router
 from gateway.observability import (
     MetricsRegistry,
@@ -398,6 +399,7 @@ class GatewayRuntime:
             allowed_hosts=self.settings.allowed_upstream_hosts,
             ssrf_protection_enabled=self.settings.ssrf_protection_enabled,
         )
+        self.upstream_health = UpstreamHealthMonitor(self.client_manager)
         self.process_stats = ProcessStatsCollector()
         self.admin_sessions = AdminSessionManager(self.settings)
         self.cipher = EnvelopeCipher(
@@ -442,6 +444,7 @@ class GatewayRuntime:
             connect_signing_key=self._connect_signing_key,
             http_client=http_client,
         )
+        self.dispatcher.health_monitor = self.upstream_health
         if sandbox_backend is not None:
             self.sandbox: SandboxBackend = sandbox_backend
         elif self.settings.sandbox_backend == "remote":
@@ -467,6 +470,7 @@ class GatewayRuntime:
         self.startup_warnings: list[str] = []
         self._startup_retry_task: asyncio.Task[None] | None = None
         self._retention_task: asyncio.Task[None] | None = None
+        self._upstream_health_task: asyncio.Task[None] | None = None
         self.lifecycle_state = GatewayLifecycleState.NEW
         self._lifecycle_lock = asyncio.Lock()
         self.demo_traffic = DemoTrafficRunner(self)
@@ -915,6 +919,9 @@ class GatewayRuntime:
                     self._retry_failed_startup_upstreams()
                 )
             self._retention_task = asyncio.create_task(self._retention_loop())
+            self._upstream_health_task = asyncio.create_task(
+                self.upstream_health.run(self.registry.list_upstreams)
+            )
         except BaseException:
             self._transition_lifecycle(GatewayLifecycleState.FAILED)
             raise
@@ -952,6 +959,10 @@ class GatewayRuntime:
                 self._retention_task.cancel()
                 await asyncio.gather(self._retention_task, return_exceptions=True)
             self._retention_task = None
+            if self._upstream_health_task is not None and not self._upstream_health_task.done():
+                self._upstream_health_task.cancel()
+                await asyncio.gather(self._upstream_health_task, return_exceptions=True)
+            self._upstream_health_task = None
             if self._startup_retry_task is not None and not self._startup_retry_task.done():
                 self._startup_retry_task.cancel()
                 await asyncio.gather(self._startup_retry_task, return_exceptions=True)
@@ -1415,6 +1426,11 @@ class GatewayRuntime:
         effective_result = sandbox_res.result
         effective_error = sandbox_res.error
         effective_error_type = sandbox_res.error_type
+        failed_subcalls = [subcall for subcall in subcalls if subcall.status == "error"]
+        if not effective_ok and failed_subcalls:
+            primary_failure = failed_subcalls[0]
+            effective_error_type = primary_failure.error_type or effective_error_type
+            effective_error = primary_failure.error or effective_error
         grounding_blocked = False
         if (self.settings.require_tool_grounding or require_grounding) and effective_ok:
             if provenance["subcall_count"] == 0 and effective_result is not None:
@@ -1458,6 +1474,20 @@ class GatewayRuntime:
             "_provenance": provenance,
         }
         if not effective_ok:
+            if failed_subcalls:
+                payload["upstream_errors"] = [
+                    {
+                        "server": subcall.server,
+                        "tool": subcall.tool,
+                        "error_type": subcall.error_type,
+                        "error": subcall.error,
+                        "retryable": subcall.retryable,
+                        "retry_attempts": subcall.retry_attempts,
+                        "outcome_unknown": subcall.outcome_unknown,
+                        "upstream_status_code": subcall.upstream_status_code,
+                    }
+                    for subcall in failed_subcalls
+                ]
             if observed_tool_shapes and any(
                 k in f"{effective_error_type or ''} {effective_error or ''}"
                 for k in ("KeyError", "TypeError", "AttributeError")
@@ -1605,6 +1635,11 @@ class GatewayRuntime:
                 "ok": ok,
                 "result": result,
                 "error": rec.error,
+                "error_type": rec.error_type,
+                "retryable": rec.retryable,
+                "retry_attempts": rec.retry_attempts,
+                "outcome_unknown": rec.outcome_unknown,
+                "upstream_status_code": rec.upstream_status_code,
                 "run_id": run["run_id"],
                 "raw_upstream_bytes": run["raw_upstream_bytes"],
                 "returned_bytes": run["returned_bytes"],
@@ -3431,6 +3466,7 @@ def create_gateway_app(
                 drift_warnings=runtime.catalog.drift_warnings,
                 startup_warnings=runtime.startup_warnings,
                 worker_status=initial_rt.get("sandbox_worker", {}),
+                upstream_health=runtime.upstream_health.list_statuses(),
             )
             await websocket.send_json(
                 {
@@ -3463,6 +3499,7 @@ def create_gateway_app(
                         drift_warnings=runtime.catalog.drift_warnings,
                         startup_warnings=runtime.startup_warnings,
                         worker_status=rt_snap.get("sandbox_worker", {}),
+                        upstream_health=runtime.upstream_health.list_statuses(),
                     )
                     await runtime.alert_evaluator.notify_webhook_if_needed(
                         tick_alerts,
@@ -3530,6 +3567,7 @@ def create_gateway_app(
                 drift_warnings=runtime.catalog.drift_warnings,
                 startup_warnings=runtime.startup_warnings,
                 worker_status=rt_snap.get("sandbox_worker", {}),
+                upstream_health=runtime.upstream_health.list_statuses(),
             )
             await runtime.alert_evaluator.notify_webhook_if_needed(
                 alerts,
@@ -3728,7 +3766,7 @@ def create_gateway_app(
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if runtime.settings.ssrf_protection_enabled:
             try:
-                for candidate_url in (cfg.url, cfg.openapi_spec_url):
+                for candidate_url in (cfg.url, cfg.openapi_spec_url, cfg.health_check.url):
                     validate_upstream_url(
                         candidate_url,
                         app_env=runtime.settings.app_env,
@@ -4784,6 +4822,7 @@ def create_gateway_app(
                             "latencies": [],
                             "errors": 0,
                             "timeouts": 0,
+                            "error_types": {},
                             "invalid_arguments": 0,
                             "schema_known": 0,
                             "schema_covered": 0,
@@ -4799,6 +4838,10 @@ def create_gateway_app(
                     status, error = str(call.get("status") or ""), str(call.get("error") or "")
                     b["errors"] += int(status != "ok" or bool(error))
                     b["timeouts"] += int("timeout" in (status + " " + error).lower())
+                    error_type = call.get("error_type")
+                    if error_type:
+                        types = b["error_types"]
+                        types[str(error_type)] = types.get(str(error_type), 0) + 1
                     if isinstance(call.get("invalid_arguments"), (int, float)):
                         b["invalid_arguments"] += int(call["invalid_arguments"])
                     if isinstance(call.get("schema_covered"), bool):
@@ -4826,6 +4869,7 @@ def create_gateway_app(
                         if latencies
                         else None,
                         "errors": b["errors"],
+                        "error_types": b["error_types"],
                         "timeouts": b["timeouts"],
                         "invalid_arguments": b["invalid_arguments"]
                         if any(
@@ -4850,7 +4894,11 @@ def create_gateway_app(
                         "write_calls": b["write"] if b["read"] or b["write"] else None,
                     }
                 )
-            return {"window": window, "rows": rows}
+            return {
+                "window": window,
+                "rows": rows,
+                "upstream_health": runtime.upstream_health.list_statuses(),
+            }
 
         @app.post("/admin/adaptive-execution/evidence")
         async def admin_import_adaptive_evidence(

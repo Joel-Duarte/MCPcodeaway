@@ -325,6 +325,39 @@ async def test_golden_end_to_end_flows(
                     for ep in ("/admin/upstreams", "/admin/telemetry/runtime", "/audit/analytics"):
                         ok_r = await gw.get(ep, headers={"Authorization": f"Bearer {adm_tok}"})
                         assert ok_r.status_code == 200, (ep, ok_r.text)
+
+                elif kind == "mcp_invalid_auth":
+                    response = await _mcp_call(gw, "not-a-signed-token", "tools/list")
+                    assert response.status_code == flow["expected_http_status"]
+
+                elif kind == "mcp_unsupported_protocol":
+                    token = dev_keys.issue_user_token(persona="finance_analyst")
+                    response = await _mcp_call(
+                        gw,
+                        token,
+                        "tools/list",
+                        {
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": "2025-03-26",
+                                "io.modelcontextprotocol/clientCapabilities": {},
+                            }
+                        },
+                        headers={"MCP-Protocol-Version": "2025-03-26"},
+                    )
+                    assert response.status_code == flow["expected_http_status"]
+                    assert response.json()["error"]["code"] == flow["expected_rpc_error_code"]
+
+                elif kind == "mcp_invalid_arguments":
+                    token = dev_keys.issue_user_token(persona=flow["persona"])
+                    response = await _mcp_call(
+                        gw,
+                        token,
+                        "tools/call",
+                        {"name": flow["tool_name"], "arguments": {}},
+                        query=flow["query"],
+                    )
+                    assert response.status_code == 200
+                    assert response.json()["error"]["code"] == flow["expected_rpc_error_code"]
                 else:
                     raise AssertionError(f"Unsupported golden flow kind: {kind}")
     finally:

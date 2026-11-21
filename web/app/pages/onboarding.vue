@@ -96,6 +96,12 @@ const draftRoles = ref("");
 const draftGroups = ref("");
 const draftAllowAllCallers = ref(false);
 const draftPreferredMode = ref("auto");
+const draftHealthCheckEnabled = ref(false);
+const draftHealthCheckUrl = ref("");
+const draftHealthInterval = ref(30);
+const draftRequestTimeout = ref(15);
+const draftUpstreamRateLimit = ref(120);
+const draftUpstreamConcurrency = ref(10);
 
 const inspectResult = ref<InspectResponse | null>(null);
 
@@ -433,6 +439,17 @@ function buildUpstreamPayload(forInspection = false) {
     tool_effects: forInspection ? {} : Object.fromEntries(Object.entries(draftToolEffects.value).filter(([, effect]) => effect !== "disabled")),
     mutating_tools: forInspection ? [] : Object.entries(draftToolEffects.value).filter(([, effect]) => effect === "write" || effect === "high_impact").map(([tool]) => tool),
     enabled: true,
+    health_check: {
+      enabled: draftHealthCheckEnabled.value,
+      url: draftHealthCheckEnabled.value ? draftHealthCheckUrl.value.trim() : undefined,
+      interval_seconds: draftHealthInterval.value,
+      timeout_seconds: 3,
+      failure_threshold: 3,
+      success_threshold: 2,
+    },
+    request_timeout_seconds: Number(draftRequestTimeout.value),
+    max_requests_per_minute: Number(draftUpstreamRateLimit.value),
+    max_concurrent_calls: Number(draftUpstreamConcurrency.value),
     ab_experiment: null,
   };
 }
@@ -450,6 +467,10 @@ const yamlPreview = computed(() => {
     `    allowed_roles: [${cfg.allowed_roles.join(", ")}]`,
     `    allowed_groups: [${cfg.allowed_groups.join(", ")}]`,
     `    allow_all_callers: ${cfg.allow_all_callers}`,
+    `    request_timeout_seconds: ${cfg.request_timeout_seconds}`,
+    `    max_requests_per_minute: ${cfg.max_requests_per_minute}`,
+    `    max_concurrent_calls: ${cfg.max_concurrent_calls}`,
+    cfg.health_check.enabled ? `    health_check: { enabled: true, url: ${cfg.health_check.url}, interval_seconds: ${cfg.health_check.interval_seconds} }` : "",
   ].filter(Boolean);
   const overrides = Object.entries(cfg.tool_mode_overrides);
   if (overrides.length) {
@@ -547,6 +568,22 @@ async function handleTestCall(toolName: string) {
 }
 
 async function handleRegister() {
+  if (draftRequestTimeout.value < 0.2 || draftRequestTimeout.value > 120) {
+    errorMessage.value = "Request timeout must be between 0.2 and 120 seconds.";
+    return;
+  }
+  if (draftUpstreamRateLimit.value < 1 || draftUpstreamRateLimit.value > 100000) {
+    errorMessage.value = "Requests per minute must be between 1 and 100,000.";
+    return;
+  }
+  if (draftUpstreamConcurrency.value < 1 || draftUpstreamConcurrency.value > 10000) {
+    errorMessage.value = "Concurrent calls must be between 1 and 10,000.";
+    return;
+  }
+  if (draftHealthCheckEnabled.value && !draftHealthCheckUrl.value.trim()) {
+    errorMessage.value = "Enter the API's health URL or turn off active health checks.";
+    return;
+  }
   if (!accessPolicyValid.value) {
     errorMessage.value = "Select at least one allowed role or group, or explicitly allow all authenticated callers.";
     return;
@@ -1052,6 +1089,53 @@ async function copyPromptText() {
           </div>
         </details>
       </div>
+
+      <section class="space-y-3 border-t border-[#E4E4E7] pt-4" aria-labelledby="upstream-limits-title">
+        <div>
+          <h3 id="upstream-limits-title" class="text-sm font-semibold text-[#09090B]">Upstream request limits</h3>
+          <p class="text-xs text-[#52525B]">These limits apply to calls leaving each gateway deployment. With Redis configured, request rates and in-flight caps are shared across replicas. The gateway rejects excess calls with a retryable capacity response; it does not queue a burst.</p>
+        </div>
+        <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <Field>
+            <FieldLabel>Request timeout (seconds)</FieldLabel>
+            <Input v-model.number="draftRequestTimeout" type="number" min="0.2" max="120" step="0.1" class="min-h-11 tabular-nums" />
+            <FieldDescription>Per upstream tool call, including MCP and OpenAPI.</FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel>Maximum requests per minute</FieldLabel>
+            <Input v-model.number="draftUpstreamRateLimit" type="number" min="1" max="100000" class="min-h-11 tabular-nums" />
+            <FieldDescription>Shared across replicas when Redis is enabled.</FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel>Maximum concurrent calls</FieldLabel>
+            <Input v-model.number="draftUpstreamConcurrency" type="number" min="1" max="10000" class="min-h-11 tabular-nums" />
+            <FieldDescription>In-flight calls; no waiting queue.</FieldDescription>
+          </Field>
+        </div>
+      </section>
+
+      <section class="space-y-3 border-t border-[#E4E4E7] pt-4" aria-labelledby="health-check-title">
+        <div>
+          <h3 id="health-check-title" class="text-sm font-semibold text-[#09090B]">Upstream health checks</h3>
+          <p class="text-xs text-[#52525B]">Optional background GET probe. Configure a dedicated unauthenticated health endpoint; caller credentials are never reused. Tool calls still report their own failures.</p>
+        </div>
+        <label class="flex min-h-11 items-center gap-2 text-xs font-medium text-[#09090B]">
+          <Checkbox :checked="draftHealthCheckEnabled" aria-label="Enable active health checks" @checked-change="(checked) => { draftHealthCheckEnabled = checked === true }"><CheckboxIndicator><AppIcon name="check" :size="13" /></CheckboxIndicator></Checkbox>
+          Enable active health checks
+        </label>
+        <div v-if="draftHealthCheckEnabled" class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <Field class="sm:col-span-2">
+            <FieldLabel>Health endpoint URL</FieldLabel>
+            <Input v-model="draftHealthCheckUrl" type="url" required placeholder="https://api.example.com/health" class="min-h-11 font-mono-data text-xs" />
+            <FieldDescription>Must return a successful HTTP status and must not require a user token or query-string secret.</FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel>Probe interval (seconds)</FieldLabel>
+            <Input v-model.number="draftHealthInterval" type="number" min="10" max="3600" class="min-h-11 tabular-nums" />
+          </Field>
+          <p class="self-center text-xs text-[#52525B]">The state changes after 3 consecutive failures and recovers after 2 consecutive successes. Probe timeout: 3 seconds.</p>
+        </div>
+      </section>
 
       <div class="flex flex-wrap items-center justify-between gap-2 border-t border-[#E4E4E7] pt-4">
         <Button @click="goToOnboardingStep('connect')">← Back: Connect</Button>

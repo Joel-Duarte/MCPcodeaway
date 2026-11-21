@@ -81,6 +81,76 @@
         "/benchmarks/latest",
         "/dev/oidc/jwks"
       ]
+    },
+    {
+      "id": "mcp_invalid_bearer_fails_closed",
+      "kind": "mcp_invalid_auth",
+      "expected_http_status": 401
+    },
+    {
+      "id": "mcp_unsupported_protocol_version_rejected",
+      "kind": "mcp_unsupported_protocol",
+      "expected_http_status": 400,
+      "expected_rpc_error_code": -32022
+    },
+    {
+      "id": "mcp_missing_required_tool_argument_rejected",
+      "kind": "mcp_invalid_arguments",
+      "persona": "finance_analyst",
+      "query": "mode=traditional",
+      "tool_name": "snowflake_ledger__get_customer_balance",
+      "expected_rpc_error_code": -32602
+    }
+  ],
+  "recovery_flows": [
+    {
+      "id": "read_retries_once_then_succeeds",
+      "kind": "read_retry_success",
+      "failures_before_success": 1,
+      "expected_calls": 2
+    },
+    {
+      "id": "read_failure_stops_after_one_retry",
+      "kind": "read_retry_exhausted",
+      "failures_before_success": null,
+      "expected_calls": 2,
+      "expected_error_type": "upstream_unavailable",
+      "expected_retry_attempts": 1
+    },
+    {
+      "id": "write_commit_response_lost_is_not_replayed",
+      "kind": "write_outcome_unknown",
+      "expected_error_type": "upstream_unavailable",
+      "expected_retry_attempts": 0,
+      "expected_outcome_unknown": true,
+      "expected_write_count": 1
+    },
+    {
+      "id": "configured_circuit_blocks_then_recovers",
+      "kind": "circuit_recovery",
+      "failure_threshold": 2,
+      "success_threshold": 2,
+      "expected_error_type": "upstream_unhealthy"
+    }
+  ],
+  "reconciliation_flows": [
+    {
+      "id": "write_response_lost_then_status_confirms_commit",
+      "kind": "lost_response_status_readback",
+      "expected_status": "committed",
+      "expected_side_effect_count": 1
+    },
+    {
+      "id": "same_idempotency_key_replays_one_effect",
+      "kind": "idempotent_replay",
+      "expected_replayed": true,
+      "expected_side_effect_count": 1
+    },
+    {
+      "id": "idempotency_key_payload_mismatch_rejected",
+      "kind": "idempotency_conflict",
+      "expected_http_status": 409,
+      "expected_side_effect_count": 1
     }
   ]
 }

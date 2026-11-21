@@ -26,6 +26,12 @@ class CacheBackend(Protocol):
 
     async def increment_window(self, key: str, window_seconds: int) -> int: ...
 
+    async def acquire_permit(
+        self, key: str, *, capacity: int, lease_seconds: int, token: str
+    ) -> bool: ...
+
+    async def release_permit(self, key: str, token: str) -> None: ...
+
 
 class InMemoryCacheBackend:
     """Zero-dependency async-safe in-memory TTL cache and sliding-window rate limiter."""
@@ -34,6 +40,7 @@ class InMemoryCacheBackend:
         self._lock = asyncio.Lock()
         self._entries: dict[str, tuple[str, float]] = {}
         self._windows: dict[str, deque[float]] = {}
+        self._permits: dict[str, dict[str, float]] = {}
         self._subscribers: dict[str, set[asyncio.Queue[str]]] = {}
 
     async def get(self, key: str) -> str | None:
@@ -65,6 +72,23 @@ class InMemoryCacheBackend:
                 bucket.popleft()
             bucket.append(now)
             return len(bucket)
+
+    async def acquire_permit(
+        self, key: str, *, capacity: int, lease_seconds: int, token: str
+    ) -> bool:
+        async with self._lock:
+            now = time.monotonic()
+            slots = self._permits.setdefault(key, {})
+            for expired in [name for name, deadline in slots.items() if deadline <= now]:
+                del slots[expired]
+            if len(slots) >= capacity:
+                return False
+            slots[token] = now + max(lease_seconds, 1)
+            return True
+
+    async def release_permit(self, key: str, token: str) -> None:
+        async with self._lock:
+            self._permits.get(key, {}).pop(token, None)
 
     async def publish_event(self, channel: str, message: str) -> None:
         for queue in list(self._subscribers.get(channel, ())):
@@ -161,6 +185,30 @@ class RedisCacheBackend:
                 raise
             await disconnect(inuse_connections=True)
             return await increment(self._get_client())
+
+    async def acquire_permit(
+        self, key: str, *, capacity: int, lease_seconds: int, token: str
+    ) -> bool:
+        script = """
+        local key = KEYS[1]
+        local now = tonumber(ARGV[1])
+        local expires = tonumber(ARGV[2])
+        local capacity = tonumber(ARGV[3])
+        local token = ARGV[4]
+        redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+        if redis.call('ZCARD', key) >= capacity then return 0 end
+        redis.call('ZADD', key, expires, token)
+        redis.call('EXPIRE', key, math.max(tonumber(ARGV[5]), 1))
+        return 1
+        """
+        now = time.time()
+        result = await self._get_client().eval(
+            script, 1, key, now, now + max(lease_seconds, 1), capacity, token, lease_seconds
+        )
+        return int(result) == 1
+
+    async def release_permit(self, key: str, token: str) -> None:
+        await self._get_client().zrem(key, token)
 
     async def close(self) -> None:
         if self._client is not None and hasattr(self._client, "aclose"):

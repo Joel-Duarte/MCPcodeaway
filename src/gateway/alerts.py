@@ -68,6 +68,7 @@ class AlertEvaluator:
         drift_warnings: list[dict[str, str]],
         startup_warnings: list[str],
         worker_status: dict[str, Any],
+        upstream_health: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         now_iso = datetime.now(UTC).isoformat()
         alerts: list[dict[str, Any]] = []
@@ -76,6 +77,17 @@ class AlertEvaluator:
             errors = sum(1 for r in runs if not r.get("ok"))
             err_pct = round((errors / len(runs)) * 100.0, 2)
             if err_pct > self.rules.error_rate_pct_max:
+                error_types: dict[str, int] = {}
+                upstream_types: dict[str, dict[str, int]] = {}
+                for run in runs:
+                    for subcall in run.get("subcalls") or []:
+                        if not isinstance(subcall, dict) or not subcall.get("error_type"):
+                            continue
+                        category = str(subcall["error_type"])
+                        error_types[category] = error_types.get(category, 0) + 1
+                        server = str(subcall.get("server") or "unknown")
+                        by_server = upstream_types.setdefault(server, {})
+                        by_server[category] = by_server.get(category, 0) + 1
                 alerts.append(
                     {
                         "id": "high_error_rate",
@@ -84,6 +96,8 @@ class AlertEvaluator:
                             f"High MCP error rate ({err_pct}% > {self.rules.error_rate_pct_max}%)"
                         ),
                         "detail": f"{errors} failed/blocked calls in last {len(runs)} runs.",
+                        "error_types": error_types,
+                        "upstream_error_types": upstream_types,
                         "observed_at": now_iso,
                     }
                 )
@@ -162,6 +176,24 @@ class AlertEvaluator:
                 }
             )
 
+        for health in upstream_health or []:
+            if health.get("status") != "unhealthy":
+                continue
+            server = str(health.get("server") or "unknown")
+            alerts.append(
+                {
+                    "id": f"upstream_health:{server}",
+                    "severity": "critical",
+                    "title": f"Upstream health check failing: {server}",
+                    "detail": str(
+                        health.get("error") or health.get("error_type") or "Probe failed"
+                    ),
+                    "error_type": health.get("error_type"),
+                    "consecutive_failures": health.get("consecutive_failures", 0),
+                    "observed_at": now_iso,
+                }
+            )
+
         w_stat = str(worker_status.get("status") or "")
         if worker_status.get("mode") == "remote" and w_stat not in {"ok", "healthy", "connected"}:
             alerts.append(
@@ -175,7 +207,10 @@ class AlertEvaluator:
             )
 
         return alerts + self._evaluate_custom_rules(
-            runs=runs, startup_warnings=startup_warnings, now_iso=now_iso
+            runs=runs,
+            startup_warnings=startup_warnings,
+            now_iso=now_iso,
+            upstream_health=upstream_health or [],
         )
 
     def _evaluate_custom_rules(
@@ -184,6 +219,7 @@ class AlertEvaluator:
         runs: list[dict[str, Any]],
         startup_warnings: list[str],
         now_iso: str,
+        upstream_health: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         if not self.rules.custom_rules:
             return []
@@ -200,7 +236,12 @@ class AlertEvaluator:
         subcall_errors = float(
             sum(1 for r in runs if not r.get("ok") and not r.get("grounding_blocked"))
         )
-        upstream_down = float(len(startup_warnings))
+        upstream_down = float(
+            max(
+                len(startup_warnings),
+                sum(1 for health in upstream_health if health.get("status") == "unhealthy"),
+            )
+        )
 
         metric_values: dict[str, float] = {
             "error_rate_pct": err_pct,

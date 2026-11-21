@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -321,7 +322,7 @@ class UpstreamClientManager:
             return self._http_client
         if self._owned_client is None:
             self._owned_client = httpx.AsyncClient(
-                timeout=15.0,
+                timeout=120.0,
                 limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
             )
         return self._owned_client
@@ -344,9 +345,20 @@ class UpstreamClientManager:
         headers.pop("Mcp-Session-Id", None)
         propagate.inject(headers)
         client = self._get_client()
-        request = httpx.Request(method, url, headers=headers, **kwargs)
+        timeout_seconds = kwargs.pop("timeout_seconds", None)
+        if timeout_seconds is None:
+            request = httpx.Request(method, url, headers=headers, **kwargs)
+        else:
+            request = client.build_request(
+                method, url, headers=headers, timeout=timeout_seconds, **kwargs
+            )
         request.headers.pop("cookie", None)
         return await client.send(request, follow_redirects=False)
+
+    async def probe_health(self, url: str, *, timeout_seconds: float) -> httpx.Response:
+        """Issue a bounded unauthenticated health request through SSRF validation."""
+        async with asyncio.timeout(timeout_seconds):
+            return await self._request("GET", url)
 
     @staticmethod
     def filter_tools(upstream: UpstreamConfig, tools: list[DiscoveredTool]) -> list[DiscoveredTool]:
@@ -367,14 +379,15 @@ class UpstreamClientManager:
         *,
         apply_filters: bool = True,
     ) -> list[DiscoveredTool]:
-        if upstream.type == "mcp_http":
-            tools = await self._discover_mcp_http(upstream, auth_headers)
-        elif upstream.type == "mcp_stdio":
-            tools = await self._discover_mcp_stdio(upstream)
-        elif upstream.type == "openapi":
-            tools = await self._discover_openapi(upstream, auth_headers)
-        else:
-            raise ValueError(f"Unsupported upstream type '{upstream.type}'")
+        async with asyncio.timeout(upstream.request_timeout_seconds):
+            if upstream.type == "mcp_http":
+                tools = await self._discover_mcp_http(upstream, auth_headers)
+            elif upstream.type == "mcp_stdio":
+                tools = await self._discover_mcp_stdio(upstream)
+            elif upstream.type == "openapi":
+                tools = await self._discover_openapi(upstream, auth_headers)
+            else:
+                raise ValueError(f"Unsupported upstream type '{upstream.type}'")
         return self.filter_tools(upstream, tools) if apply_filters else tools
 
     async def call_tool(
@@ -384,13 +397,14 @@ class UpstreamClientManager:
         arguments: dict[str, Any],
         auth_headers: dict[str, str] | None = None,
     ) -> Any:
-        if upstream.type == "mcp_http":
-            return await self._call_mcp_http(upstream, tool, arguments, auth_headers)
-        if upstream.type == "mcp_stdio":
-            return await self._call_mcp_stdio(upstream, tool, arguments)
-        if upstream.type == "openapi":
-            return await self._call_openapi(upstream, tool, arguments, auth_headers)
-        raise ValueError(f"Unsupported upstream type '{upstream.type}'")
+        async with asyncio.timeout(upstream.request_timeout_seconds):
+            if upstream.type == "mcp_http":
+                return await self._call_mcp_http(upstream, tool, arguments, auth_headers)
+            if upstream.type == "mcp_stdio":
+                return await self._call_mcp_stdio(upstream, tool, arguments)
+            if upstream.type == "openapi":
+                return await self._call_openapi(upstream, tool, arguments, auth_headers)
+            raise ValueError(f"Unsupported upstream type '{upstream.type}'")
 
     async def _discover_mcp_http(
         self, upstream: UpstreamConfig, auth_headers: dict[str, str] | None
@@ -405,6 +419,7 @@ class UpstreamClientManager:
             "POST",
             upstream.url,
             headers=discover_headers,
+            timeout_seconds=upstream.request_timeout_seconds,
             json={
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -427,6 +442,7 @@ class UpstreamClientManager:
             "POST",
             upstream.url,
             headers=headers,
+            timeout_seconds=upstream.request_timeout_seconds,
             json={
                 "jsonrpc": "2.0",
                 "id": 2,
@@ -465,7 +481,13 @@ class UpstreamClientManager:
                 "arguments": arguments,
             },
         }
-        resp = await self._request("POST", upstream.url, headers=headers, json=payload)
+        resp = await self._request(
+            "POST",
+            upstream.url,
+            headers=headers,
+            timeout_seconds=upstream.request_timeout_seconds,
+            json=payload,
+        )
         resp.raise_for_status()
         _reject_mcp_session_header(resp, upstream.name)
         body = _parse_mcp_jsonrpc_response(resp)
@@ -545,7 +567,12 @@ class UpstreamClientManager:
         if upstream.openapi_spec is not None:
             spec = upstream.openapi_spec
         elif upstream.openapi_spec_url:
-            resp = await self._request("GET", upstream.openapi_spec_url, headers=auth_headers or {})
+            resp = await self._request(
+                "GET",
+                upstream.openapi_spec_url,
+                headers=auth_headers or {},
+                timeout_seconds=upstream.request_timeout_seconds,
+            )
             resp.raise_for_status()
             spec = yaml.safe_load(resp.text)
         else:
@@ -701,7 +728,11 @@ class UpstreamClientManager:
                 body[key] = val
 
         url = f"{upstream.url.rstrip('/')}/{resolved_path.lstrip('/')}"
-        req_kwargs: dict[str, Any] = {"headers": auth_headers or {}, "params": query or None}
+        req_kwargs: dict[str, Any] = {
+            "headers": auth_headers or {},
+            "params": query or None,
+            "timeout_seconds": upstream.request_timeout_seconds,
+        }
         if tool.has_body:
             req_kwargs["json"] = body.get("body") if list(body.keys()) == ["body"] else body
         resp = await self._request(tool.http_method, url, **req_kwargs)

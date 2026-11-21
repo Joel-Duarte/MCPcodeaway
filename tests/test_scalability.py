@@ -440,6 +440,23 @@ async def test_redis_cache_backend_with_fake_client() -> None:
         async def expire(self, key: str, ttl: int) -> None:
             _ = (key, ttl)
 
+        async def eval(self, script: str, numkeys: int, *args: object) -> int:
+            _ = script
+            assert numkeys == 1
+            key, now, expires, capacity, token, ttl = args
+            _ = ttl
+            bucket = self.zsets.setdefault(str(key), {})
+            self.zsets[str(key)] = {
+                member: score for member, score in bucket.items() if score > float(now)
+            }
+            if len(self.zsets[str(key)]) >= int(capacity):
+                return 0
+            self.zsets[str(key)][str(token)] = float(expires)
+            return 1
+
+        async def zrem(self, key: str, token: str) -> None:
+            self.zsets.get(key, {}).pop(token, None)
+
         async def aclose(self) -> None:
             self.closed = True
 
@@ -453,9 +470,24 @@ async def test_redis_cache_backend_with_fake_client() -> None:
     assert await cache.increment_window("rl:u1", 60) == 1
     assert await cache.increment_window("rl:u1", 60) == 2
     assert await cache.increment_window("rl:u1", 60) == 3
+    assert await cache.acquire_permit("upstream:crm", capacity=1, lease_seconds=30, token="one")
+    assert not await cache.acquire_permit("upstream:crm", capacity=1, lease_seconds=30, token="two")
+    await cache.release_permit("upstream:crm", "one")
+    assert await cache.acquire_permit("upstream:crm", capacity=1, lease_seconds=30, token="two")
 
     await cache.close()
     assert fake.closed
+
+
+async def test_in_memory_upstream_concurrency_permits_are_shared_and_released() -> None:
+    from gateway.state import InMemoryCacheBackend
+
+    cache = InMemoryCacheBackend()
+    assert await cache.acquire_permit("upstream:crm", capacity=2, lease_seconds=30, token="a")
+    assert await cache.acquire_permit("upstream:crm", capacity=2, lease_seconds=30, token="b")
+    assert not await cache.acquire_permit("upstream:crm", capacity=2, lease_seconds=30, token="c")
+    await cache.release_permit("upstream:crm", "a")
+    assert await cache.acquire_permit("upstream:crm", capacity=2, lease_seconds=30, token="c")
 
 
 async def test_redis_rate_limiter_reconnects_after_a_lost_connection(

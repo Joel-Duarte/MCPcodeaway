@@ -10,6 +10,13 @@ upstreams:
     allowed_operations: [list_crm_accounts]
     tool_effects:
       list_crm_accounts: read
+    health_check:
+      enabled: true
+      url: http://mock-backends:8001/crm/health
+      interval_seconds: 10
+      timeout_seconds: 1
+      failure_threshold: 1
+      success_threshold: 1
     mutating_tools: []
     enabled: true
 
@@ -29,4 +36,27 @@ upstreams:
         version: 1
         confirmation_message: "Approve readiness case for {customer_id}: {reason}"
         approver_groups: [operations-approvers]
+    enabled: true
+
+  - name: idempotency_api
+    type: openapi
+    url: http://mock-backends:8001
+    openapi_spec_url: http://mock-backends:8001/openapi.json
+    auth_type: api_key
+    secret_env_var: MOCK_IDEMPOTENCY_API_KEY
+    api_key_header: X-API-Key
+    allowed_roles: [ops_engineer, gateway_admin]
+    allowed_groups: [operations, platform-admins]
+    allowed_operations:
+      - create_idempotent_operation
+      - get_idempotent_operation_status
+      - get_idempotent_operation_metrics
+    tool_effects:
+      create_idempotent_operation: write
+      get_idempotent_operation_status: read
+      get_idempotent_operation_metrics: read
+    mutating_tools: [create_idempotent_operation]
+    request_timeout_seconds: 10
+    max_requests_per_minute: 30
+    max_concurrent_calls: 4
     enabled: true

@@ -96,6 +96,31 @@ class ToolApprovalPolicy(BaseModel):
         return self
 
 
+class UpstreamHealthCheckConfig(BaseModel):
+    """Optional unauthenticated HTTP probe for an upstream service."""
+
+    enabled: bool = False
+    url: str | None = None
+    interval_seconds: int = Field(default=30, ge=10, le=3600)
+    timeout_seconds: float = Field(default=3.0, ge=0.2, le=30.0)
+    failure_threshold: int = Field(default=3, ge=1, le=20)
+    success_threshold: int = Field(default=2, ge=1, le=20)
+
+    @model_validator(mode="after")
+    def _validate_health_check(self) -> UpstreamHealthCheckConfig:
+        if self.enabled and not self.url:
+            raise ValueError("enabled health checks require an explicit HTTP health URL")
+        if self.url:
+            parsed = urlsplit(self.url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("health check URL must be an absolute HTTP or HTTPS URL")
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                raise ValueError(
+                    "health check URL must not include credentials, query parameters, or fragments"
+                )
+        return self
+
+
 class UpstreamOAuthConfig(BaseModel):
     """Per-upstream OAuth / OIDC overrides for delegated, M2M, or user_oauth."""
 
@@ -142,6 +167,10 @@ class UpstreamConfig(BaseModel):
     abac_rules: list[AbacRuleConfig] = Field(default_factory=list)
     pinned_schema_digest: str | None = None
     ab_experiment: AbExperimentConfig | None = None
+    health_check: UpstreamHealthCheckConfig = Field(default_factory=UpstreamHealthCheckConfig)
+    request_timeout_seconds: float = Field(default=15.0, ge=0.2, le=120.0)
+    max_requests_per_minute: int | None = Field(default=120, ge=1, le=100_000)
+    max_concurrent_calls: int | None = Field(default=10, ge=1, le=10_000)
     enabled: bool = True
 
     @model_validator(mode="before")

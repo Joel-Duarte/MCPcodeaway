@@ -79,6 +79,8 @@ not a durable approval queue.
 | Flow | States and transitions | Owning code / representation |
 | --- | --- | --- |
 | Upstream discovery at startup | configured → discovered, skipped (preloaded or no discovery identity), or warning; warnings may retry in the background | `GatewayRuntime.refresh_catalog`, `_retry_failed_startup_upstreams`; catalog plus `startup_warnings` |
+| Configured upstream probe and circuit | unknown → healthy/degraded → unhealthy (open); consecutive successful probes return it to healthy (closed); disabled probes do not gate calls | `config.UpstreamHealthCheckConfig`, `monitoring.UpstreamHealthMonitor`; per-process status snapshots and probe task |
+| Downstream tool failure | success, or typed failure with safe message; transient read transport errors retry once; writes never retry and may mark outcome unknown; open probe circuit pauses calls until recovery threshold | `errors.classify_upstream_error`, `dispatcher.HostDispatcher.invoke_tool`; `SubcallRecord.error_type`, `retry_attempts`, and `outcome_unknown` |
 | Demo traffic | stopped ↔ running; start creates a task, stop cancels and joins it; tier selection changes the schedule | `demo_traffic.DemoTrafficRunner`; task presence currently represents running |
 | Adaptive evidence | imported → rejected or accepted; accepted rows qualify a model/workload after five matched pairs; qualified rows still need the joint quality floor and regression checks to recommend a mode | `adaptive_execution.summarize_pairs`; evidence rows and derived `qualification` / `recommended_mode` |
 | Adaptive rollout | Observe → Active → Observe; Active affects eligible Auto requests only, while Observe reports recommendations without applying them | `GatewaySettings`, `server` adaptive-execution routes and request selection |
@@ -89,7 +91,8 @@ not a durable approval queue.
 
 | Flow | States and transitions | Owning code / representation |
 | --- | --- | --- |
-| Onboarding wizard | Connect (inspect schema) → Policy (configure access and modes) → Test & Publish (test/evaluate/register); only a verified schema unlocks progression; inspect failure retains the draft and exposes an error | `web/app/pages/onboarding.vue`; `OnboardingStep` and `SchemaInspectionState` name the navigation and inspection states, with guarded transitions |
+| Onboarding wizard | Connect (inspect schema) → Policy (configure access, modes, and optional unauthenticated health URL) → Test & Publish (test/evaluate/register); only a verified schema unlocks progression; inspect failure retains the draft and exposes an error | `web/app/pages/onboarding.vue`; `OnboardingStep` and `SchemaInspectionState` name the navigation and inspection states, with guarded transitions |
+| Upstream operations view | loading → historical call summary plus optional live probe status and error-category breakdown; unavailable summary remains an actionable error | `web/app/pages/upstreams.vue`; `/admin/adaptive-execution/tool-health` |
 | Live telemetry | idle → connecting → live → reconnecting → connecting; explicit disconnect or an unbuildable URL ends retries | `web/app/composables/useUiAgent.ts`; `TelemetryConnectionState` is the exposed state, while the socket and timer own transport details |
 | Admin API load/save actions | idle → loading/saving → success or error; each page owns its data and error message | `web/app/pages/*.vue`, `web/app/composables/useAdminApi.ts`; page-local busy flags and result/error refs |
 | Agent confirmation prompt | no pending request → waiting for operator decision → allowed/denied; abort resolves as denied and clears the pending prompt | `web/app/composables/useUiAgent.ts`; pending request with a resolver |

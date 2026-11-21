@@ -18,7 +18,7 @@ their owning flow.
 | Adding or changing an upstream | [Operator onboarding and configuration](#6-operator-onboarding-and-configuration) |
 | The admin console or admin MCP endpoint | [Admin access and operations](#7-admin-access-and-operations) |
 | Audit, traces, metrics, and retention | [Evidence and operations flow](#8-evidence-and-operations-flow) |
-| Startup, readiness, or a failed request | [Gateway lifecycle and failure paths](#9-gateway-lifecycle-and-failure-paths) |
+| Startup, readiness, upstream outage, or recovery | [Gateway lifecycle and failure paths](#9-gateway-lifecycle-and-failure-paths) and [upstream monitoring](#11-upstream-monitoring-and-error-recovery) |
 | Which routes, pages, and tests cover a journey | [Flow inventory and coverage](#10-flow-inventory-and-coverage) |
 
 ## System at a glance
@@ -233,7 +233,12 @@ flowchart LR
     Inspect -->|error / unsafe URL| Fix[Show issue; keep draft]
     Inspect -->|valid| Curate[Select operations and configure policy]
     Curate --> Auth[Configure auth, roles, groups, ABAC, effects]
-    Auth --> Test[Test call or Classic vs Code Mode evaluation]
+    Auth --> Probe{Configure an active health URL?}
+    Probe -->|No| Passive[Use observed call failures only]
+    Probe -->|Yes| ProbeConfig[Set unauthenticated GET URL and interval]
+    ProbeConfig --> Test
+    Passive --> Test
+    Test[Test call or Classic vs Code Mode evaluation]
     Test --> Review[Review generated config and checklist]
     Review --> Save[Admin save or export YAML]
     Save --> Refresh[Registry/catalog refresh]
@@ -402,7 +407,10 @@ authenticated and authorized again using that request's identity.
 | Obtain and inspect caller identity | IdP token → `GET /auth/me` → `POST /mcp` | Invalid signature/issuer/audience/expiry → 401; unapproved tenant → 403; valid claims map to roles, groups, scopes, client, and tenant. | `gateway.auth`; `tests/test_auth_obo.py`, `tests/test_mock_oidc_provider.py` |
 | Use local development identity | `GET /dev/oidc/jwks`, `POST /dev/auth/token` | Enabled only for development profiles; unknown persona or disabled endpoint is rejected. | `gateway.oauth_discovery`; `tests/test_auth_obo.py` |
 | Connect an agent and discover tools | `POST /mcp` with current MCP metadata and headers | `server/discover`, `tools/list`, paginated/deferred discovery, intent-filtered surface; malformed or old protocol metadata is rejected. | `gateway.server`, `gateway.catalog`, `gateway.discovery`; `tests/test_discovery_system1.py`, `tests/test_profiles_and_observability.py` |
+| Reject invalid caller, protocol, or tool input | `POST /mcp` → authentication and protocol boundary → schema validation | Invalid bearer is HTTP 401; unsupported protocol version is HTTP 400; missing required tool input returns JSON-RPC invalid-params without dispatch. | `tests/golden/flows.json` (`mcp_invalid_bearer_fails_closed`, `mcp_unsupported_protocol_version_rejected`, `mcp_missing_required_tool_argument_rejected`); `tests/test_golden_flows.py` |
 | Make a direct tool call | `POST /mcp` → `tools/call` | Allow/deny; argument validation; approval gate; upstream success/error; filtered and redacted result. | Sections 1–5; `tests/test_golden_flows.py`, `tests/test_gateway_modes_e2e.py` |
+| Recover from an upstream call failure | Direct tool or Code Mode callback → typed error contract | One retry for transient read failures; no write replay; uncertain write outcomes disclosed; configured probe circuit pauses and resumes traffic. | Section 11; `tests/test_upstream_recovery_golden.py`, `tests/test_upstream_monitoring.py` |
+| Monitor an upstream API | Onboarding health config → background probe → health table / alert | Off by default; SSRF validation; degraded/unhealthy/recovery thresholds; no caller credential reuse. | `gateway.monitoring`, `gateway.alerts`; golden recovery flows and `tests/test_upstream_monitoring.py` |
 | Hit caller rate or gateway concurrency limits | `POST /mcp` → dispatcher sliding-window check or concurrency middleware | Per `(tenant, subject)` call limit produces a tool error; saturated gateway returns HTTP 503 with `Retry-After: 1`. | `gateway.dispatcher`, `gateway.state`, `gateway.server`; `tests/test_scalability.py`, `tests/test_golden_flows.py` |
 | Use Code Mode for a multi-tool workflow | `POST /mcp` → `execute_code` → host callbacks | Sandbox timeout/call budget; callback auth/validation; partial upstream failure; provenance/grounding pass or block. | `gateway.sandbox`, `gateway.dispatcher`; `tests/test_sandbox_security.py`, `tests/test_provenance_and_axes.py`, `tests/test_gateway_modes_e2e.py` |
 | Link a personal downstream credential | `/auth/connect/{upstream}`, callback or secret form, `/me/connections` | Signed/expired ticket; OAuth state and PKCE validation; token exchange error; encrypted save; list, replace, delete, refresh/expiry, missing credential and retry. | Section 3; `gateway.user_connect`; `tests/test_user_connect.py`, `tests/test_crypto_secrets.py` |
@@ -447,7 +455,7 @@ through the GitOps path and a deployment loads it at startup.
 | Operate alerts, demo traffic, and alerts webhook | `/admin/alerts*`, `/admin/demo/traffic*`, `/admin/demo/models*` | Start/stop/tier/burst; threshold/no alert; webhook cooldown, unsafe URL or delivery error. | `gateway.alerts`, `gateway.demo_traffic`; `tests/test_phase15_ops_and_compliance.py`, `tests/test_phase11_scaling_analytics_ab.py` |
 | Use admin MCP tools | `POST /admin/mcp` → `server/discover`, `tools/list`, `tools/call` | Admin/viewer authorization; read-only vs mutating tool; permission/error result. | `gateway.admin_mcp`; `tests/test_adaptive_execution.py`, `tests/test_phase15_ops_and_compliance.py` |
 | Use optional dashboard, compare, and benchmark surfaces | `/dashboard/*`, `/compare/run`, `/benchmarks/latest` | Available only in profiles with features enabled; production barebones profile returns 404 for disabled surfaces. | `gateway.profiles`, `gateway.server`; `tests/test_profiles_and_observability.py`, `tests/test_golden_flows.py` |
-| Scale replicas and isolate execution | Gateway HTTP replicas, Redis/Postgres, local or remote sandbox worker | Catalog epoch sync; OBO/rate-limit isolation; worker unavailable; shared dependency loss; clean shutdown. | `docs/cloud_scalability.md`; `tests/test_cross_replica_isolation.py`, `tests/test_scalability.py`, `tests/test_provenance_and_axes.py` |
+| Scale replicas and isolate execution | Gateway HTTP replicas, Redis/Postgres, local or remote sandbox worker | Catalog epoch sync; OBO/rate-limit isolation; worker unavailable; shared dependency loss; clean shutdown; upstream circuit convergence and recovery through the load balancer. | `docs/cloud_scalability.md`; `tests/test_cross_replica_isolation.py`, `tests/test_scalability.py`, `tests/test_upstream_recovery_golden.py`, `scripts/readiness_smoke.py` |
 | Recover startup discovery after a transient outage | Startup discovery → warning → bounded rediscovery → catalog restored | Discovery succeeds after an initial failure; warning clears after recovery; retries stop after bounded attempts. | `GatewayRuntime._retry_failed_startup_upstreams`; `tests/test_golden_flows.py::test_startup_discovery_recovers_after_transient_failure` |
 
 ### Full externally visible route map
@@ -489,7 +497,7 @@ resolves the step as allowed, decline or abort resolves it as denied. This UI
 confirmation is separate from the gateway's server-enforced tool approval
 policy in section 5.
 
-## 11. Upstream availability: implemented behavior and missing flow
+## 11. Upstream monitoring and error recovery
 
 The current health behavior should be read as three separate signals:
 
@@ -497,27 +505,81 @@ The current health behavior should be read as three separate signals:
 | --- | --- | --- |
 | Gateway liveness (`GET /health`) | Reports gateway status; production response is intentionally minimal. Non-production responses include profile, catalog and startup warning details. | It does not establish that every downstream API is reachable. |
 | Gateway readiness (`GET /ready`) | Requires lifecycle state `ready`; checks configured Redis and Postgres dependencies with a bounded probe. | It does not probe configured upstreams. A single upstream outage does not make the gateway unready. |
-| Upstream reachability | Startup catalog discovery reports warnings and retries failed discovery on a short bounded schedule; calls report their own upstream errors; admin tool-health summaries derive from observed call records. | There is no general periodic active probe, per-upstream circuit breaker, or generic automatic retry for ordinary tool calls. |
+| Upstream reachability | Optional configured GET probes run at each upstream's interval. The URL is explicit, SSRF-validated, and called without caller credentials. | A probe is only as representative as the health URL an operator chooses; it does not replace the real tool-call result. |
+| Caller-facing failures | The gateway returns a stable `error_type`, safe message, retry eligibility, retry count, status code when available, and write-outcome uncertainty. MCP tool error text is redacted and preserved for the agent. | Raw transport exception text and secrets are not exposed. A failed write is never replayed automatically. |
+| Admin visibility | `/admin/adaptive-execution/tool-health` includes per-tool error-category counts and current probe state; `/admin/alerts` includes category breakdowns and alerts on unhealthy probes. | Historical categories depend on telemetry captured after this change; older runs do not have categories. |
 
-The existing recovery flow is **startup discovery failure → warning → bounded
-background rediscovery → catalog refreshed and warning cleared**. The existing
-test is `test_startup_discovery_recovers_after_transient_failure` in
-`tests/test_golden_flows.py`. Recovery after a backend fails during a live user
-call is a different journey: it currently ends in a tool/protocol error and a
-later call can succeed once the backend recovers, but the gateway does not run a
-continuous per-upstream recovery loop.
+The startup recovery flow remains **discovery failure → warning → bounded
+background rediscovery → catalog refreshed and warning cleared**. Separately,
+configured active probes run continuously. Probe state begins `unknown`, becomes
+`degraded` after an initial failure, opens a per-process circuit after the
+consecutive-failure threshold, and closes it after the consecutive-success
+threshold. While open, calls return `upstream_unhealthy`; probes continue so
+recovery can restore traffic. Circuit state is held in each gateway process and
+is not shared between replicas.
 
-For the current implementation, client-visible tool-call failures should be
-treated as outcomes for that request. The caller may decide to retry. The
-gateway must not imply that every error is safe to retry: a write can have
-completed even when its response was lost. Add an explicit, bounded retry
-contract only with idempotency rules and tests for ambiguous write outcomes.
+For recognized transient transport failures (timeout, connection failure, HTTP
+429/502/503/504), a read-classified tool receives one gateway retry after a
+short delay. Writes are never automatically retried. For a timeout on a write,
+the response marks `outcome_unknown`; the agent should inspect state before
+deciding whether to repeat the action. Other errors preserve their typed cause
+for the agent and are not automatically replayed.
 
-Future active health checking would need an upstream-configured probe (or an
-explicitly selected read-only operation), interval and timeout, status freshness,
-failure threshold, recovery threshold, and operator visibility. That is a
-design gap, not a flow the gateway currently implements. Keep it distinct from
-`/ready`; do not claim “healthy” based only on a stale startup discovery.
+Probe state remains distinct from gateway readiness: an unavailable downstream
+does not make `/ready` fail. The onboarding form defaults active checking off;
+when enabled, it uses a 30-second interval, 3-second timeout, 3-failure open
+threshold, and 2-success recovery threshold. The API allows bounded interval,
+timeout, and threshold customization. A dedicated probe should not require
+per-user credentials, which are unavailable to a background health task.
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant G as Gateway
+    participant U as Upstream API
+    participant M as Health monitor
+    participant O as Admin console / alerts
+    A->>G: Call tool
+    G->>G: Authorize, validate, check configured circuit
+    alt Circuit open
+        G-->>A: upstream_unhealthy; no upstream call
+    else Circuit closed
+        G->>U: Invoke tool
+        alt Transient error on a read
+            U-->>G: Timeout, connection error, or retryable HTTP status
+            G->>U: Retry once
+            U-->>G: Result or typed failure
+        else Write failure
+            U-->>G: Error or lost response
+            G-->>A: Typed failure; outcome_unknown when delivery is uncertain
+        else Success
+            U-->>G: Tool result
+            G-->>A: Filtered, redacted result
+        end
+    end
+    loop Configured probe interval
+        M->>U: Unauthenticated GET to health URL
+        alt Success threshold reached
+            M->>G: Close circuit and mark healthy
+        else Failure threshold reached
+            M->>G: Open circuit and mark unhealthy
+        end
+        O->>G: Poll tool-health and alerts endpoints
+        G-->>O: Probe state, error categories, and alert evidence
+    end
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> unknown: Active probe disabled or not run
+    unknown --> healthy: Probe returns HTTP 2xx
+    unknown --> degraded: Probe fails before threshold
+    healthy --> degraded: Probe failure
+    degraded --> unhealthy: Failure threshold reached / circuit opens
+    unhealthy --> healthy: Success threshold reached / circuit closes
+    healthy --> healthy: Probe succeeds
+    degraded --> healthy: Recovery threshold reached
+```
 
 ## Executable journey crosswalk
 
@@ -537,6 +599,7 @@ the corresponding runner supports it.
 | OIDC admin login/session | [`test_oidc_golden_flows.py`](../tests/test_oidc_golden_flows.py) |
 | Downstream authentication variants | [`docs/auth_spectrum_flows.md`](auth_spectrum_flows.md), [`tests/test_auth_spectrum_golden.py`](../tests/test_auth_spectrum_golden.py) |
 | Per-user OAuth/API-key connections | [`tests/test_user_connect.py`](../tests/test_user_connect.py) |
+| Error categories, safe retry, probe thresholds, ambiguous write outcome, and circuit recovery | [`tests/test_upstream_monitoring.py`](../tests/test_upstream_monitoring.py), [`tests/test_upstream_recovery_golden.py`](../tests/test_upstream_recovery_golden.py), scaled [`scripts/readiness_smoke.py`](../scripts/readiness_smoke.py) |
 
 ## Code and documentation index
 
@@ -548,6 +611,9 @@ the corresponding runner supports it.
 - Discovery and upstream transport:
   [`src/gateway/discovery.py`](../src/gateway/discovery.py),
   [`src/gateway/upstream_clients.py`](../src/gateway/upstream_clients.py)
+- Failure classification and upstream health monitoring:
+  [`src/gateway/errors.py`](../src/gateway/errors.py),
+  [`src/gateway/monitoring.py`](../src/gateway/monitoring.py)
 - Credential selection and dispatch:
   [`src/gateway/dispatcher.py`](../src/gateway/dispatcher.py),
   [`src/gateway/secrets.py`](../src/gateway/secrets.py),

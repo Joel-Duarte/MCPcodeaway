@@ -16,9 +16,10 @@ from urllib.parse import parse_qs, urlencode
 
 import httpx
 import jwt
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.security import APIKeyHeader
 from jwt.algorithms import RSAAlgorithm
 from pydantic import BaseModel
 
@@ -62,6 +63,12 @@ class CustomerRecord(BaseModel):
     region: str
     contact_email: str
     tier: str
+
+
+class IdempotencyOperationRequest(BaseModel):
+    idempotency_key: str
+    item_id: str
+    simulate_lost_response: bool = False
 
 
 _READINESS_OIDC_IDENTITIES: dict[str, dict[str, Any]] = {
@@ -542,10 +549,99 @@ def create_mock_backends_app(
         _seed_enterprise_data()
     )
     readiness_approval_cases: list[dict[str, Any]] = []
+    readiness_crm_health = {"available": True}
+    idempotency_operations: dict[str, dict[str, Any]] = {}
+    idempotency_side_effects = {"count": 0}
     bulk_ledger, bulk_invoices_by_region = _seed_bulk_data()
     collection_cases: list[dict[str, Any]] = []
 
     app = FastAPI(title="Enterprise Mock Backends", version="0.1.0")
+    idempotency_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+    def _require_idempotency_api_key(x_api_key: str | None) -> None:
+        expected = os.getenv("MOCK_IDEMPOTENCY_API_KEY", "mock-idempotency-key")
+        if x_api_key != expected:
+            raise HTTPException(status_code=401, detail="Invalid mock API key")
+
+    @app.post("/idempotency/operations", operation_id="create_idempotent_operation")
+    async def create_idempotent_operation(
+        payload: IdempotencyOperationRequest,
+        x_api_key: str | None = Security(idempotency_key_header),
+    ) -> dict[str, Any]:
+        _require_idempotency_api_key(x_api_key)
+        key = payload.idempotency_key.strip()
+        item_id = payload.item_id.strip()
+        if not key or not item_id:
+            raise HTTPException(status_code=422, detail="idempotency_key and item_id are required")
+        fingerprint = hashlib.sha256(
+            json.dumps({"item_id": item_id}, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        existing = idempotency_operations.get(key)
+        if existing is not None:
+            if existing["fingerprint"] != fingerprint:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency key was already used with a different request",
+                )
+            return {**existing["result"], "replayed": True}
+
+        idempotency_side_effects["count"] += 1
+        result = {
+            "operation_id": f"OP-{idempotency_side_effects['count']:06d}",
+            "idempotency_key": key,
+            "item_id": item_id,
+            "status": "committed",
+            "replayed": False,
+        }
+        idempotency_operations[key] = {"fingerprint": fingerprint, "result": result}
+        if payload.simulate_lost_response:
+            raise HTTPException(status_code=504, detail="Simulated response loss after commit")
+        return result
+
+    @app.get(
+        "/idempotency/operations/{idempotency_key}", operation_id="get_idempotent_operation_status"
+    )
+    async def get_idempotent_operation_status(
+        idempotency_key: str, x_api_key: str | None = Security(idempotency_key_header)
+    ) -> dict[str, Any]:
+        _require_idempotency_api_key(x_api_key)
+        operation = idempotency_operations.get(idempotency_key)
+        if operation is None:
+            raise HTTPException(status_code=404, detail="Operation not found")
+        return {**operation["result"], "replayed": False}
+
+    @app.get("/idempotency/metrics", operation_id="get_idempotent_operation_metrics")
+    async def get_idempotent_operation_metrics(
+        x_api_key: str | None = Security(idempotency_key_header),
+    ) -> dict[str, int]:
+        _require_idempotency_api_key(x_api_key)
+        return {
+            "side_effect_count": idempotency_side_effects["count"],
+            "operation_count": len(idempotency_operations),
+        }
+
+    @app.middleware("http")
+    async def readiness_crm_fault(request: Request, call_next):
+        if (
+            os.getenv("MOCK_ENABLE_READINESS_FAILURE_CONTROLS", "false").lower() == "true"
+            and request.url.path.startswith("/crm/")
+            and not readiness_crm_health["available"]
+        ):
+            return JSONResponse(
+                {"detail": "Readiness CRM fixture is intentionally unavailable"},
+                status_code=503,
+            )
+        return await call_next(request)
+
+    @app.post("/readiness/test/upstream-health")
+    async def set_readiness_crm_health(payload: dict[str, Any]) -> dict[str, bool]:
+        if os.getenv("MOCK_ENABLE_READINESS_FAILURE_CONTROLS", "false").lower() != "true":
+            raise HTTPException(status_code=404, detail="Readiness failure controls are disabled")
+        available = payload.get("available")
+        if not isinstance(available, bool):
+            raise HTTPException(status_code=422, detail="available must be a boolean")
+        readiness_crm_health["available"] = available
+        return {"available": available}
 
     snowflake_tools = [
         {
