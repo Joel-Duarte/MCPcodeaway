@@ -22,6 +22,5 @@ export default defineNuxtRouteMiddleware(async (to) => {
       return navigateTo("/");
     }
   } catch {
-    // Allow navigation to proceed cleanly; the active view will render an actionable banner if gateway is unreachable.
   }
 });

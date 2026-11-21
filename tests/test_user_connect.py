@@ -134,7 +134,6 @@ def test_user_api_key_user_oauth_client_credentials_and_admin_secrets(
         user_a_tok = runtime.dev_keys.issue_user_token(persona="finance_analyst")
         user_b_tok = runtime.dev_keys.issue_user_token(persona="eu_accountant")
 
-        # 1. /admin/secrets RBAC & vault:// storage
         r_forbid = client.put(
             "/admin/secrets/jira_shared",
             headers={"Authorization": f"Bearer {viewer_tok}"},
@@ -156,7 +155,6 @@ def test_user_api_key_user_oauth_client_credentials_and_admin_secrets(
         assert r_list.json()["secrets"][0]["name"] == "jira_shared"
         assert "secret-val" not in r_list.text
 
-        # 2. Register upstreams for user_api_key, user_oauth, and client_credentials
         pat_up = UpstreamConfig(
             name="personal_jira",
             type="openapi",
@@ -192,7 +190,6 @@ def test_user_api_key_user_oauth_client_credentials_and_admin_secrets(
         for cfg in (pat_up, oauth_up, m2m_up):
             runtime.registry.upsert(cfg)
 
-        # 3. client_credentials resolves and caches M2M token
         import asyncio
 
         id_a = asyncio.run(runtime.validator.validate_token(user_a_tok))
@@ -203,7 +200,6 @@ def test_user_api_key_user_oauth_client_credentials_and_admin_secrets(
         assert hit1 is False
         assert hit2 is True
 
-        # 4. user_api_key: missing -> UserCredentialRequiredError -> connect -> works
         with pytest.raises(UserCredentialRequiredError) as exc_info:
             asyncio.run(runtime.dispatcher.resolve_upstream_headers(id_a, pat_up))
         connect_url = exc_info.value.connect_url
@@ -222,11 +218,9 @@ def test_user_api_key_user_oauth_client_credentials_and_admin_secrets(
         h_pat, _, _ = asyncio.run(runtime.dispatcher.resolve_upstream_headers(id_a, pat_up))
         assert h_pat == {"X-Jira-Token": "pat-alice-999"}
 
-        # User B is isolated from User A's PAT
         with pytest.raises(UserCredentialRequiredError):
             asyncio.run(runtime.dispatcher.resolve_upstream_headers(id_b, pat_up))
 
-        # 5. user_oauth: PKCE redirect -> callback -> resolve -> refresh when near expiry
         r_me = client.get("/me/connections", headers={"Authorization": f"Bearer {user_a_tok}"})
         assert r_me.status_code == 200
         gh_conn = [
@@ -244,13 +238,11 @@ def test_user_api_key_user_oauth_client_credentials_and_admin_secrets(
         r_cb = client.get(f"/auth/connect/external_github/callback?code=auth-code-1&state={state}")
         assert r_cb.status_code == 200
 
-        # expires_in=10 is within 30s refresh window, so this triggers refresh_token
         h_oauth, _, _ = asyncio.run(runtime.dispatcher.resolve_upstream_headers(id_a, oauth_up))
         assert h_oauth == {"Authorization": "Bearer user-oauth-tok-2"}
         assert "authorization_code" in oauth_calls
         assert "refresh_token" in oauth_calls
 
-        # Delete connection
         r_del = client.delete(
             "/me/connections/external_github",
             headers={"Authorization": f"Bearer {user_a_tok}"},

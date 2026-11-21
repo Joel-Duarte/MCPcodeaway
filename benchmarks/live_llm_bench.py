@@ -658,7 +658,6 @@ async def _call_openai_loop(
                 if isinstance(sc, dict) and isinstance(sc.get("_provenance"), dict):
                     provenance_states.append(bool(sc["_provenance"].get("grounded")))
 
-                # Deferred tool hydration for classic deferred / x_intent discovery
                 if (
                     exec_axis == "classic"
                     and fn["name"] == "search_tools"

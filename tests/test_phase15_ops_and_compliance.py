@@ -56,7 +56,6 @@ def test_admin_upstreams_filtering_and_audit_archive(tmp_path) -> None:
     )
     app = create_gateway_app(settings=settings)
     with TestClient(app) as client:
-        # 1. Verify /admin/upstreams search, filter & pagination
         res = client.get("/admin/upstreams?q=billing&page=1&page_size=1")
         assert res.status_code == 200
         body = res.json()
@@ -66,7 +65,6 @@ def test_admin_upstreams_filtering_and_audit_archive(tmp_path) -> None:
         assert "facets" in body
         assert "groups" in body["facets"]
 
-        # 2. Seed an aged run directly via runtime store and test archive-before-purge
         runtime = app.state.runtime
         old_ts = (datetime.now(UTC) - timedelta(days=120)).isoformat()
         client.portal.call(
@@ -89,7 +87,6 @@ def test_admin_upstreams_filtering_and_audit_archive(tmp_path) -> None:
         assert arch_data["sha256"]
         assert "run-old-archive-test" in (arch_data["jsonl_content"] or "")
 
-        # 3. Retention policy schedule + 1-click optimize-mode + fuzzy analytics
         pol = client.post("/admin/audit/retention-policy?retention_days=60&auto_interval=daily")
         assert pol.status_code == 200
         assert pol.json()["policy"]["auto_interval"] == "daily"
@@ -140,7 +137,6 @@ def test_admin_upstreams_filtering_and_audit_archive(tmp_path) -> None:
         assert fdata["summary"]["total_runs"] >= 1
         assert fdata["timeline_by_group"][0]["group"] == "finance"
 
-        # 4. Self-Admin MCP admin_save_upstream and read-only optimize-mode (no AttributeError)
         mcp_save = client.post(
             "/admin/mcp",
             headers=request_headers("tools/call", tool_name="admin_save_upstream"),
@@ -205,13 +201,11 @@ def test_operator_viewer_rbac_and_audit_redaction_and_ssrf_rebinding(tmp_path) -
             }
         )
         viewer_headers = {"Authorization": f"Bearer {viewer_tok}"}
-        # operator_viewer is permitted on read-only /admin/* routes, denied on mutating /admin/*
         assert client.get("/admin/upstreams", headers=viewer_headers).status_code == 200
         assert client.get("/admin/telemetry/runtime", headers=viewer_headers).status_code == 200
         assert client.get("/admin/alerts", headers=viewer_headers).status_code == 200
         assert client.post("/admin/catalog/refresh", headers=viewer_headers).status_code == 403
 
-        # Audit store redacts secrets in code and error strings before writing to SQLite
         fin_id = client.portal.call(
             rt.validator.validate_token,
             rt.dev_keys.issue_user_token(persona="finance_analyst"),

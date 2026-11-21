@@ -999,7 +999,6 @@ def create_mock_backends_app(
         ),
     )
 
-    # Standalone Mock OIDC Provider mounted at /oidc on the mock test server (:8001)
     mock_oidc_issuer = os.getenv("MOCK_OIDC_ISSUER", "http://127.0.0.1:8001/oidc").rstrip("/")
     mock_oidc_keys = LocalDevKeyManager(issuer=mock_oidc_issuer)
     mock_oidc_audience = os.getenv("MOCK_OIDC_AUDIENCE", "api://mcp-code-gateway")

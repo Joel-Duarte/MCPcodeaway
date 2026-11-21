@@ -241,7 +241,6 @@ def create_mock_idp_app(state: MockIdpState | None = None) -> FastAPI:
         if grant_type == "urn:ietf:params:oauth:grant-type:token-exchange":
             if not subject_token:
                 raise HTTPException(status_code=400, detail="subject_token required")
-            # Keycloak can broker both Keycloak and Entra-issued subject tokens
             claims: dict[str, Any] | None = None
             for iss in (KEYCLOAK_ISSUER, ENTRA_ISSUER):
                 try:
@@ -319,7 +318,6 @@ def create_mock_idp_app(state: MockIdpState | None = None) -> FastAPI:
             refresh = f"ext_ref_{secrets.token_urlsafe(12)}"
             idp.external_tokens[access] = {"user": user}
             idp.refresh_tokens[refresh] = {"user": user, "client_id": client_id}
-            # Short TTL (10s) so tests can observe automatic refresh_token rotation
             return {
                 "access_token": access,
                 "refresh_token": refresh,

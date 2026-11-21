@@ -38,7 +38,6 @@ def create_auth_spectrum_services(idp: MockIdpState) -> dict[str, FastAPI]:
     """Create 8 standalone OpenAPI FastAPI apps covering every auth_type & dialect."""
     services: dict[str, FastAPI] = {}
 
-    # 1. Entra v2 OBO (delegated_token + entra_v2_obo)
     inv_obo = FastAPI(title="Inventory Entra OBO API", version="1.0.0")
 
     @inv_obo.get("/items", operation_id="list_inventory_items")
@@ -60,7 +59,6 @@ def create_auth_spectrum_services(idp: MockIdpState) -> dict[str, FastAPI]:
 
     services["inventory_obo"] = inv_obo
 
-    # 2. Keycloak RFC 8693 (delegated_token + rfc8693)
     tax_kc = FastAPI(title="Tax Keycloak RFC 8693 API", version="1.0.0")
     rates = {"us": 0.08, "eu": 0.20, "uk": 0.20}
 
@@ -106,7 +104,6 @@ def create_auth_spectrum_services(idp: MockIdpState) -> dict[str, FastAPI]:
 
     services["tax_keycloak"] = tax_kc
 
-    # 3. Downstream M2M (client_credentials)
     metrics_m2m = FastAPI(title="Metrics M2M API", version="1.0.0")
 
     @metrics_m2m.get("/summary", operation_id="get_metrics_summary")
@@ -142,7 +139,6 @@ def create_auth_spectrum_services(idp: MockIdpState) -> dict[str, FastAPI]:
 
     services["metrics_m2m"] = metrics_m2m
 
-    # 4. Shared API Key (api_key via vault://)
     inv_apikey = FastAPI(title="Inventory API Key Service", version="1.0.0")
 
     @inv_apikey.get("/items/{item_id}/value", operation_id="get_item_value")
@@ -155,7 +151,6 @@ def create_auth_spectrum_services(idp: MockIdpState) -> dict[str, FastAPI]:
 
     services["inventory_apikey"] = inv_apikey
 
-    # 5. Shared Bearer Secret (bearer_secret via file://)
     tax_bearer = FastAPI(title="Tax Bearer Secret Service", version="1.0.0")
 
     @tax_bearer.get("/summary", operation_id="get_tax_summary")
@@ -167,7 +162,6 @@ def create_auth_spectrum_services(idp: MockIdpState) -> dict[str, FastAPI]:
 
     services["tax_bearer"] = tax_bearer
 
-    # 6. Per-User External OAuth (user_oauth)
     ext_oauth = FastAPI(title="External OAuth User Service", version="1.0.0")
 
     @ext_oauth.get("/profile", operation_id="get_external_profile")
@@ -180,7 +174,6 @@ def create_auth_spectrum_services(idp: MockIdpState) -> dict[str, FastAPI]:
 
     services["external_oauth"] = ext_oauth
 
-    # 7. Per-User Personal API Key (user_api_key)
     ext_pat = FastAPI(title="External Personal PAT Service", version="1.0.0")
 
     @ext_pat.get("/notes", operation_id="list_personal_notes")
@@ -198,7 +191,6 @@ def create_auth_spectrum_services(idp: MockIdpState) -> dict[str, FastAPI]:
 
     services["external_pat"] = ext_pat
 
-    # 8. Open Downstream Sandbox (none)
     sandbox_open = FastAPI(title="Open Sandbox Service", version="1.0.0")
 
     @sandbox_open.get("/ping", operation_id="ping_sandbox")

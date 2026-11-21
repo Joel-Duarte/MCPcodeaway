@@ -157,7 +157,6 @@ async def test_list_servers_ceiling_and_execute_code_scoping(tmp_path) -> None:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"
         ) as client:
-            # 1. list_servers respects RBAC (finance_analyst sees 3 finance servers, not ops)
             ls_res = await _mcp_post(
                 client,
                 fin_token,
@@ -170,7 +169,6 @@ async def test_list_servers_ceiling_and_execute_code_scoping(tmp_path) -> None:
             assert {"snowflake_ledger", "billing_legacy_eu", "billing_legacy_us"} <= srv_names
             assert "ops_ticketing" not in srv_names
 
-            # 2. Request ceiling ?servers=snowflake_ledger hides billing_legacy_eu everywhere
             ceiled_ls = await _mcp_post(
                 client,
                 fin_token,
@@ -194,7 +192,6 @@ async def test_list_servers_ceiling_and_execute_code_scoping(tmp_path) -> None:
             }
             assert "billing_legacy_eu" not in returned_servers
 
-            # 3. execute_code cannot bypass request ceiling even when requesting billing_legacy_eu
             blocked_exec = await _mcp_post(
                 client,
                 fin_token,
@@ -210,7 +207,6 @@ async def test_list_servers_ceiling_and_execute_code_scoping(tmp_path) -> None:
             )
             assert blocked_exec["result"]["isError"] is True
 
-            # 4. execute_code optional `servers=[...]` narrows tools when no URL ceiling is set
             narrow_fail = await _mcp_post(
                 client,
                 fin_token,
@@ -256,7 +252,6 @@ async def test_traditional_discover_server_discover_and_pagination(tmp_path) -> 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"
         ) as client:
-            # MCP v2 server/discover metadata
             disc = await _mcp_post(client, fin_token, "server/discover")
             disc_res = disc["result"]
             assert disc_res["supportedVersions"] == ["2026-07-28"]
@@ -268,14 +263,12 @@ async def test_traditional_discover_server_discover_and_pagination(tmp_path) -> 
             )
             assert "list_servers for optional browsing" in disc_res["instructions"]
 
-            # traditional_discover exposes ONLY list_servers + search_tools upfront
             td_list = await _mcp_post(
                 client, fin_token, "tools/list", query="mode=traditional_discover"
             )
             td_names = [t["name"] for t in td_list["result"]["tools"]]
             assert td_names == ["list_servers", "search_tools"]
 
-            # search_tools in traditional_discover returns hydrated_tools with JSON schemas
             td_search = await _mcp_post(
                 client,
                 fin_token,
@@ -288,7 +281,6 @@ async def test_traditional_discover_server_discover_and_pagination(tmp_path) -> 
             assert "billing_legacy_eu__list_eu_invoices" in hydrated
             assert "inputSchema" in hydrated["billing_legacy_eu__list_eu_invoices"]
 
-            # Direct execution of hydrated tool works in traditional_discover mode
             call_res = await _mcp_post(
                 client,
                 fin_token,
@@ -299,7 +291,6 @@ async def test_traditional_discover_server_discover_and_pagination(tmp_path) -> 
             assert call_res["result"]["isError"] is False
             assert call_res["result"]["structuredContent"]["ok"] is True
 
-            # Pagination + server filtering on traditional tools/list
             p1 = await _mcp_post(
                 client, fin_token, "tools/list", {"limit": 3}, query="mode=traditional"
             )
@@ -527,7 +518,6 @@ async def test_bm25_and_x_intent_header_discovery(tmp_path) -> None:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"
         ) as client:
-            # 1. BM25 semantic ranking
             bm25_res = await _mcp_post(
                 client,
                 fin_token,
@@ -539,7 +529,6 @@ async def test_bm25_and_x_intent_header_discovery(tmp_path) -> None:
             assert bm25_sc["backend_used"] == "bm25"
             assert bm25_sc["tools"][0]["qualified_name"].startswith("snowflake_ledger__")
 
-            # 2. X-Intent in traditional_discover pre-hydrates matching tools with full JSON schemas
             td_intent = await _mcp_post(
                 client,
                 fin_token,
@@ -552,7 +541,6 @@ async def test_bm25_and_x_intent_header_discovery(tmp_path) -> None:
             assert "search_tools" in td_tool_names
             assert "billing_legacy_eu__list_eu_invoices" in td_tool_names
 
-            # 3. X-Intent in codemode keeps 3-tool surface & inlines Python stub in execute_code
             cm_intent = await _mcp_post(
                 client,
                 fin_token,

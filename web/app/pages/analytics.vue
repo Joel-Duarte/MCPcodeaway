@@ -283,7 +283,6 @@ function formatUsd(n: number | undefined): string {
       </div>
     </div>
 
-    <!-- Reactive Filters Bar (auto-applies on change) -->
     <section class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Field>
@@ -354,7 +353,6 @@ function formatUsd(n: number | undefined): string {
     </div>
 
     <template v-else-if="analytics">
-      <!-- Empty-state quick Demo Traffic CTA -->
       <section
         v-if="demoStatus.enabled && analytics.summary.total_runs === 0"
         class="flex flex-col gap-3 rounded-lg border border-[#99F6E4] bg-[#F0FDFA] p-4 sm:flex-row sm:items-center sm:justify-between"
@@ -370,7 +368,6 @@ function formatUsd(n: number | undefined): string {
         </Button>
       </section>
 
-      <!-- Summary KPI Strip -->
       <section class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
           <div class="text-xs font-medium text-[#52525B]">Analyzed Runs</div>
@@ -416,8 +413,6 @@ function formatUsd(n: number | undefined): string {
         </div>
       </section>
 
-      <!-- Group Savings Comparison Chart (SVG bars) -->
-      <!-- Segmented Tables via @ui-sdk/vue Tabs -->
       <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
         <Tabs v-model:value="activeTab">
           <TabsList aria-label="Analytics breakdowns">
@@ -591,7 +586,6 @@ function formatUsd(n: number | undefined): string {
         </Tabs>
       </section>
 
-      <!-- Aggregated Task / Group Trace Timeline -->
       <section v-if="analytics.timeline_by_group?.length" class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="border-b border-[#E4E4E7] px-4 py-3">
           <h2 class="text-[15px] font-semibold text-[#09090B]">Aggregated Trace Timeline by Group</h2>

@@ -204,7 +204,6 @@ function otherStageMs(g: TimelineGroup): number {
       <span>{{ errorMessage }}</span>
     </div>
 
-    <!-- p50 / p95 & Monty Sandbox Metrics -->
     <section v-if="runtime" class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
       <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
         <div class="text-xs text-[#52525B]">Request Latency (p50 / p95)</div>
@@ -241,7 +240,6 @@ function otherStageMs(g: TimelineGroup): number {
     <div v-if="loading" class="h-48 animate-pulse rounded-lg border border-[#E4E4E7] bg-white" />
 
     <template v-else>
-      <!-- Aggregated Group Timeline Bars -->
       <section class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="flex flex-wrap items-center justify-between gap-2 border-b border-[#E4E4E7] px-4 py-3">
           <div><h2 class="text-[15px] font-semibold text-[#09090B]">Where Time Is Spent by Group</h2><p class="mt-0.5 text-[11px] text-[#71717A]">Top five groups by run volume plus all remaining groups combined. Bars share a common 0–{{ sharedTimelineScaleMs.toFixed(1) }} ms scale; labels show average milliseconds.</p></div>
@@ -288,7 +286,6 @@ function otherStageMs(g: TimelineGroup): number {
         </div>
       </section>
 
-      <!-- Compact Slowest / Recent Runs linking to /audit?run_id=... -->
       <section class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="border-b border-[#E4E4E7] px-4 py-3">
           <h2 class="text-[15px] font-semibold text-[#09090B]">Slowest Recent Traces</h2>

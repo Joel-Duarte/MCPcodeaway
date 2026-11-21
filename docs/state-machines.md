@@ -1,0 +1,84 @@
+# Application State Machines
+
+This file is the state map for the gateway and admin console. It names the
+states that were previously inferred from booleans, nullable values, task
+handles, query parameters, and combinations of page flags. It is a navigation
+aid for maintainers and agents: the owning module remains the source of truth
+for each transition.
+
+## Gateway process lifecycle
+
+Implemented as `GatewayLifecycleState` in `gateway.server`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> new
+    new --> starting: startup()
+    starting --> ready: store and catalog initialized
+    starting --> failed: initialization raises
+    new --> stopping: shutdown()
+    ready --> stopping: shutdown()
+    failed --> stopping: shutdown()
+    stopping --> stopped: resources closed
+    stopping --> failed: cleanup raises
+```
+
+`is_ready()` is true only in `ready`, then still checks required shared
+dependencies. Calling `startup()` while already ready is idempotent. Calling
+`shutdown()` after `stopped` is idempotent. Invalid transitions raise with the
+source and destination states in the message.
+
+## Request, identity, and authorization flows
+
+| Flow | States and transitions | Owning code / persisted state |
+| --- | --- | --- |
+| MCP request | received → authenticated → authorized → dispatched → filtered/redacted → recorded/responded; any guard may end in a protocol error | `server.mcp_endpoint`, `dispatcher.HostDispatcher`, `auth.PolicyEvaluator`; request lifecycle is a sequence of gates rather than a stored session |
+| Requester confirmation | unprotected → confirmation required → signed continuation issued → nonce consumed once → dispatched; decline, mismatch, stale policy, replay, or unsupported elicitation terminates without the protected dispatch | `server._approval_request_state`, `_verify_approval_request_state`, `_input_required_confirmation`; one-time nonce in `state.AuditStore` |
+| Admin authentication | unauthenticated → OIDC/dev token validation → session established with role → expired/logout/denied | `admin_auth.AdminSessionManager`, `admin_auth` routes, `useAdminApi`; browser session and optional bearer token |
+| Per-user OAuth link | ticket issued → authorize/PKCE redirect → callback verified → token exchanged → encrypted credential stored → linked; failures leave the credential unlinked | `user_connect` routes, `CredentialVault`; OAuth state/PKCE and signed connect ticket are transient, credential is durable |
+| Per-user API key link | ticket/form opened → secret submitted → encrypted credential stored → linked; invalid ticket or validation error ends without storage | `user_connect.submit_user_secret_form`, `CredentialVault` |
+
+MCP calls are intentionally sessionless. A client must pass resource identifiers
+as explicit arguments; the gateway does not keep an MCP conversation session.
+Approval continuation is deliberately a short-lived, single-use request token,
+not a durable approval queue.
+
+## Gateway operations and adaptive behavior
+
+| Flow | States and transitions | Owning code / representation |
+| --- | --- | --- |
+| Upstream discovery at startup | configured → discovered, skipped (preloaded or no discovery identity), or warning; warnings may retry in the background | `GatewayRuntime.refresh_catalog`, `_retry_failed_startup_upstreams`; catalog plus `startup_warnings` |
+| Demo traffic | stopped ↔ running; start creates a task, stop cancels and joins it; tier selection changes the schedule | `demo_traffic.DemoTrafficRunner`; task presence currently represents running |
+| Adaptive evidence | imported → rejected or accepted; accepted rows qualify a model/workload after five matched pairs; qualified rows still need the joint quality floor and regression checks to recommend a mode | `adaptive_execution.summarize_pairs`; evidence rows and derived `qualification` / `recommended_mode` |
+| Adaptive rollout | Observe → Active → Observe; Active affects eligible Auto requests only, while Observe reports recommendations without applying them | `GatewaySettings`, `server` adaptive-execution routes and request selection |
+| A/B experiment | disabled → enabled assignment per request; eligible read-only evidence may produce a promotion recommendation; configuration controls automatic switching | `config.AbExperimentConfig`, `ab_testing`; persisted upstream configuration and audit evidence |
+| Retention scheduler | off/hourly/daily policy → periodic check → skip or prune; cancellation ends the scheduler | `GatewayRuntime._retention_loop`; saved retention policy plus task handle |
+
+## Admin-console workflows
+
+| Flow | States and transitions | Owning code / representation |
+| --- | --- | --- |
+| Onboarding wizard | Connect (inspect schema) → Policy (configure access and modes) → Test & Publish (test/evaluate/register); only a verified schema unlocks progression; inspect failure retains the draft and exposes an error | `web/app/pages/onboarding.vue`; `OnboardingStep` and `SchemaInspectionState` name the navigation and inspection states, with guarded transitions |
+| Live telemetry | idle → connecting → live → reconnecting → connecting; explicit disconnect or an unbuildable URL ends retries | `web/app/composables/useUiAgent.ts`; `TelemetryConnectionState` is the exposed state, while the socket and timer own transport details |
+| Admin API load/save actions | idle → loading/saving → success or error; each page owns its data and error message | `web/app/pages/*.vue`, `web/app/composables/useAdminApi.ts`; page-local busy flags and result/error refs |
+| Agent confirmation prompt | no pending request → waiting for operator decision → allowed/denied; abort resolves as denied and clears the pending prompt | `web/app/composables/useUiAgent.ts`; pending request with a resolver |
+| Demo controls | server-reported stopped/running plus request-in-progress; tier update has requested and persisted values | `web/app/composables/useUiAgent.ts`; API `DemoTrafficStatus`, local `busy` flag |
+
+Page-local Admin API load/save flows still use booleans and result/error refs;
+their state ownership remains page-specific. Keep the transitions above in sync
+when changing those flows and preserve distinct loading, empty, success, and
+failure feedback.
+
+## State ownership rules
+
+- Persist business state (credentials, approval replay nonces, configuration,
+  and audit evidence) in its existing store. Do not treat a process-local task,
+  browser ref, or cache entry as durable state.
+- Derive status from one authoritative owner where possible. In particular,
+  runtime readiness comes from `GatewayLifecycleState`; dependency health is an
+  additional readiness condition, not a second lifecycle flag.
+- Keep terminal and degraded outcomes distinct from success. A warning, retry,
+  unsupported capability, denied confirmation, or failed optional telemetry
+  connection must not be represented as a successful transition.
+- Preserve API contracts when adding status fields. Machine state names are
+  internal unless explicitly added to a documented response schema.

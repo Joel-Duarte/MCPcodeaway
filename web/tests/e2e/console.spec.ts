@@ -17,7 +17,6 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
       }
     });
 
-    // 1. Overview & Live Runtime + WebSocket + Demo Burst
     await page.goto(`${BASE}/dashboard/`, { waitUntil: "networkidle" });
     await expect(page.getByRole("heading", { name: /Overview & Live Runtime/i })).toBeVisible();
     await expect(page.getByText(/Gateway Replica/i)).toBeVisible();
@@ -29,39 +28,32 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
       await page.waitForTimeout(900);
     }
 
-    // 2. Gateway Usage populated + Reactive Filters
     await page.getByRole("link", { name: /Gateway Usage/i }).click();
     await expect(page.getByRole("heading", { name: /Gateway Usage, Groups & Cost Attribution/i })).toBeVisible();
 
-    // 2b. Legacy optimization route redirects to workflow efficiency.
     await page.goto(`${BASE}/dashboard/optimization`);
     await expect(page).toHaveURL(/model-performance\?tab=efficiency/);
     await expect(page.getByRole("heading", { name: /Model Performance/i })).toBeVisible();
     await expect(page.getByRole("heading", { name: /Matched cohort differences/i })).toBeVisible();
 
-    // 2c. Paired workflow performance views.
     await page.getByRole("link", { name: /Model Performance/i }).click();
     await expect(page.getByRole("heading", { name: /Model Performance/i })).toBeVisible();
     await expect(page.getByRole("tab", { name: "Routing" })).toBeVisible();
 
-    // 2d. Dedicated Traces & Latency Timeline page
     await page.getByRole("link", { name: /Traces & Timeline/i }).click();
     await expect(page.getByRole("heading", { name: /Traces & Latency Timeline/i })).toBeVisible();
     await expect(page.getByText(/Where Time Is Spent by Group/i)).toBeVisible();
 
-    // 3. Upstreams Catalog renders live servers + 500-server search
     await page.getByRole("link", { name: /Upstreams Catalog/i }).click();
     await expect(page.getByText("billing_legacy_eu").first()).toBeVisible();
     await expect(page.getByText("snowflake_ledger").first()).toBeVisible();
 
-    // 4. Audit & Compliance renders recorded runs + Real-Time toggle + Detection Guide
     await page.getByRole("link", { name: /Audit & Compliance/i }).click();
     await expect(page.getByRole("heading", { name: /Audit Runs, Provenance & Retention/i })).toBeVisible();
     await expect(page.getByText("Real-Time")).toBeVisible();
     await expect(page.getByRole("button", { name: /Errors Only/i })).toBeVisible();
     await expect(page.locator("table tbody tr").first()).toBeVisible();
 
-    // 5. Settings starts with authenticated workspace details; pricing and alert policies are separate tabs
     await page.getByRole("link", { name: /Settings & Alerts/i }).click();
     await expect(page.getByRole("heading", { name: "Gateway configuration", exact: true })).toBeVisible();
     await expect(page.getByRole("heading", { name: "Administrator identity", exact: true })).toBeVisible();
@@ -70,12 +62,10 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
     await page.getByRole("tab", { name: /Alerts & webhooks/i }).click();
     await expect(page.getByRole("heading", { name: "Custom Alert Rules", exact: true })).toBeVisible();
 
-    // Demo controls are a real server traffic runner, not a browser simulation
     await page.getByRole("link", { name: /Demo Control/i }).click();
     await expect(page.getByRole("heading", { name: "Continuous Demo Traffic Runner", exact: true })).toBeVisible();
     await expect(page.getByRole("heading", { name: "Simulated Model Performance Profiles", exact: true })).toBeVisible();
 
-    // 7. Onboarding 3-Step Progressive Wizard (Step 2 locked until Inspect Schema)
     await page.getByRole("link", { name: /Onboarding/i }).click();
     await expect(page.getByText("Stateful MCP Session", { exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /2\. Policy & Mode/i })).toBeDisabled();

@@ -136,7 +136,6 @@ upstreams:
     assert sc_a["ok"] is True
     assert sc_b["ok"] is True
 
-    # Verify audit runs in shared store are strictly isolated by subject
     runs = await shared_store.list_runs(limit=20, tenant_id="tenant-acme-dev")
     subs = {r["user_sub"] for r in runs}
     assert subs == {"user-fin-01", "user-sup-01"}

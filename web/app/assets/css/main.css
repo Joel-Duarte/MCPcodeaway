@@ -50,7 +50,6 @@ body {
   font-family: var(--ui-font-mono);
 }
 
-/* Override ui-sdk meter min-width so mobile panels never overflow horizontally */
 [data-slot="meter"],
 [data-slot="progress"] {
   min-width: 0;
@@ -61,7 +60,6 @@ body {
   transition: width 180ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-/* Crisp control sizing & Precision Light variants */
 :is(
   [data-slot="button"],
   [data-slot="dialog-trigger"],
@@ -116,7 +114,6 @@ body {
   border-color: #fca5a5;
 }
 
-/* Form inputs & select triggers aligned to DESIGN.md borders & height */
 :is([data-slot="input"], [data-slot="select-trigger"]) {
   width: 100%;
   min-height: 2.25rem;
@@ -218,7 +215,6 @@ body {
   }
 }
 
-/* Subtle horizontal scrollbar for dense data tables */
 .table-scroll::-webkit-scrollbar {
   height: 6px;
 }

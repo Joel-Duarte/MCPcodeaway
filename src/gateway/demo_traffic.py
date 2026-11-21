@@ -283,7 +283,6 @@ class DemoTrafficRunner:
             ),
         ]
 
-        # Probe all enabled upstreams and their non-mutating tools across demo models and personas.
         profiles = self.model_profiles or [{"model": "claude-sonnet-4-5"}]
         personas = [
             "finance_analyst",

@@ -45,7 +45,6 @@ def test_composable_profiles_inheritance_and_overrides(tmp_path: Path) -> None:
     assert finance.features.admin_read is False
     assert finance.require_tool_grounding is True
 
-    # Custom profile without `extends:` starts on top of barebones `production`.
     custom_yaml = tmp_path / "profiles.yaml"
     custom_yaml.write_text(
         yaml.safe_dump(
@@ -67,7 +66,6 @@ def test_composable_profiles_inheritance_and_overrides(tmp_path: Path) -> None:
     assert custom.features.dev_auth is False
     assert custom.features.comparator is False
 
-    # Explicit overrides take precedence over profile defaults.
     overridden = GatewaySettings(
         profile="custom_team",
         profiles_config_path=str(custom_yaml),
@@ -88,8 +86,6 @@ def test_composable_profiles_inheritance_and_overrides(tmp_path: Path) -> None:
 async def test_barebones_production_profile_route_gating(tmp_path: Path) -> None:
     settings = GatewaySettings(
         profile="production",
-        # Keep this test about profile route gating; production deployment
-        # secret requirements are validated separately at startup.
         app_env="sandbox",
         auth_mode="dev",
         sqlite_path=str(tmp_path / "gateway.db"),
@@ -332,7 +328,6 @@ async def test_postgres_audit_store_crud_and_optional_dep(
     await store.close()
     assert pool.closed is True
 
-    # Missing asyncpg gives actionable extra message.
     real_import = builtins.__import__
 
     def fake_import(name: str, *args: Any, **kwargs: Any):

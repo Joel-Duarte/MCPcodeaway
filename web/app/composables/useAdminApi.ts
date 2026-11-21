@@ -39,9 +39,6 @@ function buildUrl(apiBase: string, path: string): string {
   return base ? `${base}${normalized}` : normalized;
 }
 
-/**
- * Fuzzy-match a user-typed model query against available model identifiers.
- */
 export function resolveFuzzyModel(query: string, availableModels: string[]): string | null {
   const q = query.trim().toLowerCase();
   if (!q || !availableModels.length) return null;
@@ -199,11 +196,9 @@ export function useAdminApi() {
           };
         }
       } catch {
-        // Fallback to devLogin if external mock OIDC server is unreachable
         try {
           sessRes = await devLogin("gateway_admin");
         } catch {
-          // Keep unauthenticated state
         }
       }
     }

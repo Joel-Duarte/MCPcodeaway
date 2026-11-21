@@ -94,7 +94,6 @@ async def test_decoupled_execution_and_discovery_2x2_axes(tmp_path) -> None:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://gw"
             ) as gw:
-                # 1. codemode x upfront (and codemode_upfront alias) exposes execute_code w/ stubs
                 up_cm = await _post_mcp(
                     gw,
                     fin_token,
@@ -113,7 +112,6 @@ async def test_decoupled_execution_and_discovery_2x2_axes(tmp_path) -> None:
                 )
                 assert [t["name"] for t in alias_cm["result"]["tools"]] == ["execute_code"]
 
-                # Direct 1-shot execute_code in codemode_upfront without prior search_tools
                 exec_res = await _post_mcp(
                     gw,
                     fin_token,
@@ -134,7 +132,6 @@ async def test_decoupled_execution_and_discovery_2x2_axes(tmp_path) -> None:
                     exec_res["result"]["structuredContent"]["result"]["customer_id"] == "CUST-1003"
                 )
 
-                # 2. codemode x deferred exposes list_servers, search_tools, execute_code
                 def_cm = await _post_mcp(
                     gw,
                     fin_token,
@@ -147,7 +144,6 @@ async def test_decoupled_execution_and_discovery_2x2_axes(tmp_path) -> None:
                     "execute_code",
                 ]
 
-                # 3. classic x upfront vs classic x deferred via headers
                 cls_up = await _post_mcp(
                     gw,
                     fin_token,
@@ -169,7 +165,6 @@ async def test_decoupled_execution_and_discovery_2x2_axes(tmp_path) -> None:
                     "search_tools",
                 ]
 
-                # 4. hybrid x upfront embeds read stubs & exposes mutating write tool directly
                 hyb_up = await _post_mcp(
                     gw,
                     ops_token,
@@ -215,7 +210,6 @@ async def test_provenance_envelope_and_grounding_policy(tmp_path) -> None:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://gw"
             ) as gw:
-                # 1. Legitimate script returns computed delta (450.0) with observed entity ID
                 valid_code = (
                     "bal = await snowflake_ledger__get_customer_balance(customer_id='CUST-1003')\n"
                     "inv = await billing_legacy_eu__list_eu_invoices(status='overdue')\n"
@@ -244,7 +238,6 @@ async def test_provenance_envelope_and_grounding_policy(tmp_path) -> None:
                     "snowflake_ledger__get_customer_balance",
                     "billing_legacy_eu__list_eu_invoices",
                 }
-                # Verify HMAC signature independently
                 check_body = {k: v for k, v in prov.items() if k != "provenance_hmac"}
                 expected_hmac = hmac.new(
                     signing_secret.encode("utf-8"),
@@ -253,7 +246,6 @@ async def test_provenance_envelope_and_grounding_policy(tmp_path) -> None:
                 ).hexdigest()
                 assert hmac.compare_digest(prov["provenance_hmac"], expected_hmac)
 
-                # 2. Pure-Python fabrication with 0 tool calls flagged & blocked under grounding
                 fab_resp = await _post_mcp(
                     gw,
                     fin_token,
@@ -270,7 +262,6 @@ async def test_provenance_envelope_and_grounding_policy(tmp_path) -> None:
                 assert fab_sc["error_type"] == "UngroundedResultError"
                 assert fab_sc["_provenance"]["grounded"] is False
 
-                # 3. Real tool call + hallucinated entity ID CUST-9999 blocked by grounding
                 spoof_code = (
                     "await snowflake_ledger__get_customer_balance(customer_id='CUST-1003')\n"
                     "{'customer_id': 'CUST-9999', 'delta': 450.0}"
@@ -316,7 +307,6 @@ async def test_remote_worker_ws_auth_and_prod_fail_closed(tmp_path) -> None:
                 except httpx.HTTPError:
                     await asyncio.sleep(0.05)
 
-        # 1. Production rejects dev authentication before constructing runtime.
         with pytest.raises(ValueError, match="auth_mode must be 'oidc'"):
             GatewayRuntime(
                 settings=GatewaySettings(
@@ -329,8 +319,6 @@ async def test_remote_worker_ws_auth_and_prod_fail_closed(tmp_path) -> None:
                 )
             )
 
-        # 2. With the other production settings valid, a remote worker secret
-        # is independently required before the runtime can start.
         production_settings = GatewaySettings(
             app_env="prod",
             auth_mode="oidc",
@@ -358,7 +346,6 @@ async def test_remote_worker_ws_auth_and_prod_fail_closed(tmp_path) -> None:
         with pytest.raises(ValueError, match="sandbox_worker_secret"):
             GatewayRuntime(settings=production_settings)
 
-        # 3. Wrong/missing secret is rejected at WebSocket handshake
         bad_app = create_gateway_app(
             settings=GatewaySettings(
                 auth_mode="dev",
@@ -384,7 +371,6 @@ async def test_remote_worker_ws_auth_and_prod_fail_closed(tmp_path) -> None:
                 assert denied["result"]["isError"] is True
                 assert denied["result"]["structuredContent"]["ok"] is False
 
-        # 4. Matching secret succeeds with remote WS reverse-RPC + provenance
         good_app = create_gateway_app(
             settings=GatewaySettings(
                 auth_mode="dev",
@@ -528,7 +514,6 @@ async def test_typed_output_schemas_and_keyerror_shape_hints(tmp_path) -> None:
     try:
         async with app.router.lifespan_context(app):
             rt: GatewayRuntime = app.state.runtime
-            # 1. OpenAPI + MCP tools populate output_schema, to_mcp_tool_definition, and stubs
             sf_tool = rt.catalog.get_tool("snowflake_ledger__query_debt_ledger")
             eu_tool = rt.catalog.get_tool("billing_legacy_eu__list_eu_invoices")
             assert sf_tool is not None and sf_tool.output_schema is not None
@@ -550,7 +535,6 @@ async def test_typed_output_schemas_and_keyerror_shape_hints(tmp_path) -> None:
                 assert "Returns: {'queried_by': str, 'rows':" in up_desc
                 assert "ledger_balance" in up_desc and "invoices" in up_desc
 
-                # Register schema-less upstream dynamically (output_schema=None)
                 reg = await gw.post(
                     "/admin/upstreams",
                     json={
@@ -565,7 +549,6 @@ async def test_typed_output_schemas_and_keyerror_shape_hints(tmp_path) -> None:
                 w_tool = rt.catalog.get_tool("widget_api__fetch_widget")
                 assert w_tool is not None and w_tool.output_schema is None
 
-                # 2. KeyError after calling widget_api__fetch_widget returns structural shape hint
                 err_resp = await _post_mcp(
                     gw,
                     fin_token,

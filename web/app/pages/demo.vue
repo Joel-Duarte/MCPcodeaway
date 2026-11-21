@@ -60,7 +60,6 @@ async function loadModels() {
     const res = await apiFetch<{ models: DemoModelProfile[] }>("/admin/demo/models");
     if (res?.models) models.value = res.models;
   } catch {
-    // ignore in non-demo profiles
   }
 }
 

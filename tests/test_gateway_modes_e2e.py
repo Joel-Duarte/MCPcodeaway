@@ -34,7 +34,6 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://gw"
         ) as gw:
-            # 1. Code Mode tools/list returns ONLY list_servers, search_tools, and execute_code
             cm_list = await gw.post(
                 "/mcp",
                 headers={"X-Admin-Force-Mode": "codemode", "Authorization": f"Bearer {fin_token}"},
@@ -44,7 +43,6 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
             cm_names = [t["name"] for t in cm_list.json()["result"]["tools"]]
             assert cm_names == ["list_servers", "search_tools", "execute_code"]
 
-            # 2. RBAC-filtered search_tools hides ops_ticketing from finance_analyst
             search = await gw.post(
                 "/mcp",
                 headers={"X-Admin-Force-Mode": "codemode", "Authorization": f"Bearer {fin_token}"},
@@ -60,7 +58,6 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
             assert servers == {"snowflake_ledger", "billing_legacy_eu", "billing_legacy_us"}
             assert "ops_ticketing" not in servers
 
-            # 3. execute_code runs parallel asyncio.gather reconciliation inside Monty
             script = (
                 "import asyncio\n"
                 "ledger, eu, us = await asyncio.gather(\n"
@@ -101,14 +98,12 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
             ]
             assert exec_sc["raw_upstream_bytes"] > exec_sc["returned_bytes"]
 
-            # Inspect persisted audit run & token hops
             audit = await gw.get(f"/audit/runs/{exec_sc['run_id']}")
             assert audit.status_code == 200
             run_doc = audit.json()
             assert run_doc["subcall_count"] == 3
             assert len(run_doc["token_hops"]) == 3
 
-            # 4. Traditional mode exposes all accessible tools directly and rejects execute_code
             trad_list = await gw.post(
                 "/mcp",
                 headers={
@@ -141,7 +136,6 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
             assert trad_direct.status_code == 200
             assert trad_direct.json()["result"]["structuredContent"]["result"]["region"] == "EU"
 
-            # 5. Hybrid mode exposes mutating tool directly and keeps it out of execute_code
             hyb_list = await gw.post(
                 "/mcp",
                 headers={"X-Admin-Force-Mode": "hybrid", "Authorization": f"Bearer {ops_token}"},

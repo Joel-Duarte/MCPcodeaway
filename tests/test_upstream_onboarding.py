@@ -32,7 +32,6 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
         public_key_pem=dev_keys.public_pem, expected_issuer=settings.oidc_issuer
     )
 
-    # Mount a lightweight external HTTP MCP + OpenAPI target onto the shared test client
     extra_app = FastAPI()
 
     @extra_app.post("/extra/mcp")
@@ -50,7 +49,7 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
                 "result": {
                     "tools": [
                         {
-                            "name": "query_debt_ledger",  # intentional flat-name collision!
+                            "name": "query_debt_ledger",
                             "description": "Duplicate named ledger query on extra MCP",
                             "inputSchema": {"type": "object", "properties": {}},
                         }
@@ -113,7 +112,6 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://gw"
         ) as gw:
-            # 1. Inspect & register inline Swagger/OpenAPI spec -> creates Classic + Code Mode
             inspect_resp = await gw.post(
                 "/admin/upstreams/inspect",
                 json={
@@ -142,7 +140,6 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
             assert add_sw.status_code == 200
             assert add_sw.json()["registered"]
 
-            # 2. Register an extra mcp_http with colliding flat tool name
             add_http = await gw.post(
                 "/admin/upstreams",
                 json={
@@ -157,7 +154,6 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
             assert any(c["tool_name"] == "query_debt_ledger" for c in collisions)
             assert add_http.json()["onboarding_audit"]["code_mode"]["flat_name_collisions"] == []
 
-            # 3. Register a real mcp_stdio server (examples/stdio_echo_mcp.py)
             stdio_script = str(Path("examples/stdio_echo_mcp.py").resolve())
             add_stdio = await gw.post(
                 "/admin/upstreams",
@@ -172,7 +168,6 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
             assert add_stdio.status_code == 200
             assert add_stdio.json()["inspection"]["tools"][0]["name"] == "echo_upper"
 
-            # Verify hot-reload into BOTH traditional tools/list and codemode search+execute
             trad_tools = await gw.post(
                 "/mcp",
                 headers={
@@ -220,7 +215,6 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
             assert exec_sc["result"]["order"]["order_id"] == "ORD-42"
             assert exec_sc["result"]["stdio"]["upper"] == "HELLO"
 
-            # 4. Side-by-side comparison playground endpoint
             cmp_reconcile = await gw.post(
                 "/compare/run",
                 json={"persona": "finance_analyst", "scenario": "reconcile_overdue"},
@@ -236,12 +230,10 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
             assert cmp_single.status_code == 200
             assert cmp_single.json()["winner"] == "classic_or_tie"
 
-            # 5. Dashboard HTML serves cleanly
             dash = await gw.get("/dashboard")
             assert dash.status_code == 200
             assert "MCPcodeaway" in dash.text
 
-            # 6. Delete dynamic upstream cleans catalog
             deleted = await gw.delete("/admin/upstreams/stdio_echo")
             assert deleted.status_code == 200
             assert deleted.json()["deleted"]
@@ -263,7 +255,6 @@ async def test_prod_environment_locks_dynamic_upstreams_and_warns_at_scale(tmp_p
             store=SQLiteAuditStore(prod_settings.sqlite_path),
         )
 
-    # Verify tool_limit_status thresholds (>30 warning, >100 critical)
     runtime = GatewayRuntime(settings=GatewaySettings(sqlite_path=str(tmp_path / "cmp.db")))
     syn_120 = [
         DiscoveredTool(

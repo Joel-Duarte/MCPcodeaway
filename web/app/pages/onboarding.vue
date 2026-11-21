@@ -66,13 +66,15 @@ interface InspectResponse {
 
 const { apiFetch } = useAdminApi();
 
+type OnboardingStep = "connect" | "policy" | "publish";
+type SchemaInspectionState = "idle" | "inspecting" | "verified" | "failed";
+
 const dynamicPermitted = ref(true);
 const existingUpstreams = ref<string[]>([]);
 const errorMessage = ref("");
 const statusMessage = ref("");
 const registeredUpstream = ref("");
 
-// Draft upstream configuration
 const draftName = ref("inventory_api");
 const draftType = ref("openapi");
 const draftUrl = ref("http://localhost:8001");
@@ -93,17 +95,14 @@ const draftRoles = ref("finance_analyst, ops_engineer, gateway_admin");
 const draftGroups = ref("");
 const draftPreferredMode = ref("auto");
 
-// Inspection output
 const inspectResult = ref<InspectResponse | null>(null);
 
-// A/B Lab controls
 const abIntent = ref("reconcile inventory and summarize anomalies");
 const abSampleBytes = ref("12000");
 
 const abResult = ref<AbTestResult | null>(null);
 const abBusy = ref(false);
 
-// Agent Prompt & JSON Import Dialogs
 const promptDialogOpen = ref(false);
 const agentPromptText = ref("");
 const importDialogOpen = ref(false);
@@ -141,7 +140,8 @@ const draftToolApprovalModes = ref<Record<string, string>>({});
 const draftToolApprovalMessages = ref<Record<string, string>>({});
 const availableGroups = ref<string[]>(["finance", "operations", "support", "audit", "platform-admins"]);
 
-const schemaVerified = ref(false);
+const schemaInspectionState = ref<SchemaInspectionState>("idle");
+const schemaVerified = computed(() => schemaInspectionState.value === "verified");
 const testCallResult = ref<string>("");
 const testCallBusy = ref(false);
 const availableRoles = ref<string[]>([
@@ -162,7 +162,6 @@ onMounted(async () => {
       availableGroups.value = res.groups;
     }
   } catch {
-    // Keep default role list if roles endpoint unavailable
   }
 });
 
@@ -242,16 +241,22 @@ const authRequestPreview = computed(() => {
   return `GET ${host}/...\n(No Authorization header injected)`;
 });
 
-const onboardingStep = ref<1 | 2 | 3>(1);
+const onboardingStep = ref<OnboardingStep>("connect");
 const promptTab = ref("prompt");
 const sourceKind = ref<"openapi_url" | "openapi_inline" | "rest_builder" | "mcp_http">(
   "openapi_url"
 );
 
 watch([sourceKind, draftUrl, draftSpecUrl], () => {
-  schemaVerified.value = false;
+  schemaInspectionState.value = "idle";
+  inspectResult.value = null;
   testCallResult.value = "";
 });
+
+function goToOnboardingStep(nextStep: OnboardingStep): void {
+  if (nextStep !== "connect" && !schemaVerified.value) return;
+  onboardingStep.value = nextStep;
+}
 const inlineSpecText = ref(
   JSON.stringify(
     {
@@ -437,7 +442,6 @@ onMounted(async () => {
     dynamicPermitted.value = res.dynamic_upstreams_permitted;
     existingUpstreams.value = res.upstreams.map((u) => u.name);
   } catch {
-    // Error handled smoothly if user triggers action
   }
 });
 
@@ -445,19 +449,21 @@ async function handleInspect() {
   errorMessage.value = "";
   statusMessage.value = "";
   testCallResult.value = "";
+  schemaInspectionState.value = "inspecting";
+  inspectResult.value = null;
   try {
     inspectResult.value = await apiFetch<InspectResponse>("/admin/upstreams/inspect", {
       method: "POST",
       body: buildUpstreamPayload(),
     });
-    schemaVerified.value = true;
+    schemaInspectionState.value = "verified";
     const inspectedName =
       inspectResult.value.inspection.name ||
       inspectResult.value.inspection["upstream"] ||
       draftName.value.trim();
     statusMessage.value = `Inspected '${inspectedName}' (${inspectResult.value.inspection.tool_count} tools). Step 2 unlocked.`;
   } catch (err) {
-    schemaVerified.value = false;
+    schemaInspectionState.value = "failed";
     errorMessage.value = extractErrorMessage(err);
   }
 }
@@ -642,40 +648,38 @@ async function copyPromptText() {
       <span>{{ errorMessage }}</span>
     </div>
 
-    <!-- 3-Step Onboarding Stepper & Presets -->
     <section
       aria-label="Onboarding workflow steps"
       class="flex flex-col gap-3 rounded-lg border border-[#E4E4E7] bg-white p-4 sm:flex-row sm:items-center sm:justify-between"
     >
       <div class="flex flex-wrap items-center gap-2">
         <Button
-          :data-variant="onboardingStep === 1 ? 'primary' : undefined"
+          :data-variant="onboardingStep === 'connect' ? 'primary' : undefined"
           class="text-xs"
-          @click="onboardingStep = 1"
+          @click="goToOnboardingStep('connect')"
         >
           1. Connect &amp; Inspect
         </Button>
         <Button
-          :data-variant="onboardingStep === 2 ? 'primary' : undefined"
+          :data-variant="onboardingStep === 'policy' ? 'primary' : undefined"
           :disabled="!schemaVerified"
           class="text-xs"
-          @click="onboardingStep = 2"
+          @click="goToOnboardingStep('policy')"
         >
           2. Policy &amp; Mode
         </Button>
         <Button
-          :data-variant="onboardingStep === 3 ? 'primary' : undefined"
+          :data-variant="onboardingStep === 'publish' ? 'primary' : undefined"
           :disabled="!schemaVerified"
           class="text-xs"
-          @click="onboardingStep = 3"
+          @click="goToOnboardingStep('publish')"
         >
           3. Test &amp; Save
         </Button>
       </div>
     </section>
 
-    <!-- 3-Step Progressive Wizard Workspace -->
-    <div v-if="onboardingStep === 1" class="rounded-lg border border-[#E4E4E7] bg-white p-5 space-y-5">
+    <div v-if="onboardingStep === 'connect'" class="rounded-lg border border-[#E4E4E7] bg-white p-5 space-y-5">
       <div class="flex flex-wrap items-center justify-between gap-2 border-b border-[#E4E4E7] pb-3">
         <div>
           <h2 class="text-[15px] font-semibold text-[#09090B]">Step 1 — Connect API or MCP Server</h2>
@@ -688,7 +692,6 @@ async function copyPromptText() {
         </span>
       </div>
 
-      <!-- 4 Input Method Cards -->
       <div class="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
         <Button
           :data-variant="sourceKind === 'openapi_url' ? 'primary' : undefined"
@@ -741,7 +744,6 @@ async function copyPromptText() {
         </Field>
       </div>
 
-      <!-- Quick REST Endpoint Builder (for APIs without OpenAPI docs) -->
       <div v-if="sourceKind === 'rest_builder'" class="space-y-2 rounded border border-[#E4E4E7] bg-[#FAFAFA] p-3">
         <div class="flex items-center justify-between">
           <span class="text-xs font-semibold text-[#09090B]">
@@ -776,16 +778,24 @@ async function copyPromptText() {
           Inspect Schema
         </Button>
         <div class="flex items-center gap-2">
-          <span v-if="!schemaVerified" class="text-xs text-[#D97706]">
+          <span v-if="schemaInspectionState === 'idle'" class="text-xs text-[#D97706]">
             Inspect schema first to unlock Policy &amp; Guardrails
           </span>
-          <Button data-variant="primary" :disabled="!schemaVerified" @click="onboardingStep = 2">
+          <span v-else-if="schemaInspectionState === 'inspecting'" role="status" class="text-xs text-[#52525B]">
+            Checking the service schema...
+          </span>
+          <span v-else-if="schemaInspectionState === 'failed'" role="status" class="text-xs text-[#D97706]">
+            Inspection failed. Review the error, then retry.
+          </span>
+          <span v-else role="status" class="text-xs text-[#0F766E]">
+            Schema verified. Policy &amp; Guardrails are unlocked.
+          </span>
+          <Button data-variant="primary" :disabled="!schemaVerified" @click="goToOnboardingStep('policy')">
             Next: Policy &amp; Guardrails →
           </Button>
         </div>
       </div>
 
-      <!-- Discovered Tools Preview -->
       <div v-if="inspectResult" class="space-y-3 border-t border-[#E4E4E7] pt-4">
         <div class="flex items-center justify-between">
           <h3 class="text-sm font-semibold text-[#09090B]">
@@ -834,8 +844,7 @@ async function copyPromptText() {
       </div>
     </div>
 
-    <!-- Step 2: Access & Guardrails -->
-    <div v-else-if="onboardingStep === 2" class="rounded-lg border border-[#E4E4E7] bg-white p-5 space-y-5">
+    <div v-else-if="onboardingStep === 'policy'" class="rounded-lg border border-[#E4E4E7] bg-white p-5 space-y-5">
       <div class="border-b border-[#E4E4E7] pb-3">
         <h2 class="text-[15px] font-semibold text-[#09090B]">Step 2 — Access &amp; Execution</h2>
         <p class="text-xs text-[#52525B]">
@@ -938,7 +947,6 @@ async function copyPromptText() {
         </div>
       </div>
 
-      <!-- Execution mode: service-wide, auto, or per tool -->
       <div class="space-y-3 rounded border border-[#E4E4E7] bg-[#FAFAFA] p-4">
         <div>
           <h3 class="text-sm font-semibold text-[#09090B]">Execution mode</h3>
@@ -970,12 +978,11 @@ async function copyPromptText() {
       </div>
 
       <div class="flex flex-wrap items-center justify-between gap-2 border-t border-[#E4E4E7] pt-4">
-        <Button @click="onboardingStep = 1">← Back: Connect</Button>
-        <Button data-variant="primary" @click="onboardingStep = 3">Next: Test &amp; Publish →</Button>
+        <Button @click="goToOnboardingStep('connect')">← Back: Connect</Button>
+        <Button data-variant="primary" :disabled="!schemaVerified" @click="goToOnboardingStep('publish')">Next: Test &amp; Publish →</Button>
       </div>
     </div>
 
-    <!-- Step 3: Test & Save -->
     <div v-else class="grid grid-cols-1 gap-6 xl:grid-cols-12">
       <section class="space-y-5 rounded-lg border border-[#E4E4E7] bg-white p-5 xl:col-span-7">
         <div class="flex items-center gap-2 border-b border-[#E4E4E7] pb-3">
@@ -1000,7 +1007,7 @@ async function copyPromptText() {
         </div>
 
         <div class="flex flex-wrap items-center justify-between gap-2 border-t border-[#E4E4E7] pt-4">
-          <Button @click="onboardingStep = 2">← Back: Policy</Button>
+          <Button @click="goToOnboardingStep('policy')">← Back: Policy</Button>
           <div class="flex flex-wrap items-center gap-2">
             <Button :disabled="abBusy" pending-announcement="Estimating" @click="runAbTest">
               <AppIcon name="flask" :size="15" />
@@ -1050,7 +1057,6 @@ async function copyPromptText() {
       </section>
     </div>
 
-    <!-- Agent Prompt Dialog -->
     <Dialog v-model:open="promptDialogOpen">
       <DialogBackdrop />
       <DialogContent class="sm:max-w-2xl w-[calc(100%-2rem)]">
@@ -1085,7 +1091,6 @@ async function copyPromptText() {
       </DialogContent>
     </Dialog>
 
-    <!-- Import Agent JSON Dialog -->
     <Dialog v-model:open="importDialogOpen">
       <DialogBackdrop />
       <DialogContent class="sm:max-w-xl w-[calc(100%-2rem)]">

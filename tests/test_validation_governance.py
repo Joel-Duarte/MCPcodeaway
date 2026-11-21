@@ -44,7 +44,6 @@ async def test_validation_hints_redaction_and_tenant_isolation(tmp_path) -> None
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://gw"
         ) as gw:
-            # Tenant allowlist rejects unapproved tenant on /mcp
             denied = await gw.post(
                 "/mcp",
                 headers={"Authorization": f"Bearer {bad_tenant_token}"},
@@ -52,7 +51,6 @@ async def test_validation_hints_redaction_and_tenant_isolation(tmp_path) -> None
             )
             assert denied.status_code == 403
 
-            # Bad arguments trigger actionable stub-signature self-correction hint in Code Mode
             bad_args = await gw.post(
                 "/mcp",
                 headers={"Authorization": f"Bearer {fin_token}"},
@@ -71,7 +69,6 @@ async def test_validation_hints_redaction_and_tenant_isolation(tmp_path) -> None
             assert "Expected signature:" in sc_err["error"]
             assert "customer_id: str" in sc_err["error"]
 
-            # OutputRedactor masks SSNs, API keys, and JWTs from sandbox stdout and result
             redact_resp = await gw.post(
                 "/mcp",
                 headers={"Authorization": f"Bearer {fin_token}"},
@@ -215,7 +212,7 @@ async def test_pluggable_auth_types_and_schema_drift_detection(tmp_path, monkeyp
                         "auth_type": "api_key",
                         "secret_env_var": "TEST_PARTNER_API_KEY",
                         "api_key_header": "X-Partner-Key",
-                        "pinned_schema_digest": "0000000000000000",  # intentional drift
+                        "pinned_schema_digest": "0000000000000000",
                     },
                     {
                         "name": "partner_bearer",

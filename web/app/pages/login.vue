@@ -125,7 +125,6 @@ const personaItems = computed(() => {
           Your company account signed in, but it is not assigned access to this console. Ask your company administrator to grant the appropriate gateway role, then try again.
         </div>
 
-        <!-- OIDC Authorization Code + PKCE -->
         <div class="space-y-2">
           <Button
             v-if="authConfig?.oidc_enabled"
@@ -144,7 +143,6 @@ const personaItems = computed(() => {
           </p>
         </div>
 
-        <!-- Dev Admin Persona -->
         <div v-if="authConfig?.dev_auth_enabled" class="space-y-3 border-t border-[#E4E4E7] pt-4">
           <h2 class="text-[15px] font-semibold text-[#09090B]">
             Dev Admin Persona
@@ -187,7 +185,6 @@ const personaItems = computed(() => {
           </Button>
         </div>
 
-        <!-- Bearer Token Exchange -->
         <form
           v-if="authConfig?.token_login_enabled"
           class="space-y-3 border-t border-[#E4E4E7] pt-4"

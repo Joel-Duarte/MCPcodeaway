@@ -1,9 +1,3 @@
-/**
- * Antithesis Bombadil property-based UI fuzzing specification for MCPcodeaway Admin Console.
- * Run with:
- *   bombadil browser test --headless --no-sandbox --exit-on-violation --time-limit 20s \
- *     http://127.0.0.1:8000/dashboard/ web/tests/bombadil/spec.ts
- */
 import { actions, always, extract } from "@antithesishq/bombadil";
 
 export * from "@antithesishq/bombadil/browser/defaults";

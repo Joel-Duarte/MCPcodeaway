@@ -80,6 +80,7 @@ const { apiFetch, setRuntimeMeta } = useAdminApi();
 const { status: demoStatus, busy: demoBusy, runBurst } = useDemoTraffic();
 const {
   connected: wsConnected,
+  connectionState: wsConnectionState,
   events: liveEvents,
   latestRuntime,
   alerts: liveAlerts,
@@ -117,7 +118,6 @@ async function fetchOverview() {
         catalog_version: rt.gateway.catalog_version,
       });
     } catch {
-      // Keep audit/value & analytics rendered when /admin/telemetry/runtime is disabled
     }
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
@@ -188,7 +188,6 @@ function formatUsd(n: number | undefined): string {
 
 <template>
   <div class="space-y-6">
-    <!-- Page header -->
     <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div>
         <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">
@@ -200,6 +199,8 @@ function formatUsd(n: number | undefined): string {
       </div>
       <div class="flex flex-wrap items-center gap-3">
         <span
+          role="status"
+          aria-live="polite"
           class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium"
           :class="
             wsConnected
@@ -211,7 +212,17 @@ function formatUsd(n: number | undefined): string {
             class="inline-block h-1.5 w-1.5 rounded-full"
             :class="wsConnected ? 'bg-[#0F766E] animate-pulse' : 'bg-[#D97706]'"
           />
-          <span>{{ wsConnected ? "Live" : "Connecting..." }}</span>
+          <span>
+            {{
+              wsConnectionState === "live"
+                ? "Live"
+                : wsConnectionState === "reconnecting"
+                  ? "Reconnecting..."
+                  : wsConnectionState === "disconnected"
+                    ? "Offline"
+                    : "Connecting..."
+            }}
+          </span>
         </span>
         <Button v-if="!wsConnected" data-variant="primary" pending-announcement="Refreshing metrics" @click="fetchOverview">
           <AppIcon name="refresh" :size="15" />
@@ -229,7 +240,6 @@ function formatUsd(n: number | undefined): string {
       <span>{{ errorMessage }}</span>
     </div>
 
-    <!-- Loading Skeleton -->
     <div v-if="loading" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
       <div
         v-for="i in 4"
@@ -239,7 +249,6 @@ function formatUsd(n: number | undefined): string {
     </div>
 
     <template v-else>
-      <!-- Empty-state quick Demo Traffic CTA -->
       <section
         v-if="demoStatus.enabled && (valueData?.window_runs ?? 0) === 0"
         class="flex flex-col gap-3 rounded-lg border border-[#99F6E4] bg-[#F0FDFA] p-4 sm:flex-row sm:items-center sm:justify-between"
@@ -255,7 +264,6 @@ function formatUsd(n: number | undefined): string {
         </Button>
       </section>
 
-      <!-- Active Alerts & System Health Banner -->
       <section aria-label="Active monitoring alerts" class="space-y-2">
         <div
           v-if="liveAlerts.length === 0"
@@ -303,7 +311,6 @@ function formatUsd(n: number | undefined): string {
         </div>
       </section>
 
-      <!-- 4-column KPI strip -->
       <section aria-label="Gateway value summary" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
           <div class="text-xs font-medium text-[#52525B]">Gateway-reported token reduction</div>
@@ -347,7 +354,6 @@ function formatUsd(n: number | undefined): string {
       </section>
       <p class="-mt-3 text-[11px] leading-5 text-[#71717A]">Token reduction and USD reduction are gateway-reported estimates. USD uses configured model rates and is not reconciled against provider invoices.</p>
 
-      <!-- Live Activity Stream (Summary metadata only — no raw payloads or PII) -->
       <section
         aria-label="Live gateway activity stream"
         class="rounded-lg border border-[#E4E4E7] bg-white p-4"
@@ -409,7 +415,6 @@ function formatUsd(n: number | undefined): string {
         </div>
       </section>
 
-      <!-- Live Compute & Runtime Telemetry (single flat surface split by hairline border) -->
       <section class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="flex flex-wrap items-center justify-between gap-2 border-b border-[#E4E4E7] px-4 py-3">
           <div class="flex items-center gap-2">
@@ -428,7 +433,6 @@ function formatUsd(n: number | undefined): string {
         </div>
 
         <div v-if="runtimeData" class="grid grid-cols-1 divide-y divide-[#E4E4E7] md:grid-cols-2 md:divide-x md:divide-y-0">
-          <!-- Gateway Process -->
           <div class="space-y-4 p-4">
             <div class="flex items-center justify-between">
               <span class="text-sm font-semibold text-[#09090B]">Gateway Replica</span>
@@ -487,7 +491,6 @@ function formatUsd(n: number | undefined): string {
             </dl>
           </div>
 
-          <!-- Sandbox Worker -->
           <div class="space-y-4 p-4">
             <div class="flex items-center justify-between gap-2">
               <span class="text-sm font-semibold text-[#09090B]">
@@ -566,7 +569,6 @@ function formatUsd(n: number | undefined): string {
         </div>
       </section>
 
-      <!-- Execution mix + security/efficiency posture -->
       <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
           <div class="flex flex-wrap items-start justify-between gap-2">
@@ -606,7 +608,6 @@ function formatUsd(n: number | undefined): string {
         </section>
       </div>
 
-      <!-- Recommendations -->
       <section v-if="valueData?.recommendations?.length" class="rounded-lg border border-[#FDE68A] bg-[#FFFBEB] p-4">
         <h2 class="text-[15px] font-semibold text-[#92400E]">
           Optimization Recommendations
@@ -618,7 +619,6 @@ function formatUsd(n: number | undefined): string {
         </ul>
       </section>
 
-      <!-- Per-Upstream Telemetry Table -->
       <section class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="border-b border-[#E4E4E7] px-4 py-3">
           <h2 class="text-[15px] font-semibold text-[#09090B]">

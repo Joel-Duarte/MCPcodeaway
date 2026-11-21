@@ -52,7 +52,7 @@ def run_scaling_sweep(
             for raw in build_synthetic_tools(count)
         ]
         catalog.set_server_tools(cfg, discovered)
-        _ = UpstreamRegistry(GatewaySettings())  # keeps pattern aligned
+        _ = UpstreamRegistry(GatewaySettings())
         classic_defs = [to_mcp_tool_definition(t) for t in discovered]
         classic_bytes = len(json.dumps(classic_defs, separators=(",", ":")).encode("utf-8"))
         classic_tokens = estimate_tokens(classic_defs)

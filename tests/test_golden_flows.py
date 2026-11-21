@@ -124,9 +124,6 @@ async def test_golden_end_to_end_flows(
     if kind == "profile_gate":
         settings = GatewaySettings(
             profile=flow["profile"],
-            # This flow verifies profile feature gates, not production secret
-            # provisioning. Keep the production feature profile while using the
-            # local verifier for its authorized metrics request.
             app_env="sandbox",
             auth_mode="dev",
             sqlite_path=str(tmp_path / f"{flow['id']}.db"),

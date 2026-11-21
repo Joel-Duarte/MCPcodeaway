@@ -138,7 +138,6 @@ export function useDemoTraffic() {
         method: "POST",
       });
     } catch {
-      // Keep optimistic selection if demo traffic endpoint is unavailable
     }
   }
 
@@ -191,11 +190,19 @@ export interface LiveAlertItem {
   filter_status?: string;
 }
 
+export type TelemetryConnectionState =
+  | "idle"
+  | "connecting"
+  | "live"
+  | "reconnecting"
+  | "disconnected";
+
 export function useLiveTelemetry() {
   const config = useRuntimeConfig();
   const demoStatus = useState<DemoTrafficStatus>("demo-traffic-status");
 
-  const connected = useState<boolean>("ws-telemetry-connected", () => false);
+  const connectionState = useState<TelemetryConnectionState>("ws-telemetry-state", () => "idle");
+  const connected = computed(() => connectionState.value === "live");
   const events = useState<LiveTelemetryEvent[]>("ws-telemetry-events", () => []);
   const latestRuntime = useState<Record<string, unknown> | null>(
     "ws-telemetry-runtime",
@@ -226,14 +233,18 @@ export function useLiveTelemetry() {
     if (!import.meta.client || ws) return;
     intentionalClose = false;
     const url = buildWsUrl();
-    if (!url) return;
+    if (!url) {
+      connectionState.value = "disconnected";
+      return;
+    }
+    connectionState.value = "connecting";
 
     try {
       const socket = new WebSocket(url);
       ws = socket;
 
       socket.onopen = () => {
-        connected.value = true;
+        connectionState.value = "live";
       };
 
       socket.onmessage = (msg) => {
@@ -250,15 +261,16 @@ export function useLiveTelemetry() {
             totalRunsTick.value += 1;
           }
         } catch {
-          // Ignore malformed frame
         }
       };
 
       socket.onclose = () => {
-        connected.value = false;
         ws = null;
         if (!intentionalClose && import.meta.client) {
+          connectionState.value = "reconnecting";
           reconnectTimer = setTimeout(() => connect(), 2500);
+        } else {
+          connectionState.value = "disconnected";
         }
       };
 
@@ -266,8 +278,9 @@ export function useLiveTelemetry() {
         socket.close();
       };
     } catch {
-      connected.value = false;
       ws = null;
+      connectionState.value = "reconnecting";
+      reconnectTimer = setTimeout(() => connect(), 2500);
     }
   }
 
@@ -281,11 +294,12 @@ export function useLiveTelemetry() {
       ws.close();
       ws = null;
     }
-    connected.value = false;
+    connectionState.value = "disconnected";
   }
 
   return {
     connected,
+    connectionState,
     events,
     latestRuntime,
     alerts,

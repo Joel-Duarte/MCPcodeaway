@@ -298,7 +298,6 @@ function spanBarColor(stage: string, status: string) {
       </div>
     </div>
 
-    <!-- Search, Status Chips & Pagination Controls -->
     <section class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
       <div class="flex flex-wrap items-center gap-2">
         <span class="text-xs font-medium text-[#52525B]">Status:</span>
@@ -482,7 +481,6 @@ function spanBarColor(stage: string, status: string) {
       </div>
     </section>
 
-    <!-- Slide-over Audit Inspector Drawer -->
     <Drawer v-model:open="drawerOpen" side="right">
       <DrawerBackdrop />
       <DrawerContent class="w-full max-w-[95vw] sm:w-[36rem] p-0">
@@ -516,7 +514,6 @@ function spanBarColor(stage: string, status: string) {
         </div>
 
         <div v-if="selectedRun" class="min-h-0 flex-1 space-y-6 overflow-y-auto p-5 text-xs">
-          <!-- Compact summary strip: one shared surface, separated by rules. -->
           <dl class="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4">
             <div class="border-b border-[#E4E4E7] pb-2 sm:border-b-0 sm:border-r sm:pr-3">
               <dt class="text-[11px] text-[#71717A]">Duration</dt>
@@ -543,7 +540,6 @@ function spanBarColor(stage: string, status: string) {
             <p v-if="selectedRun.monty_spawn_ms || selectedRun.monty_exec_ms" class="text-[11px] text-[#52525B] tabular-nums">Monty spawn {{ (selectedRun.monty_spawn_ms ?? 0).toFixed(2) }} ms · execution {{ (selectedRun.monty_exec_ms ?? 0).toFixed(2) }} ms</p>
           </section>
 
-          <!-- Linear-style Waterfall Trace Timeline -->
           <section v-if="selectedRun.trace_spans?.length" class="space-y-3 border-t border-[#E4E4E7] pt-4">
             <div class="flex items-center justify-between gap-3">
               <h3 class="font-semibold text-[#09090B]">Request latency waterfall</h3>
@@ -582,7 +578,6 @@ function spanBarColor(stage: string, status: string) {
             </div>
           </section>
 
-          <!-- Metadata & Provenance -->
           <section class="grid grid-cols-2 gap-x-5 gap-y-4 border-t border-[#E4E4E7] pt-4">
             <div>
               <div class="text-[#71717A]">Grounded Provenance</div>
@@ -659,7 +654,6 @@ function spanBarColor(stage: string, status: string) {
       </DrawerContent>
     </Drawer>
 
-    <!-- Destructive Retention Prune Confirmation Dialog -->
     <Dialog v-model:open="pruneDialogOpen">
       <DialogBackdrop />
       <DialogContent>

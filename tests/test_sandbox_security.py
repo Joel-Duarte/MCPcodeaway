@@ -119,7 +119,6 @@ async def test_audit_and_live_telemetry_keep_owner_for_all_execution_outcomes(tm
 
     async def _next_event() -> asyncio.Task[str]:
         task = asyncio.create_task(events.__anext__())
-        # Let the async generator register its subscriber before execution.
         await asyncio.sleep(0)
         return task
 
@@ -426,7 +425,6 @@ async def test_call_budget_exhaustion_and_token_unreachability(tmp_path) -> None
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://gw"
         ) as gw_client:
-            # Exceeding max_calls_per_execution=3 must abort cleanly
             budget_resp = await gw_client.post(
                 "/mcp",
                 headers={"Authorization": f"Bearer {caller_token}"},
@@ -452,7 +450,6 @@ async def test_call_budget_exhaustion_and_token_unreachability(tmp_path) -> None
             assert not sc["ok"]
             assert "budget" in sc["error"].lower()
 
-            # Raw bearer tokens and host credentials are unreachable from sandbox scope
             probe_resp = await gw_client.post(
                 "/mcp",
                 headers={"Authorization": f"Bearer {caller_token}"},
@@ -480,7 +477,6 @@ async def test_call_budget_exhaustion_and_token_unreachability(tmp_path) -> None
             assert caller_token not in serialized
             assert "eyJ" not in serialized
 
-            # Introspection builtins like globals() are also blocked by Monty
             globals_resp = await gw_client.post(
                 "/mcp",
                 headers={"Authorization": f"Bearer {caller_token}"},

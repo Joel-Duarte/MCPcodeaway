@@ -245,7 +245,6 @@ class CredentialVault:
         payload = json.loads(plaintext)
         if not isinstance(payload, dict):
             raise CryptoError("Corrupt user credential payload")
-        # Transparently re-encrypt if the active master key ID has rotated.
         if self.cipher.needs_reencrypt(record["ciphertext"]):
             await self.save_user_credential(
                 tenant_id=tenant_id,

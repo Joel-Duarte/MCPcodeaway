@@ -131,21 +131,17 @@ def compute_empirical_model_delta(
     cl_ms = (sum(float(r.get("duration_ms", 0.0)) for r in cl_runs) / cl_n) if cl_n else 0.0
 
     delta = 0.0
-    # 1. Quality / success rate (primary driver)
     if cm_ok_rate is not None and cl_ok_rate is not None:
         delta += (cm_ok_rate - cl_ok_rate) * 25.0
     elif cm_ok_rate is not None:
         delta += (cm_ok_rate - 0.75) * 30.0
-    # 2. Token efficiency
     if cm_saved > 500:
         delta += min(12.0, cm_saved / 400.0)
-    # 3. Speed / latency comparison
     if cm_ms > 0 and cl_ms > 0:
         if cm_ms < cl_ms:
             delta += 5.0
         elif cm_ms > cl_ms * 1.5:
             delta -= 5.0
-    # 4. Multi-turn reasoning-cost penalty on traditional MCP (-turn_penalty_pts/turn > 1)
     if cl_n and turn_penalty_pts > 0:
         cl_turns = sum(float(r.get("turns") or 1.0) for r in cl_runs) / cl_n
         if cl_turns > 1.0:
@@ -555,17 +551,14 @@ def _evaluate_learned_arms(
     cm_avg_ms = cm["dur_sum"] / cm["runs"]
     cl_avg_ms = cl["dur_sum"] / cl["runs"]
 
-    # 1. Quality / error rate takes top priority
     if cm_err > cl_err + 5.0:
         return "classic", cl_avg_saved, cm_err
     if cl_err > cm_err + 5.0:
         return "codemode", cm_avg_saved, cm_err
-    # 2. Token efficiency
     if cm_avg_saved > cl_avg_saved:
         return "codemode", cm_avg_saved, cm_err
     if cl_avg_saved > cm_avg_saved:
         return "classic", cl_avg_saved, cm_err
-    # 3. Speed / latency tie-breaker
     if cm_avg_ms > 0 and cl_avg_ms > 0 and cl_avg_ms < cm_avg_ms:
         return "classic", cl_avg_saved, cm_err
     return "codemode", cm_avg_saved, cm_err
@@ -806,7 +799,6 @@ async def run_onboarding_ab_test(
     replay_ab: dict[str, Any] | None = None
     live_llm_ab: dict[str, Any] | None = None
 
-    # Build ephemeral staging runtime isolated from live config/store.
     ephemeral_settings = GatewaySettings(
         app_env="uat",
         auth_mode="dev",
@@ -823,7 +815,6 @@ async def run_onboarding_ab_test(
         preloaded_tools={candidate.name: tools},
     )
     await ephemeral_rt.store.init()
-    # Allow caller role access in ephemeral evaluation cleanly.
     eval_cfg = candidate.model_copy(update={"enabled": True})
     ephemeral_rt.registry._static[eval_cfg.name] = eval_cfg
     ephemeral_rt.catalog.set_server_tools(eval_cfg, tools)

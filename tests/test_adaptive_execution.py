@@ -413,7 +413,6 @@ async def test_mutating_benchmark_jobs_get_isolated_mock_backend_state(tmp_path)
     from gateway.mcp_protocol import request_headers, request_meta
 
     keys = LocalDevKeyManager()
-    # The real repository config is the job's normal upstream manifest.
     from pathlib import Path
 
     upstreams = str(Path(__file__).resolve().parents[1] / "config" / "upstreams.yaml")

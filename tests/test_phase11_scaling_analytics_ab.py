@@ -29,7 +29,6 @@ def test_multikey_rotation_worker_and_provenance() -> None:
     worker_app = create_sandbox_worker_app(worker_secret="new_worker_key, old_worker_key")
     client = TestClient(worker_app)
 
-    # Both primary and secondary keys work for WebSocket reverse-RPC.
     for key in ("new_worker_key", "old_worker_key"):
         with client.websocket_connect(
             "/ws/execute", headers={"Authorization": f"Bearer {key}"}
@@ -40,7 +39,6 @@ def test_multikey_rotation_worker_and_provenance() -> None:
             assert msg["sandbox_result"]["ok"] is True
             assert msg["sandbox_result"]["result"] == 3
 
-    # Unknown key is rejected cleanly.
     rejected = False
     try:
         with client.websocket_connect(
@@ -51,7 +49,6 @@ def test_multikey_rotation_worker_and_provenance() -> None:
         rejected = True
     assert rejected is True
 
-    # Worker /health exposes ProcessStatsCollector fields.
     health = client.get("/health")
     assert health.status_code == 200
     hdata = health.json()
@@ -60,7 +57,6 @@ def test_multikey_rotation_worker_and_provenance() -> None:
     assert "rss_mb" in hdata
     assert hdata["total_executions"] >= 2
 
-    # Provenance signs with primary key and verifies across rotated keys.
     sc = SubcallRecord(
         tool="demo__list",
         server="demo",
@@ -86,7 +82,6 @@ async def test_shared_cache_catalog_epoch_sync_has_no_mcp_session_state(tmp_path
     shared_cache = InMemoryCacheBackend()
     assert await shared_cache.get("mcp_sess:srv:tenant:sub") is None
 
-    # Cross-replica catalog_epoch synchronization.
     tool_v1 = DiscoveredTool(
         server="demo",
         name="ping",
@@ -142,7 +137,6 @@ async def test_audit_retention_prune_sqlite_postgres_and_admin_endpoint(tmp_path
     assert [r["run_id"] for r in remaining] == ["run-new"]
     await sqlite_store.close()
 
-    # Fake asyncpg pool test for PostgresAuditStore.prune_runs_older_than.
     class FakePool:
         def __init__(self) -> None:
             self.calls: list[tuple[str, tuple[Any, ...]]] = []
@@ -157,7 +151,6 @@ async def test_audit_retention_prune_sqlite_postgres_and_admin_endpoint(tmp_path
     assert pg_deleted == 7
     assert "DELETE FROM audit_runs WHERE created_at < $1" in fake_pool.calls[0][0]
 
-    # /admin/audit/prune endpoint enforcement + execution.
     settings = GatewaySettings(
         auth_mode="dev",
         profile="demo",
@@ -249,7 +242,6 @@ async def test_dual_mode_admin_auth_oidc_pkce_dev_and_cookie(tmp_path: Path) -> 
             assert cfg["oidc_enabled"] is True
             assert cfg["dev_auth_enabled"] is False
 
-            # Initiate OIDC PKCE login.
             login_resp = await gw.get(
                 "/auth/admin/login?next_url=/dashboard/analytics", follow_redirects=False
             )
@@ -259,7 +251,6 @@ async def test_dual_mode_admin_auth_oidc_pkce_dev_and_cookie(tmp_path: Path) -> 
             assert q["code_challenge_method"] == ["S256"]
             state_1 = q["state"][0]
 
-            # Callback with non-admin token returns to the console with a generic denial status.
             bad_cb = await gw.get(
                 f"/auth/admin/callback?code=code-non-admin&state={state_1}",
                 follow_redirects=False,
@@ -268,7 +259,6 @@ async def test_dual_mode_admin_auth_oidc_pkce_dev_and_cookie(tmp_path: Path) -> 
             assert bad_cb.headers["location"] == "/dashboard/analytics?auth_error=not_authorized"
             assert "mcpcodeaway_admin_session" not in gw.cookies
 
-            # Start second PKCE flow and complete as gateway_admin.
             login_2 = await gw.get("/auth/admin/login?next_url=/dashboard/", follow_redirects=False)
             state_2 = parse_qs(urlparse(login_2.headers["location"]).query)["state"][0]
             ok_cb = await gw.get(
@@ -279,7 +269,6 @@ async def test_dual_mode_admin_auth_oidc_pkce_dev_and_cookie(tmp_path: Path) -> 
             assert ok_cb.headers["location"] == "/dashboard/"
             assert "mcpcodeaway_admin_session" in gw.cookies
 
-            # Cookie unlocks /auth/admin/session, /admin/*, and /audit/analytics.
             sess = (await gw.get("/auth/admin/session")).json()
             assert sess["authenticated"] is True
             assert sess["is_admin"] is True
@@ -290,7 +279,6 @@ async def test_dual_mode_admin_auth_oidc_pkce_dev_and_cookie(tmp_path: Path) -> 
             ana = await gw.get("/audit/analytics")
             assert ana.status_code == 200
 
-            # A subsequent denied sign-in clears an existing privileged browser session.
             login_3 = await gw.get("/auth/admin/login?next_url=/dashboard/", follow_redirects=False)
             state_3 = parse_qs(urlparse(login_3.headers["location"]).query)["state"][0]
             denied_existing_session = await gw.get(
@@ -301,7 +289,6 @@ async def test_dual_mode_admin_auth_oidc_pkce_dev_and_cookie(tmp_path: Path) -> 
             assert "mcpcodeaway_admin_session" not in gw.cookies
             assert (await gw.get("/admin/upstreams")).status_code == 401
 
-            # Logout clears cookie.
             out = await gw.post("/auth/admin/logout")
             assert out.json()["logged_out"] is True
             gw.cookies.clear()
@@ -310,7 +297,6 @@ async def test_dual_mode_admin_auth_oidc_pkce_dev_and_cookie(tmp_path: Path) -> 
         await rt.shutdown()
         await http_client.aclose()
 
-    # Dev-mode /dev-login & /token-login checks.
     dev_settings = GatewaySettings(
         auth_mode="dev",
         profile="demo",
@@ -447,7 +433,6 @@ async def test_runtime_telemetry_analytics_cors_and_cross_tenant_isolation(
             adm_tok = dev_keys.issue_user_token(persona="gateway_admin")
             fin_tok = dev_keys.issue_user_token(persona="finance_analyst")
 
-            # Live remote worker telemetry + CORS header check.
             rt_resp = await gw.get(
                 "/admin/telemetry/runtime",
                 headers={
@@ -464,7 +449,6 @@ async def test_runtime_telemetry_analytics_cors_and_cross_tenant_isolation(
             assert rt_body["sandbox_worker"]["stats"]["cpu_percent"] == 14.5
             assert "cpu_percent" in rt_body["gateway"]
 
-            # Analytics across groups/users/client_groups/model pricing.
             ana = (
                 await gw.get(
                     "/audit/analytics?group=finance&model=gpt-4.1",
@@ -478,7 +462,6 @@ async def test_runtime_telemetry_analytics_cors_and_cross_tenant_isolation(
             assert ana["by_user"][0]["user_email"] == "alice@acme.test"
             assert ana["mode_decisions"][0]["avg_score"] == 85.0
 
-            # Non-admin tenant isolation on /audit/analytics.
             cross = await gw.get(
                 "/audit/analytics?tenant_id=tenant-other",
                 headers={"Authorization": f"Bearer {fin_tok}"},
@@ -511,7 +494,6 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
     assert large.execution == "codemode"
     assert large.score >= 55.0
 
-    # Mock upstream + mock OpenAI-compatible LLM endpoint.
     tool_schemas = [
         DiscoveredTool(
             server="inv_api",
@@ -638,7 +620,6 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
             adm_tok = dev_keys.issue_user_token(persona="gateway_admin")
             fin_tok = dev_keys.issue_user_token(persona="finance_analyst")
 
-            # Layer 1: execution=auto routes algorithmically and logs reason + score.
             auto_list = await gw.post(
                 "/mcp?execution=auto",
                 headers={
@@ -650,7 +631,6 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
             assert auto_list.status_code == 200
             assert "auto->" in auto_list.headers.get("x-gateway-mode-decision", "")
 
-            # Layer 3: enable live A/B split on inv_api and verify deterministic attribution.
             rt.registry._static["inv_api"] = cfg
             rt.catalog.set_server_tools(cfg, tool_schemas)
 
@@ -670,7 +650,6 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
             assert auto_exec.status_code == 200
             assert "experiment_id" in json.dumps((await rt.store.list_runs(limit=5))[0])
 
-            # Onboarding A/B Lab: instant replay + live mocked LLM arm.
             ab_resp = await gw.post(
                 "/admin/upstreams/ab-test",
                 headers={"Authorization": f"Bearer {adm_tok}"},
@@ -699,7 +678,6 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
             assert exps.status_code == 200
             assert "exp_inv_split" in exps.json()["results"]
 
-            # Layer 4: Empirical model score learning + Admin model score overrides.
             qwen_small = evaluate_mode_algorithm(
                 tool_count=8,
                 classic_schema_tokens=800,
@@ -793,7 +771,6 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
             )
             assert learned_resp.headers.get("x-gateway-model") == "gemini-2.5-flash"
 
-            # Historical per-tool runs do not override the configured A/B split.
             await rt.store.record_run(
                 {
                     "run_id": "tool_cm_fail_1",
@@ -895,7 +872,6 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
     ):
         assert Path(doc).is_file(), f"Missing Phase 12 QA/governance file: {doc}"
 
-    # Barebones production Docker target must contain zero Node, SPA, or examples.
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     assert "FROM base-runtime AS gateway" in dockerfile
     gw_block = dockerfile.split("FROM base-runtime AS gateway")[1].split("FROM ")[0]
@@ -903,10 +879,8 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
     assert "nodejs" not in gw_block
     assert "examples" not in gw_block
 
-    # Legacy static HTML dashboard is removed cleanly.
     assert not Path("src/gateway/static/dashboard.html").exists()
 
-    # SPA /dashboard remains reachable, and Demo Traffic + Self-Admin MCP work in demo mode.
     dev_keys = LocalDevKeyManager()
     settings = GatewaySettings(
         auth_mode="dev",
@@ -928,7 +902,6 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
             adm_tok = dev_keys.issue_user_token(persona="gateway_admin")
             fin_tok = dev_keys.issue_user_token(persona="finance_analyst")
 
-            # Self-Admin MCP rejects non-admin callers and serves tools to gateway_admin.
             denied_mcp = await gw.post(
                 "/admin/mcp",
                 headers={"Authorization": f"Bearer {fin_tok}"},
@@ -999,7 +972,6 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
             assert burst.status_code == 200
             assert burst.json()["sent"] == 2
 
-            # Custom model pricing CRUD + analytics model selector merge
             saved_p = await gw.post(
                 "/admin/pricing/models",
                 headers={"Authorization": f"Bearer {adm_tok}"},
@@ -1031,7 +1003,6 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
             assert del_p.status_code == 200
             assert del_p.json()["deleted"] is True
 
-            # Tiered demo traffic start/tier/stop
             t_start = await gw.post(
                 "/admin/demo/traffic/start?tier=stress",
                 headers={"Authorization": f"Bearer {adm_tok}"},
@@ -1052,7 +1023,6 @@ async def test_ui_governance_infra_dockerfile_ci_and_spa_fallback(tmp_path: Path
             assert t_stop.status_code == 200
             assert t_stop.json()["running"] is False
 
-            # Alerts rules + evaluation, roles catalog, and paginated audit search
             roles_r = await gw.get("/admin/roles", headers={"Authorization": f"Bearer {adm_tok}"})
             assert roles_r.status_code == 200
             assert "finance_analyst" in roles_r.json()["roles"]

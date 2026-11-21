@@ -389,7 +389,6 @@ class OidcTokenValidator:
         if self.settings.auth_mode == "dev":
             if self.dev_keys is not None and (kid is None or kid == self.dev_keys.kid):
                 return self.dev_keys.public_pem
-            # External test OIDC provider (e.g. mock_backends on :8001/oidc)
             unverified = jwt.decode(token, options={"verify_signature": False})
             iss = str(unverified.get("iss") or "")
             if self.settings.app_env != "prod" and iss == "http://127.0.0.1:8001/oidc":

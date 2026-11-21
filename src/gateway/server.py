@@ -17,6 +17,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -149,6 +150,35 @@ _VALID_MODES: set[str] = {
 _VALID_EXECUTION: set[str] = {"classic", "codemode", "hybrid", "auto"}
 _VALID_DISCOVERY_MODES: set[str] = {"upfront", "deferred", "x_intent"}
 _VALID_DISCOVERY: set[str] = {"keyword", "bm25"}
+
+
+class GatewayLifecycleState(StrEnum):
+    """Observable lifecycle states for one assembled gateway runtime."""
+
+    NEW = "new"
+    STARTING = "starting"
+    READY = "ready"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+    FAILED = "failed"
+
+
+_GATEWAY_LIFECYCLE_TRANSITIONS: dict[GatewayLifecycleState, frozenset[GatewayLifecycleState]] = {
+    GatewayLifecycleState.NEW: frozenset(
+        {GatewayLifecycleState.STARTING, GatewayLifecycleState.STOPPING}
+    ),
+    GatewayLifecycleState.STARTING: frozenset(
+        {GatewayLifecycleState.READY, GatewayLifecycleState.FAILED}
+    ),
+    GatewayLifecycleState.READY: frozenset(
+        {GatewayLifecycleState.STOPPING, GatewayLifecycleState.FAILED}
+    ),
+    GatewayLifecycleState.STOPPING: frozenset(
+        {GatewayLifecycleState.STOPPED, GatewayLifecycleState.FAILED}
+    ),
+    GatewayLifecycleState.FAILED: frozenset({GatewayLifecycleState.STOPPING}),
+    GatewayLifecycleState.STOPPED: frozenset(),
+}
 
 _MODE_TO_AXES: dict[GatewayMode, tuple[ExecutionMode, DiscoveryMode]] = {
     "traditional": ("classic", "upfront"),
@@ -421,9 +451,18 @@ class GatewayRuntime:
         self.startup_warnings: list[str] = []
         self._startup_retry_task: asyncio.Task[None] | None = None
         self._retention_task: asyncio.Task[None] | None = None
-        self._ready = False
+        self.lifecycle_state = GatewayLifecycleState.NEW
+        self._lifecycle_lock = asyncio.Lock()
         self.demo_traffic = DemoTrafficRunner(self)
         self.alert_evaluator = AlertEvaluator()
+
+    def _transition_lifecycle(self, next_state: GatewayLifecycleState) -> None:
+        """Apply one legal lifecycle transition, rejecting impossible runtime states."""
+        if next_state not in _GATEWAY_LIFECYCLE_TRANSITIONS[self.lifecycle_state]:
+            raise RuntimeError(
+                f"Invalid gateway lifecycle transition: {self.lifecycle_state} -> {next_state}"
+            )
+        self.lifecycle_state = next_state
 
     def _dev_discovery_identity(self) -> CallerIdentity | None:
         if self.dev_keys is None:
@@ -841,21 +880,33 @@ class GatewayRuntime:
                 continue
 
     async def startup(self) -> None:
-        self._ready = False
-        await self.store.init()
-        if hasattr(self.store, "get_setting"):
-            saved_rules = await self.store.get_setting("alert_rules")
-            if saved_rules:
-                self.alert_evaluator.rules = AlertRulesConfig.model_validate(saved_rules)
-        await self.refresh_catalog()
-        if self.startup_warnings:
-            self._startup_retry_task = asyncio.create_task(self._retry_failed_startup_upstreams())
-        self._retention_task = asyncio.create_task(self._retention_loop())
-        self._ready = True
+        async with self._lifecycle_lock:
+            await self._startup()
+
+    async def _startup(self) -> None:
+        if self.lifecycle_state is GatewayLifecycleState.READY:
+            return
+        self._transition_lifecycle(GatewayLifecycleState.STARTING)
+        try:
+            await self.store.init()
+            if hasattr(self.store, "get_setting"):
+                saved_rules = await self.store.get_setting("alert_rules")
+                if saved_rules:
+                    self.alert_evaluator.rules = AlertRulesConfig.model_validate(saved_rules)
+            await self.refresh_catalog()
+            if self.startup_warnings:
+                self._startup_retry_task = asyncio.create_task(
+                    self._retry_failed_startup_upstreams()
+                )
+            self._retention_task = asyncio.create_task(self._retention_loop())
+        except BaseException:
+            self._transition_lifecycle(GatewayLifecycleState.FAILED)
+            raise
+        self._transition_lifecycle(GatewayLifecycleState.READY)
 
     async def is_ready(self) -> bool:
         """Check lifecycle state and required shared dependencies for readiness probes."""
-        if not self._ready:
+        if self.lifecycle_state is not GatewayLifecycleState.READY:
             return False
         if isinstance(self.cache, RedisCacheBackend):
             try:
@@ -872,22 +923,33 @@ class GatewayRuntime:
         return True
 
     async def shutdown(self) -> None:
-        self._ready = False
-        await self.demo_traffic.stop()
-        if self._retention_task is not None and not self._retention_task.done():
-            self._retention_task.cancel()
-            await asyncio.gather(self._retention_task, return_exceptions=True)
-        self._retention_task = None
-        if self._startup_retry_task is not None and not self._startup_retry_task.done():
-            self._startup_retry_task.cancel()
-            await asyncio.gather(self._startup_retry_task, return_exceptions=True)
-        self._startup_retry_task = None
-        await self.sandbox.close()
-        await self.client_manager.close()
-        if hasattr(self.cache, "close"):
-            await self.cache.close()  # type: ignore[attr-defined]
-        if hasattr(self.store, "close"):
-            await self.store.close()  # type: ignore[attr-defined]
+        async with self._lifecycle_lock:
+            await self._shutdown()
+
+    async def _shutdown(self) -> None:
+        if self.lifecycle_state is GatewayLifecycleState.STOPPED:
+            return
+        self._transition_lifecycle(GatewayLifecycleState.STOPPING)
+        try:
+            await self.demo_traffic.stop()
+            if self._retention_task is not None and not self._retention_task.done():
+                self._retention_task.cancel()
+                await asyncio.gather(self._retention_task, return_exceptions=True)
+            self._retention_task = None
+            if self._startup_retry_task is not None and not self._startup_retry_task.done():
+                self._startup_retry_task.cancel()
+                await asyncio.gather(self._startup_retry_task, return_exceptions=True)
+            self._startup_retry_task = None
+            await self.sandbox.close()
+            await self.client_manager.close()
+            if hasattr(self.cache, "close"):
+                await self.cache.close()  # type: ignore[attr-defined]
+            if hasattr(self.store, "close"):
+                await self.store.close()  # type: ignore[attr-defined]
+        except BaseException:
+            self._transition_lifecycle(GatewayLifecycleState.FAILED)
+            raise
+        self._transition_lifecycle(GatewayLifecycleState.STOPPED)
 
     def _publish_live_summary_payload(
         self, run: dict[str, Any], identity: CallerIdentity
@@ -963,7 +1025,6 @@ class GatewayRuntime:
                 return [_execute_code_with_stubs(accessible)]
             return [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, EXECUTE_CODE_DEF]
 
-        # hybrid: Code Mode for orchestration + direct MCP definitions for mutating writes
         direct_mutating = [to_mcp_tool_definition(tool) for tool in accessible if tool.mutating]
         if eff_disc == "upfront":
             read_only = [tool for tool in accessible if not tool.mutating]
@@ -1131,8 +1192,6 @@ class GatewayRuntime:
         run: dict[str, Any],
     ) -> int:
         total_saved = int(run["estimated_tokens_saved"]) + int(run["schema_tokens_saved"])
-        # Prometheus is deployment-wide and commonly readable by operations
-        # identities. Keep labels bounded and avoid exporting tenant identifiers.
         metric_labels = {"mode": mode}
         self.metrics.inc_counter(
             "gateway_tokens_saved_total", amount=total_saved, labels=metric_labels
@@ -1319,8 +1378,6 @@ class GatewayRuntime:
                         error_type="ExecutionTimeoutError",
                     )
                 except asyncio.CancelledError:
-                    # Preserve an audit record for a caller disconnect or task
-                    # cancellation, then propagate cancellation after recording.
                     execution_cancelled = True
                     sandbox_res = SandboxResult(
                         ok=False,
@@ -1940,8 +1997,11 @@ def create_gateway_app(
     async def ready() -> dict[str, Any] | JSONResponse:
         is_ready = await runtime.is_ready()
         if not is_ready:
-            return JSONResponse(status_code=503, content={"ready": False})
-        return {"ready": True}
+            return JSONResponse(
+                status_code=503,
+                content={"ready": False, "state": runtime.lifecycle_state.value},
+            )
+        return {"ready": True, "state": runtime.lifecycle_state.value}
 
     mcp_request_slots = asyncio.Semaphore(max(1, runtime.settings.max_concurrent_mcp_requests))
 
@@ -4467,7 +4527,6 @@ def create_gateway_app(
                     raise HTTPException(status_code=400, detail="run_ids must be a list of strings")
                 if not isinstance(row.get("runtime_failure", False), bool):
                     raise HTTPException(status_code=400, detail="runtime_failure must be boolean")
-                # The evidence contract intentionally excludes prompt and answer material.
                 if any(
                     any(
                         term in str(k).lower()

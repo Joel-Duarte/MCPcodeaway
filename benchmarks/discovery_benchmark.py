@@ -22,7 +22,6 @@ from gateway.discovery import DiscoveryEngine
 from gateway.upstream_clients import DiscoveredTool
 
 _EVAL_QUERIES: list[dict[str, Any]] = [
-    # 10 Direct / Exact queries
     {
         "id": "direct_01",
         "kind": "direct",
@@ -83,7 +82,6 @@ _EVAL_QUERIES: list[dict[str, Any]] = [
         "query": "create collection case",
         "expected": {"ops_ticketing__create_collection_case"},
     },
-    # 10 Paraphrased / Semantic queries (avoiding exact tool identifiers)
     {
         "id": "semantic_01",
         "kind": "semantic",

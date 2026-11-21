@@ -47,7 +47,6 @@ const loading = ref(true);
 const statusMsg = ref("");
 const errorMsg = ref("");
 
-// Model Pricing Catalog
 const pricing = ref<ModelPricingMap | null>(null);
 const modelSearch = ref("");
 const modelPage = ref(1);
@@ -57,7 +56,6 @@ const editInPrice = ref("");
 const editOutPrice = ref("");
 const savingPricing = ref(false);
 
-// Alert Rules & Custom Rules
 const errorRateMax = ref("15.0");
 const p95LatencyMax = ref("1500");
 const groundingBlocksMax = ref("5");
@@ -68,7 +66,6 @@ const savingAlerts = ref(false);
 const testingWebhook = ref(false);
 const webhookTestResult = ref<{ delivered: boolean; https_enforced: boolean; detail: string } | null>(null);
 
-// New Custom Rule Form
 const newRuleName = ref("");
 const newRuleMetric = ref<CustomAlertRule["metric"]>("error_rate_pct");
 const newRuleOp = ref<CustomAlertRule["operator"]>(">=");
@@ -76,7 +73,6 @@ const newRuleThreshold = ref("10");
 const newRuleSeverity = ref<CustomAlertRule["severity"]>("warning");
 const newRuleWebhook = ref("");
 
-// Compliance Retention & S3 / JSONL Archive
 const retentionDays = ref("90");
 const autoInterval = ref("off");
 const archiveS3Bucket = ref("");
@@ -124,7 +120,6 @@ async function loadSettings() {
         });
       }
     } catch {
-      // Optional runtime metadata fetch
     }
     pricing.value = p;
     errorRateMax.value = String(r.error_rate_pct_max);
@@ -174,7 +169,6 @@ async function loadVaultSecrets() {
     const res = await apiFetch<{ secrets: Array<{ name: string; updated_by: string; updated_at: string }> }>("/admin/secrets");
     vaultSecrets.value = res.secrets || [];
   } catch {
-    // ignore if unavailable
   }
 }
 
@@ -493,7 +487,6 @@ async function pruneAuditRuns() {
         </div>
       </section>
 
-      <!-- Detected model pricing -->
       <section v-else-if="activeSettingsTab === 'pricing'" id="settings-panel-pricing" role="tabpanel" class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="flex flex-col gap-3 border-b border-[#E4E4E7] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
@@ -605,7 +598,6 @@ async function pruneAuditRuns() {
         </div>
       </section>
 
-      <!-- Alert thresholds and webhook destinations -->
       <section v-else-if="activeSettingsTab === 'alerts'" id="settings-panel-alerts" role="tabpanel" class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="border-b border-[#E4E4E7] px-4 py-3">
           <h2 class="text-[15px] font-semibold text-[#09090B]">Monitoring, Custom Alert Rules &amp; Webhooks</h2>
@@ -692,7 +684,6 @@ async function pruneAuditRuns() {
             <code class="font-mono-data">cloudflared tunnel --url http://localhost:9000</code> or <code class="font-mono-data">ngrok http 9000</code>.
           </div>
 
-          <!-- Custom Alert Rule Builder -->
           <div class="space-y-3 border-t border-[#E4E4E7] pt-4">
             <h3 class="text-xs font-semibold uppercase tracking-wide text-[#52525B]">Custom Alert Rules</h3>
             <div class="grid gap-2 sm:grid-cols-8 sm:items-end">
@@ -788,7 +779,6 @@ async function pruneAuditRuns() {
         </div>
       </section>
 
-      <!-- Audit retention and archive schedule -->
       <section v-else-if="activeSettingsTab === 'retention'" id="settings-panel-retention" role="tabpanel" class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="border-b border-[#E4E4E7] px-4 py-3">
           <h2 class="text-[15px] font-semibold text-[#09090B]">Compliance Audit Archive &amp; Retention</h2>

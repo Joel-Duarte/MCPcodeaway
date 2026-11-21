@@ -91,14 +91,12 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
   expect(editRes.ok, editRes.error?.message).toBe(true);
   expect((wrapper.find("input").element as HTMLInputElement).value).toBe("crm_partner_api");
 
-  // Inspect Schema first so Step 2 & Step 3 unlock cleanly
   const inspectStep = await agent.act({
     steps: [{ ref: "Inspect Schema", action: "press" }],
   });
   expect(inspectStep.ok, inspectStep.error?.message).toBe(true);
   await Promise.resolve();
 
-  // Advance to Step 2 and verify auth-specific fields mount when delegated_token is selected
   const navStep2 = await agent.act({
     steps: [{ ref: "2. Policy & Mode", action: "press" }],
   });
@@ -112,7 +110,6 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
   expect(wrapper.text()).toContain("Allowed RBAC roles");
   expect(wrapper.text()).toContain("Allowed groups");
 
-  // Advance to Step 3 so Register Upstream mounts cleanly
   const navStep3 = await agent.act({
     steps: [{ ref: "3. Test & Save", action: "press" }],
   });
@@ -123,13 +120,11 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
     .map((entry) => entry.label);
   expect(step3Labels).toContain("Save Upstream");
 
-  // Mutating Register Upstream must be blocked when allow() denies confirmation.
   const denied = await agent.act({
     steps: [{ ref: "Save Upstream", action: "press" }],
   });
   expect(denied.ok).toBe(false);
 
-  // Allowed once operator approves confirmation.
   approveMutation = true;
   const approved = await agent.act({
     steps: [{ ref: "Save Upstream", action: "press" }],

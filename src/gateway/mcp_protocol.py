@@ -28,8 +28,6 @@ def request_headers(method: str, *, tool_name: str | None = None) -> dict[str, s
         "Mcp-Method": method,
     }
     if tool_name is not None:
-        # The current HTTP binding requires RFC 2047 Base64 encoding for names
-        # outside the permitted HTTP token characters.
         invalid_token_char = any(
             not (character.isalnum() or character in "!#$%&'*+-.^_`|~") for character in tool_name
         )

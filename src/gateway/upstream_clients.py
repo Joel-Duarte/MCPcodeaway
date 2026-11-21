@@ -344,10 +344,6 @@ class UpstreamClientManager:
         headers.pop("Mcp-Session-Id", None)
         propagate.inject(headers)
         client = self._get_client()
-        # Construct the request directly rather than through build_request:
-        # build_request merges the shared AsyncClient cookie jar. Direct
-        # construction prevents a concurrent Set-Cookie response from leaking
-        # into another caller's upstream request.
         request = httpx.Request(method, url, headers=headers, **kwargs)
         request.headers.pop("cookie", None)
         return await client.send(request, follow_redirects=False)

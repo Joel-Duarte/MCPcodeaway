@@ -38,7 +38,6 @@ async def test_unauthenticated_and_invalid_tokens_return_401_with_www_authentica
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        # Missing Authorization header
         resp = await client.get("/auth/me")
         assert resp.status_code == 401
         assert (
@@ -46,24 +45,20 @@ async def test_unauthenticated_and_invalid_tokens_return_401_with_www_authentica
             == 'Bearer resource_metadata="http://127.0.0.1:8000/.well-known/oauth-protected-resource"'
         )
 
-        # Malformed header
         resp = await client.get("/auth/me", headers={"Authorization": "Basic abc123"})
         assert resp.status_code == 401
         assert "resource_metadata=" in resp.headers["www-authenticate"]
 
-        # Expired token
         expired = dev_keys.issue_user_token(persona="finance_analyst", ttl_seconds=-10)
         resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {expired}"})
         assert resp.status_code == 401
 
-        # Wrong audience token
         wrong_aud = dev_keys.issue_user_token(
             persona="finance_analyst", audience="api://some-other-service"
         )
         resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {wrong_aud}"})
         assert resp.status_code == 401
 
-        # Valid token succeeds and never exposes raw_token
         valid = dev_keys.issue_user_token(persona="finance_analyst")
         resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {valid}"})
         assert resp.status_code == 200
@@ -142,7 +137,6 @@ async def test_oauth_discovery_and_dev_token_endpoints() -> None:
         assert me.status_code == 200
         assert me.json()["sub"] == "user-sup-01"
 
-    # Dev endpoints disabled when auth_mode="oidc"
     oidc_settings = GatewaySettings(
         auth_mode="oidc",
         oidc_issuer="https://idp.example.com",
@@ -172,18 +166,15 @@ async def test_policy_evaluator_and_prod_restrictions(tmp_path) -> None:
 
     policy = PolicyEvaluator(sandbox_settings)
 
-    # Finance analyst & readonly auditor see snowflake/billing, not ops
     for p in ("finance_analyst", "readonly_auditor"):
         assert policy.can_access_upstream(identities[p], upstreams["snowflake_ledger"])[0]
         assert policy.can_access_upstream(identities[p], upstreams["billing_legacy_eu"])[0]
         assert not policy.can_access_upstream(identities[p], upstreams["ops_ticketing"])[0]
 
-    # Ops engineer can execute mutating tool in sandbox
     assert policy.can_execute_tool(
         identities["ops_engineer"], upstreams["ops_ticketing"], "create_collection_case", True
     )[0]
 
-    # Support agent can read ops_ticketing, but cannot mutate
     assert policy.can_execute_tool(
         identities["support_agent"], upstreams["ops_ticketing"], "list_terminal_incidents", False
     )[0]
@@ -191,7 +182,6 @@ async def test_policy_evaluator_and_prod_restrictions(tmp_path) -> None:
         identities["support_agent"], upstreams["ops_ticketing"], "create_collection_case", True
     )[0]
 
-    # In prod with read_only_prod=True, mutating tools and dynamic/stdio upstreams are blocked
     prod_settings = GatewaySettings(app_env="prod", read_only_prod=True, auth_mode="dev")
     prod_policy = PolicyEvaluator(prod_settings)
     assert not prod_policy.can_execute_tool(
@@ -249,7 +239,6 @@ async def test_delegated_token_exchanger_dev_cache_isolation_and_dialects() -> N
     assert second.cache_hit
     assert second.access_token == first.access_token
 
-    # User B and Tenant Beta never receive User A's cached token
     aud_res = await exchanger.exchange(
         aud_id, audience="api://snowflake-ledger", scope="snowflake.read"
     )
@@ -262,7 +251,6 @@ async def test_delegated_token_exchanger_dev_cache_isolation_and_dialects() -> N
     assert not beta_res.cache_hit
     assert beta_res.access_token != first.access_token
 
-    # Verify RFC 8693 and Entra v2 OBO HTTP dialects send exact form parameters
     captured: list[dict[str, str]] = []
 
     def token_handler(request: httpx.Request) -> httpx.Response:
@@ -333,7 +321,6 @@ async def test_mock_backends_enforce_delegated_audience_and_roles() -> None:
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=backends_app), base_url="http://backends"
     ) as client:
-        # Wrong audience rejected with 401
         wrong = await client.post(
             "/snowflake/mcp",
             headers={"Authorization": f"Bearer {eu_tok}"},
@@ -341,7 +328,6 @@ async def test_mock_backends_enforce_delegated_audience_and_roles() -> None:
         )
         assert wrong.status_code == 401
 
-        # Missing role rejected with 403 (ops_engineer lacks snowflake_reader)
         ops_sf_tok = (
             await exchanger.exchange(ops_id, "api://snowflake-ledger", "snowflake.read")
         ).access_token
@@ -352,7 +338,6 @@ async def test_mock_backends_enforce_delegated_audience_and_roles() -> None:
         )
         assert forbidden.status_code == 403
 
-        # Authorized finance analyst queries snowflake & billing-eu + OpenAPI spec
         sf_call = await client.post(
             "/snowflake/mcp",
             headers={"Authorization": f"Bearer {sf_tok}"},
@@ -378,7 +363,6 @@ async def test_mock_backends_enforce_delegated_audience_and_roles() -> None:
         assert eu_invoices.status_code == 200
         assert eu_invoices.json()["count"] == 5
 
-        # Support agent can list incidents on ops_ticketing, but cannot create collection case
         inc = await client.post(
             "/ops/mcp",
             headers={"Authorization": f"Bearer {sup_ops_tok}"},

@@ -165,7 +165,6 @@ def test_full_auth_and_authz_spectrum_golden_flows(
             scopes=["mcp.tools"],
         )
 
-        # Store vault:// secret via /admin/secrets
         r_sec = client.put(
             "/admin/secrets/inv_api_key",
             headers={"Authorization": f"Bearer {admin_tok}"},
@@ -173,7 +172,6 @@ def test_full_auth_and_authz_spectrum_golden_flows(
         )
         assert r_sec.status_code == 200
 
-        # Register all 8 OpenAPI services via /admin/upstreams (real OpenAPI discovery)
         upstreams = [
             UpstreamConfig(
                 name="inventory_obo",
@@ -285,11 +283,9 @@ def test_full_auth_and_authz_spectrum_golden_flows(
             )
             assert r_add.status_code == 200, r_add.text
 
-        # 1. Missing token -> 401 RFC 9728; unapproved tenant -> 403
         assert _mcp_call(client, None, "server/discover").status_code == 401
         assert _mcp_call(client, wrong_tenant_tok, "server/discover").status_code == 403
 
-        # 2. Entra v2 OBO + ABAC row filtering (EU accountant sees only EU item)
         r_obo = _mcp_call(
             client,
             finance_eu_tok,
@@ -302,7 +298,6 @@ def test_full_auth_and_authz_spectrum_golden_flows(
         assert d_obo["caller_sub"] == "user-fin-01"
         assert [i["region"] for i in d_obo["items"]] == ["EU"]
 
-        # 3. Keycloak RFC 8693 brokering an Entra user token
         r_kc = _mcp_call(
             client,
             finance_eu_tok,
@@ -314,7 +309,6 @@ def test_full_auth_and_authz_spectrum_golden_flows(
         assert d_kc["auth_verified"] == "rfc8693"
         assert d_kc["total"] == 120.0
 
-        # 4. Headless agent (client_credentials) allowed on metrics_m2m, denied on finance group
         r_m2m = _mcp_call(
             client,
             headless_agent_tok,
@@ -336,7 +330,6 @@ def test_full_auth_and_authz_spectrum_golden_flows(
         deny_body = r_deny_bot.json()
         assert "error" in deny_body or deny_body.get("result", {}).get("isError") is True
 
-        # 5. Shared vault:// api_key, file:// bearer_secret, and none
         assert (
             _extract_tool_json(
                 _mcp_call(
@@ -377,7 +370,6 @@ def test_full_auth_and_authz_spectrum_golden_flows(
             == "none"
         )
 
-        # 6. user_oauth PKCE flow + auto-refresh
         r_unlinked = _mcp_call(
             client,
             finance_eu_tok,
@@ -395,7 +387,6 @@ def test_full_auth_and_authz_spectrum_golden_flows(
             f"/auth/connect/external_oauth?ticket={ticket}", follow_redirects=False
         )
         assert r_auth_redir.status_code == 302
-        # Simulate external IdP authorize step via mock_idp_app
         with TestClient(idp_app) as idp_client:
             ext_loc = r_auth_redir.headers["location"]
             r_ext_auth = idp_client.get(
@@ -407,7 +398,6 @@ def test_full_auth_and_authz_spectrum_golden_flows(
         r_cb = client.get(urlsplit(cb_loc).path + "?" + urlsplit(cb_loc).query)
         assert r_cb.status_code == 200
 
-        # Calling tool now succeeds (and auto-refreshes because initial TTL=10s <= 30s)
         d_ext = _extract_tool_json(
             _mcp_call(
                 client,
@@ -420,7 +410,6 @@ def test_full_auth_and_authz_spectrum_golden_flows(
         assert d_ext["auth_verified"] == "user_oauth"
         assert d_ext["external_user"] == "user-fin-01"
 
-        # 7. user_api_key per-user isolation
         r_pat_save = client.post(
             "/me/connections/external_pat/secret",
             headers={"Authorization": f"Bearer {finance_eu_tok}"},
@@ -438,8 +427,6 @@ def test_full_auth_and_authz_spectrum_golden_flows(
         )
         assert d_pat["owner"] == "user-fin-01"
 
-        # 8. Security & Isolation: cross-tenant, cross-user, ticket-scope, and sandbox isolation
-        # 8a. Same sub ('user-fin-01') in a different approved tenant ('enterprise') has zero access
         other_tenant_same_sub_tok = idp.issue_entra_token(
             sub="user-fin-01",
             tenant_id="enterprise",
@@ -464,7 +451,6 @@ def test_full_auth_and_authz_spectrum_golden_flows(
         )
         assert "/auth/connect/external_pat?ticket=" in r_other_tenant_pat.text
 
-        # 8b. Different user in the SAME tenant cannot use user-fin-01's credentials
         other_user_same_tenant_tok = idp.issue_entra_token(
             sub="user-fin-eu-01",
             tenant_id="tenant-acme-entra",
@@ -481,14 +467,12 @@ def test_full_auth_and_authz_spectrum_golden_flows(
         )
         assert "/auth/connect/external_pat?ticket=" in r_other_user_pat.text
 
-        # 8c. Ticket signed for external_oauth cannot be replayed on external_pat
         r_replay = client.post(
             "/auth/connect/external_pat/secret",
             data={"ticket": ticket, "api_key": "stolen-attempt"},
         )
         assert r_replay.status_code == 401
 
-        # 8d. Code Mode sandbox cannot read host secrets and never leaks secrets in outputs/audit
         r_cm = client.post(
             "/mcp",
             headers={

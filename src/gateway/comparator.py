@@ -19,7 +19,7 @@ from gateway.upstream_clients import DiscoveredTool
 if TYPE_CHECKING:
     from gateway.server import GatewayRuntime
 
-_GATEWAY_SURFACE_OVERHEAD_TOKENS = 360  # list_servers + search_tools + execute_code schemas
+_GATEWAY_SURFACE_OVERHEAD_TOKENS = 360
 
 
 def audit_catalog_comparison(
@@ -287,7 +287,7 @@ async def run_side_by_side_comparison(
                 if sc.get("auth_type") == "delegated_token" and not sc.get("token_cache_hit"):
                     classic_exchanges += 1
 
-    classic_round_trips = len(classic_calls) + 1  # N tool calls + final LLM synthesis turn
+    classic_round_trips = len(classic_calls) + 1
     classic_payload_tokens = estimate_tokens([r.get("result") for r in classic_runs])
     classic_total_tokens = classic_schema_tokens * classic_round_trips + classic_payload_tokens
 
@@ -303,7 +303,7 @@ async def run_side_by_side_comparison(
             if sc.get("auth_type") == "delegated_token" and not sc.get("token_cache_hit"):
                 cm_exchanges += 1
 
-    codemode_round_trips = 2  # search_tools + execute_code
+    codemode_round_trips = 2
     codemode_payload_tokens = search_tokens + estimate_tokens(cm_exec.get("result"))
     codemode_total_tokens = codemode_schema_tokens * codemode_round_trips + codemode_payload_tokens
 

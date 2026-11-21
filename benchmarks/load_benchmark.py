@@ -64,7 +64,6 @@ async def run_load_benchmark(
         )
         await runtime.startup()
 
-        # Pool of distinct user identities making repeated requests (models realistic bursts)
         unique_count = max(4, num_users // 3)
         identities = []
         for idx in range(unique_count):
@@ -78,7 +77,6 @@ async def run_load_benchmark(
         sem = asyncio.Semaphore(concurrency)
 
         async def _bench_mode(mode: str) -> dict[str, Any]:
-            # Reset cache between modes so cache hit rates are measured fairly
             for ident in identities:
                 for aud, scp in (
                     ("api://snowflake-ledger", "snowflake.read"),

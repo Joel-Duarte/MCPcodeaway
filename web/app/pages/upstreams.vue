@@ -15,7 +15,6 @@ async function loadPerf() {
     const res = await _apiFetch<{ rows: typeof healthRows.value }>("/admin/adaptive-execution/tool-health?window=all");
     if (res?.rows) healthRows.value = res.rows;
   } catch {
-    // ignore
   }
 }
 
@@ -160,7 +159,6 @@ const upstreamsData = ref<UpstreamsResponse | null>(null);
 const deleteTarget = ref<string | null>(null);
 const deleteDialogOpen = ref(false);
 
-// 500-server scale search, filters & pagination
 const searchQuery = ref(initialUpstream);
 const groupFilter = ref("");
 const authFilter = ref("");
@@ -317,7 +315,6 @@ onMounted(() => {
       </ul>
     </div>
 
-    <!-- 500-Server Scale Search & Filter Bar -->
     <section class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
       <div class="grid gap-3 sm:grid-cols-5">
         <div class="sm:col-span-2">

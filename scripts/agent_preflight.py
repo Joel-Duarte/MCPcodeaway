@@ -8,6 +8,8 @@ import re
 import sys
 from pathlib import Path
 
+import check_comments
+
 _REQUIRED_GOVERNANCE_FILES = (
     "DESIGN.md",
     "AGENTS.md",
@@ -188,6 +190,7 @@ def _check_qa_contracts(root: Path, errors: list[str]) -> None:
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     errors: list[str] = []
+    errors.extend(check_comments.check(root))
     _check_required_files(root, errors)
     _check_python_src(root, errors)
     _check_web_and_secrets(root, errors)
@@ -198,7 +201,9 @@ def main() -> int:
         for err in errors:
             print(f"  - {err}", file=sys.stderr)
         return 1
-    print("agent_preflight OK: governance, suppression, secret, QA, and Docker checks passed.")
+    print(
+        "agent_preflight OK: governance, comment ratchet, suppression, secrets, QA, Docker passed."
+    )
     return 0
 
 

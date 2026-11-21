@@ -143,7 +143,6 @@ async def test_hitl_onboarding_guidance_curation_and_agent_prompt(tmp_path) -> N
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://gw"
             ) as gw:
-                # 1. Generic AI onboarding prompt + UpstreamConfig schema endpoint
                 prompt_resp = await gw.get("/admin/upstreams/agent-prompt")
                 assert prompt_resp.status_code == 200
                 prompt_data = prompt_resp.json()
@@ -152,7 +151,6 @@ async def test_hitl_onboarding_guidance_curation_and_agent_prompt(tmp_path) -> N
                 assert "abac_rules" in prompt_data["schema"]["properties"]
                 assert "allowed_operations" in prompt_data["schema"]["properties"]
 
-                # 2. Inspect OpenAPI spec detects securitySchemes + missing outputSchema + writes
                 insp = await gw.post(
                     "/admin/upstreams/inspect",
                     json={
@@ -175,7 +173,6 @@ async def test_hitl_onboarding_guidance_curation_and_agent_prompt(tmp_path) -> N
                 assert "list_orders" in guidance["missing_output_schema_tools"]
                 assert "CorpOAuth" in guidance["agent_onboarding_prompt"]
 
-                # 3. Register with HITL allowed_operations curation excluding delete & list_orders
                 reg = await gw.post(
                     "/admin/upstreams",
                     json={
@@ -243,7 +240,6 @@ async def test_downstream_rls_via_obo_client_groups_in_codemode(tmp_path) -> Non
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://gw"
             ) as gw:
-                # 1. eu_accountant querying unfiltered Snowflake + EU invoices gets ONLY EU rows
                 eu_exec = await _post_mcp(
                     gw,
                     eu_token,
@@ -274,7 +270,6 @@ async def test_downstream_rls_via_obo_client_groups_in_codemode(tmp_path) -> Non
                 assert "CUST-1003" in eu_sc["result"]["cust_ids"]
                 assert "CUST-1024" not in eu_sc["result"]["cust_ids"]
 
-                # 2. eu_accountant trying cross-group Snowflake point lookup or US billing fails 403
                 eu_cross = await _post_mcp(
                     gw,
                     eu_token,
@@ -308,7 +303,6 @@ async def test_downstream_rls_via_obo_client_groups_in_codemode(tmp_path) -> Non
                 assert eu_us_bill["result"]["structuredContent"]["ok"] is False
                 assert "403" in eu_us_bill["result"]["structuredContent"]["error"]
 
-                # 3. us_accountant gets ONLY US rows via its own isolated OBO token exchange
                 us_exec = await _post_mcp(
                     gw,
                     us_token,
@@ -401,7 +395,6 @@ async def test_host_side_abac_enforcement_for_api_key_upstream(tmp_path, monkeyp
         args = params.get("arguments") or {}
         legacy_calls.append({"name": name, "args": args})
         if name == "list_client_accounts":
-            # Simulates a sloppy legacy API returning mixed EU + US rows even when filtered
             res = {
                 "count": 2,
                 "rows": [
@@ -461,7 +454,6 @@ async def test_host_side_abac_enforcement_for_api_key_upstream(tmp_path, monkeyp
                 assert reg.status_code == 200, reg.text
                 assert rt.catalog.get_tool("legacy_erp__list_client_accounts") is not None
 
-                # 1. Pre-call ABAC blocks disallowed arg region='US' BEFORE touching upstream
                 legacy_calls.clear()
                 denied_arg = await _post_mcp(
                     gw,
@@ -479,7 +471,6 @@ async def test_host_side_abac_enforcement_for_api_key_upstream(tmp_path, monkeyp
                 assert "ABAC policy denied" in denied_arg["result"]["structuredContent"]["error"]
                 assert len(legacy_calls) == 0
 
-                # 2. Unfiltered call injects region='EU' & post-call strips leaked US row!
                 legacy_calls.clear()
                 filtered_res = await _post_mcp(
                     gw,
@@ -497,7 +488,6 @@ async def test_host_side_abac_enforcement_for_api_key_upstream(tmp_path, monkeyp
                 assert sc["result"]["count"] == 1
                 assert [r["customer_id"] for r in sc["result"]["rows"]] == ["CUST-1003"]
 
-                # 3. Single-record US lookup returned by upstream is blocked before entering Monty
                 denied_row = await _post_mcp(
                     gw,
                     eu_token,

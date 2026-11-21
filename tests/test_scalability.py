@@ -75,7 +75,6 @@ async def test_remote_monty_worker_reverse_rpc_isolation(tmp_path) -> None:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=gw_app), base_url="http://gw"
             ) as gw:
-                # 1. Parallel reconciliation runs inside isolated remote worker via WS reverse-RPC
                 script = (
                     "import asyncio\n"
                     "ledger, eu, us = await asyncio.gather(\n"
@@ -114,8 +113,6 @@ async def test_remote_monty_worker_reverse_rpc_isolation(tmp_path) -> None:
                 assert fin_token not in str(sc)
                 assert "eyJ" not in str(sc)
 
-                # Separate WebSocket executions must keep reverse-RPC callbacks
-                # bound to the caller that created each execution.
                 remote_backend = RemoteMontyWorkerBackend(f"ws://127.0.0.1:{port}/ws/execute")
                 callbacks_entered = 0
                 callbacks_lock = asyncio.Lock()
@@ -173,8 +170,6 @@ async def test_remote_monty_worker_reverse_rpc_isolation(tmp_path) -> None:
                     await cancelled_execution
                 await asyncio.wait_for(callback_cancelled.wait(), timeout=1.0)
 
-                # Saturation waits only for the bounded admission interval and
-                # rejects excess executions; it must not build an unbounded queue.
                 holds_started = 0
                 holds_lock = asyncio.Lock()
                 both_slots_held = asyncio.Event()
@@ -211,7 +206,6 @@ async def test_remote_monty_worker_reverse_rpc_isolation(tmp_path) -> None:
                 held_results = await holding_executions
                 assert all(result.ok and result.result == "released" for result in held_results)
 
-                # 2. Unauthorized tool is never bound into remote worker
                 denied = await gw.post(
                     "/mcp?mode=codemode",
                     headers={"Authorization": f"Bearer {fin_token}"},
@@ -355,16 +349,12 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(
             async def _run_user(idx: int) -> tuple[str, str, dict[str, Any]]:
                 await asyncio.sleep(launch_delays[idx])
                 tenant = "tenant-alpha" if idx % 2 == 0 else "tenant-beta"
-                # Reuse one subject in different tenants to catch cache/session
-                # keys that accidentally omit the tenant component.
                 sub = "shared-subject" if idx < 2 else f"concurrent-user-{idx:02d}"
                 tok = dev_keys.issue_user_token(
                     persona="finance_analyst",
                     overrides={"sub": sub, "tenant_id": tenant},
                 )
                 async with request_slots:
-                    # Alternate each caller between two independent gateway
-                    # runtimes, modeling a load balancer without sticky affinity.
                     gw = gw_a if idx % 2 == 0 else gw_b
                     resp = await gw.post(
                         "/mcp?mode=codemode",
@@ -390,7 +380,6 @@ async def test_concurrent_multi_user_cache_isolation_and_rate_limit(
                 assert sc["ok"]
                 assert sc["result"] == {"sub": expected_sub, "tid": expected_tid}
 
-            # Verify rate_limit_per_minute=20 blocks 21st call for same user within 60s
             rl_tok = dev_keys.issue_user_token(
                 persona="finance_analyst",
                 overrides={"sub": "rate-limited-user", "tenant_id": "tenant-alpha"},

@@ -203,11 +203,9 @@ def test_validate_upstream_url_ssrf_rules() -> None:
             with pytest.raises(ValueError):
                 validate_upstream_url(bad, app_env=env)
 
-    # Localhost and private IPs remain valid in sandbox/uat for local test harnesses.
     validate_upstream_url("http://127.0.0.1:8080/mcp", app_env="sandbox")
     validate_upstream_url("http://localhost:8001/openapi.json", app_env="uat")
 
-    # Prod blocks un-allowlisted loopback/private/internal hosts.
     for prod_bad in (
         "http://127.0.0.1:8080/mcp",
         "http://10.0.0.15:8080/mcp",
@@ -310,7 +308,6 @@ async def test_otel_exporter_and_otlp_optional_dependency(
     configure_telemetry(otlp_endpoint="http://127.0.0.1:4318/v1/traces")
     assert captured_endpoints == ["http://127.0.0.1:4318/v1/traces"]
 
-    # When OTLP package is missing, clear RuntimeError is raised rather than raw ImportError.
     real_import = builtins.__import__
 
     def blocked_import(name, *args, **kwargs):

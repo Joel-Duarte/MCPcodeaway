@@ -26,7 +26,6 @@ def _read_rss_mb() -> float:
     except OSError:
         pass
     usage = resource.getrusage(resource.RUSAGE_SELF)
-    # Linux ru_maxrss is in KiB; macOS ru_maxrss is in bytes.
     divisor = (1024.0 * 1024.0) if sys.platform == "darwin" else 1024.0
     return round(usage.ru_maxrss / divisor, 2)
 

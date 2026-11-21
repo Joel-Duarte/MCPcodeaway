@@ -57,7 +57,6 @@ try {
 
     await page.goto(baseUrl, { waitUntil: "networkidle" });
     for (let step = 0; step < maxSteps; step++) {
-      // Property invariants on every state transition
       const state = await page.evaluate(() => ({
         textLen: document.body?.innerText?.trim().length || 0,
         hasHeading: Boolean(document.querySelector("h1, h2, [role=heading]")),
@@ -70,7 +69,6 @@ try {
         throw new Error(`Horizontal overflow ${state.overflow}px at ${page.url()} (${vp.width}px)`);
       }
 
-      // Randomized safe interactive exploration across visible links/tabs/buttons
       const clicked = await page.evaluate((s) => {
         const candidates = Array.from(
           document.querySelectorAll("a[href^=\"/dashboard\"], button:not([disabled]), [role=tab]")
