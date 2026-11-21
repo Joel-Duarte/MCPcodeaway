@@ -101,7 +101,11 @@ class RedisCacheBackend:
         if self._client is None:
             import redis.asyncio as aioredis
 
-            self._client = aioredis.from_url(self.redis_url, decode_responses=True)
+            self._client = aioredis.from_url(
+                self.redis_url,
+                decode_responses=True,
+                health_check_interval=30,
+            )
         return self._client
 
     async def health_check(self) -> bool:
@@ -121,23 +125,42 @@ class RedisCacheBackend:
         await self._get_client().delete(key)
 
     async def increment_window(self, key: str, window_seconds: int) -> int:
+        """Increment the sliding window and reconnect once on Redis connection loss."""
         client = self._get_client()
         now = time.time()
         cutoff = now - window_seconds
         member = f"{now}:{uuid.uuid4().hex}"
-        if hasattr(client, "pipeline"):
-            pipe = client.pipeline(transaction=True)
-            pipe.zremrangebyscore(key, 0, cutoff)
-            pipe.zadd(key, {member: now})
-            pipe.zcard(key)
-            pipe.expire(key, max(window_seconds, 1))
-            res = await pipe.execute()
-            return int(res[2])
-        await client.zremrangebyscore(key, 0, cutoff)
-        await client.zadd(key, {member: now})
-        count = int(await client.zcard(key))
-        await client.expire(key, max(window_seconds, 1))
-        return count
+
+        async def increment(active_client: Any) -> int:
+            if hasattr(active_client, "pipeline"):
+                pipe = active_client.pipeline(transaction=True)
+                pipe.zremrangebyscore(key, 0, cutoff)
+                pipe.zadd(key, {member: now})
+                pipe.zcard(key)
+                pipe.expire(key, max(window_seconds, 1))
+                results = await pipe.execute()
+                return int(results[2])
+            await active_client.zremrangebyscore(key, 0, cutoff)
+            await active_client.zadd(key, {member: now})
+            count = int(await active_client.zcard(key))
+            await active_client.expire(key, max(window_seconds, 1))
+            return count
+
+        try:
+            return await increment(client)
+        except Exception as exc:
+            try:
+                from redis.exceptions import ConnectionError as RedisConnectionError
+            except ImportError:
+                raise exc from None
+            if not isinstance(exc, RedisConnectionError):
+                raise
+            pool = getattr(client, "connection_pool", None)
+            disconnect = getattr(pool, "disconnect", None)
+            if disconnect is None:
+                raise
+            await disconnect(inuse_connections=True)
+            return await increment(self._get_client())
 
     async def close(self) -> None:
         if self._client is not None and hasattr(self._client, "aclose"):

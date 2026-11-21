@@ -16,7 +16,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from gateway.auth import DEV_PERSONAS, CallerIdentity, LocalDevKeyManager
 from gateway.config import GatewaySettings
-from gateway.server import create_gateway_app
+from gateway.server import _is_dependency_connection_error, create_gateway_app
 from gateway.state import SQLiteAuditStore
 from gateway.telemetry import TelemetryRecorder
 from gateway.upstream_clients import validate_upstream_url
@@ -192,6 +192,17 @@ async def test_audit_routes_enforce_tenant_isolation(tmp_path: Path) -> None:
         all_summary = await gw.get("/audit/summary", headers=admin_h)
         assert all_summary.status_code == 200
         assert all_summary.json()["total_runs"] == 2
+
+
+def test_shared_dependency_connection_errors_are_recognized() -> None:
+    class PostgresConnectionError(Exception):
+        __module__ = "asyncpg.exceptions"
+
+    failure = RuntimeError("database unavailable")
+    failure.__cause__ = PostgresConnectionError("connection refused")
+    assert _is_dependency_connection_error(failure)
+    assert _is_dependency_connection_error(ConnectionError("redis disconnected"))
+    assert not _is_dependency_connection_error(ValueError("bad input"))
 
 
 def test_validate_upstream_url_ssrf_rules() -> None:

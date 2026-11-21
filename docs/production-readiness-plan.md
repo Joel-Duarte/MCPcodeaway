@@ -144,6 +144,16 @@ notification provider to the codebase before a customer selects one.
 
 ## Progress
 
+### Local readiness lab (2026-11-21)
+
+- Added `docker-compose.readiness.yml` with Keycloak 26.8.2 importing a local OIDC realm, two gateway replicas, and the existing shared local Postgres/Redis services. The overlay removes the mock backend's host port mapping so an unrelated host process on 8001 is left untouched.
+- Added `scripts/readiness_smoke.py` to check real OIDC tokens, tenant and admin/viewer RBAC, a generated REST-backed CRM call, and a requester/approver/replay flow through the load balancer against shared approval state.
+- Added an internal-network-only, unauthenticated readiness mutation fixture. It validates gateway approval enforcement and shared state; it is deliberately not evidence about upstream authentication or authorization.
+- Added `benchmarks/live_gateway_benchmark.py` for repeatable traditional and Code Mode read-only HTTP workloads with latency, throughput, status/error, response-size, and no-retry reporting. Added operator instructions, drill procedure, and still-open SLO targets to `docs/local-readiness-lab.md`.
+- Local Keycloak, CRM mock, tenant/RBAC, viewer-read-only, self-approval/wrong-group denial, and full requester/approver/replay smoke passed. Sequential live CRM mock runs passed at 100% success: traditional 200 requests / concurrency 10 / 20 warmups (p50 50.082 ms, p95 106.387 ms, p99 119.165 ms, 183.235 RPS); Code Mode 100 requests / concurrency 5 / 10 warmups (p50 33.682 ms, p95 49.324 ms, p99 51.155 ms, 143.964 RPS). A preceding run hit the default 120/minute per-user rate limit; the lab overlay now sets 6,000/minute to permit load measurements. These are short local mock baselines only, not capacity or SLO evidence.
+- Shared-service drills: one gateway replica stopped with 100% smoke and 40/40 read-only requests; one worker stopped with 40/40 Code Mode requests; Redis loss returned `/ready` 503. Recovery first exposed stale Redis sockets causing 500s. Added Redis pool health checks and one safe retry for the idempotent rate-limit counter; after rebuilding, 40/40 calls passed following a Redis restart. Postgres loss returned 503 from readiness and MCP; after restart, readiness and approval smoke passed. The outage call failed before requester confirmation, so no mutation was authorized or dispatched.
+- Remaining release blockers: customer IdP/group mapping, partner sandbox or contract-faithful upstream, agreed workload/SLO/RTO/RPO targets, production hosting and egress boundary, managed shared-service configuration, backup restore and image rollback proof, customer approval hierarchy and retention/export policy, and sustained/representative load evidence.
+
 ### Phase 1 review against the current project
 
 | Phase 1 item | Status | Project evidence / remaining work |

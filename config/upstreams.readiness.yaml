@@ -1,0 +1,116 @@
+upstreams:
+  - name: snowflake_ledger
+    type: mcp_http
+    url: http://mock-backends:8001/snowflake/mcp
+    auth_type: delegated_token
+    downstream_audience: api://snowflake-ledger
+    downstream_scope: snowflake.read
+    allowed_roles: [finance_analyst, snowflake_reader, readonly_auditor, admin]
+    allowed_groups: [finance, audit, platform]
+    allowed_scopes: [mcp.tools, finance.read]
+    allowed_operations: [query_debt_ledger, get_customer_balance, get_trial_balance_lines, compute_interest_penalty]
+    tool_effects: { query_debt_ledger: read, get_customer_balance: read, get_trial_balance_lines: read, compute_interest_penalty: read }
+    mutating_tools: []
+    enabled: true
+
+  - name: billing_legacy_eu
+    type: openapi
+    url: http://mock-backends:8001/billing-eu
+    openapi_spec_url: http://mock-backends:8001/billing-eu/openapi.json
+    auth_type: delegated_token
+    downstream_audience: api://billing-eu
+    downstream_scope: billing.read
+    allowed_roles: [finance_analyst, billing_reader, readonly_auditor, admin]
+    allowed_groups: [finance, audit, platform]
+    allowed_scopes: [mcp.tools, finance.read]
+    allowed_operations: [list_eu_invoices, get_eu_customer]
+    tool_effects: { list_eu_invoices: read, get_eu_customer: read }
+    mutating_tools: []
+    enabled: true
+
+  - name: billing_legacy_us
+    type: openapi
+    url: http://mock-backends:8001/billing-us
+    openapi_spec_url: http://mock-backends:8001/billing-us/openapi.json
+    auth_type: delegated_token
+    downstream_audience: api://billing-us
+    downstream_scope: billing.read
+    allowed_roles: [finance_analyst, billing_reader, readonly_auditor, admin]
+    allowed_groups: [finance, audit, platform]
+    allowed_scopes: [mcp.tools, finance.read]
+    allowed_operations: [list_us_invoices, get_us_customer]
+    tool_effects: { list_us_invoices: read, get_us_customer: read }
+    mutating_tools: []
+    enabled: true
+
+  - name: ops_ticketing
+    type: mcp_http
+    url: http://mock-backends:8001/ops/mcp
+    auth_type: delegated_token
+    downstream_audience: api://ops-ticketing
+    downstream_scope: ops.tickets
+    allowed_roles: [ops_engineer, ticketing_writer, support_agent, admin]
+    allowed_groups: [operations, support, platform]
+    allowed_scopes: [mcp.tools, ops.read, ops.write]
+    allowed_operations: [list_terminal_incidents, get_terminal_health, create_collection_case, search_sentry_errors, get_github_release_commit]
+    tool_effects: { list_terminal_incidents: read, get_terminal_health: read, create_collection_case: high_impact, search_sentry_errors: read, get_github_release_commit: read }
+    mutating_tools: [create_collection_case]
+    tool_approval_policies:
+      create_collection_case: { mode: manager_approval, version: 1, confirmation_message: "Approve creation of this outbound collections case.", approver_groups: [operations-approvers] }
+    enabled: true
+
+  - name: crm_accounts
+    type: openapi
+    url: http://mock-backends:8001/crm
+    openapi_spec_url: http://mock-backends:8001/crm/openapi.json
+    auth_type: none
+    preferred_mode: traditional
+    allowed_roles: [sales_ops, finance_analyst, gateway_admin, admin]
+    allowed_groups: [sales, finance, platform]
+    allowed_operations: [list_crm_accounts, list_crm_accounts_summary, list_crm_accounts_health, list_crm_accounts_metrics]
+    tool_effects: { list_crm_accounts: read, list_crm_accounts_summary: read, list_crm_accounts_health: read, list_crm_accounts_metrics: read }
+    mutating_tools: []
+    enabled: true
+
+  - name: hr_directory
+    type: openapi
+    url: http://mock-backends:8001/hr
+    openapi_spec_url: http://mock-backends:8001/hr/openapi.json
+    auth_type: none
+    preferred_mode: traditional
+    allowed_roles: [hr_ops, gateway_admin, admin]
+    allowed_groups: [hr, platform]
+    allowed_operations: [list_hr_employees, list_hr_employees_summary, list_hr_employees_health, list_hr_employees_metrics]
+    tool_effects: { list_hr_employees: read, list_hr_employees_summary: read, list_hr_employees_health: read, list_hr_employees_metrics: read }
+    mutating_tools: []
+    enabled: true
+
+  - name: devops_ci
+    type: openapi
+    url: http://mock-backends:8001/devops
+    openapi_spec_url: http://mock-backends:8001/devops/openapi.json
+    auth_type: none
+    preferred_mode: auto
+    allowed_roles: [platform_eng, sre_oncall, gateway_admin, admin]
+    allowed_groups: [engineering, platform]
+    allowed_operations: [list_ci_deployments, list_ci_deployments_summary, list_ci_deployments_health, list_ci_deployments_metrics]
+    tool_effects: { list_ci_deployments: read, list_ci_deployments_summary: read, list_ci_deployments_health: read, list_ci_deployments_metrics: read }
+    mutating_tools: []
+    enabled: true
+
+  - name: readiness_approvals
+    type: mcp_http
+    url: http://mock-backends:8001/readiness/approvals/mcp
+    auth_type: none
+    allowed_roles: [ops_engineer, ticketing_writer]
+    allowed_groups: [operations]
+    allowed_operations: [create_approval_case]
+    tool_effects: { create_approval_case: high_impact }
+    mutating_tools: [create_approval_case]
+    tool_approval_policies:
+      create_approval_case:
+        mode: manager_approval
+        version: 1
+        confirmation_message: "Approve readiness case for {customer_id}: {reason}"
+        approver_groups: [operations-approvers]
+    enabled: true

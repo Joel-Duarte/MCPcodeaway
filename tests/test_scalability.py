@@ -456,3 +456,57 @@ async def test_redis_cache_backend_with_fake_client() -> None:
 
     await cache.close()
     assert fake.closed
+
+
+async def test_redis_rate_limiter_reconnects_after_a_lost_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    from types import ModuleType
+
+    class RedisConnectionError(Exception):
+        pass
+
+    redis_module = ModuleType("redis")
+    exceptions_module = ModuleType("redis.exceptions")
+    exceptions_module.ConnectionError = RedisConnectionError
+    redis_module.exceptions = exceptions_module
+    monkeypatch.setitem(sys.modules, "redis", redis_module)
+    monkeypatch.setitem(sys.modules, "redis.exceptions", exceptions_module)
+
+    class _FlakyRedis:
+        def __init__(self) -> None:
+            self.zsets: dict[str, dict[str, float]] = {}
+            self.fail_next_command = True
+            self.reconnects = 0
+            self.connection_pool = self
+
+        async def disconnect(self, *, inuse_connections: bool) -> None:
+            assert inuse_connections is True
+            self.fail_next_command = False
+            self.reconnects += 1
+
+        async def zremrangebyscore(self, key: str, min_score: float, max_score: float) -> None:
+            if self.fail_next_command:
+                raise RedisConnectionError("stale Redis connection")
+            bucket = self.zsets.get(key, {})
+            self.zsets[key] = {
+                member: score
+                for member, score in bucket.items()
+                if not min_score <= score <= max_score
+            }
+
+        async def zadd(self, key: str, mapping: dict[str, float]) -> None:
+            self.zsets.setdefault(key, {}).update(mapping)
+
+        async def zcard(self, key: str) -> int:
+            return len(self.zsets.get(key, {}))
+
+        async def expire(self, key: str, ttl: int) -> None:
+            _ = (key, ttl)
+
+    client = _FlakyRedis()
+    cache = RedisCacheBackend(client=client)
+    assert await cache.increment_window("rl:user", 60) == 1
+    assert client.reconnects == 1
+    assert len(client.zsets["rl:user"]) == 1

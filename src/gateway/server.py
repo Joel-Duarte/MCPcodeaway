@@ -1927,6 +1927,31 @@ def _valid_run_timestamp(value: Any) -> bool:
         return False
 
 
+def _is_dependency_connection_error(exc: BaseException) -> bool:
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (ConnectionError, TimeoutError, OSError)):
+            return True
+        module = type(current).__module__
+        name = type(current).__name__
+        if module.startswith("asyncpg.") and (
+            name.endswith("ConnectionError") or name == "CannotConnectNowError"
+        ):
+            return True
+        if module.startswith("redis.") and name in {"ConnectionError", "TimeoutError"}:
+            return True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return False
+
+
 def create_gateway_app(
     *,
     settings: GatewaySettings | None = None,
@@ -1968,6 +1993,23 @@ def create_gateway_app(
         openapi_url=None if is_prod else "/openapi.json",
     )
     app.state.runtime = runtime
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        if not _is_dependency_connection_error(exc):
+            raise exc
+        log_event(
+            "dependency.unavailable",
+            level=logging.ERROR,
+            path=request.url.path,
+            error_type=type(exc).__name__,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "A required shared service is temporarily unavailable."},
+            headers={"Retry-After": "1"},
+        )
+
     runtime.demo_traffic.bind_app(app)
     if runtime.settings.cors_allowed_origins:
         app.add_middleware(

@@ -458,6 +458,7 @@ def create_mock_backends_app(
     debt_ledger, trial_balance, invoices_by_region, customers_by_region, incidents = (
         _seed_enterprise_data()
     )
+    readiness_approval_cases: list[dict[str, Any]] = []
     bulk_ledger, bulk_invoices_by_region = _seed_bulk_data()
     collection_cases: list[dict[str, Any]] = []
 
@@ -879,6 +880,51 @@ def create_mock_backends_app(
             server_name="ops_ticketing",
             tools=ops_tools,
             call_fn=call_ops,
+        )
+
+    @app.post("/readiness/approvals/mcp")
+    async def readiness_approvals_mcp(request: Request) -> JSONResponse:
+        """Unauthenticated mutation fixture for the local approval readiness lab only."""
+        tools = [
+            {
+                "name": "create_approval_case",
+                "description": "Create a local readiness case after manager approval.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "customer_id": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["customer_id", "reason"],
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "case_id": {"type": "string"},
+                        "customer_id": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+                "annotations": {"readOnlyHint": False, "destructiveHint": False},
+            }
+        ]
+
+        def create_readiness_case(name: str, args: dict[str, Any]) -> Any:
+            if name != "create_approval_case":
+                raise KeyError(name)
+            case = {
+                "case_id": f"READY-{len(readiness_approval_cases) + 1:04d}",
+                "customer_id": args["customer_id"],
+                "reason": args["reason"],
+            }
+            readiness_approval_cases.append(case)
+            return case
+
+        return await _handle_mcp_rpc(
+            request,
+            server_name="readiness_approvals",
+            tools=tools,
+            call_fn=create_readiness_case,
         )
 
     app.mount(
