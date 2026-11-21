@@ -352,6 +352,45 @@ class AuditStore(Protocol):
         self, tenant_id: str, user_sub: str, upstream_name: str
     ) -> bool: ...
 
+    async def create_or_get_operation(
+        self, operation: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]: ...
+
+    async def get_operation(self, operation_id: str) -> dict[str, Any] | None: ...
+
+    async def get_operation_by_dedupe_key(self, dedupe_key: str) -> dict[str, Any] | None: ...
+
+    async def list_operations(
+        self, tenant_id: str, *, statuses: list[str] | None, limit: int = 100
+    ) -> list[dict[str, Any]]: ...
+
+    async def claim_operations(
+        self, *, limit: int, now: str, lease_expires_at: str
+    ) -> list[dict[str, Any]]: ...
+
+    async def update_operation(
+        self,
+        operation_id: str,
+        *,
+        lease_token: str,
+        status: str,
+        attempt_count: int,
+        updated_at: str,
+        next_attempt_at: str | None = None,
+        lease_expires_at: str | None = None,
+        result_ciphertext: str | None = None,
+        last_error_type: str | None = None,
+        last_error: str | None = None,
+        cancel_requested: bool | None = None,
+        expires_at: str | None = None,
+    ) -> bool: ...
+
+    async def request_operation_cancel(
+        self, operation_id: str, tenant_id: str, requester_sub: str, client_id: str | None
+    ) -> bool: ...
+
+    async def prune_operations(self, *, now: str) -> int: ...
+
 
 class SQLiteAuditStore:
     """Zero-dependency SQLite-backed store for execution audit runs and dynamic upstreams."""
@@ -475,6 +514,41 @@ class SQLiteAuditStore:
                 updated_at TEXT NOT NULL
             )
             """
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS recovery_operations (
+                operation_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                requester_sub TEXT NOT NULL,
+                client_id TEXT NOT NULL DEFAULT '',
+                upstream_name TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                request_digest TEXT NOT NULL,
+                payload_ciphertext TEXT NOT NULL,
+                result_ciphertext TEXT,
+                status TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL,
+                max_attempts INTEGER NOT NULL,
+                next_attempt_at TEXT,
+                recovery_deadline TEXT NOT NULL,
+                lease_token TEXT,
+                lease_expires_at TEXT,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                last_error_type TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_recovery_operations_claim
+            ON recovery_operations (status, next_attempt_at, lease_expires_at, recovery_deadline)"""
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_recovery_operations_owner
+            ON recovery_operations (tenant_id, requester_sub, client_id, created_at DESC)"""
         )
         conn.execute(
             """
@@ -1276,6 +1350,218 @@ class SQLiteAuditStore:
             conn.commit()
             return cursor.rowcount > 0
 
+    @staticmethod
+    def _decode_operation(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        operation = dict(row)
+        operation["cancel_requested"] = bool(operation.get("cancel_requested"))
+        return operation
+
+    async def create_or_get_operation(
+        self, operation: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        async with self._lock:
+            conn = self._ensure_conn()
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO recovery_operations (
+                    operation_id, tenant_id, requester_sub, client_id, upstream_name,
+                    tool_name, dedupe_key, request_digest, payload_ciphertext,
+                    result_ciphertext, status, attempt_count, max_attempts,
+                    next_attempt_at, recovery_deadline, lease_token, lease_expires_at,
+                    cancel_requested, last_error_type, last_error, created_at,
+                    updated_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    operation["operation_id"],
+                    operation["tenant_id"],
+                    operation["requester_sub"],
+                    operation.get("client_id") or "",
+                    operation["upstream_name"],
+                    operation["tool_name"],
+                    operation["dedupe_key"],
+                    operation["request_digest"],
+                    operation["payload_ciphertext"],
+                    operation.get("result_ciphertext"),
+                    operation["status"],
+                    operation["attempt_count"],
+                    operation["max_attempts"],
+                    operation.get("next_attempt_at"),
+                    operation["recovery_deadline"],
+                    operation.get("lease_token"),
+                    operation.get("lease_expires_at"),
+                    int(bool(operation.get("cancel_requested", False))),
+                    operation.get("last_error_type"),
+                    operation.get("last_error"),
+                    operation["created_at"],
+                    operation["updated_at"],
+                    operation["expires_at"],
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM recovery_operations WHERE dedupe_key = ?",
+                (operation["dedupe_key"],),
+            ).fetchone()
+        decoded = self._decode_operation(row)
+        if decoded is None:
+            raise RuntimeError("Operation insert did not produce a durable row")
+        return decoded, cursor.rowcount > 0
+
+    async def get_operation(self, operation_id: str) -> dict[str, Any] | None:
+        async with self._lock:
+            row = (
+                self._ensure_conn()
+                .execute(
+                    "SELECT * FROM recovery_operations WHERE operation_id = ?", (operation_id,)
+                )
+                .fetchone()
+            )
+        return self._decode_operation(row)
+
+    async def get_operation_by_dedupe_key(self, dedupe_key: str) -> dict[str, Any] | None:
+        async with self._lock:
+            row = (
+                self._ensure_conn()
+                .execute("SELECT * FROM recovery_operations WHERE dedupe_key = ?", (dedupe_key,))
+                .fetchone()
+            )
+        return self._decode_operation(row)
+
+    async def list_operations(
+        self, tenant_id: str, *, statuses: list[str] | None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        marks = ",".join("?" for _ in statuses) if statuses else None
+        async with self._lock:
+            query = "SELECT * FROM recovery_operations WHERE tenant_id = ?"
+            args: tuple[Any, ...] = (tenant_id,)
+            if marks is not None:
+                query += f" AND status IN ({marks})"
+                args += tuple(statuses or [])
+            query += " ORDER BY created_at DESC LIMIT ?"
+            args += (max(1, min(limit, 200)),)
+            rows = self._ensure_conn().execute(query, args).fetchall()
+        return [decoded for row in rows if (decoded := self._decode_operation(row)) is not None]
+
+    async def claim_operations(
+        self, *, limit: int, now: str, lease_expires_at: str
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            conn = self._ensure_conn()
+            candidates = conn.execute(
+                """SELECT operation_id FROM recovery_operations
+                WHERE status IN ('pending', 'working')
+                  AND (status = 'pending' OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                ORDER BY COALESCE(next_attempt_at, created_at), created_at
+                LIMIT ?""",
+                (now, now, max(1, min(limit, 100))),
+            ).fetchall()
+            claimed: list[dict[str, Any]] = []
+            for candidate in candidates:
+                operation_id = str(candidate["operation_id"])
+                lease_token = uuid.uuid4().hex
+                updated = conn.execute(
+                    """UPDATE recovery_operations SET status='working', lease_token=?,
+                    lease_expires_at=?, updated_at=? WHERE operation_id=?
+                    AND (status='pending' OR lease_expires_at IS NULL OR lease_expires_at<=?)""",
+                    (lease_token, lease_expires_at, now, operation_id, now),
+                )
+                if updated.rowcount:
+                    row = conn.execute(
+                        "SELECT * FROM recovery_operations WHERE operation_id = ?",
+                        (operation_id,),
+                    ).fetchone()
+                    decoded = self._decode_operation(row)
+                    if decoded is not None:
+                        claimed.append(decoded)
+            conn.commit()
+        return claimed
+
+    async def update_operation(
+        self,
+        operation_id: str,
+        *,
+        lease_token: str,
+        status: str,
+        attempt_count: int,
+        updated_at: str,
+        next_attempt_at: str | None = None,
+        lease_expires_at: str | None = None,
+        result_ciphertext: str | None = None,
+        last_error_type: str | None = None,
+        last_error: str | None = None,
+        cancel_requested: bool | None = None,
+        expires_at: str | None = None,
+    ) -> bool:
+        if status not in {
+            "working",
+            "pending",
+            "completed",
+            "failed",
+            "needs_attention",
+            "cancelled",
+        }:
+            raise ValueError("Invalid recovery operation status")
+        async with self._lock:
+            conn = self._ensure_conn()
+            cursor = conn.execute(
+                """UPDATE recovery_operations SET status=?, attempt_count=?,
+                next_attempt_at=?, result_ciphertext=COALESCE(?, result_ciphertext),
+                lease_token=?, lease_expires_at=?, last_error_type=?, last_error=?,
+                cancel_requested=COALESCE(?, cancel_requested), updated_at=?,
+                expires_at=COALESCE(?, expires_at)
+                WHERE operation_id=? AND lease_token=?""",
+                (
+                    status,
+                    attempt_count,
+                    next_attempt_at,
+                    result_ciphertext,
+                    lease_token if status == "working" else None,
+                    lease_expires_at if status == "working" else None,
+                    last_error_type,
+                    last_error,
+                    None if cancel_requested is None else int(cancel_requested),
+                    updated_at,
+                    expires_at,
+                    operation_id,
+                    lease_token,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    async def request_operation_cancel(
+        self, operation_id: str, tenant_id: str, requester_sub: str, client_id: str | None
+    ) -> bool:
+        async with self._lock:
+            conn = self._ensure_conn()
+            cursor = conn.execute(
+                """UPDATE recovery_operations SET cancel_requested=1, updated_at=?
+                WHERE operation_id=? AND tenant_id=? AND requester_sub=? AND client_id=?
+                AND status IN ('pending', 'working')""",
+                (
+                    datetime.now(UTC).isoformat(),
+                    operation_id,
+                    tenant_id,
+                    requester_sub,
+                    client_id or "",
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    async def prune_operations(self, *, now: str) -> int:
+        terminal = ("completed", "failed", "needs_attention", "cancelled")
+        async with self._lock:
+            conn = self._ensure_conn()
+            cursor = conn.execute(
+                "DELETE FROM recovery_operations WHERE status IN (?, ?, ?, ?) AND expires_at <= ?",
+                (*terminal, now),
+            )
+            conn.commit()
+            return cursor.rowcount
+
 
 class PostgresAuditStore:
     """Postgres-backed AuditStore for multi-replica production deployments."""
@@ -1354,6 +1640,41 @@ class PostgresAuditStore:
         await pool.execute(
             """CREATE INDEX IF NOT EXISTS idx_tool_approvals_tenant_status_created
             ON tool_approvals (tenant_id, status, created_at DESC)"""
+        )
+        await pool.execute(
+            """CREATE TABLE IF NOT EXISTS recovery_operations (
+                operation_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                requester_sub TEXT NOT NULL,
+                client_id TEXT NOT NULL DEFAULT '',
+                upstream_name TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                request_digest TEXT NOT NULL,
+                payload_ciphertext TEXT NOT NULL,
+                result_ciphertext TEXT,
+                status TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL,
+                max_attempts INTEGER NOT NULL,
+                next_attempt_at TEXT,
+                recovery_deadline TEXT NOT NULL,
+                lease_token TEXT,
+                lease_expires_at TEXT,
+                cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                last_error_type TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )"""
+        )
+        await pool.execute(
+            """CREATE INDEX IF NOT EXISTS idx_recovery_operations_claim
+            ON recovery_operations (status, next_attempt_at, lease_expires_at, recovery_deadline)"""
+        )
+        await pool.execute(
+            """CREATE INDEX IF NOT EXISTS idx_recovery_operations_owner
+            ON recovery_operations (tenant_id, requester_sub, client_id, created_at DESC)"""
         )
         await pool.execute(
             """
@@ -2054,6 +2375,202 @@ class PostgresAuditStore:
             upstream_name,
         )
         return str(res).endswith("1")
+
+    @staticmethod
+    def _decode_operation(row: Any) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return dict(row)
+
+    async def create_or_get_operation(
+        self, operation: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            inserted = await conn.fetchrow(
+                """INSERT INTO recovery_operations (
+                    operation_id, tenant_id, requester_sub, client_id, upstream_name,
+                    tool_name, dedupe_key, request_digest, payload_ciphertext,
+                    result_ciphertext, status, attempt_count, max_attempts,
+                    next_attempt_at, recovery_deadline, lease_token, lease_expires_at,
+                    cancel_requested, last_error_type, last_error, created_at,
+                    updated_at, expires_at
+                ) VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+                    $18,$19,$20,$21,$22,$23
+                ) ON CONFLICT (dedupe_key) DO NOTHING RETURNING *""",
+                operation["operation_id"],
+                operation["tenant_id"],
+                operation["requester_sub"],
+                operation.get("client_id") or "",
+                operation["upstream_name"],
+                operation["tool_name"],
+                operation["dedupe_key"],
+                operation["request_digest"],
+                operation["payload_ciphertext"],
+                operation.get("result_ciphertext"),
+                operation["status"],
+                operation["attempt_count"],
+                operation["max_attempts"],
+                operation.get("next_attempt_at"),
+                operation["recovery_deadline"],
+                operation.get("lease_token"),
+                operation.get("lease_expires_at"),
+                bool(operation.get("cancel_requested", False)),
+                operation.get("last_error_type"),
+                operation.get("last_error"),
+                operation["created_at"],
+                operation["updated_at"],
+                operation["expires_at"],
+            )
+            row = inserted or await conn.fetchrow(
+                "SELECT * FROM recovery_operations WHERE dedupe_key=$1",
+                operation["dedupe_key"],
+            )
+        decoded = self._decode_operation(row)
+        if decoded is None:
+            raise RuntimeError("Operation insert did not produce a durable row")
+        return decoded, inserted is not None
+
+    async def get_operation(self, operation_id: str) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        row = await pool.fetchrow(
+            "SELECT * FROM recovery_operations WHERE operation_id=$1", operation_id
+        )
+        return self._decode_operation(row)
+
+    async def get_operation_by_dedupe_key(self, dedupe_key: str) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        row = await pool.fetchrow(
+            "SELECT * FROM recovery_operations WHERE dedupe_key=$1", dedupe_key
+        )
+        return self._decode_operation(row)
+
+    async def list_operations(
+        self, tenant_id: str, *, statuses: list[str] | None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        if statuses:
+            rows = await pool.fetch(
+                """SELECT * FROM recovery_operations WHERE tenant_id=$1 AND status=ANY($2::text[])
+                ORDER BY created_at DESC LIMIT $3""",
+                tenant_id,
+                statuses,
+                max(1, min(limit, 200)),
+            )
+        else:
+            rows = await pool.fetch(
+                """SELECT * FROM recovery_operations WHERE tenant_id=$1
+                ORDER BY created_at DESC LIMIT $2""",
+                tenant_id,
+                max(1, min(limit, 200)),
+            )
+        return [dict(row) for row in rows]
+
+    async def claim_operations(
+        self, *, limit: int, now: str, lease_expires_at: str
+    ) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        claimed: list[dict[str, Any]] = []
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    """SELECT operation_id FROM recovery_operations
+                    WHERE status IN ('pending', 'working')
+                      AND (status='pending' OR lease_expires_at IS NULL OR lease_expires_at<=$1)
+                      AND (next_attempt_at IS NULL OR next_attempt_at<=$1)
+                    ORDER BY COALESCE(next_attempt_at, created_at), created_at
+                    LIMIT $2 FOR UPDATE SKIP LOCKED""",
+                    now,
+                    max(1, min(limit, 100)),
+                )
+                for row in rows:
+                    lease_token = uuid.uuid4().hex
+                    updated = await conn.fetchrow(
+                        """UPDATE recovery_operations SET status='working', lease_token=$1,
+                        lease_expires_at=$2, updated_at=$3 WHERE operation_id=$4 RETURNING *""",
+                        lease_token,
+                        lease_expires_at,
+                        now,
+                        row["operation_id"],
+                    )
+                    if updated is not None:
+                        claimed.append(dict(updated))
+        return claimed
+
+    async def update_operation(
+        self,
+        operation_id: str,
+        *,
+        lease_token: str,
+        status: str,
+        attempt_count: int,
+        updated_at: str,
+        next_attempt_at: str | None = None,
+        lease_expires_at: str | None = None,
+        result_ciphertext: str | None = None,
+        last_error_type: str | None = None,
+        last_error: str | None = None,
+        cancel_requested: bool | None = None,
+        expires_at: str | None = None,
+    ) -> bool:
+        if status not in {
+            "working",
+            "pending",
+            "completed",
+            "failed",
+            "needs_attention",
+            "cancelled",
+        }:
+            raise ValueError("Invalid recovery operation status")
+        pool = await self._get_pool()
+        row = await pool.fetchrow(
+            """UPDATE recovery_operations SET status=$1, attempt_count=$2,
+            next_attempt_at=$3, result_ciphertext=COALESCE($4, result_ciphertext),
+            lease_token=$5, lease_expires_at=$6, last_error_type=$7, last_error=$8,
+            cancel_requested=COALESCE($9, cancel_requested), updated_at=$10,
+            expires_at=COALESCE($11, expires_at)
+            WHERE operation_id=$12 AND lease_token=$13 RETURNING operation_id""",
+            status,
+            attempt_count,
+            next_attempt_at,
+            result_ciphertext,
+            lease_token if status == "working" else None,
+            lease_expires_at if status == "working" else None,
+            last_error_type,
+            last_error,
+            cancel_requested,
+            updated_at,
+            expires_at,
+            operation_id,
+            lease_token,
+        )
+        return row is not None
+
+    async def request_operation_cancel(
+        self, operation_id: str, tenant_id: str, requester_sub: str, client_id: str | None
+    ) -> bool:
+        pool = await self._get_pool()
+        row = await pool.fetchrow(
+            """UPDATE recovery_operations SET cancel_requested=TRUE, updated_at=$1
+            WHERE operation_id=$2 AND tenant_id=$3 AND requester_sub=$4 AND client_id=$5
+            AND status IN ('pending','working') RETURNING operation_id""",
+            datetime.now(UTC).isoformat(),
+            operation_id,
+            tenant_id,
+            requester_sub,
+            client_id or "",
+        )
+        return row is not None
+
+    async def prune_operations(self, *, now: str) -> int:
+        pool = await self._get_pool()
+        result = await pool.execute(
+            """DELETE FROM recovery_operations WHERE status IN
+            ('completed','failed','needs_attention','cancelled') AND expires_at<=$1""",
+            now,
+        )
+        return int(str(result).rsplit(" ", 1)[-1])
 
     async def close(self) -> None:
         if self._pool is not None and hasattr(self._pool, "close"):

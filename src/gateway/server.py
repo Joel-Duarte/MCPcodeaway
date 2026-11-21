@@ -101,6 +101,7 @@ from gateway.mcp_protocol import (
     MCP_PROTOCOL_VERSION,
     MCP_PROTOCOL_VERSION_META,
     MCP_SERVER_INFO_META,
+    MCP_TASKS_EXTENSION,
 )
 from gateway.monitoring import UpstreamHealthMonitor
 from gateway.oauth_discovery import create_oauth_discovery_router
@@ -112,6 +113,7 @@ from gateway.observability import (
     set_request_context,
     update_request_context,
 )
+from gateway.recovery import OperationRecovery
 from gateway.runtime_stats import ProcessStatsCollector, collect_runtime_telemetry
 from gateway.sandbox import (
     LocalMontyBackend,
@@ -295,6 +297,21 @@ SEARCH_TOOLS_DEF: dict[str, Any] = {
     "annotations": {"readOnlyHint": True},
 }
 
+GET_OPERATION_STATUS_DEF: dict[str, Any] = {
+    "name": "get_operation_status",
+    "description": (
+        "Read the recovery status for an operation started by this authenticated caller. "
+        "Use the operation_id returned after an ambiguous write; this does not execute or retry it."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {"operation_id": {"type": "string", "minLength": 1, "maxLength": 64}},
+        "required": ["operation_id"],
+        "additionalProperties": False,
+    },
+    "annotations": {"readOnlyHint": True},
+}
+
 EXECUTE_CODE_DEF: dict[str, Any] = {
     "name": "execute_code",
     "description": (
@@ -471,6 +488,8 @@ class GatewayRuntime:
         self._startup_retry_task: asyncio.Task[None] | None = None
         self._retention_task: asyncio.Task[None] | None = None
         self._upstream_health_task: asyncio.Task[None] | None = None
+        self._recovery_worker_task: asyncio.Task[None] | None = None
+        self.recovery = OperationRecovery(self)
         self.lifecycle_state = GatewayLifecycleState.NEW
         self._lifecycle_lock = asyncio.Lock()
         self.demo_traffic = DemoTrafficRunner(self)
@@ -914,6 +933,17 @@ class GatewayRuntime:
                 if saved_rules:
                     self.alert_evaluator.rules = AlertRulesConfig.model_validate(saved_rules)
             await self.refresh_catalog()
+            if (
+                any(
+                    policy.enabled
+                    for upstream in self.registry.list_upstreams()
+                    for policy in upstream.tool_recovery_policies.values()
+                )
+                and len(self.settings.task_dedupe_secret.get_secret_value()) < 32
+            ):
+                raise ValueError(
+                    "GATEWAY_TASK_DEDUPE_SECRET must be configured before enabling write recovery"
+                )
             if self.startup_warnings:
                 self._startup_retry_task = asyncio.create_task(
                     self._retry_failed_startup_upstreams()
@@ -922,6 +952,7 @@ class GatewayRuntime:
             self._upstream_health_task = asyncio.create_task(
                 self.upstream_health.run(self.registry.list_upstreams)
             )
+            self._recovery_worker_task = asyncio.create_task(self.recovery.run_worker())
         except BaseException:
             self._transition_lifecycle(GatewayLifecycleState.FAILED)
             raise
@@ -967,6 +998,10 @@ class GatewayRuntime:
                 self._startup_retry_task.cancel()
                 await asyncio.gather(self._startup_retry_task, return_exceptions=True)
             self._startup_retry_task = None
+            if self._recovery_worker_task is not None and not self._recovery_worker_task.done():
+                self._recovery_worker_task.cancel()
+                await asyncio.gather(self._recovery_worker_task, return_exceptions=True)
+            self._recovery_worker_task = None
             await self.sandbox.close()
             await self.client_manager.close()
             if hasattr(self.cache, "close"):
@@ -1041,22 +1076,45 @@ class GatewayRuntime:
         base_exec, base_disc = _MODE_TO_AXES[mode]
         eff_exec = execution or base_exec
         eff_disc = discovery_mode or base_disc
+        recovery_status_tool = (
+            [GET_OPERATION_STATUS_DEF]
+            if any(
+                (upstream := self.registry.get(tool.server)) is not None
+                and (policy := upstream.tool_recovery_policies.get(tool.name)) is not None
+                and policy.enabled
+                for tool in accessible
+            )
+            else []
+        )
 
         if eff_exec == "classic":
             if eff_disc == "upfront":
-                return [to_mcp_tool_definition(tool) for tool in accessible]
-            return [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF]
+                return [
+                    *[to_mcp_tool_definition(tool) for tool in accessible],
+                    *recovery_status_tool,
+                ]
+            return [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, *recovery_status_tool]
 
         if eff_exec == "codemode":
             if eff_disc == "upfront":
-                return [_execute_code_with_stubs(accessible)]
-            return [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, EXECUTE_CODE_DEF]
+                return [_execute_code_with_stubs(accessible), *recovery_status_tool]
+            return [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, EXECUTE_CODE_DEF, *recovery_status_tool]
 
         direct_mutating = [to_mcp_tool_definition(tool) for tool in accessible if tool.mutating]
         if eff_disc == "upfront":
             read_only = [tool for tool in accessible if not tool.mutating]
-            return [_execute_code_with_stubs(read_only), *direct_mutating]
-        return [LIST_SERVERS_DEF, SEARCH_TOOLS_DEF, EXECUTE_CODE_DEF, *direct_mutating]
+            return [
+                _execute_code_with_stubs(read_only),
+                *direct_mutating,
+                *recovery_status_tool,
+            ]
+        return [
+            LIST_SERVERS_DEF,
+            SEARCH_TOOLS_DEF,
+            EXECUTE_CODE_DEF,
+            *direct_mutating,
+            *recovery_status_tool,
+        ]
 
     async def list_tools_for_request(
         self,
@@ -1567,6 +1625,7 @@ class GatewayRuntime:
         ab_variant: str | None = None,
         model_name: str | None = None,
         requester_confirmation_policy: ToolApprovalPolicy | None = None,
+        request_timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Invoke a single upstream tool directly (traditional / traditional_discover / hybrid)."""
         started = time.perf_counter()
@@ -1595,10 +1654,20 @@ class GatewayRuntime:
             classic_schema_tokens = estimate_tokens(
                 self.tools_for_mode(identity, "traditional", allowed_servers=allowed_servers)
             )
+            dispatch_upstream = upstream
+            if request_timeout_seconds is not None:
+                dispatch_upstream = upstream.model_copy(
+                    update={
+                        "request_timeout_seconds": min(
+                            upstream.request_timeout_seconds,
+                            max(0.2, request_timeout_seconds),
+                        )
+                    }
+                )
             result, rec = await self.dispatcher.invoke_tool(
                 identity,
                 tool,
-                upstream,
+                dispatch_upstream,
                 arguments,
                 code_mode_hints=False,
                 requester_confirmation_policy=requester_confirmation_policy,
@@ -1920,6 +1989,27 @@ def _validate_modern_mcp_request(request: Request, payload: Any) -> JSONResponse
             status_code=400,
         )
 
+    if method in {"tasks/get", "tasks/update", "tasks/cancel"}:
+        client_capabilities = meta.get(MCP_CLIENT_CAPABILITIES_META)
+        extensions = (
+            client_capabilities.get("extensions") if isinstance(client_capabilities, dict) else None
+        )
+        if not isinstance(extensions, dict) or MCP_TASKS_EXTENSION not in extensions:
+            return JSONResponse(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32021,
+                        "message": "The MCP Tasks extension is required for this request.",
+                        "data": {"requiredCapabilities": {"extensions": {MCP_TASKS_EXTENSION: {}}}},
+                    },
+                }
+            )
+        task_id = params.get("taskId")
+        name_header = request.headers.get("mcp-name")
+        if not isinstance(task_id, str) or not task_id or name_header != task_id:
+            return mismatch("Mcp-Name header must match the taskId for task methods")
     if method == "tools/call":
         name = params.get("name")
         name_header = request.headers.get("mcp-name")
@@ -2298,6 +2388,19 @@ def create_gateway_app(
                         )
                         mode_decision_reason = f"tool_override:{_ovr}"
                 request_meta = params.get("_meta", {}) if isinstance(params, dict) else {}
+                client_capabilities = (
+                    request_meta.get(MCP_CLIENT_CAPABILITIES_META)
+                    if isinstance(request_meta, dict)
+                    else None
+                )
+                client_extensions = (
+                    client_capabilities.get("extensions")
+                    if isinstance(client_capabilities, dict)
+                    else None
+                )
+                supports_tasks = (
+                    isinstance(client_extensions, dict) and MCP_TASKS_EXTENSION in client_extensions
+                )
                 client_info = (
                     request_meta.get("io.modelcontextprotocol/clientInfo")
                     or params.get("clientInfo")
@@ -2385,13 +2488,39 @@ def create_gateway_app(
                         resp.headers["X-Gateway-Model"] = effective_model_name
                     return resp
 
+                if method in {"tasks/get", "tasks/update", "tasks/cancel"}:
+                    task_id = str(params.get("taskId") or "")
+                    row = await runtime.recovery.get_owned(identity, task_id)
+                    if row is None:
+                        return _finish(
+                            _jsonrpc_err(req_id, -32602, "Invalid or inaccessible taskId."),
+                            status_label="not_found",
+                        )
+                    if method == "tasks/get":
+                        return _finish(
+                            _jsonrpc_ok(req_id, runtime.recovery.task_result(row, create=False))
+                        )
+                    if method == "tasks/cancel":
+                        if row["status"] in {"pending", "working"}:
+                            await runtime.store.request_operation_cancel(
+                                task_id,
+                                identity.tenant_id,
+                                identity.sub,
+                                identity.client_id,
+                            )
+                        return _finish(_jsonrpc_ok(req_id, {}), status_label="cancel_requested")
+                    return _finish(_jsonrpc_ok(req_id, {}))
+
                 if method == "server/discover":
                     return _finish(
                         _jsonrpc_ok(
                             req_id,
                             {
                                 "supportedVersions": [MCP_PROTOCOL_VERSION],
-                                "capabilities": {"tools": {}},
+                                "capabilities": {
+                                    "tools": {},
+                                    "extensions": {MCP_TASKS_EXTENSION: {}},
+                                },
                                 "_meta": {
                                     MCP_SERVER_INFO_META: {
                                         "name": "mcpcodeaway",
@@ -2525,6 +2654,43 @@ def create_gateway_app(
                 if method == "tools/call":
                     tool_name = str(params.get("name") or "")
                     arguments = dict(params.get("arguments") or {})
+
+                    if tool_name == "get_operation_status":
+                        operation_id = str(arguments.get("operation_id") or "")
+                        row = await runtime.recovery.get_owned(identity, operation_id)
+                        if row is None:
+                            return _finish(
+                                _jsonrpc_ok(
+                                    req_id,
+                                    {
+                                        "content": [
+                                            {"type": "text", "text": "Operation not found."}
+                                        ],
+                                        "structuredContent": {
+                                            "ok": False,
+                                            "operation_id": operation_id,
+                                            "operation_status": "not_found",
+                                        },
+                                        "isError": True,
+                                    },
+                                ),
+                                status_label="not_found",
+                            )
+                        status_result = runtime.recovery.status_result(row)
+                        return _finish(
+                            _jsonrpc_ok(
+                                req_id,
+                                {
+                                    "content": [
+                                        {"type": "text", "text": json.dumps(status_result)}
+                                    ],
+                                    "structuredContent": status_result,
+                                    "isError": row["status"]
+                                    in {"failed", "needs_attention", "cancelled"},
+                                },
+                            ),
+                            status_label=str(row["status"]),
+                        )
 
                     if tool_name == "list_servers":
                         srv_rows = runtime.catalog.list_accessible_servers(
@@ -3044,19 +3210,48 @@ def create_gateway_app(
                                 status_label="approval_replay",
                             )
                     try:
-                        res = await runtime.call_direct_tool_for_identity(
-                            identity,
-                            tool_name,
-                            arguments,
-                            mode=effective_mode,
-                            allowed_servers=allowed_servers,
-                            mode_decision_reason=mode_decision_reason,
-                            mode_decision_score=mode_decision_score,
-                            experiment_id=experiment_id,
-                            ab_variant=ab_variant,
-                            model_name=effective_model_name,
-                            requester_confirmation_policy=requester_confirmation_policy,
+                        recovery_enabled = bool(
+                            target_tool is not None
+                            and (recovery_upstream := runtime.registry.get(target_tool.server))
+                            is not None
+                            and (
+                                recovery_policy := recovery_upstream.tool_recovery_policies.get(
+                                    target_tool.name
+                                )
+                            )
+                            is not None
+                            and recovery_policy.enabled
                         )
+                        if recovery_enabled:
+                            res, recovery_status = await runtime.recovery.begin_direct_call(
+                                identity,
+                                tool_name=tool_name,
+                                arguments=arguments,
+                                mode=effective_mode,
+                                allowed_servers=allowed_servers,
+                                requester_confirmation_policy=requester_confirmation_policy,
+                                supports_tasks=supports_tasks,
+                                mode_decision_reason=mode_decision_reason,
+                                mode_decision_score=mode_decision_score,
+                                experiment_id=experiment_id,
+                                ab_variant=ab_variant,
+                                model_name=effective_model_name,
+                            )
+                        else:
+                            res = await runtime.call_direct_tool_for_identity(
+                                identity,
+                                tool_name,
+                                arguments,
+                                mode=effective_mode,
+                                allowed_servers=allowed_servers,
+                                mode_decision_reason=mode_decision_reason,
+                                mode_decision_score=mode_decision_score,
+                                experiment_id=experiment_id,
+                                ab_variant=ab_variant,
+                                model_name=effective_model_name,
+                                requester_confirmation_policy=requester_confirmation_policy,
+                            )
+                            recovery_status = "ok" if res.get("ok") else "error"
                     except KeyError as exc:
                         if (
                             manager_approval_record is not None
@@ -3120,20 +3315,26 @@ def create_gateway_app(
                     ):
                         await runtime.store.finish_tool_approval(
                             manager_approval_record["approval_id"],
-                            "completed" if res["ok"] else "execution_failed",
+                            "completed"
+                            if recovery_status == "ok"
+                            else "recovery_pending"
+                            if recovery_status in {"task", "pending"}
+                            else "execution_failed",
                             datetime.now(UTC).isoformat(),
                         )
 
                     return _finish(
                         _jsonrpc_ok(
                             req_id,
-                            {
+                            res
+                            if recovery_status in {"task", "pending"}
+                            else {
                                 "content": [{"type": "text", "text": json.dumps(res, default=str)}],
                                 "structuredContent": res,
-                                "isError": not res["ok"],
+                                "isError": not res.get("ok"),
                             },
                         ),
-                        status_label="ok" if res["ok"] else "error",
+                        status_label=recovery_status,
                     )
 
                 unsupported_method = _jsonrpc_err(
@@ -3806,6 +4007,55 @@ def create_gateway_app(
             candidate_tools=discovered,
         )
         return inspection, audit
+
+    @app.get("/admin/operations")
+    async def list_admin_operations(
+        status: str = Query(
+            default="all",
+            pattern="^(all|pending|working|completed|failed|needs_attention|cancelled)$",
+        ),
+        limit: int = Query(default=100, ge=1, le=200),
+        authorization: str | None = Header(default=None),
+        mcpcodeaway_admin_session: str | None = Cookie(default=None),
+    ) -> dict[str, Any]:
+        identity = await _authorize_control_plane(
+            authorization,
+            mcpcodeaway_admin_session,
+            require_admin_role=True,
+            allow_viewer=True,
+            allowed_roles=set(runtime.settings.admin_roles) | set(runtime.settings.viewer_roles),
+        )
+        if identity is None:
+            return {"operations": [], "count": 0}
+        statuses = None if status == "all" else [status]
+        records = await runtime.store.list_operations(
+            identity.tenant_id,
+            statuses=statuses,
+            limit=limit,
+        )
+        visible = []
+        for record in records:
+            visible.append(
+                {
+                    "operation_id": record["operation_id"],
+                    "requester_sub": record["requester_sub"],
+                    "client_id": record.get("client_id") or None,
+                    "upstream_name": record["upstream_name"],
+                    "tool_name": record["tool_name"],
+                    "status": record["status"],
+                    "attempt_count": int(record["attempt_count"]),
+                    "max_attempts": int(record["max_attempts"]),
+                    "created_at": record["created_at"],
+                    "updated_at": record["updated_at"],
+                    "recovery_deadline": record["recovery_deadline"],
+                    "last_error_type": record.get("last_error_type"),
+                    "last_error": OutputRedactor.redact_text(str(record.get("last_error") or ""))[
+                        :500
+                    ]
+                    or None,
+                }
+            )
+        return {"operations": visible, "count": len(visible)}
 
     if features.approval_api:
 
@@ -5329,6 +5579,72 @@ def create_gateway_app(
                         f"Classify every enabled operation: {', '.join(sorted(missing_effects))}"
                     ),
                 )
+            for operation, recovery_policy in cfg.tool_recovery_policies.items():
+                if not recovery_policy.enabled:
+                    continue
+                if len(runtime.settings.task_dedupe_secret.get_secret_value()) < 32:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "Configure GATEWAY_TASK_DEDUPE_SECRET (at least 32 characters) "
+                            "before enabling recovery."
+                        ),
+                    )
+                operation_tool = discovered_tools.get(operation)
+                key_name = str(recovery_policy.idempotency_key_argument or "")
+                key_schema = (
+                    operation_tool.input_schema.get("properties", {}).get(key_name)
+                    if operation_tool is not None
+                    else None
+                )
+                if cfg.auth_type == "delegated_token":
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Recovery for '{operation}' requires a background-capable "
+                            "upstream credential."
+                        ),
+                    )
+                if operation not in cfg.allowed_operations or cfg.tool_effects.get(
+                    operation
+                ) not in {"write", "high_impact"}:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "Recovery can only be enabled for an enabled write operation: "
+                            f"'{operation}'."
+                        ),
+                    )
+                if not isinstance(key_schema, dict) or key_schema.get("type") != "string":
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Recovery key '{key_name}' must be a string property on '{operation}'."
+                        ),
+                    )
+                if recovery_policy.status_tool:
+                    status_tool = discovered_tools.get(recovery_policy.status_tool)
+                    status_key_schema = (
+                        status_tool.input_schema.get("properties", {}).get(
+                            recovery_policy.status_key_argument or ""
+                        )
+                        if status_tool is not None
+                        else None
+                    )
+                    if (
+                        status_tool is None
+                        or recovery_policy.status_tool not in cfg.allowed_operations
+                        or cfg.tool_effects.get(recovery_policy.status_tool) != "read"
+                        or not isinstance(status_key_schema, dict)
+                        or status_key_schema.get("type") != "string"
+                    ):
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                "Recovery status lookup must be an enabled read operation "
+                                "with a string key argument."
+                            ),
+                        )
             for operation in cfg.allowed_operations:
                 effect = cfg.tool_effects[operation]
                 tool = discovered_tools[operation]

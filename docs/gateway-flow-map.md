@@ -44,8 +44,10 @@ flowchart LR
 The gateway's MCP HTTP calls are sessionless: each request supplies its own
 identity and arguments. Durable business state (for example credentials,
 configuration, approval state, and audit records) belongs in the configured
-store. Request context, task handles, and in-memory caches are not durable
-business state.
+store. Opt-in recovery for explicitly idempotent direct writes persists an
+encrypted operation record. MCP Tasks clients poll that record; other clients
+use the read-only `get_operation_status` tool. The gateway does not retain an
+MCP connection or send later notifications to the original client.
 
 ## 1. Caller request flow
 
@@ -409,7 +411,8 @@ authenticated and authorized again using that request's identity.
 | Connect an agent and discover tools | `POST /mcp` with current MCP metadata and headers | `server/discover`, `tools/list`, paginated/deferred discovery, intent-filtered surface; malformed or old protocol metadata is rejected. | `gateway.server`, `gateway.catalog`, `gateway.discovery`; `tests/test_discovery_system1.py`, `tests/test_profiles_and_observability.py` |
 | Reject invalid caller, protocol, or tool input | `POST /mcp` → authentication and protocol boundary → schema validation | Invalid bearer is HTTP 401; unsupported protocol version is HTTP 400; missing required tool input returns JSON-RPC invalid-params without dispatch. | `tests/golden/flows.json` (`mcp_invalid_bearer_fails_closed`, `mcp_unsupported_protocol_version_rejected`, `mcp_missing_required_tool_argument_rejected`); `tests/test_golden_flows.py` |
 | Make a direct tool call | `POST /mcp` → `tools/call` | Allow/deny; argument validation; approval gate; upstream success/error; filtered and redacted result. | Sections 1–5; `tests/test_golden_flows.py`, `tests/test_gateway_modes_e2e.py` |
-| Recover from an upstream call failure | Direct tool or Code Mode callback → typed error contract | One retry for transient read failures; no write replay; uncertain write outcomes disclosed; configured probe circuit pauses and resumes traffic. | Section 11; `tests/test_upstream_recovery_golden.py`, `tests/test_upstream_monitoring.py` |
+| Recover from an upstream call failure | Direct tool → typed error contract or durable operation record | Reads may retry once. Writes replay only when an admin enables recovery, configures a string idempotency-key argument and upstream key retention, and the API honors that key. A client that opts into MCP Tasks polls `tasks/get`; other clients receive an operation ID and use `get_operation_status`. Code Mode scripts are never resumed or replayed. | Section 11; `tests/test_upstream_recovery_golden.py`, `tests/test_mcp_task_recovery.py`, `tests/test_upstream_monitoring.py` |
+| Inspect pending write recovery | `GET /admin/operations`; MCP task polling or `get_operation_status` | Tenant-scoped read-only operator view; task and operation reads reauthorize the original caller; bounded retries end in a confirmed result or `needs_attention`. | `gateway.recovery`, `/admin/operations`; `tests/test_mcp_task_recovery.py` |
 | Monitor an upstream API | Onboarding health config → background probe → health table / alert | Off by default; SSRF validation; degraded/unhealthy/recovery thresholds; no caller credential reuse. | `gateway.monitoring`, `gateway.alerts`; golden recovery flows and `tests/test_upstream_monitoring.py` |
 | Hit caller rate or gateway concurrency limits | `POST /mcp` → dispatcher sliding-window check or concurrency middleware | Per `(tenant, subject)` call limit produces a tool error; saturated gateway returns HTTP 503 with `Retry-After: 1`. | `gateway.dispatcher`, `gateway.state`, `gateway.server`; `tests/test_scalability.py`, `tests/test_golden_flows.py` |
 | Use Code Mode for a multi-tool workflow | `POST /mcp` → `execute_code` → host callbacks | Sandbox timeout/call budget; callback auth/validation; partial upstream failure; provenance/grounding pass or block. | `gateway.sandbox`, `gateway.dispatcher`; `tests/test_sandbox_security.py`, `tests/test_provenance_and_axes.py`, `tests/test_gateway_modes_e2e.py` |
@@ -506,7 +509,7 @@ The current health behavior should be read as three separate signals:
 | Gateway liveness (`GET /health`) | Reports gateway status; production response is intentionally minimal. Non-production responses include profile, catalog and startup warning details. | It does not establish that every downstream API is reachable. |
 | Gateway readiness (`GET /ready`) | Requires lifecycle state `ready`; checks configured Redis and Postgres dependencies with a bounded probe. | It does not probe configured upstreams. A single upstream outage does not make the gateway unready. |
 | Upstream reachability | Optional configured GET probes run at each upstream's interval. The URL is explicit, SSRF-validated, and called without caller credentials. | A probe is only as representative as the health URL an operator chooses; it does not replace the real tool-call result. |
-| Caller-facing failures | The gateway returns a stable `error_type`, safe message, retry eligibility, retry count, status code when available, and write-outcome uncertainty. MCP tool error text is redacted and preserved for the agent. | Raw transport exception text and secrets are not exposed. A failed write is never replayed automatically. |
+| Caller-facing failures | The gateway returns a stable `error_type`, safe message, retry eligibility, retry count, status code when available, and write-outcome uncertainty. An explicitly opted-in idempotent direct write can return a task handle or an operation ID while bounded recovery runs. | Raw transport exception text and secrets are not exposed. An ordinary write is never replayed; recovery uses the same upstream key and exact stored arguments only when its contract is configured. |
 | Admin visibility | `/admin/adaptive-execution/tool-health` includes per-tool error-category counts and current probe state; `/admin/alerts` includes category breakdowns and alerts on unhealthy probes. | Historical categories depend on telemetry captured after this change; older runs do not have categories. |
 
 The startup recovery flow remains **discovery failure → warning → bounded
@@ -520,10 +523,28 @@ is not shared between replicas.
 
 For recognized transient transport failures (timeout, connection failure, HTTP
 429/502/503/504), a read-classified tool receives one gateway retry after a
-short delay. Writes are never automatically retried. For a timeout on a write,
-the response marks `outcome_unknown`; the agent should inspect state before
-deciding whether to repeat the action. Other errors preserve their typed cause
-for the agent and are not automatically replayed.
+short delay. For writes, recovery is off by default. An administrator may opt a
+direct write into bounded recovery by configuring the upstream's idempotency
+argument, synchronous wait budget, total write attempts, maximum recovery age,
+and upstream key retention. An optional read-only status tool can reconcile a
+commit before the gateway replays the exact call with the same key. An upstream
+that does not honor idempotency keys is not safe for this feature.
+
+If the MCP request advertises the Tasks extension, an uncertain call returns a
+task handle and the client polls `tasks/get`. Otherwise, the gateway returns an
+operation ID and exposes a caller-scoped `get_operation_status` tool. The
+original HTTP/MCP connection is not held open, and no server notification is
+sent later. After attempt or age limits, unresolved work becomes
+`needs_attention`; operators can inspect it in the read-only Operations
+Recovery page. The gateway does not offer a manual replay button.
+
+Operation arguments, upstream idempotency keys, and final results are encrypted
+at rest with the configured credential-encryption key. A separate stable
+`GATEWAY_TASK_DEDUPE_SECRET` protects caller-scoped idempotency fingerprints; it
+must remain stable while operation records are retained. Production uses the
+shared Postgres store and database claim leases so replicas do not own separate
+queues. SQLite supports local development. Code Mode scripts are not persisted
+or replayed; clients can inspect operation IDs for direct writes only.
 
 Probe state remains distinct from gateway readiness: an unavailable downstream
 does not make `/ready` fail. The onboarding form defaults active checking off;

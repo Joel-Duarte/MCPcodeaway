@@ -12,6 +12,7 @@ export interface AdminSessionState {
   authenticated: boolean;
   user: AdminUserProfile | null;
   is_admin: boolean;
+  is_viewer?: boolean;
   is_approver?: boolean;
   can_access_admin_console: boolean;
   admin_auth_required: boolean;

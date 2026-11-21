@@ -8,7 +8,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gateway.profiles import PROFILE_SETTING_FIELDS, ProfileFeatures, resolve_profile
@@ -96,6 +96,63 @@ class ToolApprovalPolicy(BaseModel):
         return self
 
 
+class ToolRecoveryPolicy(BaseModel):
+    """Opt-in bounded recovery contract for a single mutating upstream tool."""
+
+    enabled: bool = False
+    idempotency_key_argument: str | None = None
+    synchronous_budget_seconds: float | None = Field(default=None, gt=0, le=30)
+    max_attempts: int | None = Field(default=None, ge=1, le=3)
+    max_recovery_age_seconds: int | None = Field(default=None, ge=1, le=3600)
+    upstream_key_retention_seconds: int | None = Field(default=None, ge=1, le=86_400)
+    status_tool: str | None = None
+    status_key_argument: str | None = None
+    status_field: str = Field(default="status", min_length=1, max_length=128)
+    status_pending_values: list[str] = Field(default_factory=lambda: ["pending", "processing"])
+    status_success_values: list[str] = Field(
+        default_factory=lambda: ["completed", "committed", "succeeded"]
+    )
+    status_not_found_values: list[str] = Field(default_factory=lambda: ["not_found", "absent"])
+    status_failure_values: list[str] = Field(default_factory=lambda: ["failed", "rejected"])
+
+    @model_validator(mode="after")
+    def _validate_recovery_contract(self) -> ToolRecoveryPolicy:
+        if not self.enabled:
+            return self
+        required = {
+            "idempotency_key_argument": self.idempotency_key_argument,
+            "synchronous_budget_seconds": self.synchronous_budget_seconds,
+            "max_attempts": self.max_attempts,
+            "max_recovery_age_seconds": self.max_recovery_age_seconds,
+            "upstream_key_retention_seconds": self.upstream_key_retention_seconds,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ValueError(
+                "Enabled tool recovery requires explicit settings: " + ", ".join(missing)
+            )
+        if not self.idempotency_key_argument or not self.idempotency_key_argument.strip():
+            raise ValueError("idempotency_key_argument must be a non-empty argument name")
+        if self.upstream_key_retention_seconds is not None and (
+            self.upstream_key_retention_seconds < int(self.max_recovery_age_seconds or 0)
+        ):
+            raise ValueError("upstream key retention must cover the maximum recovery age")
+        if bool(self.status_tool) != bool(self.status_key_argument):
+            raise ValueError("status_tool and status_key_argument must be configured together")
+        value_sets = [
+            self.status_pending_values,
+            self.status_success_values,
+            self.status_not_found_values,
+            self.status_failure_values,
+        ]
+        flattened = [value.casefold() for values in value_sets for value in values]
+        if any(not value.strip() for values in value_sets for value in values):
+            raise ValueError("recovery status values must be non-empty")
+        if len(flattened) != len(set(flattened)):
+            raise ValueError("recovery status values must not overlap")
+        return self
+
+
 class UpstreamHealthCheckConfig(BaseModel):
     """Optional unauthenticated HTTP probe for an upstream service."""
 
@@ -164,6 +221,7 @@ class UpstreamConfig(BaseModel):
     preferred_mode: GatewayMode | None = None
     tool_mode_overrides: dict[str, GatewayMode] = Field(default_factory=dict)
     tool_approval_policies: dict[str, ToolApprovalPolicy] = Field(default_factory=dict)
+    tool_recovery_policies: dict[str, ToolRecoveryPolicy] = Field(default_factory=dict)
     abac_rules: list[AbacRuleConfig] = Field(default_factory=list)
     pinned_schema_digest: str | None = None
     ab_experiment: AbExperimentConfig | None = None
@@ -191,6 +249,29 @@ class UpstreamConfig(BaseModel):
                 f"Upstream name '{value}' must match ^[a-z][a-z0-9_]*$ (lowercase slug)"
             )
         return value
+
+    @model_validator(mode="after")
+    def _validate_recovery_policies(self) -> UpstreamConfig:
+        for tool_name, policy in self.tool_recovery_policies.items():
+            if not policy.enabled:
+                continue
+            effect = self.tool_effects.get(tool_name)
+            if effect not in {"write", "high_impact"}:
+                raise ValueError(
+                    f"Recovery for '{tool_name}' requires a write or high_impact "
+                    "effect classification"
+                )
+            if self.auth_type == "delegated_token":
+                raise ValueError(
+                    f"Recovery for '{tool_name}' requires a background-capable upstream credential"
+                )
+            if policy.status_tool:
+                status_effect = self.tool_effects.get(policy.status_tool)
+                if status_effect != "read":
+                    raise ValueError(
+                        f"Recovery status tool '{policy.status_tool}' must be classified as read"
+                    )
+        return self
 
 
 class GatewaySettings(BaseSettings):
@@ -237,6 +318,13 @@ class GatewaySettings(BaseSettings):
     execution_wall_timeout_seconds: float = Field(default=60.0, gt=0)
     max_concurrent_tool_calls_per_execution: int = Field(default=8, ge=1)
     max_sandbox_code_bytes: int = Field(default=256 * 1024, ge=1, le=256 * 1024)
+    task_max_synchronous_budget_seconds: float = Field(default=30.0, gt=0, le=30.0)
+    task_max_attempts: int = Field(default=3, ge=1, le=3)
+    task_max_recovery_age_seconds: int = Field(default=3600, ge=1, le=3600)
+    task_result_retention_seconds: int = Field(default=86_400, ge=60, le=86_400)
+    task_worker_poll_interval_seconds: float = Field(default=1.0, ge=0.1, le=30.0)
+    task_worker_lease_seconds: int = Field(default=300, ge=10, le=300)
+    task_dedupe_secret: SecretStr = SecretStr("")
 
     sandbox_backend: Literal["local", "remote"] = "local"
     sandbox_worker_url: str | None = None

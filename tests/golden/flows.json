@@ -152,5 +152,23 @@
       "expected_http_status": 409,
       "expected_side_effect_count": 1
     }
+  ],
+  "task_recovery_flows": [
+    {
+      "id": "task_opt_in_recovers_commit_after_lost_response",
+      "kind": "mcp_task_recovery",
+      "expected_task_status": "completed",
+      "expected_upstream_side_effect_count": 1
+    },
+    {
+      "id": "legacy_client_gets_operation_status_fallback",
+      "kind": "legacy_recovery_status",
+      "expected_status_tool": "get_operation_status"
+    },
+    {
+      "id": "same_key_different_payload_conflicts",
+      "kind": "idempotency_conflict",
+      "expected_rpc_error_code": -32602
+    }
   ]
 }

@@ -399,19 +399,20 @@ def create_admin_auth_router(runtime: GatewayRuntime) -> APIRouter:
                 "authenticated": False,
                 "user": None,
                 "is_admin": False,
+                "is_viewer": False,
                 "is_approver": False,
                 "can_access_admin_console": False,
                 "admin_auth_required": settings.admin_auth_required,
             }
         is_admin = bool(set(identity.roles) & set(settings.admin_roles))
+        is_viewer = bool(set(identity.roles) & set(settings.viewer_roles))
         is_approver = bool(set(identity.roles) & set(settings.approval_roles))
-        can_access_admin_console = (
-            is_admin or is_approver or bool(set(identity.roles) & set(settings.viewer_roles))
-        )
+        can_access_admin_console = is_admin or is_approver or is_viewer
         return {
             "authenticated": True,
             "user": identity.public_profile(),
             "is_admin": is_admin,
+            "is_viewer": is_viewer,
             "is_approver": is_approver,
             "can_access_admin_console": can_access_admin_console,
             "admin_auth_required": settings.admin_auth_required,

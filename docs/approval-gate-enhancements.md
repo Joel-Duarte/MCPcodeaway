@@ -144,12 +144,12 @@ proposed -> pending_approval -> approved -> executing -> completed
 | Mechanism | Good for | Limitation |
 | --- | --- | --- |
 | MCP `input_required` | Requester answers during the original tool call | Client-driven round trip; not an external approver queue or durable background job |
-| MCP Tasks extension | A supported MCP client needs to poll or receive status for long-running `tools/call` work, including work waiting for input | Optional extension; clients must support it, task access must be reauthorized per request, and task storage/retention still need design |
+| MCP Tasks extension | A supported MCP client needs to poll status for long-running, explicitly idempotent direct writes | Implemented as a per-request opt-in with `tasks/get` polling and caller reauthorization. The durable task maps to an encrypted operation record; task storage and retention use the configured audit store. It does not represent manager approval or send push notifications. |
 | SSE/WebSocket event | A currently connected UI or agent orchestrator wants fast status updates | Not durable delivery; reconnect and query state |
 | Webhook/queue signal | A workflow engine or agent runner should resume after an outcome | Requires signed/authenticated delivery, retries, deduplication, and an idempotent receiver |
 | Pollable approval/workflow API | Broad compatibility with agent runtimes and external approval tools | More client work and polling load; use bounded intervals and pagination |
 
-MCP Tasks can represent long-running work and mid-task input for clients that opt in. It is not a manager directory, approval policy, or notification provider. Treat task IDs as sensitive handles, bind each task to its tenant and owner, and authorize every `tasks/get`, `tasks/update`, and `tasks/cancel` request.
+MCP Tasks can represent long-running work and mid-task input for clients that opt in. This gateway currently uses it only for configured direct write recovery; it is not a manager directory, approval policy, or notification provider. Task IDs are bound to the tenant, subject, and client, and every `tasks/get`, `tasks/update`, and `tasks/cancel` request is reauthorized.
 
 ## Onboarding and editing surface
 

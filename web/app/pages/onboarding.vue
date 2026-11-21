@@ -55,6 +55,7 @@ interface InspectResponse {
       name: string;
       description?: string;
       mutating: boolean;
+      input_schema?: { properties?: Record<string, { type?: string }> };
       output_schema?: Record<string, unknown> | null;
     }[];
   };
@@ -147,6 +148,17 @@ const draftToolModes = ref<Record<string, string>>({});
 const draftToolApprovalMessages = ref<Record<string, string>>({});
 const draftToolEffects = ref<Record<string, string>>({});
 const draftToolApprovalGroups = ref<Record<string, string>>({});
+const draftToolRecovery = ref<Record<string, {
+  enabled: boolean;
+  keyArgument: string;
+  synchronousBudget: number;
+  maxAttempts: number;
+  recoveryAge: number;
+  keyRetention: number;
+  statusTool: string;
+  statusKeyArgument: string;
+  statusField: string;
+}>>({});
 const availableGroups = ref<string[]>([]);
 const rolesLoadError = ref("");
 const rolesLoading = ref(true);
@@ -368,6 +380,24 @@ function toolApprovalPoliciesPayload(): Record<string, { mode: string; version: 
   return policies;
 }
 
+function toolRecoveryPoliciesPayload() {
+  return Object.fromEntries(Object.entries(draftToolRecovery.value)
+    .filter(([tool, recovery]) => recovery.enabled && ["write", "high_impact"].includes(draftToolEffects.value[tool] || ""))
+    .map(([tool, recovery]) => [tool, {
+      enabled: true,
+      idempotency_key_argument: recovery.keyArgument.trim(),
+      synchronous_budget_seconds: Number(recovery.synchronousBudget),
+      max_attempts: Number(recovery.maxAttempts),
+      max_recovery_age_seconds: Number(recovery.recoveryAge),
+      upstream_key_retention_seconds: Number(recovery.keyRetention),
+      ...(recovery.statusTool.trim() ? {
+        status_tool: recovery.statusTool.trim(),
+        status_key_argument: recovery.statusKeyArgument.trim(),
+        status_field: recovery.statusField.trim() || "status",
+      } : {}),
+    }]));
+}
+
 function buildUpstreamPayload(forInspection = false) {
   const roles = draftRoles.value
     .split(",")
@@ -435,6 +465,7 @@ function buildUpstreamPayload(forInspection = false) {
     preferred_mode: draftPreferredMode.value,
     tool_mode_overrides: toolOverridesPayload(),
     tool_approval_policies: toolApprovalPoliciesPayload(),
+    tool_recovery_policies: forInspection ? {} : toolRecoveryPoliciesPayload(),
     allowed_operations: forInspection ? null : Object.entries(draftToolEffects.value).filter(([, effect]) => effect !== "disabled").map(([tool]) => tool),
     tool_effects: forInspection ? {} : Object.fromEntries(Object.entries(draftToolEffects.value).filter(([, effect]) => effect !== "disabled")),
     mutating_tools: forInspection ? [] : Object.entries(draftToolEffects.value).filter(([, effect]) => effect === "write" || effect === "high_impact").map(([tool]) => tool),
@@ -491,6 +522,12 @@ const yamlPreview = computed(() => {
       })
     );
   }
+  const recoveries = Object.entries(cfg.tool_recovery_policies || {});
+  if (recoveries.length) {
+    lines.push(`    tool_recovery_policies:`, ...recoveries.map(([tool, policy]) =>
+      `      ${tool}: ${JSON.stringify(policy)}`,
+    ));
+  }
   lines.push(`    allowed_operations: [${cfg.allowed_operations?.join(", ") || ""}]`);
   if (Object.keys(cfg.tool_effects).length) {
     lines.push(`    tool_effects:`, ...Object.entries(cfg.tool_effects).map(([tool, effect]) => `      ${tool}: ${effect}`));
@@ -536,6 +573,17 @@ async function handleInspect() {
     draftToolModes.value = {};
     draftToolApprovalMessages.value = {};
     draftToolApprovalGroups.value = {};
+    draftToolRecovery.value = Object.fromEntries(inspectResult.value.inspection.tools.map((tool) => [tool.name, {
+      enabled: false,
+      keyArgument: "idempotency_key",
+      synchronousBudget: 10,
+      maxAttempts: 3,
+      recoveryAge: 900,
+      keyRetention: 3600,
+      statusTool: "",
+      statusKeyArgument: "idempotency_key",
+      statusField: "status",
+    }]));
   } catch (err) {
     schemaInspectionState.value = "failed";
     errorMessage.value = extractErrorMessage(err);
@@ -578,6 +626,16 @@ async function handleRegister() {
   }
   if (draftUpstreamConcurrency.value < 1 || draftUpstreamConcurrency.value > 10000) {
     errorMessage.value = "Concurrent calls must be between 1 and 10,000.";
+    return;
+  }
+  if (Object.entries(draftToolRecovery.value).some(([tool, recovery]) => recovery.enabled && (
+    !["write", "high_impact"].includes(draftToolEffects.value[tool] || "") ||
+    !recovery.keyArgument.trim() || recovery.synchronousBudget <= 0 || recovery.synchronousBudget > 30 ||
+    recovery.maxAttempts < 1 || recovery.maxAttempts > 3 || recovery.recoveryAge < 1 || recovery.recoveryAge > 3600 ||
+    recovery.keyRetention < recovery.recoveryAge || recovery.keyRetention > 86400 ||
+    (recovery.statusTool.trim() && !recovery.statusKeyArgument.trim())
+  ))) {
+    errorMessage.value = "Recovery needs a mutating operation, key argument, valid bounded recovery limits, and key retention at least as long as recovery age.";
     return;
   }
   if (draftHealthCheckEnabled.value && !draftHealthCheckUrl.value.trim()) {
@@ -1085,6 +1143,58 @@ async function copyPromptText() {
               </Select>
               <Input v-if="draftToolEffects[t.name] === 'write' || draftToolEffects[t.name] === 'high_impact'" v-model="draftToolApprovalMessages[t.name]" :aria-label="`Action summary for ${t.name}`" :placeholder="draftToolEffects[t.name] === 'write' ? `Confirm this write to ${t.name}.` : `Approve this high impact action: ${t.name}.`" maxlength="300" class="min-h-11 text-xs sm:col-span-3" />
               <Input v-if="draftToolEffects[t.name] === 'high_impact'" v-model="draftToolApprovalGroups[t.name]" :aria-label="`Approver groups for ${t.name}`" placeholder="Approver groups, comma separated" maxlength="300" class="min-h-11 text-xs sm:col-span-3" />
+              <div v-if="draftToolEffects[t.name] === 'write' || draftToolEffects[t.name] === 'high_impact'" class="space-y-2 border-t border-[#E4E4E7] pt-3 sm:col-span-3">
+                <label class="flex min-h-11 items-center gap-2 text-xs font-medium text-[#09090B]">
+                  <Checkbox
+                    :checked="draftToolRecovery[t.name]?.enabled === true"
+                    :disabled="draftAuthType === 'delegated_token'"
+                    :aria-label="`Enable bounded recovery for ${t.name}`"
+                    @checked-change="(checked) => { draftToolRecovery[t.name].enabled = checked === true }"
+                  ><CheckboxIndicator><AppIcon name="check" :size="13" /></CheckboxIndicator></Checkbox>
+                  Enable durable recovery for ambiguous write outcomes
+                </label>
+                <p class="text-xs leading-5 text-[#52525B]">
+                  Recovery requires the upstream API to honor this idempotency key for the configured retention. The gateway stores encrypted operation data and retries only this exact write. Background recovery needs a service or per-user stored credential; delegated-token-only upstreams cannot use it.
+                </p>
+                <div v-if="draftToolRecovery[t.name]?.enabled" class="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                  <Field>
+                    <FieldLabel>Idempotency key argument</FieldLabel>
+                    <Input v-model="draftToolRecovery[t.name].keyArgument" :aria-label="`Idempotency key argument for ${t.name}`" placeholder="idempotency_key" class="min-h-11 font-mono-data text-xs" />
+                    <FieldDescription>String property passed to the upstream unchanged.</FieldDescription>
+                  </Field>
+                  <Field>
+                    <FieldLabel>Maximum synchronous wait (seconds)</FieldLabel>
+                    <Input v-model.number="draftToolRecovery[t.name].synchronousBudget" type="number" min="0.2" max="30" step="0.1" class="min-h-11 tabular-nums" />
+                  </Field>
+                  <Field>
+                    <FieldLabel>Total write attempts</FieldLabel>
+                    <Input v-model.number="draftToolRecovery[t.name].maxAttempts" type="number" min="1" max="3" class="min-h-11 tabular-nums" />
+                  </Field>
+                  <Field>
+                    <FieldLabel>Maximum recovery age (seconds)</FieldLabel>
+                    <Input v-model.number="draftToolRecovery[t.name].recoveryAge" type="number" min="1" max="3600" class="min-h-11 tabular-nums" />
+                  </Field>
+                  <Field>
+                    <FieldLabel>Upstream key retention (seconds)</FieldLabel>
+                    <Input v-model.number="draftToolRecovery[t.name].keyRetention" type="number" min="1" max="86400" class="min-h-11 tabular-nums" />
+                    <FieldDescription>Must cover the full recovery age.</FieldDescription>
+                  </Field>
+                  <Field>
+                    <FieldLabel>Status lookup tool (optional)</FieldLabel>
+                    <Input v-model="draftToolRecovery[t.name].statusTool" :aria-label="`Status lookup tool for ${t.name}`" placeholder="get_operation_status" class="min-h-11 font-mono-data text-xs" />
+                    <FieldDescription>Configure a read-only operation that looks up the key.</FieldDescription>
+                  </Field>
+                  <Field v-if="draftToolRecovery[t.name].statusTool.trim()">
+                    <FieldLabel>Status lookup key argument</FieldLabel>
+                    <Input v-model="draftToolRecovery[t.name].statusKeyArgument" :aria-label="`Status lookup key argument for ${t.name}`" class="min-h-11 font-mono-data text-xs" />
+                  </Field>
+                  <Field v-if="draftToolRecovery[t.name].statusTool.trim()">
+                    <FieldLabel>Status field</FieldLabel>
+                    <Input v-model="draftToolRecovery[t.name].statusField" :aria-label="`Status field for ${t.name}`" class="min-h-11 font-mono-data text-xs" />
+                    <FieldDescription>Expected values use gateway defaults: pending, completed, not_found, failed.</FieldDescription>
+                  </Field>
+                </div>
+              </div>
             </div>
           </div>
         </details>

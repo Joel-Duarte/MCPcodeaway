@@ -99,6 +99,11 @@ class EnvelopeCipher:
         return bool(self._keys)
 
     @property
+    def is_ephemeral(self) -> bool:
+        """Whether the active encryption key exists only for this process lifetime."""
+        return self._ephemeral
+
+    @property
     def active_kid(self) -> str:
         return self._active_kid
 
