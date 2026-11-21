@@ -183,6 +183,8 @@ async def test_hitl_onboarding_guidance_curation_and_agent_prompt(tmp_path) -> N
                         "auth_type": "none",
                         "allowed_roles": ["finance_analyst"],
                         "allowed_operations": ["get_health"],
+                        "tool_effects": {"get_health": "read"},
+                        "mutating_tools": [],
                     },
                 )
                 assert reg.status_code == 200, reg.text
@@ -441,6 +443,9 @@ async def test_host_side_abac_enforcement_for_api_key_upstream(tmp_path, monkeyp
                         "secret_env_var": "LEGACY_SHARED_API_KEY",
                         "api_key_header": "X-Legacy-Key",
                         "allowed_roles": ["finance_analyst"],
+                        "allowed_operations": ["list_client_accounts", "get_account"],
+                        "tool_effects": {"list_client_accounts": "read", "get_account": "read"},
+                        "mutating_tools": [],
                         "abac_rules": [
                             {
                                 "claim": "client_groups",

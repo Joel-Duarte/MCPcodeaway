@@ -14,11 +14,26 @@ from examples.mock_backends import build_synthetic_tools, create_mock_backends_a
 from gateway.auth import LocalDevKeyManager
 from gateway.cli import main as cli_main
 from gateway.comparator import audit_catalog_comparison
-from gateway.config import GatewaySettings, UpstreamConfig
+from gateway.config import GatewaySettings, UpstreamConfig, UpstreamRegistry
 from gateway.mcp_protocol import request_headers, request_meta
 from gateway.server import GatewayRuntime, create_gateway_app
 from gateway.state import SQLiteAuditStore
 from gateway.upstream_clients import DiscoveredTool
+
+
+def test_production_upstreams_require_access_and_operation_allowlists(tmp_path: Path) -> None:
+    path = tmp_path / "upstreams.yaml"
+    settings = GatewaySettings(
+        app_env="prod",
+        auth_mode="oidc",
+        upstreams_config_path=str(path),
+    )
+    path.write_text(
+        "upstreams:\n  - name: open_service\n    type: mcp_http\n    url: https://api.example/mcp\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="allowed_roles or allowed_groups"):
+        UpstreamRegistry(settings)
 
 
 async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) -> None:
@@ -135,6 +150,10 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
                     "url": "http://127.0.0.1:8001/extra-srv",
                     "openapi_spec": swagger_spec,
                     "auth_type": "none",
+                    "allowed_operations": ["get_order"],
+                    "tool_effects": {"get_order": "read"},
+                    "mutating_tools": [],
+                    "allow_all_callers": True,
                 },
             )
             assert add_sw.status_code == 200
@@ -147,6 +166,10 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
                     "type": "mcp_http",
                     "url": "http://127.0.0.1:8001/extra-srv/extra/mcp",
                     "auth_type": "none",
+                    "allowed_operations": ["query_debt_ledger"],
+                    "tool_effects": {"query_debt_ledger": "read"},
+                    "mutating_tools": [],
+                    "allow_all_callers": True,
                 },
             )
             assert add_http.status_code == 200
@@ -163,6 +186,10 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
                     "command": sys.executable,
                     "args": [stdio_script],
                     "auth_type": "none",
+                    "allowed_operations": ["echo_upper"],
+                    "tool_effects": {"echo_upper": "read"},
+                    "mutating_tools": [],
+                    "allow_all_callers": True,
                 },
             )
             assert add_stdio.status_code == 200

@@ -76,9 +76,24 @@ class AbExperimentConfig(BaseModel):
 class ToolApprovalPolicy(BaseModel):
     """Gateway-owned policy for authorization steps before a tool call."""
 
-    mode: Literal["none", "requester_confirmation"] = "none"
+    mode: Literal["none", "requester_confirmation", "manager_approval"] = "none"
     version: int = Field(default=1, ge=1)
     confirmation_message: str = Field(default="", max_length=300)
+    approver_groups: list[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def _validate_approval_policy(self) -> ToolApprovalPolicy:
+        if self.mode == "manager_approval" and not self.approver_groups:
+            raise ValueError("manager_approval requires at least one approver group")
+        if self.mode == "manager_approval" and not self.confirmation_message.strip():
+            raise ValueError("manager_approval requires a human-readable action summary")
+        if self.mode != "manager_approval" and self.approver_groups:
+            raise ValueError("approver_groups are only valid for manager_approval")
+        if any(not group.strip() or len(group) > 120 for group in self.approver_groups):
+            raise ValueError("approver groups must be non-empty strings of at most 120 characters")
+        if len(set(self.approver_groups)) != len(self.approver_groups):
+            raise ValueError("approver_groups must not contain duplicates")
+        return self
 
 
 class UpstreamOAuthConfig(BaseModel):
@@ -114,11 +129,13 @@ class UpstreamConfig(BaseModel):
     oauth: UpstreamOAuthConfig | None = None
     allowed_roles: list[str] = Field(default_factory=list)
     allowed_groups: list[str] = Field(default_factory=list)
+    allow_all_callers: bool = False
     allowed_clients: list[str] = Field(default_factory=list)
     allowed_scopes: list[str] = Field(default_factory=list)
     mutating_tools: list[str] = Field(default_factory=list)
-    allowed_operations: list[str] = Field(default_factory=list)
+    allowed_operations: list[str] | None = None
     excluded_operations: list[str] = Field(default_factory=list)
+    tool_effects: dict[str, Literal["read", "write", "high_impact"]] = Field(default_factory=dict)
     preferred_mode: GatewayMode | None = None
     tool_mode_overrides: dict[str, GatewayMode] = Field(default_factory=dict)
     tool_approval_policies: dict[str, ToolApprovalPolicy] = Field(default_factory=dict)
@@ -207,6 +224,8 @@ class GatewaySettings(BaseSettings):
     require_admin_auth: bool | None = None
     admin_roles: list[str] = Field(default_factory=lambda: ["gateway_admin", "platform_admin"])
     viewer_roles: list[str] = Field(default_factory=lambda: ["operator_viewer"])
+    approval_roles: list[str] = Field(default_factory=lambda: ["tool_approver"])
+    tool_approval_ttl_seconds: int = Field(default=86400, ge=300, le=604800)
     metrics_roles: list[str] = Field(
         default_factory=lambda: ["gateway_admin", "platform_admin", "ops_observer"]
     )
@@ -463,6 +482,46 @@ class UpstreamRegistry:
         items = raw.get("upstreams", []) if isinstance(raw, dict) else raw
         for item in items:
             cfg = UpstreamConfig.model_validate(item)
+            if self.settings.app_env == "prod" and cfg.enabled:
+                if not cfg.allowed_roles and not cfg.allowed_groups and not cfg.allow_all_callers:
+                    raise ValueError(
+                        f"Production upstream '{cfg.name}' must set allowed_roles or "
+                        "allowed_groups, or explicitly set allow_all_callers: true."
+                    )
+                if cfg.allowed_operations is None:
+                    raise ValueError(
+                        f"Production upstream '{cfg.name}' must declare allowed_operations; "
+                        "omitted allowlists are not permitted."
+                    )
+                if set(cfg.allowed_operations) != set(cfg.tool_effects):
+                    raise ValueError(
+                        f"Production upstream '{cfg.name}' must classify every enabled operation "
+                        "and must not classify disabled operations."
+                    )
+                if set(cfg.mutating_tools) != {
+                    operation
+                    for operation, effect in cfg.tool_effects.items()
+                    if effect in {"write", "high_impact"}
+                }:
+                    raise ValueError(
+                        f"Production upstream '{cfg.name}' mutating_tools must match its write "
+                        "and high-impact classifications."
+                    )
+                for operation, effect in cfg.tool_effects.items():
+                    policy = cfg.tool_approval_policies.get(operation)
+                    expected = (
+                        "none"
+                        if effect == "read"
+                        else "manager_approval"
+                        if effect == "high_impact"
+                        else "requester_confirmation"
+                    )
+                    if (policy.mode if policy else "none") != expected:
+                        raise ValueError(
+                            f"Production operation '{cfg.name}__{operation}' classified "
+                            f"as '{effect}' "
+                            f"requires policy '{expected}'."
+                        )
             self._static[cfg.name] = cfg
 
     async def refresh(self) -> None:

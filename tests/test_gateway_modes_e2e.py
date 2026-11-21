@@ -182,8 +182,6 @@ async def test_gateway_modes_e2e_reconciliation_and_audit(tmp_path) -> None:
                     },
                 },
             )
-            write_sc = hyb_direct_write.json()["result"]["structuredContent"]
-            assert write_sc["ok"]
-            assert write_sc["result"]["case_id"] == "CASE-0001"
+            assert hyb_direct_write.json()["error"]["code"] == -32021
 
     await backend_client.aclose()

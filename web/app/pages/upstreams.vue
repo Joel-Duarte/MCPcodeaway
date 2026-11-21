@@ -9,12 +9,18 @@ const expandedUpstreamName = ref<string | null>(initialUpstream || null);
 const toolDrawerOpen = ref(false);
 const selectedTool = ref<{ upstream: string; tool: string; opener: HTMLElement } | null>(null);
 const healthRows = ref<Array<{ server: string; tool: string; count: number; bytes: number; mean_latency_ms: number | null; p95_latency_ms: number | null; errors: number | null; timeouts: number; invalid_arguments: number | null; schema_coverage_pct: number | null; read_calls: number | null; write_calls: number | null }>>([]);
+const performanceError = ref("");
+const performanceLoading = ref(true);
 
 async function loadPerf() {
+  performanceError.value = "";
   try {
     const res = await _apiFetch<{ rows: typeof healthRows.value }>("/admin/adaptive-execution/tool-health?window=all");
     if (res?.rows) healthRows.value = res.rows;
-  } catch {
+  } catch (err) {
+    performanceError.value = extractErrorMessage(err);
+  } finally {
+    performanceLoading.value = false;
   }
 }
 
@@ -303,6 +309,11 @@ onMounted(() => {
       <AppIcon name="alert" :size="16" class="mt-0.5" />
       <span>{{ errorMessage }}</span>
     </div>
+    <div v-if="performanceError" role="alert" class="flex flex-col gap-2 rounded-lg border border-[#FECACA] bg-[#FEF2F2] px-4 py-3 text-[13px] text-[#991B1B] sm:flex-row sm:items-center sm:justify-between">
+      <span>Tool performance data is unavailable; health summaries may be incomplete. {{ performanceError }}</span>
+      <Button class="min-h-11" @click="loadPerf">Retry performance data</Button>
+    </div>
+    <div v-else-if="performanceLoading" role="status" class="text-xs text-[#71717A]">Loading tool performance data…</div>
 
     <div
       v-if="upstreamsData?.drift_warnings?.length"

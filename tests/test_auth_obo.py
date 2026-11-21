@@ -16,10 +16,62 @@ from gateway.auth import (
     LocalDevKeyManager,
     OidcTokenValidator,
     PolicyEvaluator,
+    claims_to_identity,
 )
-from gateway.config import GatewaySettings, UpstreamConfig, UpstreamRegistry
+from gateway.config import ClaimMappingConfig, GatewaySettings, UpstreamConfig, UpstreamRegistry
 from gateway.oauth_discovery import create_oauth_discovery_router
 from gateway.state import InMemoryCacheBackend, SQLiteAuditStore
+
+
+@pytest.mark.parametrize(
+    ("claims", "mapping", "expected"),
+    [
+        (
+            {
+                "sub": "entra-user",
+                "tid": "tenant-a",
+                "roles": ["finance_reader"],
+                "groups": ["finance"],
+                "azp": "gateway",
+            },
+            ClaimMappingConfig(),
+            ("entra-user", "tenant-a", ["finance_reader"], ["finance"]),
+        ),
+        (
+            {
+                "sub": "okta-user",
+                "org_id": "tenant-b",
+                "app_roles": ["ticket_writer"],
+                "okta_groups": ["operations"],
+                "cid": "gateway",
+            },
+            ClaimMappingConfig(
+                tenant="org_id", roles="app_roles", groups="okta_groups", client_id="cid"
+            ),
+            ("okta-user", "tenant-b", ["ticket_writer"], ["operations"]),
+        ),
+        (
+            {
+                "sub": "keycloak-user",
+                "tenant": "tenant-c",
+                "gateway_roles": ["tool_approver"],
+                "gateway_groups": ["operations-approvers"],
+                "client_id": "gateway",
+            },
+            ClaimMappingConfig(
+                tenant="tenant",
+                roles="gateway_roles",
+                groups="gateway_groups",
+                client_id="client_id",
+            ),
+            ("keycloak-user", "tenant-c", ["tool_approver"], ["operations-approvers"]),
+        ),
+    ],
+    ids=["entra-standard-claims", "okta-mapped-claims", "keycloak-mapped-claims"],
+)
+def test_oidc_provider_claim_fixtures_map_roles_and_groups(claims, mapping, expected) -> None:
+    identity = claims_to_identity(claims, mapping)
+    assert (identity.sub, identity.tenant_id, identity.roles, identity.groups) == expected
 
 
 def _build_auth_app(

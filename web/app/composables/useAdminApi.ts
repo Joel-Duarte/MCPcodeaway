@@ -12,6 +12,7 @@ export interface AdminSessionState {
   authenticated: boolean;
   user: AdminUserProfile | null;
   is_admin: boolean;
+  is_approver?: boolean;
   can_access_admin_console: boolean;
   admin_auth_required: boolean;
 }
@@ -140,6 +141,7 @@ export function useAdminApi() {
           authenticated: false,
           user: null,
           is_admin: false,
+          is_approver: false,
           can_access_admin_console: false,
           admin_auth_required: true,
         };

@@ -69,7 +69,8 @@ const { apiFetch } = useAdminApi();
 type OnboardingStep = "connect" | "policy" | "publish";
 type SchemaInspectionState = "idle" | "inspecting" | "verified" | "failed";
 
-const dynamicPermitted = ref(true);
+const dynamicPermitted = ref(false);
+const upstreamsLoadError = ref("");
 const existingUpstreams = ref<string[]>([]);
 const errorMessage = ref("");
 const statusMessage = ref("");
@@ -91,8 +92,9 @@ const draftOAuthClientId = ref("");
 const draftOAuthClientSecretRef = ref("");
 const draftOAuthScopes = ref("");
 const draftApiKeyHeader = ref("X-API-Key");
-const draftRoles = ref("finance_analyst, ops_engineer, gateway_admin");
+const draftRoles = ref("");
 const draftGroups = ref("");
+const draftAllowAllCallers = ref(false);
 const draftPreferredMode = ref("auto");
 
 const inspectResult = ref<InspectResponse | null>(null);
@@ -136,23 +138,27 @@ const toolModeOptions = [
   { value: "traditional_discover", label: "Classic MCP" },
 ];
 const draftToolModes = ref<Record<string, string>>({});
-const draftToolApprovalModes = ref<Record<string, string>>({});
 const draftToolApprovalMessages = ref<Record<string, string>>({});
-const availableGroups = ref<string[]>(["finance", "operations", "support", "audit", "platform-admins"]);
+const draftToolEffects = ref<Record<string, string>>({});
+const draftToolApprovalGroups = ref<Record<string, string>>({});
+const availableGroups = ref<string[]>([]);
+const rolesLoadError = ref("");
+const rolesLoading = ref(true);
 
 const schemaInspectionState = ref<SchemaInspectionState>("idle");
 const schemaVerified = computed(() => schemaInspectionState.value === "verified");
+const approvalPoliciesValid = computed(() => Object.entries(draftToolEffects.value).every(([tool, effect]) => {
+  if (effect !== "high_impact") return true;
+  return Boolean(draftToolApprovalGroups.value[tool]?.split(",").some((group) => group.trim()));
+}));
+const accessPolicyValid = computed(() => draftAllowAllCallers.value || selectedRoleSet.value.size > 0 || selectedGroupSet.value.size > 0);
 const testCallResult = ref<string>("");
 const testCallBusy = ref(false);
-const availableRoles = ref<string[]>([
-  "finance_analyst",
-  "ops_engineer",
-  "support_agent",
-  "readonly_auditor",
-  "gateway_admin",
-]);
+const availableRoles = ref<string[]>([]);
 
-onMounted(async () => {
+async function loadRoles() {
+  rolesLoading.value = true;
+  rolesLoadError.value = "";
   try {
     const res = await apiFetch<{ roles?: string[]; groups?: string[] }>("/admin/roles", {}, true);
     if (res.roles && res.roles.length > 0) {
@@ -161,9 +167,14 @@ onMounted(async () => {
     if (res.groups && res.groups.length > 0) {
       availableGroups.value = res.groups;
     }
-  } catch {
+  } catch (err) {
+    rolesLoadError.value = extractErrorMessage(err);
+  } finally {
+    rolesLoading.value = false;
   }
-});
+}
+
+onMounted(() => { void loadRoles(); });
 
 const selectedRoleSet = computed(() => {
   return new Set(
@@ -178,6 +189,7 @@ const selectedGroupSet = computed(
   () => new Set(draftGroups.value.split(",").map((g) => g.trim()).filter(Boolean)),
 );
 function toggleGroup(group: string) {
+  draftAllowAllCallers.value = false;
   const next = new Set(selectedGroupSet.value);
   if (next.has(group)) next.delete(group);
   else next.add(group);
@@ -185,6 +197,7 @@ function toggleGroup(group: string) {
 }
 
 function toggleRole(role: string) {
+  draftAllowAllCallers.value = false;
   const next = new Set(selectedRoleSet.value);
   if (next.has(role)) {
     next.delete(role);
@@ -253,6 +266,10 @@ watch([sourceKind, draftUrl, draftSpecUrl], () => {
   testCallResult.value = "";
 });
 
+watch([draftRoles, draftGroups], ([roles, groups]) => {
+  if (roles.trim() || groups.trim()) draftAllowAllCallers.value = false;
+});
+
 function goToOnboardingStep(nextStep: OnboardingStep): void {
   if (nextStep !== "connect" && !schemaVerified.value) return;
   onboardingStep.value = nextStep;
@@ -318,20 +335,34 @@ function toolOverridesPayload(): Record<string, string> {
   return out;
 }
 
-function toolApprovalPoliciesPayload(): Record<string, { mode: string; version: number; confirmation_message?: string }> {
-  const policies: Record<string, { mode: string; version: number; confirmation_message?: string }> = {};
-  for (const [tool, mode] of Object.entries(draftToolApprovalModes.value)) {
-    if (mode === "requester_confirmation") {
-      const policy: { mode: string; version: number; confirmation_message?: string } = { mode, version: 1 };
-      const message = draftToolApprovalMessages.value[tool]?.trim();
-      if (message) policy.confirmation_message = message;
-      policies[tool] = policy;
+const toolEffectOptions = [
+  { value: "disabled", label: "Disabled" },
+  { value: "read", label: "Read only" },
+  { value: "write", label: "Write — caller confirms" },
+  { value: "high_impact", label: "High impact — manager approval" },
+];
+const restMethodOptions = [
+  { value: "get", label: "GET" },
+  { value: "post", label: "POST" },
+  { value: "put", label: "PUT" },
+  { value: "delete", label: "DELETE" },
+];
+
+function toolApprovalPoliciesPayload(): Record<string, { mode: string; version: number; confirmation_message?: string; approver_groups?: string[] }> {
+  const policies: Record<string, { mode: string; version: number; confirmation_message?: string; approver_groups?: string[] }> = {};
+  for (const [tool, effect] of Object.entries(draftToolEffects.value)) {
+    const message = draftToolApprovalMessages.value[tool]?.trim();
+    if (effect === "write") {
+      policies[tool] = { mode: "requester_confirmation", version: 1, confirmation_message: message || `Confirm this write to ${tool}.` };
+    } else if (effect === "high_impact") {
+      const groups = (draftToolApprovalGroups.value[tool] || "").split(",").map((group) => group.trim()).filter(Boolean);
+      policies[tool] = { mode: "manager_approval", version: 1, confirmation_message: message || `Approve this high impact action: ${tool}.`, approver_groups: groups };
     }
   }
   return policies;
 }
 
-function buildUpstreamPayload() {
+function buildUpstreamPayload(forInspection = false) {
   const roles = draftRoles.value
     .split(",")
     .map((s) => s.trim())
@@ -392,11 +423,15 @@ function buildUpstreamPayload() {
           scopes: oauthScopesList,
         }
       : undefined,
-    allowed_roles: roles,
-    allowed_groups: groups,
+    allowed_roles: draftAllowAllCallers.value ? [] : roles,
+    allowed_groups: draftAllowAllCallers.value ? [] : groups,
+    allow_all_callers: draftAllowAllCallers.value,
     preferred_mode: draftPreferredMode.value,
     tool_mode_overrides: toolOverridesPayload(),
     tool_approval_policies: toolApprovalPoliciesPayload(),
+    allowed_operations: forInspection ? null : Object.entries(draftToolEffects.value).filter(([, effect]) => effect !== "disabled").map(([tool]) => tool),
+    tool_effects: forInspection ? {} : Object.fromEntries(Object.entries(draftToolEffects.value).filter(([, effect]) => effect !== "disabled")),
+    mutating_tools: forInspection ? [] : Object.entries(draftToolEffects.value).filter(([, effect]) => effect === "write" || effect === "high_impact").map(([tool]) => tool),
     enabled: true,
     ab_experiment: null,
   };
@@ -413,6 +448,8 @@ const yamlPreview = computed(() => {
     `    auth_type: ${cfg.auth_type}`,
     `    preferred_mode: ${cfg.preferred_mode}`,
     `    allowed_roles: [${cfg.allowed_roles.join(", ")}]`,
+    `    allowed_groups: [${cfg.allowed_groups.join(", ")}]`,
+    `    allow_all_callers: ${cfg.allow_all_callers}`,
   ].filter(Boolean);
   const overrides = Object.entries(cfg.tool_mode_overrides);
   if (overrides.length) {
@@ -426,14 +463,22 @@ const yamlPreview = computed(() => {
         const message = policy.confirmation_message
           ? `, confirmation_message: ${JSON.stringify(policy.confirmation_message)}`
           : "";
-        return `      ${tool}: { mode: ${policy.mode}, version: ${policy.version}${message} }`;
+        const groups = policy.approver_groups?.length
+          ? `, approver_groups: [${policy.approver_groups.join(", ")}]`
+          : "";
+        return `      ${tool}: { mode: ${policy.mode}, version: ${policy.version}${message}${groups} }`;
       })
     );
+  }
+  lines.push(`    allowed_operations: [${cfg.allowed_operations?.join(", ") || ""}]`);
+  if (Object.keys(cfg.tool_effects).length) {
+    lines.push(`    tool_effects:`, ...Object.entries(cfg.tool_effects).map(([tool, effect]) => `      ${tool}: ${effect}`));
   }
   return lines.join("\n");
 });
 
-onMounted(async () => {
+async function loadUpstreams() {
+  upstreamsLoadError.value = "";
   try {
     const res = await apiFetch<{
       dynamic_upstreams_permitted: boolean;
@@ -441,9 +486,13 @@ onMounted(async () => {
     }>("/admin/upstreams");
     dynamicPermitted.value = res.dynamic_upstreams_permitted;
     existingUpstreams.value = res.upstreams.map((u) => u.name);
-  } catch {
+  } catch (err) {
+    dynamicPermitted.value = false;
+    upstreamsLoadError.value = extractErrorMessage(err);
   }
-});
+}
+
+onMounted(() => { void loadUpstreams(); });
 
 async function handleInspect() {
   errorMessage.value = "";
@@ -454,7 +503,7 @@ async function handleInspect() {
   try {
     inspectResult.value = await apiFetch<InspectResponse>("/admin/upstreams/inspect", {
       method: "POST",
-      body: buildUpstreamPayload(),
+      body: buildUpstreamPayload(true),
     });
     schemaInspectionState.value = "verified";
     const inspectedName =
@@ -462,6 +511,10 @@ async function handleInspect() {
       inspectResult.value.inspection["upstream"] ||
       draftName.value.trim();
     statusMessage.value = `Inspected '${inspectedName}' (${inspectResult.value.inspection.tool_count} tools). Step 2 unlocked.`;
+    draftToolEffects.value = Object.fromEntries(inspectResult.value.inspection.tools.map((tool) => [tool.name, "disabled"]));
+    draftToolModes.value = {};
+    draftToolApprovalMessages.value = {};
+    draftToolApprovalGroups.value = {};
   } catch (err) {
     schemaInspectionState.value = "failed";
     errorMessage.value = extractErrorMessage(err);
@@ -494,6 +547,18 @@ async function handleTestCall(toolName: string) {
 }
 
 async function handleRegister() {
+  if (!accessPolicyValid.value) {
+    errorMessage.value = "Select at least one allowed role or group, or explicitly allow all authenticated callers.";
+    return;
+  }
+  if (!approvalPoliciesValid.value) {
+    errorMessage.value = "Choose at least one approver group for each high impact operation.";
+    return;
+  }
+  if (rolesLoadError.value) {
+    errorMessage.value = "Role and group choices could not be loaded. Retry the lookup before saving access policy.";
+    return;
+  }
   errorMessage.value = "";
   statusMessage.value = "";
   registeredUpstream.value = "";
@@ -647,6 +712,10 @@ async function copyPromptText() {
       <AppIcon name="alert" :size="16" class="mt-0.5" />
       <span>{{ errorMessage }}</span>
     </div>
+    <div v-if="upstreamsLoadError" role="alert" class="flex flex-col gap-2 rounded-lg border border-[#FECACA] bg-[#FEF2F2] px-4 py-3 text-[13px] text-[#991B1B] sm:flex-row sm:items-center sm:justify-between">
+      <span>Could not load gateway registration settings: {{ upstreamsLoadError }}</span>
+      <Button class="min-h-11" @click="loadUpstreams">Retry settings lookup</Button>
+    </div>
 
     <section
       aria-label="Onboarding workflow steps"
@@ -756,16 +825,10 @@ async function copyPromptText() {
           :key="idx"
           class="grid grid-cols-1 gap-2 sm:grid-cols-12 sm:items-center"
         >
-          <select
-            v-model="ep.method"
-            aria-label="HTTP method"
-            class="sm:col-span-2 rounded border border-[#D4D4D8] bg-white px-2 py-1.5 text-xs uppercase"
-          >
-            <option value="get">GET</option>
-            <option value="post">POST</option>
-            <option value="put">PUT</option>
-            <option value="delete">DELETE</option>
-          </select>
+          <Select :items="restMethodOptions" :value="ep.method" @value-change="(value) => { if (value) ep.method = String(value) }">
+            <SelectTrigger aria-label="HTTP method" class="min-h-11 sm:col-span-2"><SelectValue /><AppIcon name="chevron-down" :size="14" /></SelectTrigger>
+            <SelectContent><SelectItem v-for="method in restMethodOptions" :key="method.value" :value="method.value">{{ method.label }}<SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator></SelectItem></SelectContent>
+          </Select>
           <Input v-model="ep.path" class="sm:col-span-4 font-mono-data text-xs" placeholder="/orders" />
           <Input v-model="ep.operationId" class="sm:col-span-3 font-mono-data text-xs" placeholder="list_orders" />
           <Input v-model="ep.summary" class="sm:col-span-2 text-xs" placeholder="Summary" />
@@ -932,18 +995,29 @@ async function copyPromptText() {
 
         <div class="sm:col-span-2 space-y-2">
           <div class="text-xs font-medium text-[#09090B]">Allowed RBAC roles (click to toggle)</div>
+          <p class="text-[11px] text-[#71717A]">Enter verified roles from your identity provider. The gateway evaluates these against the authenticated caller.</p>
+          <Input v-model="draftRoles" aria-label="Allowed role names" placeholder="role_one, role_two" class="min-h-11 font-mono-data text-xs" />
+          <div v-if="rolesLoading" role="status" class="text-xs text-[#71717A]">Loading configured roles and groups…</div>
+          <div v-if="rolesLoadError" role="alert" class="rounded border border-[#FECACA] bg-[#FEF2F2] p-3 text-xs text-[#991B1B]">
+            {{ rolesLoadError }} <Button class="ml-2 min-h-11" @click="loadRoles">Retry lookup</Button>
+          </div>
+          <p v-if="!rolesLoading && !rolesLoadError && availableRoles.length === 0" class="text-xs text-[#71717A]">No configured roles were found. Leave this empty to allow any authenticated caller, or configure roles before restricting access.</p>
           <div class="flex flex-wrap gap-1.5">
-            <button v-for="role in availableRoles" :key="role" type="button" class="rounded border px-2.5 py-1 text-xs font-medium transition-colors"
+            <button v-for="role in availableRoles" :key="role" type="button" :aria-pressed="selectedRoleSet.has(role)" class="min-h-11 rounded border px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E] sm:min-h-9"
               :class="selectedRoleSet.has(role) ? 'border-[#0F766E] bg-[#F0FDFA] text-[#0F766E]' : 'border-[#E4E4E7] bg-white text-[#52525B] hover:bg-[#F4F4F5]'"
               @click="toggleRole(role)">{{ role }}</button>
           </div>
           <div class="pt-1 text-xs font-medium text-[#09090B]">Allowed groups (click to toggle)</div>
+          <Input v-model="draftGroups" aria-label="Allowed group names" placeholder="group_one, group_two" class="min-h-11 font-mono-data text-xs" />
           <div class="flex flex-wrap gap-1.5">
-            <button v-for="g in availableGroups" :key="g" type="button" class="rounded border px-2.5 py-1 text-xs font-medium transition-colors"
+            <button v-for="g in availableGroups" :key="g" type="button" :aria-pressed="selectedGroupSet.has(g)" class="min-h-11 rounded border px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E] sm:min-h-9"
               :class="selectedGroupSet.has(g) ? 'border-[#0F766E] bg-[#F0FDFA] text-[#0F766E]' : 'border-[#E4E4E7] bg-white text-[#52525B] hover:bg-[#F4F4F5]'"
               @click="toggleGroup(g)">{{ g }}</button>
           </div>
-          <p class="text-[11px] text-[#71717A]">Leave both empty to allow any authenticated caller. Selecting roles and groups restricts access to matching callers.</p>
+          <label class="flex min-h-11 items-center gap-2 text-xs text-[#52525B]">
+            <Checkbox :checked="draftAllowAllCallers" aria-label="Allow all authenticated callers" @checked-change="(checked) => { draftAllowAllCallers = checked === true; if (draftAllowAllCallers) { draftRoles = ''; draftGroups = ''; } }"><CheckboxIndicator><AppIcon name="check" :size="13" /></CheckboxIndicator></Checkbox>
+            Explicitly allow any authenticated caller for this upstream
+          </label>
         </div>
       </div>
 
@@ -960,18 +1034,20 @@ async function copyPromptText() {
         </Select>
         <details v-if="inspectResult" class="rounded border border-[#E4E4E7] bg-white p-3">
           <summary class="min-h-11 cursor-pointer py-2 text-xs font-semibold text-[#09090B] sm:min-h-9">Per-tool execution and confirmation ({{ inspectResult.inspection.tool_count }} tools)</summary>
-          <p class="mt-1 text-xs text-[#52525B]">Requester confirmation pauses direct MCP calls before dispatch. Code Mode cannot invoke confirmed tools. This is a caller prompt, not an external manager approval.</p>
+          <p class="mt-1 text-xs text-[#52525B]">Tools start disabled. Enable each operation deliberately and classify its effect. Writes require caller confirmation; high impact actions require one eligible group approval. Code Mode cannot invoke gated tools.</p>
           <div class="mt-3 max-h-72 space-y-1.5 overflow-y-auto">
-            <div v-for="t in inspectResult.inspection.tools" :key="t.qualified_name" class="grid grid-cols-1 items-center gap-2 border-t border-[#E4E4E7] py-2 sm:grid-cols-[minmax(0,1fr)_10rem_12rem]">
-              <div class="min-w-0"><div class="truncate font-mono-data text-xs text-[#09090B]">{{ t.name }}</div><div class="text-[11px] text-[#71717A]">{{ t.mutating ? "writes data" : "read-only" }}</div></div>
-              <select :value="draftToolModes[t.name] || 'inherit'" :aria-label="`Execution mode for ${t.name}`" class="rounded border border-[#D4D4D8] bg-white px-2 py-1.5 text-xs" @change="draftToolModes[t.name] = ($event.target as HTMLSelectElement).value">
-                <option v-for="m in toolModeOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
-              </select>
-              <select :value="draftToolApprovalModes[t.name] || 'none'" :aria-label="`Requester confirmation for ${t.name}`" class="min-h-11 rounded border border-[#D4D4D8] bg-white px-2 py-1.5 text-xs sm:min-h-9" @change="draftToolApprovalModes[t.name] = ($event.target as HTMLSelectElement).value">
-                <option value="none">No extra confirmation</option>
-                <option value="requester_confirmation">Ask caller before each call</option>
-              </select>
-              <Input v-if="draftToolApprovalModes[t.name] === 'requester_confirmation'" v-model="draftToolApprovalMessages[t.name]" :aria-label="`Confirmation message for ${t.name}`" placeholder="Optional prompt context" maxlength="300" class="min-h-11 text-xs sm:col-span-3 sm:min-h-9" />
+            <div v-for="t in inspectResult.inspection.tools" :key="t.qualified_name" class="grid grid-cols-1 items-start gap-2 border-t border-[#E4E4E7] py-3 sm:grid-cols-[minmax(0,1fr)_minmax(12rem,0.8fr)_minmax(11rem,0.7fr)]">
+              <div class="min-w-0"><div class="truncate font-mono-data text-xs text-[#09090B]">{{ t.name }}</div><div class="text-[11px] text-[#71717A]">Upstream reports {{ t.mutating ? "a possible write" : "read-only behavior" }}; classify according to your review.</div></div>
+              <Select :items="toolEffectOptions" :value="draftToolEffects[t.name] || 'disabled'" @value-change="(value) => { if (value) draftToolEffects[t.name] = String(value) }">
+                <SelectTrigger :aria-label="`Access classification for ${t.name}`" class="min-h-11"><SelectValue /><AppIcon name="chevron-down" :size="14" /></SelectTrigger>
+                <SelectContent><SelectItem v-for="effect in toolEffectOptions" :key="effect.value" :value="effect.value">{{ effect.label }}<SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator></SelectItem></SelectContent>
+              </Select>
+              <Select :items="toolModeOptions" :value="draftToolModes[t.name] || 'inherit'" @value-change="(value) => { if (value) draftToolModes[t.name] = String(value) }">
+                <SelectTrigger :aria-label="`Execution mode for ${t.name}`" class="min-h-11"><SelectValue /><AppIcon name="chevron-down" :size="14" /></SelectTrigger>
+                <SelectContent><SelectItem v-for="mode in toolModeOptions" :key="mode.value" :value="mode.value">{{ mode.label }}<SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator></SelectItem></SelectContent>
+              </Select>
+              <Input v-if="draftToolEffects[t.name] === 'write' || draftToolEffects[t.name] === 'high_impact'" v-model="draftToolApprovalMessages[t.name]" :aria-label="`Action summary for ${t.name}`" :placeholder="draftToolEffects[t.name] === 'write' ? `Confirm this write to ${t.name}.` : `Approve this high impact action: ${t.name}.`" maxlength="300" class="min-h-11 text-xs sm:col-span-3" />
+              <Input v-if="draftToolEffects[t.name] === 'high_impact'" v-model="draftToolApprovalGroups[t.name]" :aria-label="`Approver groups for ${t.name}`" placeholder="Approver groups, comma separated" maxlength="300" class="min-h-11 text-xs sm:col-span-3" />
             </div>
           </div>
         </details>
@@ -1013,7 +1089,7 @@ async function copyPromptText() {
               <AppIcon name="flask" :size="15" />
               <span>Estimate Code Mode vs Classic</span>
             </Button>
-            <Button v-if="dynamicPermitted" data-variant="primary" data-agent-confirm="Register or update this upstream service in the gateway?" pending-announcement="Registering upstream" @click="handleRegister">
+            <Button v-if="dynamicPermitted" data-variant="primary" :disabled="!approvalPoliciesValid || !accessPolicyValid || rolesLoading || Boolean(rolesLoadError)" data-agent-confirm="Register or update this upstream service in the gateway?" pending-announcement="Registering upstream" @click="handleRegister">
               Save Upstream
             </Button>
             <Button @click="copyYaml">

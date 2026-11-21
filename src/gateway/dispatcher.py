@@ -706,7 +706,7 @@ class HostDispatcher:
             approval_policy = current_upstream.tool_approval_policies.get(tool.name)
             if (
                 approval_policy is not None
-                and approval_policy.mode == "requester_confirmation"
+                and approval_policy.mode in {"requester_confirmation", "manager_approval"}
                 and requester_confirmation_policy != approval_policy
             ):
                 reason = "Requester confirmation is required for this tool call."
@@ -780,7 +780,8 @@ class HostDispatcher:
                 latest_approval_policy = latest_upstream.tool_approval_policies.get(tool.name)
                 if (
                     latest_approval_policy is not None
-                    and latest_approval_policy.mode == "requester_confirmation"
+                    and latest_approval_policy.mode
+                    in {"requester_confirmation", "manager_approval"}
                     and requester_confirmation_policy != latest_approval_policy
                 ):
                     reason = "Requester confirmation is required for this tool call."

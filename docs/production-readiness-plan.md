@@ -111,6 +111,37 @@ If Kubernetes is selected, separately test rendered manifests, security policies
 - [ ] Capacity results and configuration values are recorded.
 - [ ] No unresolved P0/P1 isolation, authorization, or resource-bound issue remains.
 
+## MVP approval and launch blockers
+
+The repository now implements a narrow, durable approval path, but it does not
+make a customer deployment production-ready by itself. The release owner still
+needs to supply and verify these deployment-specific inputs:
+
+- A single production OIDC issuer and API audience for the deployment, plus the
+  customer's stable role and group claim mapping. The `tool_approver` role and
+  groups such as `operations-approvers` are examples; they must exist in the
+  chosen IdP and be tested with real tokens.
+- One real upstream and reviewed `allowed_operations` / `tool_effects` policy.
+  Production startup now rejects enabled upstreams that omit operation
+  allowlists, effects, matching mutation declarations, or required gate policy.
+- Workload profile, peak concurrency, response sizes, rate limits, SLOs, and
+  recovery objectives. Gateway and sandbox workers must be measured and scaled
+  independently; this repository contains no evidence-backed capacity claim.
+- A named hosting target, TLS ingress, network egress enforcement, secret
+  manager, shared Redis/Postgres services, backup and restore evidence, image
+  promotion, and rollback procedure. SSRF application checks do not prove DNS
+  pinning or an egress boundary.
+- A pilot proving the chosen MCP client can render requester confirmation and
+  retry after manager approval, plus expiry, policy-change, persistence outage,
+  duplicate-decision, and two-replica recovery behavior.
+- An approval-record retention and archive policy. Current audit archive/prune
+  endpoints cover execution runs; they do not yet export or prune approval
+  decisions. Decide the required retention, export format, and deletion rules
+  before storing real customer action summaries in production.
+
+These are release blockers, not reasons to add a speculative platform or
+notification provider to the codebase before a customer selects one.
+
 ## Progress
 
 ### Phase 1 review against the current project
@@ -131,3 +162,5 @@ If Kubernetes is selected, separately test rendered manifests, security policies
 - Follow-up verification on 2026-11-21: 5 targeted test cases passed for audit/live-telemetry ownership, timeout cancellation, and the three seeded concurrency schedules. `./scripts/pre-ci.sh --fast` passed, including preflight, Ruff checks, and 11 golden/regression tests.
 - Phase 1 remains open. The concurrent isolation test now varies reproducible launch timing across three recorded seeds, and audit/live-telemetry ownership is checked for success, failure, cancellation, and timeout. These focused checks do not replace randomized scheduling over the full suite. No generic conversation ID is needed for the current stateless call model: each execution has caller identity and an audit `run_id`; domain resource IDs should be introduced only for a concrete workflow that retains business state across calls.
 - Phase 2 bounds have implementation and targeted evidence, but broader overload/resource-limit proofs remain open. Real shared Redis/Postgres across separate gateway instances, restart/failure behavior, network policy, load measurements, and recovery exercises are later-phase work. No Kubernetes manifests or deployment target work has started. The adversarial review document remains separate and uncommitted.
+- Approval MVP implementation: SQLite and Postgres durable action records, tenant-scoped list/decision routes, group membership checks, requester/approver separation, policy version validation, atomic single-use execution claim, configurable TTL, and `/admin/approvals` console page. Onboarding starts all discovered operations disabled and requires explicit role/group access plus effect classification. Production static config now requires a complete operation allowlist and matching approval policy. The requester and manager golden journey file covers requester flows and the first approval/execute/retry flow; broader failure and multi-replica evidence remains open.
+- Deployment readiness is still blocked on the customer IdP and actual group claims, real upstream pilot, workload/SLO targets, named hosting target, enforced network egress, managed shared services, backup/restore and rollback evidence, and measured capacity. Gateway and worker scaling budgets must be verified separately.

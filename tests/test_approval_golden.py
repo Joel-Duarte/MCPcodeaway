@@ -12,15 +12,16 @@ import pytest
 from fastapi import FastAPI
 
 from gateway.auth import LocalDevKeyManager
-from gateway.config import GatewaySettings
+from gateway.config import GatewaySettings, ToolApprovalPolicy
 from gateway.mcp_protocol import MCP_CLIENT_CAPABILITIES_META, request_headers, request_meta
-from gateway.server import create_gateway_app
+from gateway.server import _render_approval_summary, create_gateway_app
 from gateway.state import SQLiteAuditStore
 
 _GOLDEN_PATH = Path(__file__).parent / "golden" / "approval_flows.json"
 _FLOWS = json.loads(_GOLDEN_PATH.read_text(encoding="utf-8"))["flows"]
 _TOOL = "approval_fixture__write_item"
 _ITEM_ID = "item-204"
+_MANAGER_FLOWS = json.loads(_GOLDEN_PATH.read_text(encoding="utf-8"))["manager_flows"]
 
 
 def _mock_upstream() -> tuple[FastAPI, dict[str, int]]:
@@ -116,7 +117,7 @@ async def _call(
     )
 
 
-async def _environment(tmp_path: Path):
+async def _environment(tmp_path: Path, *, manager_approval: bool = False):
     backend_app, calls = _mock_upstream()
     backend_client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=backend_app), base_url="http://127.0.0.1:8001"
@@ -133,9 +134,14 @@ async def _environment(tmp_path: Path):
                 "mutating_tools": ["write_item"],
                 "tool_approval_policies": {
                     "write_item": {
-                        "mode": "requester_confirmation",
+                        "mode": "manager_approval"
+                        if manager_approval
+                        else "requester_confirmation",
                         "version": 1,
-                        "confirmation_message": "Write this item?",
+                        "confirmation_message": "Approve writing item {item_id}?"
+                        if manager_approval
+                        else "Write this item?",
+                        **({"approver_groups": ["item-approvers"]} if manager_approval else {}),
                     }
                 },
             }
@@ -364,5 +370,135 @@ async def test_requester_approval_golden_journeys(flow: dict[str, str], tmp_path
 
                 else:
                     raise AssertionError(f"Unsupported approval golden flow: {kind}")
+    finally:
+        await backend_client.aclose()
+
+
+@pytest.mark.parametrize("flow", _MANAGER_FLOWS, ids=lambda flow: flow["id"])
+async def test_manager_approval_golden_journeys(flow: dict[str, str], tmp_path: Path) -> None:
+    assert flow["kind"] == "manager_approval"
+    app, backend_client, dev_keys, calls = await _environment(tmp_path, manager_approval=True)
+    requester_token = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={
+            "sub": "requester-1",
+            "roles": ["admin"],
+            "groups": ["platform-admins"],
+            "scopes": ["mcp.tools", "mcp.write"],
+        },
+    )
+    self_approver_token = requester_token
+    wrong_group_token = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={
+            "sub": "approver-wrong-group",
+            "roles": ["tool_approver"],
+            "groups": ["finance"],
+        },
+    )
+    approver_token = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={
+            "sub": "approver-1",
+            "roles": ["tool_approver"],
+            "groups": ["item-approvers"],
+        },
+    )
+    second_approver_token = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={
+            "sub": "approver-2",
+            "roles": ["tool_approver"],
+            "groups": ["item-approvers"],
+        },
+    )
+
+    try:
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+            ) as gateway:
+                requested = await _call(
+                    gateway,
+                    requester_token,
+                    arguments={"item_id": _ITEM_ID},
+                    capabilities=_capabilities(),
+                )
+                state = requested.json()["result"]["requestState"]
+                accepted = await _call(
+                    gateway,
+                    requester_token,
+                    arguments={"item_id": _ITEM_ID},
+                    capabilities=_capabilities(),
+                    request_state=state,
+                    input_responses=_accepted_response(),
+                )
+                result = accepted.json()["result"]["structuredContent"]
+                assert result["approval_status"] == "pending"
+                assert calls["write_item"] == 0
+                approval_id = result["approval_id"]
+                path = f"/admin/approvals/{approval_id}/decision"
+                inbox = await gateway.get(
+                    "/admin/approvals?status=pending",
+                    headers={"Authorization": f"Bearer {approver_token}"},
+                )
+                assert inbox.status_code == 200
+                assert inbox.json()["approvals"][0]["action_summary"] == (
+                    f"Approve writing item {_ITEM_ID}?"
+                )
+                safe_summary = _render_approval_summary(
+                    ToolApprovalPolicy(
+                        mode="manager_approval",
+                        confirmation_message="Use {item_id}; discard {api_key}.",
+                        approver_groups=["item-approvers"],
+                    ),
+                    {"item_id": _ITEM_ID, "api_key": "should-not-persist"},
+                )
+                assert safe_summary == f"Use {_ITEM_ID}; discard [redacted]."
+
+                own = await gateway.post(
+                    path,
+                    headers={"Authorization": f"Bearer {self_approver_token}"},
+                    json={"decision": "approve"},
+                )
+                assert own.status_code == 403
+                wrong_group = await gateway.post(
+                    path,
+                    headers={"Authorization": f"Bearer {wrong_group_token}"},
+                    json={"decision": "approve"},
+                )
+                assert wrong_group.status_code == 403
+
+                decisions = await asyncio.gather(
+                    gateway.post(
+                        path,
+                        headers={"Authorization": f"Bearer {approver_token}"},
+                        json={"decision": "approve"},
+                    ),
+                    gateway.post(
+                        path,
+                        headers={"Authorization": f"Bearer {second_approver_token}"},
+                        json={"decision": "approve"},
+                    ),
+                )
+                assert sorted(response.status_code for response in decisions) == [200, 409]
+                decided = next(response for response in decisions if response.status_code == 200)
+                assert decided.json()["approval"]["status"] == "approved"
+
+                replay = await _call(
+                    gateway,
+                    requester_token,
+                    arguments={"item_id": _ITEM_ID},
+                )
+                assert replay.json()["result"]["structuredContent"]["ok"] is True
+                assert calls["write_item"] == 1
+                second_replay = await _call(
+                    gateway,
+                    requester_token,
+                    arguments={"item_id": _ITEM_ID},
+                    capabilities=_capabilities(),
+                )
+                assert second_replay.json()["result"]["resultType"] == "input_required"
+                assert calls["write_item"] == 1
     finally:
         await backend_client.aclose()

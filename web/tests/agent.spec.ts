@@ -110,6 +110,11 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
   expect(wrapper.text()).toContain("Allowed RBAC roles");
   expect(wrapper.text()).toContain("Allowed groups");
 
+  const accessPolicy = await agent.act({
+    steps: [{ ref: "Allowed role names", action: "setValue", args: ["finance_analyst"] }],
+  });
+  expect(accessPolicy.ok, accessPolicy.error?.message).toBe(true);
+
   const navStep3 = await agent.act({
     steps: [{ ref: "3. Test & Save", action: "press" }],
   });

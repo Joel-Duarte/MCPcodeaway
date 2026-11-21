@@ -17,6 +17,12 @@ upstreams:
     allowed_scopes:
       - mcp.tools
       - finance.read
+    allowed_operations: [query_debt_ledger, get_customer_balance, get_trial_balance_lines, compute_interest_penalty]
+    tool_effects:
+      query_debt_ledger: read
+      get_customer_balance: read
+      get_trial_balance_lines: read
+      compute_interest_penalty: read
     mutating_tools: []
     enabled: true
 
@@ -39,6 +45,10 @@ upstreams:
     allowed_scopes:
       - mcp.tools
       - finance.read
+    allowed_operations: [list_eu_invoices, get_eu_customer]
+    tool_effects:
+      list_eu_invoices: read
+      get_eu_customer: read
     mutating_tools: []
     enabled: true
 
@@ -61,6 +71,10 @@ upstreams:
     allowed_scopes:
       - mcp.tools
       - finance.read
+    allowed_operations: [list_us_invoices, get_us_customer]
+    tool_effects:
+      list_us_invoices: read
+      get_us_customer: read
     mutating_tools: []
     enabled: true
 
@@ -83,6 +97,18 @@ upstreams:
       - mcp.tools
       - ops.read
       - ops.write
-    mutating_tools:
-      - create_collection_case
+    allowed_operations: [list_terminal_incidents, get_terminal_health, create_collection_case, search_sentry_errors, get_github_release_commit]
+    tool_effects:
+      list_terminal_incidents: read
+      get_terminal_health: read
+      create_collection_case: high_impact
+      search_sentry_errors: read
+      get_github_release_commit: read
+    mutating_tools: [create_collection_case]
+    tool_approval_policies:
+      create_collection_case:
+        mode: manager_approval
+        version: 1
+        confirmation_message: Approve creation of this outbound collections case.
+        approver_groups: [operations-approvers]
     enabled: true

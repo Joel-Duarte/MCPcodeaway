@@ -44,6 +44,9 @@ def _mcp_call(
     params: dict[str, Any] | None = None,
     *,
     tool_name: str | None = None,
+    capabilities: dict[str, Any] | None = None,
+    request_state: str | None = None,
+    input_responses: dict[str, Any] | None = None,
 ) -> Any:
     headers: dict[str, str] = {
         "Content-Type": "application/json",
@@ -59,9 +62,13 @@ def _mcp_call(
     merged_params = dict(params or {})
     merged_params["_meta"] = {
         MCP_PROTOCOL_VERSION_META: MCP_PROTOCOL_VERSION,
-        MCP_CLIENT_CAPABILITIES_META: {},
+        MCP_CLIENT_CAPABILITIES_META: capabilities or {},
         MCP_SERVER_INFO_META: {"name": "golden-agent", "version": "1.0"},
     }
+    if request_state is not None:
+        merged_params["requestState"] = request_state
+    if input_responses is not None:
+        merged_params["inputResponses"] = input_responses
     return client.post(
         "/mcp",
         headers=headers,
@@ -182,6 +189,9 @@ def test_full_auth_and_authz_spectrum_golden_flows(
                 downstream_audience="api://inventory_obo",
                 downstream_scope="api://inventory_obo/mcp.tools",
                 allowed_groups=["finance"],
+                allowed_operations=["list_inventory_items"],
+                tool_effects={"list_inventory_items": "read"},
+                mutating_tools=[],
                 abac_rules=[
                     AbacRuleConfig(
                         claim="client_groups",
@@ -201,7 +211,16 @@ def test_full_auth_and_authz_spectrum_golden_flows(
                 downstream_audience="api://tax_keycloak",
                 downstream_scope="mcp.tools",
                 allowed_groups=["finance"],
+                allowed_operations=["calculate_tax"],
+                tool_effects={"calculate_tax": "write"},
                 mutating_tools=["calculate_tax"],
+                tool_approval_policies={
+                    "calculate_tax": {
+                        "mode": "requester_confirmation",
+                        "version": 1,
+                        "confirmation_message": "Confirm tax calculation.",
+                    }
+                },
                 oauth=UpstreamOAuthConfig(
                     token_exchange_dialect="rfc8693",
                     token_endpoint=f"{KEYCLOAK_ISSUER}/protocol/openid-connect/token",
@@ -217,6 +236,9 @@ def test_full_auth_and_authz_spectrum_golden_flows(
                 auth_type="client_credentials",
                 allowed_roles=["finance_analyst", "finance_bot_role"],
                 allowed_clients=["copilot-finance-agent", "nightly-reconcile-bot"],
+                allowed_operations=["get_metrics_summary"],
+                tool_effects={"get_metrics_summary": "read"},
+                mutating_tools=[],
                 oauth=UpstreamOAuthConfig(
                     token_endpoint=f"{ENTRA_ISSUER}/token",
                     client_id="gw-m2m-client",
@@ -233,6 +255,9 @@ def test_full_auth_and_authz_spectrum_golden_flows(
                 secret_ref="vault://inv_api_key",
                 api_key_header="X-API-Key",
                 allowed_groups=["finance"],
+                allowed_operations=["get_item_value"],
+                tool_effects={"get_item_value": "read"},
+                mutating_tools=[],
             ),
             UpstreamConfig(
                 name="tax_bearer",
@@ -242,6 +267,9 @@ def test_full_auth_and_authz_spectrum_golden_flows(
                 auth_type="bearer_secret",
                 secret_ref=f"file://{bearer_file}",
                 allowed_groups=["finance", "audit"],
+                allowed_operations=["get_tax_summary"],
+                tool_effects={"get_tax_summary": "read"},
+                mutating_tools=[],
             ),
             UpstreamConfig(
                 name="external_oauth",
@@ -250,6 +278,9 @@ def test_full_auth_and_authz_spectrum_golden_flows(
                 openapi_spec_url="https://external_oauth.internal/openapi.json",
                 auth_type="user_oauth",
                 allowed_groups=["finance"],
+                allowed_operations=["get_external_profile"],
+                tool_effects={"get_external_profile": "read"},
+                mutating_tools=[],
                 oauth=UpstreamOAuthConfig(
                     authorize_endpoint="https://mock-idp.local/external/oauth/authorize",
                     token_endpoint="https://mock-idp.local/external/oauth/token",
@@ -265,6 +296,9 @@ def test_full_auth_and_authz_spectrum_golden_flows(
                 auth_type="user_api_key",
                 api_key_header="X-Personal-Token",
                 allowed_groups=["finance"],
+                allowed_operations=["list_personal_notes"],
+                tool_effects={"list_personal_notes": "read"},
+                mutating_tools=[],
             ),
             UpstreamConfig(
                 name="sandbox_open",
@@ -273,6 +307,9 @@ def test_full_auth_and_authz_spectrum_golden_flows(
                 openapi_spec_url="https://sandbox_open.internal/openapi.json",
                 auth_type="none",
                 allowed_groups=["finance", "audit"],
+                allowed_operations=["ping_sandbox"],
+                tool_effects={"ping_sandbox": "read"},
+                mutating_tools=[],
             ),
         ]
         for cfg in upstreams:
@@ -298,12 +335,26 @@ def test_full_auth_and_authz_spectrum_golden_flows(
         assert d_obo["caller_sub"] == "user-fin-01"
         assert [i["region"] for i in d_obo["items"]] == ["EU"]
 
+        r_kc_prompt = _mcp_call(
+            client,
+            finance_eu_tok,
+            "tools/call",
+            {"name": "tax_keycloak__calculate_tax", "arguments": {"region": "eu", "subtotal": 100}},
+            tool_name="tax_keycloak__calculate_tax",
+            capabilities={"elicitation": {"form": {}}},
+        )
+        assert r_kc_prompt.status_code == 200
+        kc_prompt = r_kc_prompt.json()["result"]
+        assert kc_prompt["resultType"] == "input_required"
         r_kc = _mcp_call(
             client,
             finance_eu_tok,
             "tools/call",
             {"name": "tax_keycloak__calculate_tax", "arguments": {"region": "eu", "subtotal": 100}},
             tool_name="tax_keycloak__calculate_tax",
+            capabilities={"elicitation": {"form": {}}},
+            request_state=kc_prompt["requestState"],
+            input_responses={"confirm": {"action": "accept", "content": {"confirm": True}}},
         )
         d_kc = _extract_tool_json(r_kc)
         assert d_kc["auth_verified"] == "rfc8693"

@@ -196,6 +196,54 @@ class AuditStore(Protocol):
 
     async def consume_request_state_nonce(self, nonce: str, expires_at: str) -> bool: ...
 
+    async def create_or_get_tool_approval(self, approval: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def get_tool_approval(
+        self, approval_id: str, tenant_id: str
+    ) -> dict[str, Any] | None: ...
+
+    async def find_tool_approval(
+        self,
+        *,
+        tenant_id: str,
+        requester_sub: str,
+        upstream_name: str,
+        tool_name: str,
+        argument_digest: str,
+        policy_version: int,
+    ) -> dict[str, Any] | None: ...
+
+    async def list_tool_approvals(
+        self, tenant_id: str, *, statuses: list[str], limit: int = 100
+    ) -> list[dict[str, Any]]: ...
+
+    async def decide_tool_approval(
+        self,
+        approval_id: str,
+        tenant_id: str,
+        approver_sub: str,
+        decision: str,
+        decided_at: str,
+    ) -> dict[str, Any] | None: ...
+
+    async def claim_tool_approval(
+        self,
+        approval_id: str,
+        tenant_id: str,
+        requester_sub: str,
+        argument_digest: str,
+        policy_version: int,
+        started_at: str,
+    ) -> bool: ...
+
+    async def finish_tool_approval(
+        self, approval_id: str, status: str, finished_at: str
+    ) -> None: ...
+
+    async def invalidate_tool_approvals(
+        self, upstream_name: str, tool_name: str, current_policy_version: int, invalidated_at: str
+    ) -> int: ...
+
     async def export_runs_older_than(self, retention_days: int) -> list[dict[str, Any]]: ...
 
     async def prune_runs_older_than(self, retention_days: int) -> int: ...
@@ -311,6 +359,36 @@ class SQLiteAuditStore:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS consumed_request_state_nonces (
                 nonce TEXT PRIMARY KEY, expires_at TEXT NOT NULL)"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS tool_approvals (
+                approval_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                requester_sub TEXT NOT NULL,
+                upstream_name TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                argument_digest TEXT NOT NULL,
+                policy_version INTEGER NOT NULL,
+                approver_groups_json TEXT NOT NULL,
+                action_summary TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                decided_by TEXT,
+                decided_at TEXT,
+                execution_started_at TEXT,
+                completed_at TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_approvals_active_action
+            ON tool_approvals (tenant_id, requester_sub, upstream_name, tool_name,
+                               argument_digest, policy_version)
+            WHERE status IN ('pending', 'approved', 'denied')"""
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_tool_approvals_tenant_status_created
+            ON tool_approvals (tenant_id, status, created_at DESC)"""
         )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS tool_guidance (
@@ -736,6 +814,223 @@ class SQLiteAuditStore:
             conn.commit()
             return cursor.rowcount == 1
 
+    @staticmethod
+    def _decode_tool_approval(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        result = dict(row)
+        result["approver_groups"] = json.loads(result.pop("approver_groups_json"))
+        return result
+
+    async def create_or_get_tool_approval(self, approval: dict[str, Any]) -> dict[str, Any]:
+        async with self._lock:
+            conn = self._ensure_conn()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE tool_approvals SET status='expired' WHERE status IN "
+                    "('pending','approved','denied') AND expires_at<=?",
+                    (approval["created_at"],),
+                )
+                conn.execute(
+                    """INSERT OR IGNORE INTO tool_approvals (
+                        approval_id, tenant_id, requester_sub, upstream_name, tool_name,
+                        argument_digest, policy_version, approver_groups_json, action_summary,
+                        status, created_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                    (
+                        approval["approval_id"],
+                        approval["tenant_id"],
+                        approval["requester_sub"],
+                        approval["upstream_name"],
+                        approval["tool_name"],
+                        approval["argument_digest"],
+                        int(approval["policy_version"]),
+                        json.dumps(approval["approver_groups"], separators=(",", ":")),
+                        approval["action_summary"],
+                        approval["created_at"],
+                        approval["expires_at"],
+                    ),
+                )
+                row = conn.execute(
+                    """SELECT * FROM tool_approvals WHERE tenant_id=? AND requester_sub=?
+                    AND upstream_name=? AND tool_name=? AND argument_digest=? AND policy_version=?
+                    AND status IN ('pending', 'approved', 'denied')
+                    ORDER BY created_at DESC LIMIT 1""",
+                    (
+                        approval["tenant_id"],
+                        approval["requester_sub"],
+                        approval["upstream_name"],
+                        approval["tool_name"],
+                        approval["argument_digest"],
+                        int(approval["policy_version"]),
+                    ),
+                ).fetchone()
+                conn.commit()
+                decoded = self._decode_tool_approval(row)
+                if decoded is None:
+                    raise RuntimeError("Tool approval record could not be loaded after creation")
+                return decoded
+            except Exception:
+                conn.rollback()
+                raise
+
+    async def get_tool_approval(self, approval_id: str, tenant_id: str) -> dict[str, Any] | None:
+        async with self._lock:
+            row = (
+                self._ensure_conn()
+                .execute(
+                    "SELECT * FROM tool_approvals WHERE approval_id=? AND tenant_id=?",
+                    (approval_id, tenant_id),
+                )
+                .fetchone()
+            )
+        return self._decode_tool_approval(row)
+
+    async def find_tool_approval(
+        self,
+        *,
+        tenant_id: str,
+        requester_sub: str,
+        upstream_name: str,
+        tool_name: str,
+        argument_digest: str,
+        policy_version: int,
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute(
+                "UPDATE tool_approvals SET status='expired' WHERE status IN "
+                "('pending','approved','denied') AND expires_at<=?",
+                (datetime.now(UTC).isoformat(),),
+            )
+            conn.commit()
+            row = conn.execute(
+                """SELECT * FROM tool_approvals WHERE tenant_id=? AND requester_sub=?
+                AND upstream_name=? AND tool_name=? AND argument_digest=? AND policy_version=?
+                AND status IN ('pending', 'approved', 'denied')
+                ORDER BY created_at DESC LIMIT 1""",
+                (
+                    tenant_id,
+                    requester_sub,
+                    upstream_name,
+                    tool_name,
+                    argument_digest,
+                    policy_version,
+                ),
+            ).fetchone()
+        return self._decode_tool_approval(row)
+
+    async def list_tool_approvals(
+        self, tenant_id: str, *, statuses: list[str], limit: int = 100
+    ) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        marks = ",".join("?" for _ in statuses)
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute(
+                "UPDATE tool_approvals SET status='expired' WHERE status IN "
+                "('pending','approved','denied') AND expires_at<=?",
+                (datetime.now(UTC).isoformat(),),
+            )
+            conn.commit()
+            rows = conn.execute(
+                f"SELECT * FROM tool_approvals WHERE tenant_id=? AND status IN ({marks}) "
+                "ORDER BY created_at DESC LIMIT ?",
+                (tenant_id, *statuses, max(1, min(limit, 200))),
+            ).fetchall()
+        return [self._decode_tool_approval(row) for row in rows if row is not None]
+
+    async def decide_tool_approval(
+        self, approval_id: str, tenant_id: str, approver_sub: str, decision: str, decided_at: str
+    ) -> dict[str, Any] | None:
+        if decision not in {"approved", "denied"}:
+            raise ValueError("decision must be approved or denied")
+        async with self._lock:
+            conn = self._ensure_conn()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    """UPDATE tool_approvals SET status=?, decided_by=?, decided_at=?
+                    WHERE approval_id=? AND tenant_id=? AND requester_sub<>? AND status='pending'
+                    AND expires_at>?""",
+                    (
+                        decision,
+                        approver_sub,
+                        decided_at,
+                        approval_id,
+                        tenant_id,
+                        approver_sub,
+                        decided_at,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    conn.commit()
+                    return None
+                row = conn.execute(
+                    "SELECT * FROM tool_approvals WHERE approval_id=? AND tenant_id=?",
+                    (approval_id, tenant_id),
+                ).fetchone()
+                conn.commit()
+                return self._decode_tool_approval(row)
+            except Exception:
+                conn.rollback()
+                raise
+
+    async def claim_tool_approval(
+        self,
+        approval_id: str,
+        tenant_id: str,
+        requester_sub: str,
+        argument_digest: str,
+        policy_version: int,
+        started_at: str,
+    ) -> bool:
+        async with self._lock:
+            conn = self._ensure_conn()
+            cursor = conn.execute(
+                """UPDATE tool_approvals SET status='executing', execution_started_at=?
+                WHERE approval_id=? AND tenant_id=? AND requester_sub=? AND argument_digest=?
+                AND policy_version=? AND status='approved' AND expires_at>?""",
+                (
+                    started_at,
+                    approval_id,
+                    tenant_id,
+                    requester_sub,
+                    argument_digest,
+                    policy_version,
+                    started_at,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
+    async def finish_tool_approval(self, approval_id: str, status: str, finished_at: str) -> None:
+        if status not in {"completed", "execution_failed"}:
+            raise ValueError("invalid tool approval completion status")
+        async with self._lock:
+            self._ensure_conn().execute(
+                "UPDATE tool_approvals SET status=?, completed_at=? "
+                "WHERE approval_id=? AND status='executing'",
+                (status, finished_at, approval_id),
+            )
+            self._ensure_conn().commit()
+
+    async def invalidate_tool_approvals(
+        self, upstream_name: str, tool_name: str, current_policy_version: int, invalidated_at: str
+    ) -> int:
+        async with self._lock:
+            conn = self._ensure_conn()
+            cursor = conn.execute(
+                """UPDATE tool_approvals SET status='invalidated', completed_at=?
+                WHERE upstream_name=? AND tool_name=? AND policy_version<>?
+                AND status IN ('pending','approved','denied')""",
+                (invalidated_at, upstream_name, tool_name, current_policy_version),
+            )
+            conn.commit()
+            return cursor.rowcount
+
     async def import_adaptive_evidence(self, tenant_id: str, rows: list[dict[str, Any]]) -> int:
         async with self._lock:
             conn = self._ensure_conn()
@@ -958,6 +1253,36 @@ class PostgresAuditStore:
         await pool.execute(
             """CREATE TABLE IF NOT EXISTS consumed_request_state_nonces (
                 nonce TEXT PRIMARY KEY, expires_at TEXT NOT NULL)"""
+        )
+        await pool.execute(
+            """CREATE TABLE IF NOT EXISTS tool_approvals (
+                approval_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                requester_sub TEXT NOT NULL,
+                upstream_name TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                argument_digest TEXT NOT NULL,
+                policy_version INTEGER NOT NULL,
+                approver_groups_json TEXT NOT NULL,
+                action_summary TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                decided_by TEXT,
+                decided_at TEXT,
+                execution_started_at TEXT,
+                completed_at TEXT
+            )"""
+        )
+        await pool.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_approvals_active_action
+            ON tool_approvals (tenant_id, requester_sub, upstream_name, tool_name,
+                               argument_digest, policy_version)
+            WHERE status IN ('pending', 'approved', 'denied')"""
+        )
+        await pool.execute(
+            """CREATE INDEX IF NOT EXISTS idx_tool_approvals_tenant_status_created
+            ON tool_approvals (tenant_id, status, created_at DESC)"""
         )
         await pool.execute(
             """
@@ -1310,6 +1635,194 @@ class PostgresAuditStore:
                     expires_at,
                 )
         return status.endswith(" 1")
+
+    @staticmethod
+    def _decode_tool_approval(row: Any) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        result = dict(row)
+        result["approver_groups"] = json.loads(result.pop("approver_groups_json"))
+        return result
+
+    async def create_or_get_tool_approval(self, approval: dict[str, Any]) -> dict[str, Any]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE tool_approvals SET status='expired' WHERE status IN "
+                    "('pending','approved','denied') AND expires_at<=$1",
+                    approval["created_at"],
+                )
+                await conn.execute(
+                    """INSERT INTO tool_approvals (
+                        approval_id, tenant_id, requester_sub, upstream_name, tool_name,
+                        argument_digest, policy_version, approver_groups_json, action_summary,
+                        status, created_at, expires_at
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,$11)
+                    ON CONFLICT DO NOTHING""",
+                    approval["approval_id"],
+                    approval["tenant_id"],
+                    approval["requester_sub"],
+                    approval["upstream_name"],
+                    approval["tool_name"],
+                    approval["argument_digest"],
+                    int(approval["policy_version"]),
+                    json.dumps(approval["approver_groups"], separators=(",", ":")),
+                    approval["action_summary"],
+                    approval["created_at"],
+                    approval["expires_at"],
+                )
+                row = await conn.fetchrow(
+                    """SELECT * FROM tool_approvals WHERE tenant_id=$1 AND requester_sub=$2
+                    AND upstream_name=$3 AND tool_name=$4 AND argument_digest=$5
+                    AND policy_version=$6 AND status IN ('pending','approved','denied')
+                    ORDER BY created_at DESC LIMIT 1""",
+                    approval["tenant_id"],
+                    approval["requester_sub"],
+                    approval["upstream_name"],
+                    approval["tool_name"],
+                    approval["argument_digest"],
+                    int(approval["policy_version"]),
+                )
+        decoded = self._decode_tool_approval(row)
+        if decoded is None:
+            raise RuntimeError("Tool approval record could not be loaded after creation")
+        return decoded
+
+    async def get_tool_approval(self, approval_id: str, tenant_id: str) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        row = await pool.fetchrow(
+            "SELECT * FROM tool_approvals WHERE approval_id=$1 AND tenant_id=$2",
+            approval_id,
+            tenant_id,
+        )
+        return self._decode_tool_approval(row)
+
+    async def find_tool_approval(
+        self,
+        *,
+        tenant_id: str,
+        requester_sub: str,
+        upstream_name: str,
+        tool_name: str,
+        argument_digest: str,
+        policy_version: int,
+    ) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        await pool.execute(
+            "UPDATE tool_approvals SET status='expired' WHERE status IN "
+            "('pending','approved','denied') AND expires_at<=$1",
+            datetime.now(UTC).isoformat(),
+        )
+        row = await pool.fetchrow(
+            """SELECT * FROM tool_approvals WHERE tenant_id=$1 AND requester_sub=$2
+            AND upstream_name=$3 AND tool_name=$4 AND argument_digest=$5 AND policy_version=$6
+            AND status IN ('pending','approved','denied') ORDER BY created_at DESC LIMIT 1""",
+            tenant_id,
+            requester_sub,
+            upstream_name,
+            tool_name,
+            argument_digest,
+            policy_version,
+        )
+        return self._decode_tool_approval(row)
+
+    async def list_tool_approvals(
+        self, tenant_id: str, *, statuses: list[str], limit: int = 100
+    ) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        pool = await self._get_pool()
+        await pool.execute(
+            "UPDATE tool_approvals SET status='expired' WHERE status IN "
+            "('pending','approved','denied') AND expires_at<=$1",
+            datetime.now(UTC).isoformat(),
+        )
+        rows = await pool.fetch(
+            "SELECT * FROM tool_approvals WHERE tenant_id=$1 AND status=ANY($2::text[]) "
+            "ORDER BY created_at DESC LIMIT $3",
+            tenant_id,
+            statuses,
+            max(1, min(limit, 200)),
+        )
+        return [self._decode_tool_approval(row) for row in rows]
+
+    async def decide_tool_approval(
+        self, approval_id: str, tenant_id: str, approver_sub: str, decision: str, decided_at: str
+    ) -> dict[str, Any] | None:
+        if decision not in {"approved", "denied"}:
+            raise ValueError("decision must be approved or denied")
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                updated = await conn.execute(
+                    """UPDATE tool_approvals SET status=$1, decided_by=$2, decided_at=$3
+                    WHERE approval_id=$4 AND tenant_id=$5 AND requester_sub<>$2
+                    AND status='pending' AND expires_at>$3""",
+                    decision,
+                    approver_sub,
+                    decided_at,
+                    approval_id,
+                    tenant_id,
+                )
+                if not updated.endswith(" 1"):
+                    return None
+                row = await conn.fetchrow(
+                    "SELECT * FROM tool_approvals WHERE approval_id=$1 AND tenant_id=$2",
+                    approval_id,
+                    tenant_id,
+                )
+        return self._decode_tool_approval(row)
+
+    async def claim_tool_approval(
+        self,
+        approval_id: str,
+        tenant_id: str,
+        requester_sub: str,
+        argument_digest: str,
+        policy_version: int,
+        started_at: str,
+    ) -> bool:
+        pool = await self._get_pool()
+        status = await pool.execute(
+            """UPDATE tool_approvals SET status='executing', execution_started_at=$1
+            WHERE approval_id=$2 AND tenant_id=$3 AND requester_sub=$4 AND argument_digest=$5
+            AND policy_version=$6 AND status='approved' AND expires_at>$1""",
+            started_at,
+            approval_id,
+            tenant_id,
+            requester_sub,
+            argument_digest,
+            policy_version,
+        )
+        return status.endswith(" 1")
+
+    async def finish_tool_approval(self, approval_id: str, status: str, finished_at: str) -> None:
+        if status not in {"completed", "execution_failed"}:
+            raise ValueError("invalid tool approval completion status")
+        pool = await self._get_pool()
+        await pool.execute(
+            "UPDATE tool_approvals SET status=$1, completed_at=$2 "
+            "WHERE approval_id=$3 AND status='executing'",
+            status,
+            finished_at,
+            approval_id,
+        )
+
+    async def invalidate_tool_approvals(
+        self, upstream_name: str, tool_name: str, current_policy_version: int, invalidated_at: str
+    ) -> int:
+        pool = await self._get_pool()
+        status = await pool.execute(
+            """UPDATE tool_approvals SET status='invalidated', completed_at=$1
+            WHERE upstream_name=$2 AND tool_name=$3 AND policy_version<>$4
+            AND status IN ('pending','approved','denied')""",
+            invalidated_at,
+            upstream_name,
+            tool_name,
+            current_policy_version,
+        )
+        return int(status.split()[-1]) if status.split()[-1].isdigit() else 0
 
     async def import_adaptive_evidence(self, tenant_id: str, rows: list[dict[str, Any]]) -> int:
         pool = await self._get_pool()

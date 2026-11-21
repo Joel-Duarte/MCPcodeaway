@@ -543,6 +543,9 @@ async def test_typed_output_schemas_and_keyerror_shape_hints(tmp_path) -> None:
                         "url": "http://127.0.0.1:8001/schemaless/mcp",
                         "auth_type": "none",
                         "allowed_roles": ["finance_analyst"],
+                        "allowed_operations": ["fetch_widget"],
+                        "tool_effects": {"fetch_widget": "read"},
+                        "mutating_tools": [],
                     },
                 )
                 assert reg.status_code == 200, reg.text

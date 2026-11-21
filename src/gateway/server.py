@@ -16,7 +16,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -90,6 +90,7 @@ from gateway.discovery import DiscoveryEngine
 from gateway.dispatcher import (
     ExecutionBudget,
     HostDispatcher,
+    OutputRedactor,
     SubcallRecord,
     bind_positional_arguments,
     build_provenance_envelope,
@@ -1780,6 +1781,30 @@ def _input_required_confirmation(req_id: Any, state: str, message: str) -> JSONR
     )
 
 
+_SENSITIVE_APPROVAL_FIELD_RE = re.compile(
+    r"password|secret|token|api[_-]?key|authorization|credential|ssn|card|email|phone",
+    re.IGNORECASE,
+)
+_APPROVAL_FIELD_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _render_approval_summary(policy: ToolApprovalPolicy, arguments: dict[str, Any]) -> str:
+    """Render only administrator-selected scalar argument fields into an approval summary."""
+    summary = policy.confirmation_message.strip()
+
+    def substitute(match: re.Match[str]) -> str:
+        name = match.group(1)
+        value = arguments.get(name)
+        if _SENSITIVE_APPROVAL_FIELD_RE.search(name):
+            return "[redacted]"
+        if not isinstance(value, (str, int, float, bool)):
+            return "[omitted]"
+        safe_value = OutputRedactor.redact_text(str(value)).replace("\n", " ").strip()
+        return safe_value[:120]
+
+    return _APPROVAL_FIELD_RE.sub(substitute, summary)[:600]
+
+
 def _validate_modern_mcp_request(request: Request, payload: Any) -> JSONResponse | None:
     """Require the current sessionless per-request envelope and HTTP headers."""
     if not isinstance(payload, dict):
@@ -1888,6 +1913,10 @@ class UpstreamTestCallRequest(BaseModel):
     upstream: UpstreamConfig
     tool_name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolApprovalDecisionRequest(BaseModel):
+    decision: str = Field(pattern="^(approve|deny)$")
 
 
 def _valid_run_timestamp(value: Any) -> bool:
@@ -2540,6 +2569,7 @@ def create_gateway_app(
                         )
 
                     requester_confirmation_policy: ToolApprovalPolicy | None = None
+                    manager_approval_record: dict[str, Any] | None = None
                     await runtime.ensure_catalog_for_identity(identity)
                     target_tool = runtime.catalog.get_tool(tool_name)
                     if target_tool is not None:
@@ -2551,7 +2581,62 @@ def create_gateway_app(
                         )
                         if (
                             approval_policy is not None
-                            and approval_policy.mode == "requester_confirmation"
+                            and approval_policy.mode == "manager_approval"
+                        ):
+                            argument_digest = hashlib.sha256(
+                                json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode(
+                                    "utf-8"
+                                )
+                            ).hexdigest()
+                            manager_approval_record = await runtime.store.find_tool_approval(
+                                tenant_id=identity.tenant_id,
+                                requester_sub=identity.sub,
+                                upstream_name=target_tool.server,
+                                tool_name=target_tool.name,
+                                argument_digest=argument_digest,
+                                policy_version=approval_policy.version,
+                            )
+                            if manager_approval_record is not None:
+                                status = manager_approval_record["status"]
+                                if status == "pending":
+                                    result = {
+                                        "approval_status": "pending",
+                                        "approval_id": manager_approval_record["approval_id"],
+                                        "message": (
+                                            "This action is waiting for an eligible approver."
+                                        ),
+                                    }
+                                    return _finish(
+                                        _jsonrpc_ok(
+                                            req_id,
+                                            {
+                                                "content": [
+                                                    {"type": "text", "text": result["message"]}
+                                                ],
+                                                "structuredContent": result,
+                                                "isError": True,
+                                            },
+                                        ),
+                                        status_label="approval_pending",
+                                    )
+                                if status == "denied":
+                                    return _finish(
+                                        _jsonrpc_err(
+                                            req_id,
+                                            -31004,
+                                            "An approver denied this action. A new request "
+                                            "requires a policy change or expiry.",
+                                        ),
+                                        status_label="approval_denied",
+                                    )
+                        if (
+                            approval_policy is not None
+                            and approval_policy.mode
+                            in {"requester_confirmation", "manager_approval"}
+                            and not (
+                                manager_approval_record is not None
+                                and manager_approval_record["status"] == "approved"
+                            )
                         ):
                             if (
                                 allowed_servers is not None
@@ -2644,7 +2729,7 @@ def create_gateway_app(
                                     "expires_at": expires_at,
                                     "nonce": uuid.uuid4().hex,
                                 }
-                                message = approval_policy.confirmation_message.strip() or (
+                                message = _render_approval_summary(approval_policy, arguments) or (
                                     f"Confirm this call to {target_tool.qualified_name}. "
                                     "Review the tool call and its arguments before responding."
                                 )
@@ -2683,7 +2768,7 @@ def create_gateway_app(
                                     status_label="error",
                                 )
                             if not isinstance(responses, dict):
-                                message = approval_policy.confirmation_message.strip() or (
+                                message = _render_approval_summary(approval_policy, arguments) or (
                                     f"Confirm this call to {target_tool.qualified_name}. "
                                     "Review the tool call and its arguments before responding."
                                 )
@@ -2693,7 +2778,7 @@ def create_gateway_app(
                                 )
                             confirmation = responses.get("confirm")
                             if not isinstance(confirmation, dict):
-                                message = approval_policy.confirmation_message.strip() or (
+                                message = _render_approval_summary(approval_policy, arguments) or (
                                     f"Confirm this call to {target_tool.qualified_name}. "
                                     "Review the tool call and its arguments before responding."
                                 )
@@ -2753,7 +2838,7 @@ def create_gateway_app(
                                 and isinstance(confirmation.get("content"), dict)
                                 and confirmation["content"].get("confirm") is True
                             ):
-                                message = approval_policy.confirmation_message.strip() or (
+                                message = _render_approval_summary(approval_policy, arguments) or (
                                     f"Confirm this call to {target_tool.qualified_name}. "
                                     "Review the tool call and its arguments before responding."
                                 )
@@ -2783,7 +2868,89 @@ def create_gateway_app(
                                 policy_version=approval_policy.version,
                             )
                             requester_confirmation_policy = approval_policy
+                            if approval_policy.mode == "manager_approval":
+                                created_at = datetime.now(UTC)
+                                approval = await runtime.store.create_or_get_tool_approval(
+                                    {
+                                        "approval_id": uuid.uuid4().hex,
+                                        "tenant_id": identity.tenant_id,
+                                        "requester_sub": identity.sub,
+                                        "upstream_name": target_tool.server,
+                                        "tool_name": target_tool.name,
+                                        "argument_digest": argument_digest,
+                                        "policy_version": approval_policy.version,
+                                        "approver_groups": approval_policy.approver_groups,
+                                        "action_summary": _render_approval_summary(
+                                            approval_policy, arguments
+                                        ),
+                                        "created_at": created_at.isoformat(),
+                                        "expires_at": (
+                                            created_at
+                                            + timedelta(
+                                                seconds=runtime.settings.tool_approval_ttl_seconds
+                                            )
+                                        ).isoformat(),
+                                    }
+                                )
+                                result = {
+                                    "approval_status": approval["status"],
+                                    "approval_id": approval["approval_id"],
+                                    "message": (
+                                        "Requester confirmed. This action is waiting for an "
+                                        "eligible approver."
+                                    ),
+                                }
+                                log_event(
+                                    "approval.manager_requested",
+                                    approval_id=approval["approval_id"],
+                                    tenant_id=identity.tenant_id,
+                                    requester_sub=identity.sub,
+                                    tool=target_tool.qualified_name,
+                                    policy_version=approval_policy.version,
+                                )
+                                return _finish(
+                                    _jsonrpc_ok(
+                                        req_id,
+                                        {
+                                            "content": [
+                                                {"type": "text", "text": result["message"]}
+                                            ],
+                                            "structuredContent": result,
+                                            "isError": True,
+                                        },
+                                    ),
+                                    status_label="approval_pending",
+                                )
 
+                        if (
+                            approval_policy is not None
+                            and approval_policy.mode == "manager_approval"
+                            and manager_approval_record is not None
+                            and manager_approval_record["status"] == "approved"
+                        ):
+                            requester_confirmation_policy = approval_policy
+
+                    if (
+                        manager_approval_record is not None
+                        and manager_approval_record["status"] == "approved"
+                    ):
+                        claimed = await runtime.store.claim_tool_approval(
+                            manager_approval_record["approval_id"],
+                            identity.tenant_id,
+                            identity.sub,
+                            manager_approval_record["argument_digest"],
+                            int(manager_approval_record["policy_version"]),
+                            datetime.now(UTC).isoformat(),
+                        )
+                        if not claimed:
+                            return _finish(
+                                _jsonrpc_err(
+                                    req_id,
+                                    -32602,
+                                    "This approved action has expired or has already been used.",
+                                ),
+                                status_label="approval_replay",
+                            )
                     try:
                         res = await runtime.call_direct_tool_for_identity(
                             identity,
@@ -2799,11 +2966,71 @@ def create_gateway_app(
                             requester_confirmation_policy=requester_confirmation_policy,
                         )
                     except KeyError as exc:
+                        if (
+                            manager_approval_record is not None
+                            and manager_approval_record["status"] == "approved"
+                        ):
+                            await runtime.store.finish_tool_approval(
+                                manager_approval_record["approval_id"],
+                                "execution_failed",
+                                datetime.now(UTC).isoformat(),
+                            )
                         return _finish(_jsonrpc_err(req_id, -32601, str(exc)), status_label="error")
                     except PermissionError as exc:
+                        if (
+                            manager_approval_record is not None
+                            and manager_approval_record["status"] == "approved"
+                        ):
+                            await runtime.store.finish_tool_approval(
+                                manager_approval_record["approval_id"],
+                                "execution_failed",
+                                datetime.now(UTC).isoformat(),
+                            )
                         return _finish(_jsonrpc_err(req_id, -31003, str(exc)), status_label="error")
                     except (ValueError, RuntimeError) as exc:
+                        if (
+                            manager_approval_record is not None
+                            and manager_approval_record["status"] == "approved"
+                        ):
+                            await runtime.store.finish_tool_approval(
+                                manager_approval_record["approval_id"],
+                                "execution_failed",
+                                datetime.now(UTC).isoformat(),
+                            )
                         return _finish(_jsonrpc_err(req_id, -32602, str(exc)), status_label="error")
+                    except Exception as exc:
+                        if (
+                            manager_approval_record is None
+                            or manager_approval_record["status"] != "approved"
+                        ):
+                            raise
+                        await runtime.store.finish_tool_approval(
+                            manager_approval_record["approval_id"],
+                            "execution_failed",
+                            datetime.now(UTC).isoformat(),
+                        )
+                        log_event(
+                            "approval.execution_failed",
+                            approval_id=manager_approval_record["approval_id"],
+                            tenant_id=identity.tenant_id,
+                            requester_sub=identity.sub,
+                            tool=target_tool.qualified_name if target_tool else tool_name,
+                            error_type=type(exc).__name__,
+                        )
+                        return _finish(
+                            _jsonrpc_err(req_id, -32603, "Approved tool execution failed."),
+                            status_label="error",
+                        )
+
+                    if (
+                        manager_approval_record is not None
+                        and manager_approval_record["status"] == "approved"
+                    ):
+                        await runtime.store.finish_tool_approval(
+                            manager_approval_record["approval_id"],
+                            "completed" if res["ok"] else "execution_failed",
+                            datetime.now(UTC).isoformat(),
+                        )
 
                     return _finish(
                         _jsonrpc_ok(
@@ -3485,6 +3712,143 @@ def create_gateway_app(
         )
         return inspection, audit
 
+    if features.approval_api:
+
+        def _approval_public_record(record: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "approval_id": record["approval_id"],
+                "upstream_name": record["upstream_name"],
+                "tool_name": record["tool_name"],
+                "action_summary": record["action_summary"],
+                "requester_sub": record["requester_sub"],
+                "approver_groups": record["approver_groups"],
+                "status": record["status"],
+                "created_at": record["created_at"],
+                "expires_at": record["expires_at"],
+                "decided_by": record.get("decided_by"),
+                "decided_at": record.get("decided_at"),
+                "completed_at": record.get("completed_at"),
+            }
+
+        def _approval_roles() -> set[str]:
+            return set(runtime.settings.admin_roles) | set(runtime.settings.approval_roles)
+
+        def _is_approval_group_member(identity: CallerIdentity, record: dict[str, Any]) -> bool:
+            return bool(set(identity.groups) & set(record["approver_groups"]))
+
+        @app.get("/admin/approvals")
+        async def list_admin_tool_approvals(
+            status: str = Query(default="pending", pattern="^(pending|approved|denied|all)$"),
+            limit: int = Query(default=100, ge=1, le=200),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+                allowed_roles=(
+                    set(runtime.settings.admin_roles)
+                    | set(runtime.settings.viewer_roles)
+                    | set(runtime.settings.approval_roles)
+                ),
+            )
+            if identity is None:
+                return {"approvals": [], "count": 0}
+            statuses = ["pending", "approved", "denied"] if status == "all" else [status]
+            records = await runtime.store.list_tool_approvals(
+                identity.tenant_id, statuses=statuses, limit=limit
+            )
+            is_admin = bool(set(identity.roles) & set(runtime.settings.admin_roles))
+            is_approver = bool(set(identity.roles) & set(runtime.settings.approval_roles))
+            visible = [
+                _approval_public_record(record)
+                for record in records
+                if _is_approval_group_member(identity, record)
+                and (is_admin or is_approver or record["requester_sub"] == identity.sub)
+            ]
+            return {"approvals": visible, "count": len(visible)}
+
+        @app.post("/admin/approvals/{approval_id}/decision")
+        async def decide_admin_tool_approval(
+            approval_id: str,
+            body: ToolApprovalDecisionRequest,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allowed_roles=_approval_roles(),
+            )
+            if identity is None:
+                raise HTTPException(status_code=401, detail="Approval identity required")
+            record = await runtime.store.get_tool_approval(approval_id, identity.tenant_id)
+            if record is None:
+                raise HTTPException(status_code=404, detail="Approval request not found")
+            if record["requester_sub"] == identity.sub:
+                raise HTTPException(
+                    status_code=403, detail="Requesters cannot approve their own action"
+                )
+            if not _is_approval_group_member(identity, record):
+                raise HTTPException(status_code=403, detail="Approver group membership required")
+            if not record["approver_groups"]:
+                raise HTTPException(
+                    status_code=409, detail="Approval policy has no eligible approver group"
+                )
+            upstream = runtime.registry.get(record["upstream_name"])
+            active_policy = (
+                upstream.tool_approval_policies.get(record["tool_name"])
+                if upstream is not None
+                else None
+            )
+            if (
+                active_policy is None
+                or active_policy.mode != "manager_approval"
+                or active_policy.version != record["policy_version"]
+                or active_policy.approver_groups != record["approver_groups"]
+            ):
+                await runtime.store.invalidate_tool_approvals(
+                    record["upstream_name"],
+                    record["tool_name"],
+                    active_policy.version + 1 if active_policy is not None else -1,
+                    datetime.now(UTC).isoformat(),
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="Approval policy changed. The requester must submit a new action.",
+                )
+            timestamp = datetime.now(UTC).isoformat()
+            decided = await runtime.store.decide_tool_approval(
+                approval_id,
+                identity.tenant_id,
+                identity.sub,
+                "approved" if body.decision == "approve" else "denied",
+                timestamp,
+            )
+            if decided is None or decided["status"] == "pending":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Approval is expired or has already received a decision.",
+                )
+            if decided.get("decided_by") != identity.sub:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Approval is expired or has already received a decision.",
+                )
+            log_event(
+                "approval.manager_decision",
+                approval_id=approval_id,
+                outcome=decided["status"],
+                tenant_id=identity.tenant_id,
+                requester_sub=decided["requester_sub"],
+                approver_sub=identity.sub,
+                tool=f"{decided['upstream_name']}__{decided['tool_name']}",
+            )
+            return {"approval": _approval_public_record(decided)}
+
     if features.admin_write:
 
         @app.put("/admin/upstreams/{name}/tools/{tool_name}/guidance")
@@ -3536,10 +3900,14 @@ def create_gateway_app(
             if cfg is None:
                 raise HTTPException(status_code=404, detail=f"Upstream '{name}' not found")
             mode = payload.get("mode", "none")
-            if not isinstance(mode, str) or mode not in {"none", "requester_confirmation"}:
+            if not isinstance(mode, str) or mode not in {
+                "none",
+                "requester_confirmation",
+                "manager_approval",
+            }:
                 raise HTTPException(
                     status_code=422,
-                    detail="mode must be 'none' or 'requester_confirmation'.",
+                    detail="mode must be none, requester_confirmation, or manager_approval.",
                 )
             message = payload.get("confirmation_message", "")
             if not isinstance(message, str) or len(message) > 300:
@@ -3547,12 +3915,35 @@ def create_gateway_app(
                     status_code=422,
                     detail="confirmation_message must be text of at most 300 characters.",
                 )
+            approver_groups = payload.get("approver_groups", [])
+            if not isinstance(approver_groups, list) or any(
+                not isinstance(group, str) for group in approver_groups
+            ):
+                raise HTTPException(
+                    status_code=422, detail="approver_groups must be a list of strings."
+                )
             previous = cfg.tool_approval_policies.get(tool.name, ToolApprovalPolicy())
+            effect = cfg.tool_effects.get(tool.name)
+            if effect is not None:
+                expected_mode = {
+                    "read": "none",
+                    "write": "requester_confirmation",
+                    "high_impact": "manager_approval",
+                }[effect]
+                if mode != expected_mode:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Operation effect '{effect}' requires policy '{expected_mode}'. "
+                            "Update the operation classification to change its approval gate."
+                        ),
+                    )
             try:
                 policy = ToolApprovalPolicy(
                     mode=mode,
                     version=previous.version + 1,
                     confirmation_message=message.strip(),
+                    approver_groups=approver_groups,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -3565,6 +3956,9 @@ def create_gateway_app(
             runtime.registry.upsert(updated)
             await runtime.refresh_catalog()
             await runtime.bump_catalog_epoch()
+            await runtime.store.invalidate_tool_approvals(
+                name, tool.name, policy.version, datetime.now(UTC).isoformat()
+            )
             log_event(
                 "approval.policy.updated",
                 upstream=name,
@@ -4791,9 +5185,84 @@ def create_gateway_app(
                 authorization, mcpcodeaway_admin_session, require_admin_role=True
             )
 
+            if cfg.allowed_operations is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Select operations to enable and classify each as read, write, "
+                        "or high impact."
+                    ),
+                )
+            if not cfg.allowed_roles and not cfg.allowed_groups and not cfg.allow_all_callers:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Select allowed roles or groups, or explicitly set "
+                        "allow_all_callers to true."
+                    ),
+                )
+
             inspection, audit = await _inspect_candidate(cfg, authorization)
+            discovered_tools = {
+                str(tool["name"]): DiscoveredTool.model_validate(tool)
+                for tool in inspection.get("all_tools", [])
+            }
+            unknown_operations = set(cfg.allowed_operations) - discovered_tools.keys()
+            if unknown_operations:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Selected operations were not discovered: "
+                        f"{', '.join(sorted(unknown_operations))}"
+                    ),
+                )
+            missing_effects = set(cfg.allowed_operations) - cfg.tool_effects.keys()
+            if missing_effects:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Classify every enabled operation: {', '.join(sorted(missing_effects))}"
+                    ),
+                )
+            for operation in cfg.allowed_operations:
+                effect = cfg.tool_effects[operation]
+                tool = discovered_tools[operation]
+                if effect == "read" and tool.mutating:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Operation '{operation}' is reported as mutating and cannot "
+                            "be classified as read."
+                        ),
+                    )
+                policy = cfg.tool_approval_policies.get(operation)
+                expected_mode = (
+                    "none"
+                    if effect == "read"
+                    else (
+                        "manager_approval" if effect == "high_impact" else "requester_confirmation"
+                    )
+                )
+                if (policy.mode if policy else "none") != expected_mode:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Operation '{operation}' requires the '{expected_mode}' policy "
+                            "for its effect classification."
+                        ),
+                    )
+            effective_mutating_tools = sorted(
+                set(cfg.mutating_tools)
+                | {
+                    operation
+                    for operation, effect in cfg.tool_effects.items()
+                    if effect in {"write", "high_impact"}
+                }
+            )
+            if effective_mutating_tools != cfg.mutating_tools:
+                cfg = cfg.model_copy(update={"mutating_tools": effective_mutating_tools})
             existing = runtime.registry.get(cfg.name)
-            if existing is not None and cfg.tool_approval_policies:
+            if existing is not None:
                 versioned_policies = dict(cfg.tool_approval_policies)
                 for tool_key, previous in existing.tool_approval_policies.items():
                     incoming = versioned_policies.get(tool_key)
@@ -4820,6 +5289,10 @@ def create_gateway_app(
             await runtime.store.save_dynamic_upstream(cfg.name, cfg.model_dump(exclude_none=True))
             await runtime.refresh_catalog()
             await runtime.bump_catalog_epoch()
+            for tool_key, policy in cfg.tool_approval_policies.items():
+                await runtime.store.invalidate_tool_approvals(
+                    cfg.name, tool_key, policy.version, datetime.now(UTC).isoformat()
+                )
             return {
                 "registered": True,
                 "upstream": cfg.model_dump(exclude_none=True, exclude={"openapi_spec"}),

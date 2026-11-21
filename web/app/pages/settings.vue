@@ -159,16 +159,23 @@ async function saveAdaptiveMode() {
 
 
 const vaultSecrets = ref<Array<{ name: string; updated_by: string; updated_at: string }>>([]);
+const vaultError = ref("");
+const vaultLoading = ref(false);
 const newSecretName = ref("");
 const newSecretValue = ref("");
 const savingSecret = ref(false);
 const secretNotice = ref("");
 
 async function loadVaultSecrets() {
+  vaultLoading.value = true;
+  vaultError.value = "";
   try {
     const res = await apiFetch<{ secrets: Array<{ name: string; updated_by: string; updated_at: string }> }>("/admin/secrets");
     vaultSecrets.value = res.secrets || [];
-  } catch {
+  } catch (err) {
+    vaultError.value = extractErrorMessage(err);
+  } finally {
+    vaultLoading.value = false;
   }
 }
 
@@ -909,6 +916,13 @@ async function pruneAuditRuns() {
           </div>
         </form>
         <p v-if="secretNotice" class="text-xs text-[#0F766E]">{{ secretNotice }}</p>
+
+        <div v-if="vaultError" role="alert" class="flex flex-col gap-2 rounded border border-[#FECACA] bg-[#FEF2F2] p-3 text-xs text-[#991B1B] sm:flex-row sm:items-center sm:justify-between">
+          <span>Could not load stored secret references: {{ vaultError }}</span>
+          <Button class="min-h-11" :disabled="vaultLoading" @click="loadVaultSecrets">Retry</Button>
+        </div>
+        <div v-else-if="vaultLoading" role="status" class="text-xs text-[#71717A]">Loading secret references…</div>
+        <div v-else-if="vaultSecrets.length === 0" class="rounded border border-[#E4E4E7] bg-[#FAFAFA] p-4 text-xs text-[#71717A]">No stored secret references.</div>
 
         <div v-if="vaultSecrets.length > 0" class="overflow-x-auto rounded border border-[#E4E4E7]">
           <table class="w-full border-collapse text-left text-xs">

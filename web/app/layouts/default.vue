@@ -46,6 +46,12 @@ const navigation = [
     icon: "upstreams",
   },
   {
+    label: "Approvals",
+    to: "/approvals",
+    group: "Govern",
+    icon: "audit",
+  },
+  {
     label: "Audit & Compliance",
     to: "/audit",
     group: "Govern",
@@ -73,10 +79,16 @@ const navigation = [
 
 const groupedNavigation = computed(() => {
   const groups = ["Operate", "Optimize", "Govern", "Configure", "Demo"] as const;
+  const visibleNavigation = navigation.filter(
+    (item) =>
+      item.to !== "/approvals" ||
+      session.value?.is_admin ||
+      session.value?.is_approver,
+  );
   return groups.map((group) => ({
     name: group,
-    items: navigation.filter((item) => item.group === group),
-  }));
+    items: visibleNavigation.filter((item) => item.group === group),
+  })).filter((group) => group.items.length > 0);
 });
 
 const activeItem = computed(
@@ -93,6 +105,7 @@ const adminIdentity = computed(() => {
 const adminRole = computed(() => {
   const roles = session.value?.user?.roles || [];
   if (roles.some((role) => role.toLowerCase().includes("admin")) || session.value?.is_admin) return "Administrator";
+  if (session.value?.is_approver) return "Approver";
   if (roles.some((role) => role.toLowerCase().includes("viewer"))) return "Viewer";
   if (roles.length) return roles.join(" · ");
   return session.value?.can_access_admin_console ? "Console access" : "Development session";

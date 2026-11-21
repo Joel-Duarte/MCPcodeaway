@@ -256,6 +256,9 @@ async def test_golden_end_to_end_flows(
                             "secret_env_var": "LEGACY_GOLDEN_KEY",
                             "api_key_header": "X-Legacy-Key",
                             "allowed_roles": ["finance_analyst"],
+                            "allowed_operations": ["list_accounts"],
+                            "tool_effects": {"list_accounts": "read"},
+                            "mutating_tools": [],
                             "abac_rules": [
                                 {
                                     "claim": "client_groups",

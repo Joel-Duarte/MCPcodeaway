@@ -83,6 +83,10 @@ async def test_control_plane_admin_rbac_enforced(tmp_path: Path) -> None:
             },
         },
         "auth_type": "none",
+        "allow_all_callers": True,
+        "allowed_operations": ["list_items"],
+        "tool_effects": {"list_items": "read"},
+        "mutating_tools": [],
     }
 
     async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as gw:

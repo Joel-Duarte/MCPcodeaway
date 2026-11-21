@@ -12,6 +12,7 @@ profiles:
       metrics: true
       admin_read: true
       admin_write: false
+      approval_api: true
       dashboard_ui: false
       comparator: false
       benchmarks_api: false

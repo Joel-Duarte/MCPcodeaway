@@ -352,7 +352,7 @@ class UpstreamClientManager:
     def filter_tools(upstream: UpstreamConfig, tools: list[DiscoveredTool]) -> list[DiscoveredTool]:
         """Apply optional allowed_operations / excluded_operations curation lists."""
         filtered = list(tools)
-        if upstream.allowed_operations:
+        if upstream.allowed_operations is not None:
             allowed = set(upstream.allowed_operations)
             filtered = [t for t in filtered if t.name in allowed]
         if upstream.excluded_operations:

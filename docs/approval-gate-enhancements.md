@@ -1,6 +1,6 @@
 # Approval Gates and Central Enforcement — Proposal
 
-**Status:** Phase A requester confirmation is implemented for direct MCP calls. External approvals and durable multi-step workflows remain future work.
+**Status:** MVP v1 includes requester confirmation and durable one-approver group decisions for direct MCP calls. Notifications, multi-step workflows, quorums, and automatic approval remain future work.
 
 ## Purpose
 
@@ -77,9 +77,23 @@ Enforce the boundary in the host-side dispatcher immediately before every upstre
 
 For a future approved bulk workflow, split **prepare** from **execute**. Preparation produces a bounded, immutable list of intended actions and a digest; approval binds to that exact list, policy version, tenant, caller, and expiry. A durable workflow executor—not a re-run of the agent's script—executes the approved steps with per-step authorization, idempotency, and audit. Define partial-failure and compensation behavior before allowing multi-step side effects. If a customer needs to approve an entire Code Mode-generated plan, this prepare/approve/execute flow is a separate feature and must not be simulated by prompting in the middle of Code Mode.
 
-## External approvals: future central-enforcement path
+## MVP v1 — durable one-approver group decision
 
-For a manager or other reviewer, separate proposal, approval, and execution:
+The gateway now supports one narrow manager-approval path for direct tool calls. A policy classifies an operation as `high_impact` and names one or more customer-owned OIDC groups. The caller first confirms the exact request. The gateway persists a tenant-scoped action digest, requester, tool, policy version, group set, human-readable summary, and expiry in the configured SQLite or Postgres store. It does not hold the MCP request open or dispatch the action while approval is pending.
+
+An authenticated `tool_approver` (configurable through `GATEWAY_APPROVAL_ROLES`) who belongs to an eligible group can approve or deny from `/admin/approvals` in the console or the approval API. The requester cannot approve their own action. Approval is bound to the exact argument digest and policy version. The requester retries the same call; the gateway re-authenticates and re-authorizes, atomically claims the approved record, dispatches at most once, and stores the outcome. A policy edit or expiry invalidates the approval. Without the required client input capability or an eligible approver, the action remains undispatched.
+
+The administrator-configured `confirmation_message` is the review summary. It may include `{argument_name}` placeholders for top-level scalar arguments. Only those explicitly named fields are shown; secret-like field names and detected credentials/cards are redacted, non-scalar values are omitted, and substitutions are length-bounded. Treat this as a deliberate data disclosure choice: do not include personal or regulated fields unless the approver needs them.
+
+V1 is deliberately limited: one approval from any member of the configured groups is sufficient; decisions are terminal; there is no notification delivery, escalation, delegation, quorum, automatic agent resume, or arbitrary Code Mode continuation. The requester must know to retry. Execution uses the current upstream credentials and current authorization policy, so a durable record is not a stored credential or a reusable grant.
+
+Approval rows currently remain in the configured store and are not included in the audit-run JSONL/S3 archive or audit-run prune endpoint. Set an explicit customer retention and export contract before using real production actions; approval summaries may contain customer business data.
+
+Production configuration must explicitly classify every enabled operation in `allowed_operations` and `tool_effects`. `read` operations have no extra gate, `write` operations require requester confirmation, and `high_impact` operations require requester confirmation plus a manager approval group. Production startup rejects omitted allowlists, missing classifications, inconsistent `mutating_tools`, and missing approval policies.
+
+## Future approval workflows
+
+For richer manager or reviewer workflows, extend the MVP without collapsing proposal, approval, and execution:
 
 1. The gateway evaluates the request and creates a pending action record without dispatching the protected side effect.
 2. The record stores the requester, tenant, target service/tool, sanitized human-readable action summary, exact action digest, policy version, requested quorum, eligible approver rule, expiry, and idempotency key. Keep the data needed to resume work; avoid storing credentials or unnecessary payloads.
@@ -155,9 +169,9 @@ Do not build a separate approval inbox UI for the first input-required slice. Fi
 
 The gateway supports per-tool requester-confirmation policy in onboarding, the tool editor, and upstream configuration. Direct MCP calls use `input_required`; the dispatcher enforces policy for every invocation, including Code Mode callbacks. Sealed state binds the tenant, subject, client, tool, exact argument digest, policy digest/version, expiry, and a one-time stored nonce. Retries authenticate and authorize again; the dispatcher checks that the confirmed policy still matches before the upstream call. Clients without form elicitation fail closed, and the admin live-test route will not bypass a configured gate. The approval golden journeys cover acceptance, decline and replay, argument and identity mismatch, policy invalidation, missing client capability, Code Mode rejection, concurrent duplicate confirmation, and admin-only policy edits. Expiry and persistence-backend failure paths remain follow-up coverage.
 
-### Phase B — Approval contract
+### Phase B — Pilot and operational contract
 
-Before adding a manager-approval UI, define the pending-action schema, lifecycle, approver resolver interface, one-of-N and quorum semantics, requester/approver separation, expiry, notification contract, event delivery, idempotency, and tenant-scoped audit. Pilot with one real upstream and an existing approval system if possible.
+Pilot v1 with one real upstream and one customer-owned approver group. Confirm that the action summary is understandable, group claims are stable, the requester retry contract works in the chosen client, and approval outcomes are discoverable in audit. Add expiry, persistence-failure, stale-policy, duplicate decision, and two-replica tests before broad rollout. Add notifications or an external workflow connector only after a customer chooses its system and delivery contract.
 
 ### Phase C — Durable workflows and agent resumption
 
@@ -165,7 +179,7 @@ Add shared persistence, recovery/lease rules, task or workflow APIs, notificatio
 
 ### Phase D — Productized approval operations
 
-Only after a validated workflow, decide whether to build a gateway-owned approver inbox, policy editor, delegation/escalation controls, and reports across services. If model-assisted approval is considered, first run it in shadow mode against versioned, independently reviewed evaluation data; compare risk/coverage, false-approval rates, abstentions, reviewer overrides, and downstream outcomes per action class. Do not fine-tune a model or allow it to auto-approve as part of Phase A. Measure approval completion time, abandonment, duplicate prevention, and operational cost.
+Only after a validated workflow, consider multi-stage/quorum approvals, manager resolution, notification adapters, delegation/escalation controls, and reports across services. Deterministic auto-approval and AI-assisted routing are later options. If model assistance is considered, first run it in shadow mode against versioned, independently reviewed evaluation data; compare risk/coverage, false-approval rates, abstentions, reviewer overrides, and downstream outcomes per action class. Model auto-approval is outside this MVP and requires an explicit safety envelope and held-out evidence. Measure approval completion time, abandonment, duplicate prevention, and operational cost.
 
 ## Protocol and design references
 

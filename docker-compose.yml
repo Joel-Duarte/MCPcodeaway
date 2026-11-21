@@ -165,6 +165,7 @@ services:
       GATEWAY_CLAIM_MAPPING: '${GATEWAY_CLAIM_MAPPING:-{}}'
       GATEWAY_ADMIN_ROLES: '${GATEWAY_ADMIN_ROLES:-["gateway_admin","platform_admin"]}'
       GATEWAY_VIEWER_ROLES: '${GATEWAY_VIEWER_ROLES:-["operator_viewer"]}'
+      GATEWAY_APPROVAL_ROLES: '${GATEWAY_APPROVAL_ROLES:-["tool_approver"]}'
       GATEWAY_METRICS_ROLES: '${GATEWAY_METRICS_ROLES:-["gateway_admin","platform_admin","ops_observer"]}'
       GATEWAY_REQUIRE_ADMIN_AUTH: ${GATEWAY_REQUIRE_ADMIN_AUTH:-true}
       GATEWAY_METRICS_REQUIRE_AUTH: ${GATEWAY_METRICS_REQUIRE_AUTH:-true}

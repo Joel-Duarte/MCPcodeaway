@@ -110,12 +110,15 @@ export function useDemoTraffic() {
     last_error: "",
   }));
   const busy = useState<boolean>("demo-traffic-busy", () => false);
+  const statusError = useState<string>("demo-traffic-status-error", () => "");
 
   async function refreshStatus(): Promise<void> {
+    statusError.value = "";
     try {
       status.value = await apiFetch<DemoTrafficStatus>("/admin/demo/traffic/status", {}, true);
-    } catch {
+    } catch (error) {
       status.value = { ...status.value, enabled: false, running: false };
+      statusError.value = error instanceof Error ? error.message : "Could not load demo traffic status.";
     }
   }
 
@@ -132,12 +135,14 @@ export function useDemoTraffic() {
   }
 
   async function setTier(tier: DemoTier): Promise<void> {
-    status.value = { ...status.value, tier };
     try {
       status.value = await apiFetch<DemoTrafficStatus>(`/admin/demo/traffic/tier?tier=${tier}`, {
         method: "POST",
       });
-    } catch {
+      statusError.value = "";
+    } catch (error) {
+      statusError.value = error instanceof Error ? error.message : "Could not update demo traffic tier.";
+      throw error;
     }
   }
 
@@ -170,6 +175,7 @@ export function useDemoTraffic() {
   return {
     status,
     busy,
+    statusError,
     refreshStatus,
     startTraffic,
     setTier,

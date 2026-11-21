@@ -12,6 +12,7 @@ const { apiFetch, extractErrorMessage: _unused } = { apiFetch: useAdminApi().api
 const {
   status: demoStatus,
   busy: demoBusy,
+  statusError: demoStatusError,
   startTraffic,
   stopTraffic,
   setTier,
@@ -59,7 +60,8 @@ async function loadModels() {
   try {
     const res = await apiFetch<{ models: DemoModelProfile[] }>("/admin/demo/models");
     if (res?.models) models.value = res.models;
-  } catch {
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err);
   }
 }
 
@@ -72,6 +74,8 @@ async function saveModels() {
       body: JSON.stringify({ models: models.value }),
     });
     notice.value = "Saved demo model profiles.";
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err);
   } finally {
     saving.value = false;
   }
@@ -152,6 +156,10 @@ onMounted(() => {
     </div>
     <div v-if="errorMsg" role="alert" class="rounded border border-[#FECACA] bg-[#FEF2F2] px-3 py-2 text-xs text-[#DC2626]">
       {{ errorMsg }}
+    </div>
+    <div v-if="demoStatusError" role="alert" class="flex flex-col gap-2 rounded border border-[#FECACA] bg-[#FEF2F2] px-3 py-2 text-xs text-[#991B1B] sm:flex-row sm:items-center sm:justify-between">
+      <span>Demo traffic status unavailable: {{ demoStatusError }}</span>
+      <Button class="min-h-11" @click="refreshStatus">Retry status</Button>
     </div>
 
     <div class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-4">

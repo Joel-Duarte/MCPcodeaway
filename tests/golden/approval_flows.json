@@ -11,5 +11,8 @@
     { "id": "code_mode_cannot_dispatch_confirmed_tool", "kind": "code_mode" },
     { "id": "concurrent_confirmation_dispatches_once", "kind": "concurrent_accept" },
     { "id": "policy_editor_requires_admin", "kind": "admin_rbac" }
+  ],
+  "manager_flows": [
+    { "id": "separate_group_approves_exact_action_once", "kind": "manager_approval" }
   ]
 }

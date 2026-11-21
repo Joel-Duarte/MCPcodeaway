@@ -23,6 +23,33 @@ stateDiagram-v2
     stopping --> failed: cleanup raises
 ```
 
+## Direct tool approval
+
+The durable approval lifecycle is owned by `AuditStore` and enforced in
+`gateway.server`. Requester confirmation is separate from the manager decision.
+
+```mermaid
+stateDiagram-v2
+    [*] --> requester_confirmation
+    requester_confirmation --> pending: requester accepts; persist exact action digest
+    requester_confirmation --> declined: requester declines
+    pending --> approved: eligible group member approves
+    pending --> denied: eligible group member denies
+    pending --> expired: TTL elapsed
+    pending --> invalidated: policy version changes
+    approved --> executing: requester retries exact call; atomic claim
+    approved --> expired: TTL elapsed
+    executing --> completed: upstream returns
+    executing --> execution_failed: dispatch fails
+```
+
+Only `approved` may transition to `executing`, through a compare-and-set claim.
+The requester must be re-authenticated and re-authorized on retry. The exact
+argument digest, tenant, requester, tool, and policy version must match the
+stored record. One eligible group member is sufficient in v1, and requesters
+cannot approve their own action. Pending work is not dispatched; the original
+MCP request does not remain open while a person decides.
+
 `is_ready()` is true only in `ready`, then still checks required shared
 dependencies. Calling `startup()` while already ready is idempotent. Calling
 `shutdown()` after `stopped` is idempotent. Invalid transitions raise with the

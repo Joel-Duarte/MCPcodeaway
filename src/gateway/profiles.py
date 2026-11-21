@@ -30,6 +30,7 @@ class ProfileFeatures(BaseModel):
     metrics: bool = True
     admin_read: bool = True
     admin_write: bool = False
+    approval_api: bool = True
     dashboard_ui: bool = False
     comparator: bool = False
     benchmarks_api: bool = False
@@ -91,6 +92,7 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
             "metrics": True,
             "admin_read": True,
             "admin_write": False,
+            "approval_api": True,
             "dashboard_ui": False,
             "comparator": False,
             "benchmarks_api": False,
