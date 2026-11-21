@@ -194,6 +194,8 @@ class AuditStore(Protocol):
 
     async def delete_dynamic_upstream(self, name: str) -> bool: ...
 
+    async def consume_request_state_nonce(self, nonce: str, expires_at: str) -> bool: ...
+
     async def export_runs_older_than(self, retention_days: int) -> list[dict[str, Any]]: ...
 
     async def prune_runs_older_than(self, retention_days: int) -> int: ...
@@ -305,6 +307,10 @@ class SQLiteAuditStore:
             """CREATE TABLE IF NOT EXISTS adaptive_evidence (
                 tenant_id TEXT NOT NULL, evidence_id TEXT NOT NULL, created_at TEXT NOT NULL,
                 payload_json TEXT NOT NULL, PRIMARY KEY (tenant_id, evidence_id))"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS consumed_request_state_nonces (
+                nonce TEXT PRIMARY KEY, expires_at TEXT NOT NULL)"""
         )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS tool_guidance (
@@ -715,6 +721,21 @@ class SQLiteAuditStore:
             )
             conn.commit()
 
+    async def consume_request_state_nonce(self, nonce: str, expires_at: str) -> bool:
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute(
+                "DELETE FROM consumed_request_state_nonces WHERE expires_at < ?",
+                (datetime.now(UTC).isoformat(),),
+            )
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO consumed_request_state_nonces "
+                "(nonce, expires_at) VALUES (?, ?)",
+                (nonce, expires_at),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
     async def import_adaptive_evidence(self, tenant_id: str, rows: list[dict[str, Any]]) -> int:
         async with self._lock:
             conn = self._ensure_conn()
@@ -933,6 +954,10 @@ class PostgresAuditStore:
             """CREATE TABLE IF NOT EXISTS adaptive_evidence (
                 tenant_id TEXT NOT NULL, evidence_id TEXT NOT NULL, created_at TEXT NOT NULL,
                 payload_json TEXT NOT NULL, PRIMARY KEY (tenant_id, evidence_id))"""
+        )
+        await pool.execute(
+            """CREATE TABLE IF NOT EXISTS consumed_request_state_nonces (
+                nonce TEXT PRIMARY KEY, expires_at TEXT NOT NULL)"""
         )
         await pool.execute(
             """
@@ -1269,6 +1294,22 @@ class PostgresAuditStore:
             payload,
             now,
         )
+
+    async def consume_request_state_nonce(self, nonce: str, expires_at: str) -> bool:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM consumed_request_state_nonces WHERE expires_at < $1",
+                    datetime.now(UTC).isoformat(),
+                )
+                status = await conn.execute(
+                    "INSERT INTO consumed_request_state_nonces (nonce, expires_at) VALUES ($1, $2) "
+                    "ON CONFLICT (nonce) DO NOTHING",
+                    nonce,
+                    expires_at,
+                )
+        return status.endswith(" 1")
 
     async def import_adaptive_evidence(self, tenant_id: str, rows: list[dict[str, Any]]) -> int:
         pool = await self._get_pool()

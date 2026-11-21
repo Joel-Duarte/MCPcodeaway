@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -78,6 +79,7 @@ from gateway.config import (
     ExecutionMode,
     GatewayMode,
     GatewaySettings,
+    ToolApprovalPolicy,
     UpstreamConfig,
     UpstreamRegistry,
 )
@@ -386,6 +388,7 @@ class GatewayRuntime:
             cache=self.cache,
             client_manager=self.client_manager,
             catalog=self.catalog,
+            registry=self.registry,
             metrics=self.metrics,
             secret_resolver=self.secret_resolver,
             credential_vault=self.credential_vault,
@@ -1460,6 +1463,7 @@ class GatewayRuntime:
         experiment_id: str | None = None,
         ab_variant: str | None = None,
         model_name: str | None = None,
+        requester_confirmation_policy: ToolApprovalPolicy | None = None,
     ) -> dict[str, Any]:
         """Invoke a single upstream tool directly (traditional / traditional_discover / hybrid)."""
         started = time.perf_counter()
@@ -1494,6 +1498,7 @@ class GatewayRuntime:
                 upstream,
                 arguments,
                 code_mode_hints=False,
+                requester_confirmation_policy=requester_confirmation_policy,
             )
             duration_ms = round((time.perf_counter() - started) * 1000, 3)
             ok = rec.status == "ok"
@@ -1657,6 +1662,64 @@ def _jsonrpc_ok(req_id: Any, result: Any) -> JSONResponse:
 def _jsonrpc_err(req_id: Any, code: int, message: str) -> JSONResponse:
     return JSONResponse(
         {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+    )
+
+
+def _approval_request_state(settings: GatewaySettings, payload: dict[str, Any]) -> str:
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(serialized).rstrip(b"=").decode("ascii")
+    key = hashlib.sha256(settings.provenance_signing_secrets[0].encode("utf-8")).digest()
+    signature = hmac.new(key, encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def _verify_approval_request_state(settings: GatewaySettings, state: Any) -> dict[str, Any] | None:
+    if not isinstance(state, str) or len(state) > 4096 or state.count(".") != 1:
+        return None
+    encoded, signature = state.split(".", 1)
+    if not encoded or not re.fullmatch(r"[0-9a-f]{64}", signature):
+        return None
+    valid = False
+    for secret in settings.provenance_signing_secrets:
+        key = hashlib.sha256(secret.encode("utf-8")).digest()
+        expected = hmac.new(key, encoded.encode("ascii"), hashlib.sha256).hexdigest()
+        valid |= hmac.compare_digest(expected, signature)
+    if not valid:
+        return None
+    try:
+        serialized = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        payload = json.loads(serialized)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _input_required_confirmation(req_id: Any, state: str, message: str) -> JSONResponse:
+    return _jsonrpc_ok(
+        req_id,
+        {
+            "resultType": "input_required",
+            "requestState": state,
+            "inputRequests": {
+                "confirm": {
+                    "method": "elicitation/create",
+                    "params": {
+                        "mode": "form",
+                        "message": message,
+                        "requestedSchema": {
+                            "type": "object",
+                            "properties": {
+                                "confirm": {
+                                    "type": "boolean",
+                                    "title": "Confirm this tool call",
+                                }
+                            },
+                            "required": ["confirm"],
+                        },
+                    },
+                }
+            },
+        },
     )
 
 
@@ -2416,6 +2479,236 @@ def create_gateway_app(
                             status_label="error",
                         )
 
+                    requester_confirmation_policy: ToolApprovalPolicy | None = None
+                    await runtime.ensure_catalog_for_identity(identity)
+                    target_tool = runtime.catalog.get_tool(tool_name)
+                    if target_tool is not None:
+                        target_upstream = runtime.registry.get(target_tool.server)
+                        approval_policy = (
+                            target_upstream.tool_approval_policies.get(target_tool.name)
+                            if target_upstream is not None
+                            else None
+                        )
+                        if (
+                            approval_policy is not None
+                            and approval_policy.mode == "requester_confirmation"
+                        ):
+                            if (
+                                allowed_servers is not None
+                                and target_tool.server not in allowed_servers
+                            ):
+                                return _finish(
+                                    _jsonrpc_err(
+                                        req_id,
+                                        -31003,
+                                        "Tool is outside the request-level server ceiling.",
+                                    ),
+                                    status_label="error",
+                                )
+                            allowed, reason = runtime.policy.can_execute_tool(
+                                identity,
+                                target_upstream,
+                                target_tool.name,
+                                target_tool.mutating,
+                            )
+                            if not allowed:
+                                return _finish(
+                                    _jsonrpc_err(req_id, -31003, reason), status_label="error"
+                                )
+
+                            request_meta = params.get("_meta")
+                            request_meta = request_meta if isinstance(request_meta, dict) else {}
+                            client_capabilities = request_meta.get(MCP_CLIENT_CAPABILITIES_META)
+                            client_capabilities = (
+                                client_capabilities if isinstance(client_capabilities, dict) else {}
+                            )
+                            elicitation_capability = client_capabilities.get("elicitation")
+                            supports_form_elicitation = isinstance(
+                                elicitation_capability, dict
+                            ) and isinstance(elicitation_capability.get("form"), dict)
+                            if not supports_form_elicitation:
+                                return _finish(
+                                    JSONResponse(
+                                        {
+                                            "jsonrpc": "2.0",
+                                            "id": req_id,
+                                            "error": {
+                                                "code": -32021,
+                                                "message": (
+                                                    "Requester confirmation is required, but "
+                                                    "this client lacks form elicitation."
+                                                ),
+                                                "data": {
+                                                    "requiredCapabilities": {
+                                                        "elicitation": {"form": {}}
+                                                    }
+                                                },
+                                            },
+                                        }
+                                    ),
+                                    status_label="error",
+                                )
+
+                            policy_payload = approval_policy.model_dump(mode="json")
+                            policy_digest = hashlib.sha256(
+                                json.dumps(
+                                    policy_payload, sort_keys=True, separators=(",", ":")
+                                ).encode("utf-8")
+                            ).hexdigest()
+                            argument_digest = hashlib.sha256(
+                                json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode(
+                                    "utf-8"
+                                )
+                            ).hexdigest()
+                            request_state = params.get("requestState")
+                            responses = params.get("inputResponses")
+                            if request_state is None:
+                                if responses is not None:
+                                    return _finish(
+                                        _jsonrpc_err(
+                                            req_id,
+                                            -32602,
+                                            "inputResponses requires the matching requestState.",
+                                        ),
+                                        status_label="error",
+                                    )
+                                expires_at = int(time.time()) + 300
+                                state_payload = {
+                                    "method": "tools/call",
+                                    "tool": target_tool.qualified_name,
+                                    "arguments": argument_digest,
+                                    "tenant": identity.tenant_id,
+                                    "subject": identity.sub,
+                                    "client": identity.client_id,
+                                    "policy": policy_digest,
+                                    "expires_at": expires_at,
+                                    "nonce": uuid.uuid4().hex,
+                                }
+                                message = approval_policy.confirmation_message.strip() or (
+                                    f"Confirm this call to {target_tool.qualified_name}. "
+                                    "Review the tool call and its arguments before responding."
+                                )
+                                return _finish(
+                                    _input_required_confirmation(
+                                        req_id,
+                                        _approval_request_state(runtime.settings, state_payload),
+                                        message,
+                                    ),
+                                    status_label="input_required",
+                                )
+
+                            state_payload = _verify_approval_request_state(
+                                runtime.settings, request_state
+                            )
+                            now = int(time.time())
+                            if (
+                                state_payload is None
+                                or state_payload.get("method") != "tools/call"
+                                or state_payload.get("tool") != target_tool.qualified_name
+                                or state_payload.get("arguments") != argument_digest
+                                or state_payload.get("tenant") != identity.tenant_id
+                                or state_payload.get("subject") != identity.sub
+                                or state_payload.get("client") != identity.client_id
+                                or state_payload.get("policy") != policy_digest
+                                or not isinstance(state_payload.get("expires_at"), int)
+                                or state_payload["expires_at"] <= now
+                                or not isinstance(state_payload.get("nonce"), str)
+                            ):
+                                return _finish(
+                                    _jsonrpc_err(
+                                        req_id,
+                                        -32602,
+                                        "Invalid, expired, or mismatched requestState.",
+                                    ),
+                                    status_label="error",
+                                )
+                            if not isinstance(responses, dict):
+                                message = approval_policy.confirmation_message.strip() or (
+                                    f"Confirm this call to {target_tool.qualified_name}. "
+                                    "Review the tool call and its arguments before responding."
+                                )
+                                return _finish(
+                                    _input_required_confirmation(req_id, request_state, message),
+                                    status_label="input_required",
+                                )
+                            confirmation = responses.get("confirm")
+                            if not isinstance(confirmation, dict):
+                                message = approval_policy.confirmation_message.strip() or (
+                                    f"Confirm this call to {target_tool.qualified_name}. "
+                                    "Review the tool call and its arguments before responding."
+                                )
+                                return _finish(
+                                    _input_required_confirmation(req_id, request_state, message),
+                                    status_label="input_required",
+                                )
+                            action = confirmation.get("action")
+                            if (isinstance(action, str) and action in {"decline", "cancel"}) or (
+                                action == "accept"
+                                and isinstance(confirmation.get("content"), dict)
+                                and confirmation["content"].get("confirm") is False
+                            ):
+                                log_event(
+                                    "approval.requester_confirmation",
+                                    outcome="declined" if action == "decline" else "cancelled",
+                                    tenant_id=identity.tenant_id,
+                                    user_sub=identity.sub,
+                                    tool=target_tool.qualified_name,
+                                    policy_version=approval_policy.version,
+                                )
+                                return _finish(
+                                    _jsonrpc_ok(
+                                        req_id,
+                                        {
+                                            "content": [
+                                                {
+                                                    "type": "text",
+                                                    "text": (
+                                                        "Requester declined or cancelled. "
+                                                        "No upstream action was taken."
+                                                    ),
+                                                }
+                                            ],
+                                            "isError": True,
+                                        },
+                                    ),
+                                    status_label="cancelled",
+                                )
+                            if not (
+                                action == "accept"
+                                and isinstance(confirmation.get("content"), dict)
+                                and confirmation["content"].get("confirm") is True
+                            ):
+                                message = approval_policy.confirmation_message.strip() or (
+                                    f"Confirm this call to {target_tool.qualified_name}. "
+                                    "Review the tool call and its arguments before responding."
+                                )
+                                return _finish(
+                                    _input_required_confirmation(req_id, request_state, message),
+                                    status_label="input_required",
+                                )
+                            consumed = await runtime.store.consume_request_state_nonce(
+                                state_payload["nonce"],
+                                datetime.fromtimestamp(
+                                    state_payload["expires_at"], UTC
+                                ).isoformat(),
+                            )
+                            if not consumed:
+                                return _finish(
+                                    _jsonrpc_err(
+                                        req_id, -32602, "This confirmation has already been used."
+                                    ),
+                                    status_label="error",
+                                )
+                            log_event(
+                                "approval.requester_confirmation",
+                                outcome="accepted",
+                                tenant_id=identity.tenant_id,
+                                user_sub=identity.sub,
+                                tool=target_tool.qualified_name,
+                                policy_version=approval_policy.version,
+                            )
+                            requester_confirmation_policy = approval_policy
+
                     try:
                         res = await runtime.call_direct_tool_for_identity(
                             identity,
@@ -2428,6 +2721,7 @@ def create_gateway_app(
                             experiment_id=experiment_id,
                             ab_variant=ab_variant,
                             model_name=effective_model_name,
+                            requester_confirmation_policy=requester_confirmation_policy,
                         )
                     except KeyError as exc:
                         return _finish(_jsonrpc_err(req_id, -32601, str(exc)), status_label="error")
@@ -2995,7 +3289,11 @@ def create_gateway_app(
                 "input_schema": tool.input_schema,
                 "output_schema": tool.output_schema,
                 "guidance": entries.get(tool_name),
+                "approval_policy": runtime.registry.get(name)
+                .tool_approval_policies.get(tool.name, ToolApprovalPolicy())
+                .model_dump(),
                 "can_edit": features.admin_write
+                and runtime.settings.dynamic_upstreams_permitted
                 and (caller is None or bool(set(caller.roles) & set(runtime.settings.admin_roles))),
             }
 
@@ -3138,6 +3436,70 @@ def create_gateway_app(
                 (caller.tenant_id or "") if caller else "", tool_name, saved
             )
             return {"guidance": saved}
+
+        @app.put("/admin/upstreams/{name}/tools/{tool_name}/approval-policy")
+        async def save_admin_tool_approval_policy(
+            name: str,
+            tool_name: str,
+            payload: dict[str, Any],
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            actor = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            if not runtime.settings.dynamic_upstreams_permitted:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "Tool approval policies are managed through "
+                        "config/upstreams.yaml in this profile."
+                    ),
+                )
+            tool = await _catalog_tool_for_admin(name, tool_name)
+            cfg = runtime.registry.get(name)
+            if cfg is None:
+                raise HTTPException(status_code=404, detail=f"Upstream '{name}' not found")
+            mode = payload.get("mode", "none")
+            if not isinstance(mode, str) or mode not in {"none", "requester_confirmation"}:
+                raise HTTPException(
+                    status_code=422,
+                    detail="mode must be 'none' or 'requester_confirmation'.",
+                )
+            message = payload.get("confirmation_message", "")
+            if not isinstance(message, str) or len(message) > 300:
+                raise HTTPException(
+                    status_code=422,
+                    detail="confirmation_message must be text of at most 300 characters.",
+                )
+            previous = cfg.tool_approval_policies.get(tool.name, ToolApprovalPolicy())
+            try:
+                policy = ToolApprovalPolicy(
+                    mode=mode,
+                    version=previous.version + 1,
+                    confirmation_message=message.strip(),
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            policies = dict(cfg.tool_approval_policies)
+            policies[tool.name] = policy
+            updated = cfg.model_copy(update={"tool_approval_policies": policies})
+            await runtime.store.save_dynamic_upstream(
+                updated.name, updated.model_dump(exclude_none=True)
+            )
+            runtime.registry.upsert(updated)
+            await runtime.refresh_catalog()
+            await runtime.bump_catalog_epoch()
+            log_event(
+                "approval.policy.updated",
+                upstream=name,
+                tool=tool.qualified_name,
+                mode=policy.mode,
+                version=policy.version,
+                tenant_id=actor.tenant_id if actor else "",
+                actor_sub=actor.sub if actor else "admin",
+            )
+            return {"approval_policy": policy.model_dump()}
 
         @app.get("/admin/upstreams/agent-prompt")
         async def admin_agent_onboarding_prompt(
@@ -3485,6 +3847,23 @@ def create_gateway_app(
             if target_tool is None:
                 raise HTTPException(
                     status_code=404, detail=f"Tool '{body.tool_name}' not found on upstream"
+                )
+            candidate_policy = body.upstream.tool_approval_policies.get(target_tool.name)
+            registered_upstream = runtime.registry.get(body.upstream.name)
+            registered_policy = (
+                registered_upstream.tool_approval_policies.get(target_tool.name)
+                if registered_upstream is not None
+                else None
+            )
+            if any(
+                policy is not None and policy.mode == "requester_confirmation"
+                for policy in (candidate_policy, registered_policy)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Live test calls are disabled for tools requiring requester confirmation."
+                    ),
                 )
             if target_tool.mutating:
                 raise HTTPException(
@@ -4339,6 +4718,31 @@ def create_gateway_app(
             )
 
             inspection, audit = await _inspect_candidate(cfg, authorization)
+            existing = runtime.registry.get(cfg.name)
+            if existing is not None and cfg.tool_approval_policies:
+                versioned_policies = dict(cfg.tool_approval_policies)
+                for tool_key, previous in existing.tool_approval_policies.items():
+                    incoming = versioned_policies.get(tool_key)
+                    if incoming is None:
+                        versioned_policies[tool_key] = ToolApprovalPolicy(
+                            mode="none",
+                            version=previous.version + 1,
+                            confirmation_message=previous.confirmation_message,
+                        )
+                    else:
+                        if not incoming.confirmation_message:
+                            incoming = incoming.model_copy(
+                                update={"confirmation_message": previous.confirmation_message}
+                            )
+                        changed = incoming.model_dump(exclude={"version"}) != previous.model_dump(
+                            exclude={"version"}
+                        )
+                        versioned_policies[tool_key] = incoming.model_copy(
+                            update={
+                                "version": previous.version + 1 if changed else previous.version
+                            }
+                        )
+                cfg = cfg.model_copy(update={"tool_approval_policies": versioned_policies})
             await runtime.store.save_dynamic_upstream(cfg.name, cfg.model_dump(exclude_none=True))
             await runtime.refresh_catalog()
             await runtime.bump_catalog_epoch()

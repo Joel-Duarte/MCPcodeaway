@@ -137,6 +137,8 @@ const toolModeOptions = [
   { value: "traditional_discover", label: "Classic MCP" },
 ];
 const draftToolModes = ref<Record<string, string>>({});
+const draftToolApprovalModes = ref<Record<string, string>>({});
+const draftToolApprovalMessages = ref<Record<string, string>>({});
 const availableGroups = ref<string[]>(["finance", "operations", "support", "audit", "platform-admins"]);
 
 const schemaVerified = ref(false);
@@ -311,6 +313,19 @@ function toolOverridesPayload(): Record<string, string> {
   return out;
 }
 
+function toolApprovalPoliciesPayload(): Record<string, { mode: string; version: number; confirmation_message?: string }> {
+  const policies: Record<string, { mode: string; version: number; confirmation_message?: string }> = {};
+  for (const [tool, mode] of Object.entries(draftToolApprovalModes.value)) {
+    if (mode === "requester_confirmation") {
+      const policy: { mode: string; version: number; confirmation_message?: string } = { mode, version: 1 };
+      const message = draftToolApprovalMessages.value[tool]?.trim();
+      if (message) policy.confirmation_message = message;
+      policies[tool] = policy;
+    }
+  }
+  return policies;
+}
+
 function buildUpstreamPayload() {
   const roles = draftRoles.value
     .split(",")
@@ -376,6 +391,7 @@ function buildUpstreamPayload() {
     allowed_groups: groups,
     preferred_mode: draftPreferredMode.value,
     tool_mode_overrides: toolOverridesPayload(),
+    tool_approval_policies: toolApprovalPoliciesPayload(),
     enabled: true,
     ab_experiment: null,
   };
@@ -396,6 +412,18 @@ const yamlPreview = computed(() => {
   const overrides = Object.entries(cfg.tool_mode_overrides);
   if (overrides.length) {
     lines.push(`    tool_mode_overrides:`, ...overrides.map(([k, v]) => `      ${k}: ${v}`));
+  }
+  const approvals = Object.entries(cfg.tool_approval_policies);
+  if (approvals.length) {
+    lines.push(
+      `    tool_approval_policies:`,
+      ...approvals.map(([tool, policy]) => {
+        const message = policy.confirmation_message
+          ? `, confirmation_message: ${JSON.stringify(policy.confirmation_message)}`
+          : "";
+        return `      ${tool}: { mode: ${policy.mode}, version: ${policy.version}${message} }`;
+      })
+    );
   }
   return lines.join("\n");
 });
@@ -923,13 +951,19 @@ async function copyPromptText() {
           </SelectContent>
         </Select>
         <details v-if="inspectResult" class="rounded border border-[#E4E4E7] bg-white p-3">
-          <summary class="cursor-pointer text-xs font-semibold text-[#09090B]">Per-tool overrides ({{ inspectResult.inspection.tool_count }} detected tools, {{ Object.values(draftToolModes).filter((m) => m && m !== 'inherit').length }} overridden)</summary>
+          <summary class="min-h-11 cursor-pointer py-2 text-xs font-semibold text-[#09090B] sm:min-h-9">Per-tool execution and confirmation ({{ inspectResult.inspection.tool_count }} tools)</summary>
+          <p class="mt-1 text-xs text-[#52525B]">Requester confirmation pauses direct MCP calls before dispatch. Code Mode cannot invoke confirmed tools. This is a caller prompt, not an external manager approval.</p>
           <div class="mt-3 max-h-72 space-y-1.5 overflow-y-auto">
-            <div v-for="t in inspectResult.inspection.tools" :key="t.qualified_name" class="grid grid-cols-1 items-center gap-2 sm:grid-cols-[1fr_14rem]">
+            <div v-for="t in inspectResult.inspection.tools" :key="t.qualified_name" class="grid grid-cols-1 items-center gap-2 border-t border-[#E4E4E7] py-2 sm:grid-cols-[minmax(0,1fr)_10rem_12rem]">
               <div class="min-w-0"><div class="truncate font-mono-data text-xs text-[#09090B]">{{ t.name }}</div><div class="text-[11px] text-[#71717A]">{{ t.mutating ? "writes data" : "read-only" }}</div></div>
               <select :value="draftToolModes[t.name] || 'inherit'" :aria-label="`Execution mode for ${t.name}`" class="rounded border border-[#D4D4D8] bg-white px-2 py-1.5 text-xs" @change="draftToolModes[t.name] = ($event.target as HTMLSelectElement).value">
                 <option v-for="m in toolModeOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
               </select>
+              <select :value="draftToolApprovalModes[t.name] || 'none'" :aria-label="`Requester confirmation for ${t.name}`" class="min-h-11 rounded border border-[#D4D4D8] bg-white px-2 py-1.5 text-xs sm:min-h-9" @change="draftToolApprovalModes[t.name] = ($event.target as HTMLSelectElement).value">
+                <option value="none">No extra confirmation</option>
+                <option value="requester_confirmation">Ask caller before each call</option>
+              </select>
+              <Input v-if="draftToolApprovalModes[t.name] === 'requester_confirmation'" v-model="draftToolApprovalMessages[t.name]" :aria-label="`Confirmation message for ${t.name}`" placeholder="Optional prompt context" maxlength="300" class="min-h-11 text-xs sm:col-span-3 sm:min-h-9" />
             </div>
           </div>
         </details>

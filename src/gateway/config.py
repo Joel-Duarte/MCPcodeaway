@@ -73,6 +73,14 @@ class AbExperimentConfig(BaseModel):
     auto_switch_enabled: bool = True
 
 
+class ToolApprovalPolicy(BaseModel):
+    """Gateway-owned policy for authorization steps before a tool call."""
+
+    mode: Literal["none", "requester_confirmation"] = "none"
+    version: int = Field(default=1, ge=1)
+    confirmation_message: str = Field(default="", max_length=300)
+
+
 class UpstreamOAuthConfig(BaseModel):
     """Per-upstream OAuth / OIDC overrides for delegated, M2M, or user_oauth."""
 
@@ -113,6 +121,7 @@ class UpstreamConfig(BaseModel):
     excluded_operations: list[str] = Field(default_factory=list)
     preferred_mode: GatewayMode | None = None
     tool_mode_overrides: dict[str, GatewayMode] = Field(default_factory=dict)
+    tool_approval_policies: dict[str, ToolApprovalPolicy] = Field(default_factory=dict)
     abac_rules: list[AbacRuleConfig] = Field(default_factory=list)
     pinned_schema_digest: str | None = None
     ab_experiment: AbExperimentConfig | None = None

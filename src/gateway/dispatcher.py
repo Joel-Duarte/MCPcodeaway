@@ -25,7 +25,7 @@ from gateway.auth import (
     UserCredentialRequiredError,
 )
 from gateway.catalog import ToolCatalog, render_python_stub
-from gateway.config import GatewaySettings, UpstreamConfig
+from gateway.config import GatewaySettings, ToolApprovalPolicy, UpstreamConfig, UpstreamRegistry
 from gateway.crypto import sign_connect_ticket
 from gateway.observability import MetricsRegistry, log_event
 from gateway.secrets import CredentialVault, SecretResolver
@@ -409,6 +409,7 @@ class HostDispatcher:
         cache: CacheBackend,
         client_manager: UpstreamClientManager,
         catalog: ToolCatalog,
+        registry: UpstreamRegistry,
         metrics: MetricsRegistry | None = None,
         secret_resolver: SecretResolver | None = None,
         credential_vault: CredentialVault | None = None,
@@ -422,6 +423,7 @@ class HostDispatcher:
         self.cache = cache
         self.client_manager = client_manager
         self.catalog = catalog
+        self.registry = registry
         self.metrics = metrics
         self.secret_resolver = secret_resolver or SecretResolver(settings=settings)
         self.credential_vault = credential_vault
@@ -672,6 +674,7 @@ class HostDispatcher:
         *,
         budget: ExecutionBudget | None = None,
         code_mode_hints: bool = False,
+        requester_confirmation_policy: ToolApprovalPolicy | None = None,
     ) -> tuple[Any, SubcallRecord]:
         started = time.perf_counter()
         with _TRACER.start_as_current_span("gateway.downstream.call") as span:
@@ -696,6 +699,23 @@ class HostDispatcher:
                     server=upstream.name,
                     tool=tool.qualified_name,
                     reason=reason,
+                )
+                raise PermissionError(reason)
+
+            current_upstream = self.registry.get(upstream.name) or upstream
+            approval_policy = current_upstream.tool_approval_policies.get(tool.name)
+            if (
+                approval_policy is not None
+                and approval_policy.mode == "requester_confirmation"
+                and requester_confirmation_policy != approval_policy
+            ):
+                reason = "Requester confirmation is required for this tool call."
+                log_event(
+                    "approval.confirmation_required",
+                    level=logging.WARNING,
+                    server=upstream.name,
+                    tool=tool.qualified_name,
+                    execution="codemode" if code_mode_hints else "direct",
                 )
                 raise PermissionError(reason)
 
@@ -756,6 +776,22 @@ class HostDispatcher:
                             "server": upstream.name,
                         },
                     )
+                latest_upstream = self.registry.get(upstream.name) or upstream
+                latest_approval_policy = latest_upstream.tool_approval_policies.get(tool.name)
+                if (
+                    latest_approval_policy is not None
+                    and latest_approval_policy.mode == "requester_confirmation"
+                    and requester_confirmation_policy != latest_approval_policy
+                ):
+                    reason = "Requester confirmation is required for this tool call."
+                    log_event(
+                        "approval.confirmation_required",
+                        level=logging.WARNING,
+                        server=upstream.name,
+                        tool=tool.qualified_name,
+                        execution="codemode" if code_mode_hints else "direct",
+                    )
+                    raise PermissionError(reason)
                 raw_result = await self.client_manager.call_tool(
                     upstream,
                     tool,
