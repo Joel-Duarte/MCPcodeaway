@@ -170,5 +170,29 @@
       "kind": "idempotency_conflict",
       "expected_rpc_error_code": -32602
     }
+  ],
+  "recovery_lab_flows": [
+    {
+      "id": "task_recovers_lost_response",
+      "kind": "task_status_reconciliation",
+      "expected_task_status": "completed",
+      "expected_side_effect_count": 1
+    },
+    {
+      "id": "same_key_replay_is_deduplicated",
+      "kind": "idempotent_replay",
+      "expected_side_effect_count": 1
+    },
+    {
+      "id": "changed_payload_is_rejected",
+      "kind": "idempotency_conflict",
+      "expected_rpc_error_code": -32602,
+      "expected_side_effect_count": 1
+    },
+    {
+      "id": "legacy_client_uses_status_fallback",
+      "kind": "legacy_status_fallback",
+      "expected_side_effect_count": 2
+    }
   ]
 }

@@ -8,7 +8,22 @@ interface DemoModelProfile {
   traditional_turns: number;
 }
 
-const { apiFetch, extractErrorMessage: _unused } = { apiFetch: useAdminApi().apiFetch, extractErrorMessage };
+interface RecoveryLabScenario {
+  id: string;
+  status: "passed" | "failed";
+  detail: string;
+  operation_id: string | null;
+  task_id: string | null;
+  side_effect_count: number | null;
+}
+
+interface RecoveryLabResult {
+  status: "passed" | "failed";
+  scenarios: RecoveryLabScenario[];
+  isolation: string;
+}
+
+const { apiFetch } = useAdminApi();
 const {
   status: demoStatus,
   busy: demoBusy,
@@ -24,6 +39,9 @@ const models = ref<DemoModelProfile[]>([]);
 const saving = ref(false);
 const notice = ref("");
 const errorMsg = ref("");
+const recoveryRunning = ref(false);
+const recoveryError = ref("");
+const recoveryResult = ref<RecoveryLabResult | null>(null);
 
 const newModelName = ref("");
 const newCodeSuccessRate = ref(0.95);
@@ -90,6 +108,21 @@ async function runCalibrationBurst(count = 100) {
     notice.value = `Dispatched ${count}-request A/B demo burst.`;
   } catch (err) {
     errorMsg.value = extractErrorMessage(err);
+  }
+}
+
+async function runRecoveryLab() {
+  recoveryRunning.value = true;
+  recoveryError.value = "";
+  try {
+    recoveryResult.value = await apiFetch<RecoveryLabResult>("/admin/demo/recovery/run", {
+      method: "POST",
+      timeout: 20000,
+    });
+  } catch (err) {
+    recoveryError.value = `${extractErrorMessage(err)} Check that the gateway is using the demo profile and retry.`;
+  } finally {
+    recoveryRunning.value = false;
   }
 }
 
@@ -231,6 +264,88 @@ onMounted(() => {
         </Button>
       </div>
     </div>
+
+    <section class="space-y-4 rounded-lg border border-[#E4E4E7] bg-white p-4" aria-labelledby="recovery-lab-title">
+      <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <h2 id="recovery-lab-title" class="text-[0.9375rem] font-semibold text-[#09090B]">MCP Write Recovery Lab</h2>
+          <p class="mt-1 max-w-3xl text-sm text-[#52525B]">
+            Run real MCP tool calls against a fresh in-process mock API. The lab verifies task polling,
+            idempotent replay, changed-payload rejection, and the legacy status fallback without calling configured upstreams.
+          </p>
+        </div>
+        <Button
+          data-variant="primary"
+          class="min-h-11 shrink-0"
+          :disabled="recoveryRunning"
+          :pending="recoveryRunning"
+          pending-announcement="Running the MCP recovery lab"
+          @click="runRecoveryLab"
+        >
+          {{ recoveryRunning ? "Running recovery checks…" : "Run recovery checks" }}
+        </Button>
+      </div>
+
+      <div v-if="recoveryRunning && !recoveryResult" class="space-y-2" role="status" aria-live="polite">
+        <p class="text-xs text-[#52525B]">Creating an isolated gateway and mock, then polling the recovery task.</p>
+        <div class="h-2 animate-pulse rounded bg-[#E4E4E7]" />
+        <div class="h-2 w-2/3 animate-pulse rounded bg-[#E4E4E7]" />
+      </div>
+
+      <div v-if="recoveryError" role="alert" class="rounded border border-[#FECACA] bg-[#FEF2F2] px-3 py-2 text-sm text-[#991B1B]">
+        {{ recoveryError }}
+      </div>
+
+      <div v-if="!recoveryRunning && !recoveryResult && !recoveryError" class="rounded border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-3 text-sm text-[#52525B]">
+        Run the lab to verify recovery behavior from the gateway’s MCP boundary through the mock API.
+      </div>
+
+      <template v-if="recoveryResult">
+        <div
+          class="flex flex-col gap-1 rounded border px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between"
+          :class="recoveryResult.status === 'passed'
+            ? 'border-[#99F6E4] bg-[#F0FDFA] text-[#0F766E]'
+            : 'border-[#FECACA] bg-[#FEF2F2] text-[#991B1B]'"
+          role="status"
+          aria-live="polite"
+        >
+          <span>Recovery lab {{ recoveryResult.status }}: {{ recoveryResult.scenarios.filter((scenario) => scenario.status === 'passed').length }} of {{ recoveryResult.scenarios.length }} scenarios passed.</span>
+          <span class="text-xs">{{ recoveryResult.isolation }}</span>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full min-w-[640px] text-left text-sm tabular-nums">
+            <thead class="border-b border-[#E4E4E7] text-xs text-[#71717A]">
+              <tr>
+                <th scope="col" class="py-2 pr-3 font-medium">Scenario</th>
+                <th scope="col" class="py-2 pr-3 font-medium">Result</th>
+                <th scope="col" class="py-2 pr-3 font-medium">Side effects</th>
+                <th scope="col" class="py-2 font-medium">Evidence</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-[#E4E4E7]">
+              <tr v-for="scenario in recoveryResult.scenarios" :key="scenario.id">
+                <th scope="row" class="py-3 pr-3 align-top font-medium text-[#09090B]">{{ scenario.id.replaceAll("_", " ") }}</th>
+                <td class="py-3 pr-3 align-top">
+                  <span
+                    class="inline-flex rounded border px-2 py-1 text-xs font-medium"
+                    :class="scenario.status === 'passed'
+                      ? 'border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]'
+                      : 'border-[#FECACA] bg-[#FEF2F2] text-[#DC2626]'"
+                  >{{ scenario.status }}</span>
+                </td>
+                <td class="py-3 pr-3 align-top font-mono-data text-[#09090B]">{{ scenario.side_effect_count ?? "—" }}</td>
+                <td class="max-w-xl whitespace-normal py-3 align-top text-[#52525B]">
+                  <p>{{ scenario.detail }}</p>
+                  <p v-if="scenario.task_id || scenario.operation_id" class="mt-1 break-all font-mono-data text-xs text-[#71717A]">
+                    {{ scenario.task_id ? `Task ${scenario.task_id}` : `Operation ${scenario.operation_id}` }}
+                  </p>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </template>
+    </section>
 
     <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
       <h2 class="text-sm font-semibold text-[#09090B]">Simulated Model Performance Profiles</h2>

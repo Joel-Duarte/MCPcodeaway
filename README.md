@@ -64,7 +64,7 @@ uv run uvicorn examples.mock_backends:app --port 8001
 uv run uvicorn gateway.server:app --port 8000
 ```
 
-Open `http://127.0.0.1:8000/dashboard` for the interactive side-by-side playground, HITL onboarding wizard, and agent prompt exporter.
+Open `http://127.0.0.1:8000/dashboard` for the interactive playground, HITL onboarding wizard, and agent prompt exporter. In the demo profile, **Demo Control → MCP Write Recovery Lab** runs isolated golden recovery journeys against an in-process mock; it does not call registered upstreams.
 
 ### CLI Onboarding & Comparison
 

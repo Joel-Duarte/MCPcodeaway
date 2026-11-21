@@ -532,6 +532,8 @@ def create_mock_backends_app(
     public_key_pem: str | Callable[[], str] | None = None,
     expected_issuer: str | None = None,
     jwks_url: str | None = None,
+    *,
+    allow_unauthenticated_idempotency_api: bool = False,
 ) -> FastAPI:
     """Create isolated mock enterprise MCP and OpenAPI services for demos and tests."""
     resolved_jwks_url = jwks_url or os.getenv(
@@ -559,6 +561,8 @@ def create_mock_backends_app(
     idempotency_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
     def _require_idempotency_api_key(x_api_key: str | None) -> None:
+        if allow_unauthenticated_idempotency_api:
+            return
         expected = os.getenv("MOCK_IDEMPOTENCY_API_KEY", "mock-idempotency-key")
         if x_api_key != expected:
             raise HTTPException(status_code=401, detail="Invalid mock API key")

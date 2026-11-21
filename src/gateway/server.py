@@ -4522,6 +4522,28 @@ def create_gateway_app(
                     status_code=403, detail="Demo traffic simulator is disabled in production"
                 )
 
+        if runtime.settings.effective_profile_name == "demo":
+
+            @app.post("/admin/demo/recovery/run")
+            async def admin_demo_recovery_run(
+                authorization: str | None = Header(default=None),
+                mcpcodeaway_admin_session: str | None = Cookie(default=None),
+            ) -> dict[str, Any]:
+                identity = await _authorize_control_plane(
+                    authorization,
+                    mcpcodeaway_admin_session,
+                    require_admin_role=True,
+                )
+                if identity is None:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="An authenticated demo administrator is required.",
+                    )
+                _ensure_demo_traffic_allowed()
+                from examples.recovery_lab import run_recovery_lab
+
+                return await run_recovery_lab()
+
         @app.get("/admin/demo/traffic/status")
         async def admin_demo_traffic_status(
             authorization: str | None = Header(default=None),
