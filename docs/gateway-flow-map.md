@@ -182,10 +182,14 @@ sequenceDiagram
 ```
 
 Owners: `gateway.user_connect`, `gateway.crypto`, `gateway.secrets`, and
-`gateway.dispatcher`. The console connection view uses `/me/connections`; the
-signed connect flow uses `/auth/connect/{upstream_name}`. Credentials are
-isolated to the caller and tenant, and are never intended to be pasted into an
-agent conversation.
+`gateway.dispatcher`. Personal credential linking and lifecycle operations are
+API/integration-driven through `/me/connections` and
+`/auth/connect/{upstream_name}`; the gateway does not provide an end-user
+identity or credential-management portal. Credentials are isolated to the
+caller and tenant, and are never intended to be pasted into an agent
+conversation. In PostgreSQL deployments, per-user OAuth tokens remain
+process-local, so users reconnect after a restart or replica change; encrypted
+per-user API keys are durable.
 
 ## 4. Discovery and execution flow
 

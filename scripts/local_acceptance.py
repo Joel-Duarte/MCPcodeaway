@@ -243,9 +243,24 @@ def main() -> int:
             command.append("tests/test_postgres_process_acceptance.py")
             env["MCP_RUN_POSTGRES_PROCESS_TESTS"] = "1"
         if args.with_process_crash:
-            command.append("tests/test_process_crash_acceptance.py")
             env["MCP_RUN_POSTGRES_CRASH_TESTS"] = "1"
         run(command, env=env)
+        if args.with_process_crash:
+            crash_env = env.copy()
+            crash_env["MCP_TEST_POSTGRES_DSN"] = env["MCP_TEST_POSTGRES_MIGRATION_DSN"]
+            run(
+                [
+                    "uv",
+                    "run",
+                    "--extra",
+                    "postgres",
+                    "pytest",
+                    "-q",
+                    "-rs",
+                    "tests/test_process_crash_acceptance.py",
+                ],
+                env=crash_env,
+            )
     finally:
         if use_postgres:
             cleanup_command = ["docker", "compose"]

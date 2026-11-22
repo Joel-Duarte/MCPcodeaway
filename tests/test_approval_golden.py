@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -179,6 +180,27 @@ def _declined_response() -> dict[str, Any]:
 
 def _capabilities() -> dict[str, Any]:
     return {"elicitation": {"form": {}}}
+
+
+async def _create_pending_manager_approval(gateway: httpx.AsyncClient, requester_token: str) -> str:
+    requested = await _call(
+        gateway,
+        requester_token,
+        arguments={"item_id": _ITEM_ID},
+        capabilities=_capabilities(),
+    )
+    state = requested.json()["result"]["requestState"]
+    accepted = await _call(
+        gateway,
+        requester_token,
+        arguments={"item_id": _ITEM_ID},
+        capabilities=_capabilities(),
+        request_state=state,
+        input_responses=_accepted_response(),
+    )
+    result = accepted.json()["result"]["structuredContent"]
+    assert result["approval_status"] == "pending"
+    return result["approval_id"]
 
 
 @pytest.mark.parametrize("flow", _FLOWS, ids=lambda flow: flow["id"])
@@ -484,6 +506,16 @@ async def test_manager_approval_golden_journeys(flow: dict[str, str], tmp_path: 
                 assert sorted(response.status_code for response in decisions) == [200, 409]
                 decided = next(response for response in decisions if response.status_code == 200)
                 assert decided.json()["approval"]["status"] == "approved"
+                conflicting = await gateway.post(
+                    path,
+                    headers={"Authorization": f"Bearer {second_approver_token}"},
+                    json={"decision": "deny"},
+                )
+                assert conflicting.status_code == 409
+                persisted = await app.state.runtime.store.get_tool_approval(
+                    approval_id, "tenant-acme-dev"
+                )
+                assert persisted is not None and persisted["status"] == "approved"
 
                 replay = await _call(
                     gateway,
@@ -500,5 +532,198 @@ async def test_manager_approval_golden_journeys(flow: dict[str, str], tmp_path: 
                 )
                 assert second_replay.json()["result"]["resultType"] == "input_required"
                 assert calls["write_item"] == 1
+    finally:
+        await backend_client.aclose()
+
+
+async def test_expired_manager_approval_cannot_authorize_write(tmp_path: Path) -> None:
+    app, backend_client, dev_keys, calls = await _environment(tmp_path, manager_approval=True)
+    requester = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={
+            "sub": "requester-expired",
+            "roles": ["admin"],
+            "groups": ["platform-admins"],
+            "scopes": ["mcp.tools", "mcp.write"],
+        },
+    )
+    approver = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={
+            "sub": "approver-expired",
+            "roles": ["tool_approver"],
+            "groups": ["item-approvers"],
+        },
+    )
+    try:
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+            ) as gateway:
+                approval_id = await _create_pending_manager_approval(gateway, requester)
+                conn = app.state.runtime.store._ensure_conn()
+                conn.execute(
+                    "UPDATE tool_approvals SET expires_at=? WHERE approval_id=?",
+                    ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), approval_id),
+                )
+                conn.commit()
+                response = await gateway.post(
+                    f"/admin/approvals/{approval_id}/decision",
+                    headers={"Authorization": f"Bearer {approver}"},
+                    json={"decision": "approve"},
+                )
+                assert response.status_code == 409
+                retry = await _call(gateway, requester, arguments={"item_id": _ITEM_ID})
+                assert "error" in retry.json()
+                assert calls["write_item"] == 0
+    finally:
+        await backend_client.aclose()
+
+
+async def test_approval_persistence_failure_does_not_accept_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, backend_client, dev_keys, calls = await _environment(tmp_path, manager_approval=True)
+    requester = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={
+            "sub": "requester-persist",
+            "roles": ["admin"],
+            "groups": ["platform-admins"],
+            "scopes": ["mcp.tools", "mcp.write"],
+        },
+    )
+    approver = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={
+            "sub": "approver-persist",
+            "roles": ["tool_approver"],
+            "groups": ["item-approvers"],
+        },
+    )
+
+    async def fail_decision(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("simulated approval-store outage")
+
+    try:
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://gateway",
+            ) as gateway:
+                approval_id = await _create_pending_manager_approval(gateway, requester)
+                monkeypatch.setattr(app.state.runtime.store, "decide_tool_approval", fail_decision)
+                failed = await gateway.post(
+                    f"/admin/approvals/{approval_id}/decision",
+                    headers={"Authorization": f"Bearer {approver}"},
+                    json={"decision": "approve"},
+                )
+                assert failed.status_code == 500
+                monkeypatch.undo()
+                persisted = await app.state.runtime.store.get_tool_approval(
+                    approval_id, "tenant-acme-dev"
+                )
+                assert persisted is not None and persisted["status"] == "pending"
+                retry = await _call(gateway, requester, arguments={"item_id": _ITEM_ID})
+                assert retry.json()["result"]["structuredContent"]["approval_status"] == "pending"
+                assert calls["write_item"] == 0
+    finally:
+        await backend_client.aclose()
+
+
+async def test_approved_action_rechecks_current_authorization(tmp_path: Path) -> None:
+    app, backend_client, dev_keys, calls = await _environment(tmp_path, manager_approval=True)
+    requester = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={
+            "sub": "requester-stale",
+            "roles": ["admin"],
+            "groups": ["platform-admins"],
+            "scopes": ["mcp.tools", "mcp.write"],
+        },
+    )
+    approver = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={
+            "sub": "approver-stale",
+            "roles": ["tool_approver"],
+            "groups": ["item-approvers"],
+        },
+    )
+    revoked = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={"sub": "requester-stale", "roles": [], "groups": [], "scopes": ["mcp.tools"]},
+    )
+    try:
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+            ) as gateway:
+                approval_id = await _create_pending_manager_approval(gateway, requester)
+                decision = await gateway.post(
+                    f"/admin/approvals/{approval_id}/decision",
+                    headers={"Authorization": f"Bearer {approver}"},
+                    json={"decision": "approve"},
+                )
+                assert decision.status_code == 200
+                retry = await _call(gateway, revoked, arguments={"item_id": _ITEM_ID})
+                assert retry.status_code == 200
+                assert retry.json()["error"]["code"] == -31003
+                assert calls["write_item"] == 0
+    finally:
+        await backend_client.aclose()
+
+
+async def test_approved_action_does_not_survive_policy_version_change(tmp_path: Path) -> None:
+    app, backend_client, dev_keys, calls = await _environment(tmp_path, manager_approval=True)
+    requester = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={
+            "sub": "requester-policy-change",
+            "roles": ["admin"],
+            "groups": ["platform-admins"],
+            "scopes": ["mcp.tools", "mcp.write"],
+        },
+    )
+    approver = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={
+            "sub": "approver-policy-change",
+            "roles": ["tool_approver"],
+            "groups": ["item-approvers"],
+        },
+    )
+    try:
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+            ) as gateway:
+                approval_id = await _create_pending_manager_approval(gateway, requester)
+                decision = await gateway.post(
+                    f"/admin/approvals/{approval_id}/decision",
+                    headers={"Authorization": f"Bearer {approver}"},
+                    json={"decision": "approve"},
+                )
+                assert decision.status_code == 200
+
+                runtime = app.state.runtime
+                upstream = runtime.registry.get("approval_fixture")
+                assert upstream is not None
+                current_policy = upstream.tool_approval_policies["write_item"]
+                runtime.registry._static[upstream.name] = upstream.model_copy(
+                    update={
+                        "tool_approval_policies": {
+                            "write_item": current_policy.model_copy(update={"version": 2})
+                        }
+                    }
+                )
+                retry = await _call(
+                    gateway,
+                    requester,
+                    arguments={"item_id": _ITEM_ID},
+                    capabilities=_capabilities(),
+                )
+                assert retry.json()["result"]["resultType"] == "input_required"
+                assert calls["write_item"] == 0
     finally:
         await backend_client.aclose()
