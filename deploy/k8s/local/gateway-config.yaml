@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+  namespace: mcpcodeaway-k1
+data:
+  GATEWAY_APP_ENV: sandbox
+  GATEWAY_AUTH_MODE: dev
+  GATEWAY_PROFILE: demo
+  GATEWAY_UPSTREAMS_CONFIG_PATH: /app/config/upstreams.k8s.yaml
+  GATEWAY_SQLITE_PATH: /tmp/unused-gateway.db
+  GATEWAY_EXPOSE_INSTANCE_ID: "true"
+  GATEWAY_LOG_FORMAT: json
+  GATEWAY_LOG_LEVEL: INFO
+  GATEWAY_SANDBOX_BACKEND: local
+  GATEWAY_REDIS_URL: ""
+  GATEWAY_GATEWAY_MODE: codemode
+  GATEWAY_ALLOWED_TENANTS: '["tenant-acme-dev"]'
+  GATEWAY_RATE_LIMIT_PER_MINUTE: "6000"
+  upstreams.k8s.yaml: |
+    upstreams:
+      - name: recovery_workbench
+        demo_only: true
+        type: mcp_http
+        url: http://mock-backends:8001/recovery/mcp
+        auth_type: none
+        allowed_roles: [gateway_admin, admin]
+        allowed_groups: [platform-admins]
+        allowed_scopes: [mcp.tools, mcp.write]
+        allowed_operations: [submit_change, get_change_status]
+        tool_effects: { submit_change: write, get_change_status: read }
+        tool_approval_policies:
+          submit_change: { mode: requester_confirmation, version: 1 }
+          get_change_status: { mode: none, version: 1 }
+        mutating_tools: [submit_change]
+        tool_recovery_policies:
+          submit_change:
+            enabled: true
+            idempotency_key_argument: idempotency_key
+            synchronous_budget_seconds: 0.4
+            max_attempts: 3
+            max_recovery_age_seconds: 30
+            upstream_key_retention_seconds: 60
+            status_tool: get_change_status
+            status_key_argument: idempotency_key
+        ab_experiment:
+          enabled: true
+          experiment_id: k1-read-only-experiment
+          codemode_traffic_pct: 100
+          read_only_only: true
+        enabled: true

@@ -2345,6 +2345,15 @@ def create_gateway_app(
     mcp_request_slots = asyncio.Semaphore(max(1, runtime.settings.max_concurrent_mcp_requests))
 
     @app.middleware("http")
+    async def expose_opt_in_instance_id(request: Request, call_next: Callable[..., Any]) -> Any:
+        response = await call_next(request)
+        if os.getenv("GATEWAY_EXPOSE_INSTANCE_ID", "false").lower() == "true":
+            instance_id = os.getenv("POD_NAME", "")
+            if instance_id:
+                response.headers["X-Gateway-Instance"] = instance_id
+        return response
+
+    @app.middleware("http")
     async def bound_mcp_concurrency(request: Request, call_next: Callable[..., Any]) -> Any:
         if request.url.path != "/mcp":
             return await call_next(request)

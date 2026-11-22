@@ -1231,6 +1231,17 @@ def create_mock_backends_app(
             call_fn=call_recovery_workbench,
         )
 
+    @app.get("/recovery/test/metrics")
+    async def recovery_test_metrics() -> dict[str, int]:
+        """Expose aggregate side-effect counters only in the opt-in local K1 fixture."""
+        if os.getenv("MOCK_ENABLE_K1_TEST_CONTROLS", "false").lower() != "true":
+            raise HTTPException(status_code=404, detail="Not found")
+        return {
+            "commits": demo_change_metrics["commits"],
+            "operations": len(demo_changes),
+            "replays": demo_change_metrics["replays"],
+        }
+
     app.mount(
         "/billing-eu",
         _build_billing_subapp(

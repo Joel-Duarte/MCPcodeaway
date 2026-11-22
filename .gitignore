@@ -24,3 +24,4 @@ benchmarks/results.json
 benchmarks/subagent_mcp_trial.json
 dashboard-screenshots/
 .readiness/
+.k8s-local/

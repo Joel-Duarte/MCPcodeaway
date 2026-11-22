@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mcpcodeaway-k1
+  labels:
+    app.kubernetes.io/part-of: mcpcodeaway
+    app.kubernetes.io/managed-by: k8s-local.sh

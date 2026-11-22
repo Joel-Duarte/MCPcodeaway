@@ -2,9 +2,10 @@ FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS builder
 
 WORKDIR /app
 COPY pyproject.toml .python-version ./
+COPY uv.lock ./
 COPY src ./src
 COPY config ./config
-RUN uv sync --no-dev --extra redis --extra postgres --extra otlp
+RUN uv sync --frozen --no-dev --extra redis --extra postgres --extra otlp
 
 FROM node:22-slim AS web-builder
 
@@ -27,6 +28,8 @@ COPY --from=builder /app/pyproject.toml /app/pyproject.toml
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TMPDIR=/tmp \
     GATEWAY_SQLITE_PATH=/tmp/gateway.db
 
 FROM base-runtime AS gateway
