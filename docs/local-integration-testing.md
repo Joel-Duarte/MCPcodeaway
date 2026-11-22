@@ -43,8 +43,9 @@ The script waits for PostgreSQL health, runs the same local acceptance set plus 
 Direct PostgreSQL invocation is also available after starting the service:
 
 ```sh
+export MCP_TEST_POSTGRES_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 docker compose -f docker-compose.acceptance.yml -p mcpcodeaway-local-acceptance up -d --wait postgres
-MCP_TEST_POSTGRES_DSN='postgresql://gateway_test:local_acceptance_only@127.0.0.1:55432/mcpcodeaway_acceptance' uv run --extra postgres pytest -m postgres -q
+MCP_TEST_POSTGRES_DSN="postgresql://gateway_test:${MCP_TEST_POSTGRES_PASSWORD}@127.0.0.1:55432/mcpcodeaway_acceptance?sslmode=disable" uv run --extra postgres pytest -m postgres -q
 docker compose -f docker-compose.acceptance.yml -p mcpcodeaway-local-acceptance down --volumes --remove-orphans
 ```
 

@@ -4,9 +4,9 @@ services:
     environment:
       POSTGRES_DB: mcpcodeaway_acceptance
       POSTGRES_USER: gateway_test
-      POSTGRES_PASSWORD: local_acceptance_only
+      POSTGRES_PASSWORD: ${MCP_TEST_POSTGRES_PASSWORD:?set MCP_TEST_POSTGRES_PASSWORD for local acceptance}
     ports:
-      - "127.0.0.1:${MCP_TEST_POSTGRES_PORT:-55432}:5432"
+      - "${MCP_TEST_POSTGRES_HOST_BIND:-127.0.0.1}:${MCP_TEST_POSTGRES_PORT:-55432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U gateway_test -d mcpcodeaway_acceptance"]
       interval: 2s

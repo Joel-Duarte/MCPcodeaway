@@ -248,7 +248,8 @@ async def crash_postgres():
         parsed.scheme not in {"postgres", "postgresql"}
         or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
         or parsed.username != "gateway_test"
-        or parsed.password != "local_acceptance_only"
+        or not parsed.password
+        or parsed.password != os.getenv("MCP_TEST_POSTGRES_PASSWORD")
         or parsed.path != "/mcpcodeaway_acceptance"
     ):
         pytest.fail("crash tests only permit the isolated local acceptance PostgreSQL DSN")

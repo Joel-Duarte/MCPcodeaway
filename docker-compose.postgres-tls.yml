@@ -1,0 +1,14 @@
+services:
+  postgres:
+    environment:
+      POSTGRES_USER: acceptance_bootstrap
+      POSTGRES_DB: mcpcodeaway_acceptance
+      POSTGRES_PASSWORD: ${MCP_TEST_POSTGRES_PASSWORD:?set MCP_TEST_POSTGRES_PASSWORD for local acceptance}
+      GATEWAY_DB_PASSWORD: ${MCP_TEST_POSTGRES_PASSWORD:?set MCP_TEST_POSTGRES_PASSWORD for local acceptance}
+    command:
+      - sh
+      - -c
+      - chown postgres:postgres /run/certs/server.key && chmod 600 /run/certs/server.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/run/certs/server.crt -c ssl_key_file=/run/certs/server.key -c ssl_ca_file=/run/certs/ca.crt
+    volumes:
+      - ${MCP_TEST_POSTGRES_CERT_DIR:?set MCP_TEST_POSTGRES_CERT_DIR for TLS acceptance}:/run/certs
+      - ./tests/fixtures/postgres/init_roles.sh:/docker-entrypoint-initdb.d/20-init-roles.sh:ro
