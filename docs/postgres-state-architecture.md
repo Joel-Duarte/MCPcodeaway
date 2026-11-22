@@ -13,7 +13,7 @@ MCP_POSTGRES_MIGRATION_DSN='postgresql://<migration-user>:<password>@<host>/<dat
 
 The command reports the before and after versions and exits nonzero on failure. It takes a transaction-scoped PostgreSQL advisory lock, so concurrent deploy jobs serialize. It never falls back to the gateway DSN. Do not put a DSN in command history or logs; inject it through the deployment secret manager. Before deploying a new gateway version, apply its migrations once, then start replicas with the runtime DSN.
 
-The current schema version is **2**. Version 1 establishes all PostgreSQL tables and indexes; version 2 removes previously persisted `user_oauth` token envelopes and creates a limited operations view. Migrations are in `src/gateway/migrations.py`. To add one, append the next integer version and ordered SQL statements to `MIGRATIONS`, extend the expected schema contract when needed, and add migration coverage. Migrations are transactional and already recorded versions are skipped.
+The current schema version is **3**. Version 1 establishes the base gateway tables and indexes; version 2 removes previously persisted `user_oauth` token envelopes and creates a limited operations view; version 3 adds immutable business-value definition versions and publication history, attributed workflow executions/calls, request-body bindings, append-only execution and completion events, and their uniqueness constraints. Migrations are in `src/gateway/migrations.py`. To add one, append the next integer version and ordered SQL statements to `MIGRATIONS`, extend the expected schema contract when needed, and add migration coverage. Migrations are transactional and already recorded versions are skipped.
 
 Credential categories, OAuth expiry/refresh and revocation behavior, the deliberate PostgreSQL OAuth reconnect limitation, and the safe legacy-secret review procedure are documented in [Credential lifecycle](credential-lifecycle.md).
 
@@ -31,6 +31,12 @@ Gateway startup opens PostgreSQL, checks connectivity, validates the schema vers
 | `tool_approvals`, active-action unique and tenant/status indexes | **Approval state.** Binds the decision to tenant, requester, operation, argument digest, policy version, expiry, approver groups, and one-time execution status. | Gateway approval workflow; the approver identity is validated by the configured identity provider. | Must survive process and cluster restarts and be shared across replicas. | Loss can discard pending decisions and weaken replay prevention; inconsistent copies can permit duplicate or stale decisions. | Shared durable PostgreSQL; essential when human approval is enabled. |
 | `consumed_request_state_nonces` primary key | **Execution safety state.** One-time request/OAuth state consumption with expiry. | Gateway protocol state; identity provider is authoritative for identity. | Must be shared while a nonce is live; expiry pruning is safe. | Loss can permit replay of an unexpired state nonce; replicas with separate copies do not coordinate. | PostgreSQL for multi-replica deployments; essential to the nonce replay guarantee. |
 | `dynamic_upstreams` primary key | **Administrative configuration.** Admin-selected upstream definitions, including upstream-preferred execution mode, loaded into the registry. | Gateway administrators/configuration. | Must survive restarts and be consistent across replicas when database-managed onboarding is enabled. | Loss removes configured upstreams; stale replica copies produce different catalogs and routing. | PostgreSQL, or a single authoritative deployment configuration source if database onboarding is disabled. |
+| `integration_definition_versions` composite primary key | **Business-value configuration.** Immutable, digest-addressed integration/workflow definitions, including the pinned baseline and completion/evidence declaration. Revision allocation is serialized per tenant/upstream. | Gateway administrators; the published immutable revision is pinned into each execution at start. | Must be shared and durable for publication, historical interpretation, and execution attribution. | Loss removes workflow definitions and baseline history; altered revisions could change the meaning of prior measurements. | PostgreSQL. Updates and deletes are rejected by database triggers; new versions are inserted. |
+| `integration_definition_publications` primary key and latest-publication index | **Append-only publication history.** Records publish, rollback, and unpublish events; current published definitions are derived from the latest event per tenant/upstream. | Gateway administrator actions. | Must be shared and durable so all replicas expose the same workflow and value IDs. | Loss or divergent history changes which definitions are listed and started. | PostgreSQL. Database triggers reject updates and deletes. |
+| `workflow_executions`, request bindings, calls, and execution events | **Attribution and execution coordination state.** Binds tenant/caller/client, selected definition revision and metadata, start and outer JSON-RPC request IDs to body digests, stable logical call keys to tool/argument digests, call status and boolean predicate evidence, and write leases. Exact start-request retransmission returns the original execution; request ID/body mismatch and a second distinct standalone call identity are rejected atomically. Expiry alone never transfers an active write lease to another call; the original call/journal must be reconciled and explicitly released. | Gateway attribution layer; upstream systems remain authoritative for business effects. | Must be shared and durable across replicas for retries, writes, and workflow completion checks. | Loss can permit duplicate attribution or lose the evidence needed to determine whether the declared workflow completed. | PostgreSQL. Request bindings and execution events are insert-only; execution and call status/lease rows are updated by the store. No raw tool arguments or full upstream outputs are persisted. |
+
+The caller must encode JSON-RPC request IDs with a type tag (`string:...` versus `number:...`) before placing them in these text-keyed bindings. JSON-RPC IDs correlate responses; they are not business idempotency keys. Exact retransmissions keep both the tagged ID and canonical request-body digest; a deliberate repeat after a completed operation uses a new ID.
+| `business_value_events` completion and optional outcome-identity unique indexes | **Credited business outcome evidence.** Stores at most one completion per execution and can enforce one credited event per tenant/upstream/outcome namespace/digest. A conflicting outcome identity creates no additional credit. | Gateway completion evaluator; the upstream remains authoritative for the outcome itself. | Must be shared and durable for consistent historical reporting across replicas. | Loss or duplicate rows can distort measured completed outcomes. | PostgreSQL. Inserts only; database triggers reject updates and deletes. Persist only digests and minimal redacted evidence. |
 | `gateway_settings` primary key | **Administrative configuration.** Persisted gateway-owned settings including alert/retention policy, adaptive observe/active mode, and model-routing score state. It does not replace deployment configuration. | Gateway administrators and the adaptive evidence/routing subsystem. | Must survive restarts; replicas should read the same version. | Loss resets database-managed settings and adaptive score state; inconsistent replicas can evaluate different settings or routing evidence. | PostgreSQL when these settings are administered through the gateway or used by shared routing; otherwise config/evidence source. |
 | `gateway_secrets` primary key | **Administrative configuration**, security-sensitive. Stores arbitrary envelope-encrypted strings; ciphertext is not equivalent to safe-to-disclose data. | Gateway secret administrator and generic secret resolver. OAuth client-secret resolution rejects `vault://`. | Persists across restarts and is shared if used. Key material must remain outside PostgreSQL. | No automatic expiry or pruning; deletion is explicit by secret name. Loss requires reprovisioning. | Prefer environment or a dedicated secret manager. Rows cannot be classified reliably from names/ciphertext and require operator review. Never store OAuth access/refresh tokens or OAuth client secrets here. |
 | `user_upstream_credentials` primary key | **Administrative/user connection state**, security-sensitive. Encrypted user API-key credentials remain available for supported user connections. | The user and upstream credential issuer. | API-key records currently survive restarts and are shared. Encryption key remains outside PostgreSQL. | Loss requires reconnecting; inconsistent copies make user credentials appear unavailable. | PostgreSQL only for encrypted non-OAuth credentials required by the user-connect feature. For PostgreSQL deployments, OAuth access and refresh tokens are process-local and are purged from PostgreSQL by migration v2; users reconnect after a restart or replica change. SQLite retains its existing local encrypted credential behavior. |
@@ -107,18 +113,25 @@ GRANT SELECT ON
     audit_runs, dynamic_upstreams, model_pricing, gateway_settings,
     adaptive_evidence, consumed_request_state_nonces, tool_approvals,
     tool_guidance, gateway_secrets, recovery_operations,
-    sensitive_write_audits, user_upstream_credentials
+    sensitive_write_audits, user_upstream_credentials,
+    integration_definition_versions, integration_definition_publications,
+    workflow_executions, workflow_request_bindings, workflow_calls,
+    workflow_execution_events, business_value_events
 TO mcpcodeaway_runtime;
 GRANT INSERT ON
     audit_runs, dynamic_upstreams, model_pricing, gateway_settings,
     adaptive_evidence, consumed_request_state_nonces, tool_approvals,
     tool_guidance, gateway_secrets, recovery_operations,
-    sensitive_write_audits, user_upstream_credentials
+    sensitive_write_audits, user_upstream_credentials,
+    integration_definition_versions, integration_definition_publications,
+    workflow_executions, workflow_request_bindings, workflow_calls,
+    workflow_execution_events, business_value_events
 TO mcpcodeaway_runtime;
 GRANT UPDATE ON
     audit_runs, dynamic_upstreams, model_pricing, gateway_settings,
     tool_approvals, tool_guidance, gateway_secrets, recovery_operations,
-    sensitive_write_audits, user_upstream_credentials
+    sensitive_write_audits, user_upstream_credentials,
+    workflow_executions, workflow_calls
 TO mcpcodeaway_runtime;
 GRANT DELETE ON
     audit_runs, dynamic_upstreams, model_pricing, consumed_request_state_nonces,
@@ -131,6 +144,8 @@ GRANT SELECT ON sensitive_write_operations TO mcpcodeaway_operations;
 ```
 
 The runtime role gets `DELETE` only on tables where the store prunes or removes records, and does not receive `UPDATE` on append/claim-only adaptive evidence or nonce state. It gets no `CREATE`, `ALTER`, `DROP`, ownership, or migration-history write permissions. The operations role receives no base-table access and cannot update journal records. Reapply runtime grants for newly added tables as part of each deployment migration. For a dedicated schema, replace `public` in the example with the schema used by both DSNs.
+
+Version 3 business-value tables are included in runtime `SELECT`/`INSERT` grants. Only `workflow_executions` and `workflow_calls` receive `UPDATE` because they hold mutable lifecycle status and expiring write-lease state. Definition versions, publication history, workflow request bindings, execution events, and business-value completion events remain insert-only for the runtime role; triggers also reject update/delete for immutable and append-only records. Migration DDL and trigger/function creation remain migration-role work and are never run by gateway startup.
 
 ## Unavailable PostgreSQL
 

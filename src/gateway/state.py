@@ -37,6 +37,48 @@ def _postgres_dsn_with_secure_tls_default(dsn: str) -> str:
     return f"{dsn} sslmode=verify-full"
 
 
+_BUSINESS_RAW_KEYS = {"args", "arguments", "output", "full_output", "raw_output", "result"}
+
+
+def _business_json(value: Any) -> str:
+    """Serialize compact audit metadata while rejecting raw invocation content."""
+
+    def check(node: Any) -> None:
+        if isinstance(node, dict):
+            forbidden = _BUSINESS_RAW_KEYS.intersection(str(key).lower() for key in node)
+            if forbidden:
+                raise ValueError(
+                    f"business audit payload contains prohibited field: {sorted(forbidden)[0]}"
+                )
+            for child in node.values():
+                check(child)
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                check(child)
+
+    check(value)
+    return json.dumps(value, default=str, sort_keys=True)
+
+
+def _decode_workflow_call(row: Any) -> dict[str, Any]:
+    """Decode a durable call while exposing only persisted digest/evidence fields."""
+    result = dict(row)
+    evidence = json.loads(result.pop("payload_json", "{}"))
+    result["evidence"] = evidence
+    if not result.get("tool_qualified_name"):
+        result["tool_qualified_name"] = (
+            f"{result.get('upstream_name', '')}__{result.get('tool_name', '')}"
+        )
+    for key in (
+        "evidence_predicate_matched",
+        "completion_predicate_matched",
+        "sensitive_write_journal_status",
+    ):
+        if key in evidence:
+            result[key] = evidence[key]
+    return result
+
+
 class CacheBackend(Protocol):
     """Protocol for token caching and sliding-window rate limiting."""
 
@@ -263,6 +305,68 @@ class AuditStore(Protocol):
 
     async def init(self) -> None: ...
 
+    async def save_integration_definition_version(
+        self, definition: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def get_integration_definition_version(
+        self, tenant_id: str, upstream_name: str, revision: str
+    ) -> dict[str, Any] | None: ...
+
+    async def list_integration_definition_versions(
+        self, tenant_id: str, upstream_name: str
+    ) -> list[dict[str, Any]]: ...
+
+    async def append_integration_definition_publication(
+        self, event: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def get_current_published_integration_definition(
+        self, tenant_id: str, upstream_name: str
+    ) -> dict[str, Any] | None: ...
+
+    async def list_current_published_integration_definitions(
+        self, tenant_id: str
+    ) -> list[dict[str, Any]]: ...
+
+    async def create_business_execution(self, execution: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def get_business_execution(
+        self, business_execution_id: str, tenant_id: str, caller_sub: str, client_id: str
+    ) -> dict[str, Any] | None: ...
+
+    async def bind_workflow_request(
+        self,
+        tenant_id: str,
+        business_execution_id: str,
+        outer_request_id: str,
+        request_digest: str,
+    ) -> dict[str, Any]: ...
+
+    async def create_workflow_call(self, call: dict[str, Any]) -> tuple[dict[str, Any], bool]: ...
+
+    async def list_workflow_calls(
+        self, tenant_id: str, business_execution_id: str
+    ) -> list[dict[str, Any]]: ...
+
+    async def update_workflow_call(self, workflow_call_id: str, fields: dict[str, Any]) -> bool: ...
+
+    async def append_workflow_execution_event(self, event: dict[str, Any]) -> bool: ...
+
+    async def claim_workflow_write(
+        self, execution_id: str, call_id: str, lease_until: str
+    ) -> bool: ...
+
+    async def release_workflow_write(self, execution_id: str, call_id: str) -> bool: ...
+
+    async def record_business_value_event(
+        self, event: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, bool]: ...
+
+    async def list_business_value_events(
+        self, tenant_id: str, *, since: str | None = None, limit: int = 1000
+    ) -> list[dict[str, Any]]: ...
+
     async def record_run(self, run: dict[str, Any]) -> None: ...
 
     async def import_adaptive_evidence(self, tenant_id: str, rows: list[dict[str, Any]]) -> int: ...
@@ -428,6 +532,13 @@ class AuditStore(Protocol):
     ) -> bool: ...
 
     async def prune_operations(self, *, now: str) -> int: ...
+
+
+class BusinessExecutionConflict(ValueError):
+    """Expected attribution conflict, such as request-ID body mismatch or a second
+    distinct call identity in a standalone execution. Callers should reject the
+    attribution request without treating the durable store as unavailable.
+    """
 
 
 class SQLiteAuditStore:
@@ -633,6 +744,94 @@ class SQLiteAuditStore:
                 sum_turns REAL NOT NULL DEFAULT 0,
                 PRIMARY KEY (bucket_hour, tenant_id, model, server, tool, mode)
             )
+            """
+        )
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS integration_definition_versions (
+                tenant_id TEXT NOT NULL, upstream_name TEXT NOT NULL, revision TEXT NOT NULL,
+                definition_digest TEXT NOT NULL, definition_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, PRIMARY KEY (tenant_id, upstream_name, revision)
+            );
+            CREATE TABLE IF NOT EXISTS integration_definition_publications (
+                event_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, upstream_name TEXT NOT NULL,
+                action TEXT NOT NULL, revision TEXT, actor_sub TEXT NOT NULL, created_at
+                TEXT NOT NULL,
+                evidence_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_definition_publications_latest
+                ON integration_definition_publications (tenant_id, upstream_name,
+                created_at DESC, event_id DESC);
+            CREATE TABLE IF NOT EXISTS workflow_executions (
+                business_execution_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                caller_sub TEXT NOT NULL,
+                client_id TEXT NOT NULL, kind TEXT NOT NULL, upstream_name TEXT NOT NULL,
+                definition_revision TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL, standalone_call_key TEXT, active_write_call_id TEXT,
+                write_lease_until TEXT, start_request_id TEXT, start_request_digest TEXT,
+                payload_json TEXT NOT NULL,
+                UNIQUE (tenant_id, caller_sub, client_id, start_request_id)
+            );
+            CREATE TABLE IF NOT EXISTS workflow_request_bindings (
+                tenant_id TEXT NOT NULL, business_execution_id TEXT NOT NULL,
+                outer_request_id TEXT NOT NULL, request_digest TEXT NOT NULL, created_at
+                TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, business_execution_id, outer_request_id)
+            );
+            CREATE TABLE IF NOT EXISTS workflow_calls (
+                workflow_call_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                business_execution_id TEXT NOT NULL, call_key TEXT NOT NULL,
+                outer_request_id TEXT NOT NULL, callback_ordinal INTEGER NOT NULL,
+                upstream_name TEXT NOT NULL, tool_name TEXT NOT NULL, request_digest TEXT NOT NULL,
+                tool_qualified_name TEXT NOT NULL, arguments_digest TEXT NOT NULL,
+                status TEXT NOT NULL, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, payload_json TEXT NOT NULL, run_id TEXT,
+                sensitive_write_operation_id TEXT, approval_id TEXT,
+                UNIQUE (tenant_id, call_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_calls_execution
+                ON workflow_calls (tenant_id, business_execution_id, created_at);
+            CREATE TABLE IF NOT EXISTS workflow_execution_events (
+                event_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                business_execution_id TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+                event_type TEXT NOT NULL, created_at TEXT NOT NULL, evidence_json TEXT NOT NULL,
+                UNIQUE (tenant_id, business_execution_id, idempotency_key)
+            );
+            CREATE TABLE IF NOT EXISTS business_value_events (
+                event_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                business_execution_id TEXT NOT NULL, completion_key TEXT NOT NULL,
+                upstream_name TEXT NOT NULL, outcome_namespace TEXT, outcome_digest TEXT,
+                credited INTEGER NOT NULL, created_at TEXT NOT NULL, evidence_json TEXT NOT NULL,
+                UNIQUE (tenant_id, business_execution_id, completion_key)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_business_value_outcome_identity
+                ON business_value_events (tenant_id, upstream_name, outcome_namespace,
+                outcome_digest)
+                WHERE outcome_namespace IS NOT NULL AND outcome_digest IS NOT NULL;
+            CREATE TRIGGER IF NOT EXISTS immutable_definition_versions_update
+                BEFORE UPDATE ON integration_definition_versions BEGIN SELECT
+                RAISE(ABORT, 'immutable record'); END;
+            CREATE TRIGGER IF NOT EXISTS immutable_definition_versions_delete
+                BEFORE DELETE ON integration_definition_versions BEGIN SELECT
+                RAISE(ABORT, 'immutable record'); END;
+            CREATE TRIGGER IF NOT EXISTS append_only_definition_publications_update
+                BEFORE UPDATE ON integration_definition_publications BEGIN SELECT
+                RAISE(ABORT, 'append-only record'); END;
+            CREATE TRIGGER IF NOT EXISTS append_only_definition_publications_delete
+                BEFORE DELETE ON integration_definition_publications BEGIN SELECT
+                RAISE(ABORT, 'append-only record'); END;
+            CREATE TRIGGER IF NOT EXISTS append_only_workflow_events_update
+                BEFORE UPDATE ON workflow_execution_events BEGIN SELECT RAISE(ABORT,
+                'append-only record'); END;
+            CREATE TRIGGER IF NOT EXISTS append_only_workflow_events_delete
+                BEFORE DELETE ON workflow_execution_events BEGIN SELECT RAISE(ABORT,
+                'append-only record'); END;
+            CREATE TRIGGER IF NOT EXISTS append_only_business_value_update
+                BEFORE UPDATE ON business_value_events BEGIN SELECT RAISE(ABORT,
+                'append-only record'); END;
+            CREATE TRIGGER IF NOT EXISTS append_only_business_value_delete
+                BEFORE DELETE ON business_value_events BEGIN SELECT RAISE(ABORT,
+                'append-only record'); END;
             """
         )
         conn.commit()
@@ -1725,6 +1924,545 @@ class SQLiteAuditStore:
             conn.commit()
             return cursor.rowcount
 
+    async def save_integration_definition_version(
+        self, definition: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Insert an immutable, digest-addressed integration definition version."""
+        row = dict(definition)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        payload = json.dumps(row.get("definition", {}), default=str, sort_keys=True)
+        required = ("tenant_id", "upstream_name", "definition_digest")
+        if any(not row.get(key) for key in required):
+            raise ValueError("integration definition requires tenant, upstream and digest")
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute("BEGIN IMMEDIATE")
+            if not row.get("revision"):
+                maximum = conn.execute(
+                    (
+                        "SELECT MAX(CAST(revision AS INTEGER)) FROM "
+                        "integration_definition_versions WHERE tenant_id=? AND "
+                        "upstream_name=? AND revision GLOB '[0-9]*'"
+                    ),
+                    (row["tenant_id"], row["upstream_name"]),
+                ).fetchone()[0]
+                row["revision"] = str(int(maximum or 0) + 1)
+            conn.execute(
+                """INSERT OR IGNORE INTO integration_definition_versions
+                (tenant_id, upstream_name, revision, definition_digest, definition_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    row["tenant_id"],
+                    row["upstream_name"],
+                    row["revision"],
+                    row["definition_digest"],
+                    payload,
+                    row["created_at"],
+                ),
+            )
+            saved = conn.execute(
+                (
+                    "SELECT * FROM integration_definition_versions WHERE "
+                    "tenant_id=? AND upstream_name=? AND revision=?"
+                ),
+                (row["tenant_id"], row["upstream_name"], row["revision"]),
+            ).fetchone()
+            if (
+                saved["definition_digest"] != row["definition_digest"]
+                or saved["definition_json"] != payload
+            ):
+                conn.rollback()
+                raise BusinessExecutionConflict(
+                    "immutable integration definition revision already exists with "
+                    "different content"
+                )
+            conn.commit()
+        return {**dict(saved), "definition": json.loads(saved["definition_json"])}
+
+    async def get_integration_definition_version(
+        self, tenant_id: str, upstream_name: str, revision: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            row = (
+                self._ensure_conn()
+                .execute(
+                    (
+                        "SELECT * FROM integration_definition_versions WHERE "
+                        "tenant_id=? AND upstream_name=? AND revision=?"
+                    ),
+                    (tenant_id, upstream_name, revision),
+                )
+                .fetchone()
+            )
+        return {**dict(row), "definition": json.loads(row["definition_json"])} if row else None
+
+    async def list_integration_definition_versions(
+        self, tenant_id: str, upstream_name: str
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = (
+                self._ensure_conn()
+                .execute(
+                    (
+                        "SELECT * FROM integration_definition_versions WHERE "
+                        "tenant_id=? AND upstream_name=? ORDER BY CAST(revision AS "
+                        "INTEGER),created_at"
+                    ),
+                    (tenant_id, upstream_name),
+                )
+                .fetchall()
+            )
+        return [{**dict(row), "definition": json.loads(row["definition_json"])} for row in rows]
+
+    async def append_integration_definition_publication(
+        self, event: dict[str, Any]
+    ) -> dict[str, Any]:
+        row = dict(event)
+        row.setdefault("event_id", uuid.uuid4().hex)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        action = str(row.get("action", "publish"))
+        if action not in {"publish", "rollback", "unpublish"}:
+            raise ValueError("invalid definition publication action")
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute("BEGIN IMMEDIATE")
+            revision = row.get("revision")
+            if (
+                revision is not None
+                and not conn.execute(
+                    (
+                        "SELECT 1 FROM integration_definition_versions WHERE "
+                        "tenant_id=? AND upstream_name=? AND revision=?"
+                    ),
+                    (row["tenant_id"], row["upstream_name"], revision),
+                ).fetchone()
+            ):
+                conn.rollback()
+                raise ValueError("publication target definition version does not exist")
+            evidence = _business_json(row.get("evidence", {}))
+            conn.execute(
+                "INSERT INTO integration_definition_publications VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row["event_id"],
+                    row["tenant_id"],
+                    row["upstream_name"],
+                    action,
+                    revision,
+                    row.get("actor_sub", ""),
+                    row["created_at"],
+                    evidence,
+                ),
+            )
+            conn.commit()
+        return {**row, "evidence": json.loads(evidence)}
+
+    async def get_current_published_integration_definition(
+        self, tenant_id: str, upstream_name: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            conn = self._ensure_conn()
+            event = conn.execute(
+                (
+                    "SELECT * FROM integration_definition_publications WHERE "
+                    "tenant_id=? AND upstream_name=? ORDER BY created_at DESC, "
+                    "rowid DESC LIMIT 1"
+                ),
+                (tenant_id, upstream_name),
+            ).fetchone()
+            if not event or event["action"] == "unpublish" or not event["revision"]:
+                return None
+            definition = conn.execute(
+                (
+                    "SELECT * FROM integration_definition_versions WHERE "
+                    "tenant_id=? AND upstream_name=? AND revision=?"
+                ),
+                (tenant_id, upstream_name, event["revision"]),
+            ).fetchone()
+        return (
+            {**dict(definition), "definition": json.loads(definition["definition_json"])}
+            if definition
+            else None
+        )
+
+    async def list_current_published_integration_definitions(
+        self, tenant_id: str
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = (
+                self._ensure_conn()
+                .execute(
+                    """SELECT d.* FROM integration_definition_publications p
+                JOIN integration_definition_versions d ON d.tenant_id=p.tenant_id AND
+                d.upstream_name=p.upstream_name AND d.revision=p.revision
+                WHERE p.tenant_id=? AND p.action<>'unpublish' AND p.revision IS NOT NULL
+                AND p.rowid=(SELECT p2.rowid FROM integration_definition_publications p2
+                    WHERE p2.tenant_id=p.tenant_id AND p2.upstream_name=p.upstream_name
+                    ORDER BY p2.created_at DESC,p2.rowid DESC LIMIT 1)
+                ORDER BY d.upstream_name,d.revision""",
+                    (tenant_id,),
+                )
+                .fetchall()
+            )
+        return [{**dict(row), "definition": json.loads(row["definition_json"])} for row in rows]
+
+    async def create_business_execution(self, execution: dict[str, Any]) -> dict[str, Any]:
+        row = dict(execution)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        payload = _business_json(row.get("metadata", {}))
+        if row.get("start_request_id") is not None and not row.get("start_request_digest"):
+            raise ValueError("a start request ID requires its exact request body digest")
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute("BEGIN IMMEDIATE")
+            request_id = row.get("start_request_id")
+            if request_id is not None:
+                existing = conn.execute(
+                    """SELECT * FROM workflow_executions
+                    WHERE tenant_id=? AND caller_sub=? AND client_id=? AND start_request_id=?""",
+                    (row["tenant_id"], row["caller_sub"], row.get("client_id", ""), request_id),
+                ).fetchone()
+                if existing:
+                    if existing["start_request_digest"] != row.get("start_request_digest"):
+                        conn.rollback()
+                        raise BusinessExecutionConflict(
+                            "start request ID was reused with a different request body"
+                        )
+                    conn.commit()
+                    return {**dict(existing), "metadata": json.loads(existing["payload_json"])}
+            conn.execute(
+                """INSERT INTO workflow_executions
+                (business_execution_id,tenant_id,caller_sub,client_id,kind,upstream_name,
+                 definition_revision,status,created_at,expires_at,start_request_id,
+                 start_request_digest,payload_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    row["business_execution_id"],
+                    row["tenant_id"],
+                    row["caller_sub"],
+                    row.get("client_id", ""),
+                    row["kind"],
+                    row["upstream_name"],
+                    row.get("definition_revision"),
+                    row.get("status", "active"),
+                    row["created_at"],
+                    row["expires_at"],
+                    request_id,
+                    row.get("start_request_digest"),
+                    payload,
+                ),
+            )
+            conn.commit()
+            saved = conn.execute(
+                "SELECT * FROM workflow_executions WHERE business_execution_id=?",
+                (row["business_execution_id"],),
+            ).fetchone()
+        return {**dict(saved), "metadata": json.loads(saved["payload_json"])}
+
+    async def get_business_execution(
+        self, business_execution_id: str, tenant_id: str, caller_sub: str, client_id: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            row = (
+                self._ensure_conn()
+                .execute(
+                    (
+                        "SELECT * FROM workflow_executions WHERE "
+                        "business_execution_id=? AND tenant_id=? AND caller_sub=? AND "
+                        "client_id=?"
+                    ),
+                    (business_execution_id, tenant_id, caller_sub, client_id),
+                )
+                .fetchone()
+            )
+        return {**dict(row), "metadata": json.loads(row["payload_json"])} if row else None
+
+    async def bind_workflow_request(
+        self, tenant_id: str, business_execution_id: str, outer_request_id: str, request_digest: str
+    ) -> dict[str, Any]:
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT OR IGNORE INTO workflow_request_bindings VALUES (?, ?, ?, ?, ?)",
+                (
+                    tenant_id,
+                    business_execution_id,
+                    outer_request_id,
+                    request_digest,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            row = conn.execute(
+                (
+                    "SELECT * FROM workflow_request_bindings WHERE tenant_id=? AND "
+                    "business_execution_id=? AND outer_request_id=?"
+                ),
+                (tenant_id, business_execution_id, outer_request_id),
+            ).fetchone()
+            if row["request_digest"] != request_digest:
+                conn.rollback()
+                raise BusinessExecutionConflict(
+                    "outer request ID was reused with a different request body"
+                )
+            conn.commit()
+        return dict(row)
+
+    async def create_workflow_call(self, call: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        row = dict(call)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        row.setdefault("updated_at", row["created_at"])
+        payload = _business_json(row.get("evidence", {}))
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute("BEGIN IMMEDIATE")
+            execution = conn.execute(
+                (
+                    "SELECT kind, standalone_call_key FROM workflow_executions "
+                    "WHERE business_execution_id=? AND tenant_id=?"
+                ),
+                (row["business_execution_id"], row["tenant_id"]),
+            ).fetchone()
+            if not execution:
+                conn.rollback()
+                raise ValueError("business execution does not exist")
+            if execution["kind"] == "standalone_tool":
+                if (
+                    execution["standalone_call_key"]
+                    and execution["standalone_call_key"] != row["call_key"]
+                ):
+                    conn.rollback()
+                    raise BusinessExecutionConflict(
+                        "standalone execution already claimed by a different logical call"
+                    )
+                conn.execute(
+                    (
+                        "UPDATE workflow_executions SET "
+                        "standalone_call_key=COALESCE(standalone_call_key, ?) WHERE "
+                        "business_execution_id=?"
+                    ),
+                    (row["call_key"], row["business_execution_id"]),
+                )
+            inserted = conn.execute(
+                (
+                    "INSERT OR IGNORE INTO workflow_calls (workflow_call_id, "
+                    "tenant_id, business_execution_id, call_key, outer_request_id, "
+                    "callback_ordinal, upstream_name, tool_name, request_digest, "
+                    "tool_qualified_name, arguments_digest, status, created_at, "
+                    "updated_at, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?, ?)"
+                ),
+                (
+                    row["workflow_call_id"],
+                    row["tenant_id"],
+                    row["business_execution_id"],
+                    row["call_key"],
+                    row["outer_request_id"],
+                    int(row.get("callback_ordinal", 0)),
+                    row["upstream_name"],
+                    row["tool_name"],
+                    row["request_digest"],
+                    row.get("tool_qualified_name", f"{row['upstream_name']}__{row['tool_name']}"),
+                    row["arguments_digest"],
+                    row.get("status", "started"),
+                    row["created_at"],
+                    row["updated_at"],
+                    payload,
+                ),
+            )
+            saved = conn.execute(
+                "SELECT * FROM workflow_calls WHERE tenant_id=? AND call_key=?",
+                (row["tenant_id"], row["call_key"]),
+            ).fetchone()
+            if (
+                saved["workflow_call_id"] != row["workflow_call_id"]
+                or saved["business_execution_id"] != row["business_execution_id"]
+                or saved["outer_request_id"] != row["outer_request_id"]
+                or saved["request_digest"] != row["request_digest"]
+                or saved["arguments_digest"] != row["arguments_digest"]
+                or saved["upstream_name"] != row["upstream_name"]
+                or saved["tool_name"] != row["tool_name"]
+                or saved["tool_qualified_name"]
+                != row.get("tool_qualified_name", f"{row['upstream_name']}__{row['tool_name']}")
+                or saved["callback_ordinal"] != int(row.get("callback_ordinal", 0))
+            ):
+                conn.rollback()
+                raise BusinessExecutionConflict("call key is already bound to another invocation")
+            created = bool(inserted.rowcount)
+            conn.commit()
+        return (_decode_workflow_call(saved), created)
+
+    async def list_workflow_calls(
+        self, tenant_id: str, business_execution_id: str
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = (
+                self._ensure_conn()
+                .execute(
+                    (
+                        "SELECT * FROM workflow_calls WHERE tenant_id=? AND "
+                        "business_execution_id=? ORDER BY created_at, workflow_call_id"
+                    ),
+                    (tenant_id, business_execution_id),
+                )
+                .fetchall()
+            )
+        return [_decode_workflow_call(row) for row in rows]
+
+    async def update_workflow_call(self, workflow_call_id: str, fields: dict[str, Any]) -> bool:
+        allowed = {
+            "status",
+            "updated_at",
+            "run_id",
+            "sensitive_write_operation_id",
+            "approval_id",
+            "evidence",
+        }
+        if set(fields) - allowed:
+            raise ValueError("unsupported workflow call update field")
+        fields = dict(fields)
+        if "evidence" in fields:
+            fields["payload_json"] = _business_json(fields.pop("evidence"))
+        fields.setdefault("updated_at", datetime.now(UTC).isoformat())
+        async with self._lock:
+            conn = self._ensure_conn()
+            cur = conn.execute(
+                "UPDATE workflow_calls SET "
+                + ", ".join(f"{key}=?" for key in fields)
+                + " WHERE workflow_call_id=?",
+                (*fields.values(), workflow_call_id),
+            )
+            conn.commit()
+        return bool(cur.rowcount)
+
+    async def append_workflow_execution_event(self, event: dict[str, Any]) -> bool:
+        row = dict(event)
+        row.setdefault("event_id", uuid.uuid4().hex)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        evidence = _business_json(row.get("evidence", {}))
+        async with self._lock:
+            conn = self._ensure_conn()
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO workflow_execution_events VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row["event_id"],
+                    row["tenant_id"],
+                    row["business_execution_id"],
+                    row["idempotency_key"],
+                    row["event_type"],
+                    row["created_at"],
+                    evidence,
+                ),
+            )
+            inserted = bool(cur.rowcount)
+            if not inserted:
+                saved = conn.execute(
+                    """SELECT event_type,evidence_json FROM workflow_execution_events
+                    WHERE tenant_id=? AND business_execution_id=? AND idempotency_key=?""",
+                    (row["tenant_id"], row["business_execution_id"], row["idempotency_key"]),
+                ).fetchone()
+                if (
+                    saved is None
+                    or saved["event_type"] != row["event_type"]
+                    or saved["evidence_json"] != evidence
+                ):
+                    raise BusinessExecutionConflict(
+                        "workflow event idempotency key was reused with different content"
+                    )
+            conn.commit()
+        return inserted
+
+    async def claim_workflow_write(self, execution_id: str, call_id: str, lease_until: str) -> bool:
+        async with self._lock:
+            conn = self._ensure_conn()
+            cur = conn.execute(
+                (
+                    "UPDATE workflow_executions SET active_write_call_id=?, "
+                    "write_lease_until=? WHERE business_execution_id=? AND "
+                    "(active_write_call_id IS NULL OR active_write_call_id=?)"
+                ),
+                (call_id, lease_until, execution_id, call_id),
+            )
+            conn.commit()
+        return bool(cur.rowcount)
+
+    async def release_workflow_write(self, execution_id: str, call_id: str) -> bool:
+        async with self._lock:
+            conn = self._ensure_conn()
+            cur = conn.execute(
+                (
+                    "UPDATE workflow_executions SET active_write_call_id=NULL, "
+                    "write_lease_until=NULL WHERE business_execution_id=? AND "
+                    "active_write_call_id=?"
+                ),
+                (execution_id, call_id),
+            )
+            conn.commit()
+        return bool(cur.rowcount)
+
+    async def record_business_value_event(
+        self, event: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, bool]:
+        row = dict(event)
+        row.setdefault("event_id", uuid.uuid4().hex)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        evidence = _business_json(row.get("evidence", {}))
+        identity = (row.get("outcome_namespace"), row.get("outcome_digest"))
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute("BEGIN IMMEDIATE")
+            prior = conn.execute(
+                (
+                    "SELECT * FROM business_value_events WHERE tenant_id=? AND "
+                    "business_execution_id=? AND completion_key=?"
+                ),
+                (row["tenant_id"], row["business_execution_id"], row["completion_key"]),
+            ).fetchone()
+            if not prior and all(identity):
+                prior = conn.execute(
+                    (
+                        "SELECT * FROM business_value_events WHERE tenant_id=? AND "
+                        "upstream_name=? AND outcome_namespace=? AND outcome_digest=?"
+                    ),
+                    (row["tenant_id"], row["upstream_name"], *identity),
+                ).fetchone()
+            if prior:
+                conn.commit()
+                return ({**dict(prior), "evidence": json.loads(prior["evidence_json"])}, False)
+            conn.execute(
+                "INSERT INTO business_value_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row["event_id"],
+                    row["tenant_id"],
+                    row["business_execution_id"],
+                    row["completion_key"],
+                    row["upstream_name"],
+                    identity[0],
+                    identity[1],
+                    1,
+                    row["created_at"],
+                    evidence,
+                ),
+            )
+            conn.commit()
+        return ({**row, "credited": 1, "evidence": json.loads(evidence)}, True)
+
+    async def list_business_value_events(
+        self, tenant_id: str, *, since: str | None = None, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = (
+                self._ensure_conn()
+                .execute(
+                    (
+                        "SELECT * FROM business_value_events WHERE tenant_id=? AND (? "
+                        "IS NULL OR created_at>=?) ORDER BY created_at DESC LIMIT ?"
+                    ),
+                    (tenant_id, since, since, max(1, min(limit, 10000))),
+                )
+                .fetchall()
+            )
+        return [{**dict(row), "evidence": json.loads(row["evidence_json"])} for row in rows]
+
 
 class PostgresAuditStore:
     """Postgres-backed AuditStore for multi-replica production deployments."""
@@ -2701,3 +3439,493 @@ class PostgresAuditStore:
             res = self._pool.close()
             if inspect.isawaitable(res):
                 await res
+
+    async def save_integration_definition_version(
+        self, definition: dict[str, Any]
+    ) -> dict[str, Any]:
+        row = dict(definition)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        payload = json.dumps(row.get("definition", {}), default=str, sort_keys=True)
+        required = ("tenant_id", "upstream_name", "definition_digest")
+        if any(not row.get(key) for key in required):
+            raise ValueError("integration definition requires tenant, upstream and digest")
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            if not row.get("revision"):
+                lock_key = f"integration-definition:{row['tenant_id']}:{row['upstream_name']}"
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", lock_key
+                )
+                maximum = await conn.fetchval(
+                    (
+                        "SELECT MAX(revision::bigint) FROM "
+                        "integration_definition_versions WHERE tenant_id=$1 AND "
+                        "upstream_name=$2 AND revision ~ '^[0-9]+$'"
+                    ),
+                    row["tenant_id"],
+                    row["upstream_name"],
+                )
+                row["revision"] = str(int(maximum or 0) + 1)
+            await conn.execute(
+                """INSERT INTO integration_definition_versions VALUES ($1,$2,$3,$4,$5,$6)
+                ON CONFLICT (tenant_id,upstream_name,revision) DO NOTHING""",
+                row["tenant_id"],
+                row["upstream_name"],
+                row["revision"],
+                row["definition_digest"],
+                payload,
+                row["created_at"],
+            )
+            saved = await conn.fetchrow(
+                (
+                    "SELECT * FROM integration_definition_versions WHERE "
+                    "tenant_id=$1 AND upstream_name=$2 AND revision=$3"
+                ),
+                row["tenant_id"],
+                row["upstream_name"],
+                row["revision"],
+            )
+        if (
+            saved["definition_digest"] != row["definition_digest"]
+            or saved["definition_json"] != payload
+        ):
+            raise BusinessExecutionConflict(
+                "immutable integration definition revision already exists with different content"
+            )
+        return {**dict(saved), "definition": json.loads(saved["definition_json"])}
+
+    async def get_integration_definition_version(
+        self, tenant_id: str, upstream_name: str, revision: str
+    ) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                (
+                    "SELECT * FROM integration_definition_versions WHERE "
+                    "tenant_id=$1 AND upstream_name=$2 AND revision=$3"
+                ),
+                tenant_id,
+                upstream_name,
+                revision,
+            )
+        return {**dict(row), "definition": json.loads(row["definition_json"])} if row else None
+
+    async def list_integration_definition_versions(
+        self, tenant_id: str, upstream_name: str
+    ) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                (
+                    "SELECT * FROM integration_definition_versions WHERE "
+                    "tenant_id=$1 AND upstream_name=$2 ORDER BY CASE WHEN revision "
+                    "~ '^[0-9]+$' THEN revision::bigint END NULLS LAST,created_at"
+                ),
+                tenant_id,
+                upstream_name,
+            )
+        return [{**dict(row), "definition": json.loads(row["definition_json"])} for row in rows]
+
+    async def append_integration_definition_publication(
+        self, event: dict[str, Any]
+    ) -> dict[str, Any]:
+        row = dict(event)
+        row.setdefault("event_id", uuid.uuid4().hex)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        action = str(row.get("action", "publish"))
+        if action not in {"publish", "rollback", "unpublish"}:
+            raise ValueError("invalid definition publication action")
+        evidence = _business_json(row.get("evidence", {}))
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            if row.get("revision") is not None and not await conn.fetchval(
+                (
+                    "SELECT EXISTS(SELECT 1 FROM integration_definition_versions "
+                    "WHERE tenant_id=$1 AND upstream_name=$2 AND revision=$3)"
+                ),
+                row["tenant_id"],
+                row["upstream_name"],
+                row["revision"],
+            ):
+                raise ValueError("publication target definition version does not exist")
+            await conn.execute(
+                "INSERT INTO integration_definition_publications VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                row["event_id"],
+                row["tenant_id"],
+                row["upstream_name"],
+                action,
+                row.get("revision"),
+                row.get("actor_sub", ""),
+                row["created_at"],
+                evidence,
+            )
+        return {**row, "evidence": json.loads(evidence)}
+
+    async def get_current_published_integration_definition(
+        self, tenant_id: str, upstream_name: str
+    ) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT d.* FROM integration_definition_publications p
+                JOIN integration_definition_versions d USING (tenant_id,upstream_name,revision)
+                WHERE p.tenant_id=$1 AND p.upstream_name=$2 AND p.action<>'unpublish' AND
+                p.revision IS NOT NULL
+                ORDER BY p.created_at DESC,p.event_id DESC LIMIT 1""",
+                tenant_id,
+                upstream_name,
+            )
+        return {**dict(row), "definition": json.loads(row["definition_json"])} if row else None
+
+    async def list_current_published_integration_definitions(
+        self, tenant_id: str
+    ) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT d.* FROM (
+                SELECT DISTINCT ON (tenant_id,upstream_name) * FROM
+                integration_definition_publications
+                WHERE tenant_id=$1 ORDER BY tenant_id,upstream_name,created_at DESC,event_id DESC
+                ) p JOIN integration_definition_versions d USING (tenant_id,upstream_name,revision)
+                WHERE p.action<>'unpublish' AND p.revision IS NOT NULL ORDER BY
+                d.upstream_name,d.revision""",
+                tenant_id,
+            )
+        return [{**dict(row), "definition": json.loads(row["definition_json"])} for row in rows]
+
+    async def create_business_execution(self, execution: dict[str, Any]) -> dict[str, Any]:
+        row = dict(execution)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        payload = _business_json(row.get("metadata", {}))
+        if row.get("start_request_id") is not None and not row.get("start_request_digest"):
+            raise ValueError("a start request ID requires its exact request body digest")
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            saved = await conn.fetchrow(
+                """INSERT INTO workflow_executions
+                (business_execution_id,tenant_id,caller_sub,client_id,kind,upstream_name,
+                 definition_revision,status,created_at,expires_at,start_request_id,
+                 start_request_digest,payload_json)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                ON CONFLICT (tenant_id,caller_sub,client_id,start_request_id) DO NOTHING
+                RETURNING *""",
+                row["business_execution_id"],
+                row["tenant_id"],
+                row["caller_sub"],
+                row.get("client_id", ""),
+                row["kind"],
+                row["upstream_name"],
+                row.get("definition_revision"),
+                row.get("status", "active"),
+                row["created_at"],
+                row["expires_at"],
+                row.get("start_request_id"),
+                row.get("start_request_digest"),
+                payload,
+            )
+            if saved is None and row.get("start_request_id") is not None:
+                saved = await conn.fetchrow(
+                    """SELECT * FROM workflow_executions WHERE tenant_id=$1 AND caller_sub=$2
+                    AND client_id=$3 AND start_request_id=$4 FOR UPDATE""",
+                    row["tenant_id"],
+                    row["caller_sub"],
+                    row.get("client_id", ""),
+                    row["start_request_id"],
+                )
+                if saved["start_request_digest"] != row["start_request_digest"]:
+                    raise BusinessExecutionConflict(
+                        "start request ID was reused with a different request body"
+                    )
+            elif saved is None:
+                raise RuntimeError("business execution ID already exists")
+        return {**dict(saved), "metadata": json.loads(saved["payload_json"])}
+
+    async def get_business_execution(
+        self, business_execution_id: str, tenant_id: str, caller_sub: str, client_id: str
+    ) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                (
+                    "SELECT * FROM workflow_executions WHERE "
+                    "business_execution_id=$1 AND tenant_id=$2 AND caller_sub=$3 "
+                    "AND client_id=$4"
+                ),
+                business_execution_id,
+                tenant_id,
+                caller_sub,
+                client_id,
+            )
+        return {**dict(row), "metadata": json.loads(row["payload_json"])} if row else None
+
+    async def bind_workflow_request(
+        self, tenant_id: str, business_execution_id: str, outer_request_id: str, request_digest: str
+    ) -> dict[str, Any]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                (
+                    "INSERT INTO workflow_request_bindings VALUES ($1,$2,$3,$4,$5) "
+                    "ON CONFLICT (tenant_id,business_execution_id,outer_request_id) "
+                    "DO NOTHING"
+                ),
+                tenant_id,
+                business_execution_id,
+                outer_request_id,
+                request_digest,
+                datetime.now(UTC).isoformat(),
+            )
+            row = await conn.fetchrow(
+                (
+                    "SELECT * FROM workflow_request_bindings WHERE tenant_id=$1 AND "
+                    "business_execution_id=$2 AND outer_request_id=$3 FOR UPDATE"
+                ),
+                tenant_id,
+                business_execution_id,
+                outer_request_id,
+            )
+            if row["request_digest"] != request_digest:
+                raise BusinessExecutionConflict(
+                    "outer request ID was reused with a different request body"
+                )
+        return dict(row)
+
+    async def create_workflow_call(self, call: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        row = dict(call)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        row.setdefault("updated_at", row["created_at"])
+        payload = _business_json(row.get("evidence", {}))
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            execution = await conn.fetchrow(
+                (
+                    "SELECT kind,standalone_call_key FROM workflow_executions WHERE "
+                    "business_execution_id=$1 AND tenant_id=$2 FOR UPDATE"
+                ),
+                row["business_execution_id"],
+                row["tenant_id"],
+            )
+            if not execution:
+                raise ValueError("business execution does not exist")
+            if execution["kind"] == "standalone_tool":
+                if (
+                    execution["standalone_call_key"]
+                    and execution["standalone_call_key"] != row["call_key"]
+                ):
+                    raise BusinessExecutionConflict(
+                        "standalone execution already claimed by a different logical call"
+                    )
+                await conn.execute(
+                    (
+                        "UPDATE workflow_executions SET "
+                        "standalone_call_key=COALESCE(standalone_call_key,$1) WHERE "
+                        "business_execution_id=$2"
+                    ),
+                    row["call_key"],
+                    row["business_execution_id"],
+                )
+            inserted = await conn.fetchrow(
+                """INSERT INTO workflow_calls
+                (workflow_call_id,tenant_id,business_execution_id,call_key,outer_request_id,callback_ordinal,upstream_name,tool_name,request_digest,tool_qualified_name,arguments_digest,status,created_at,updated_at,payload_json)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                ON CONFLICT (tenant_id,call_key) DO NOTHING RETURNING *""",
+                row["workflow_call_id"],
+                row["tenant_id"],
+                row["business_execution_id"],
+                row["call_key"],
+                row["outer_request_id"],
+                int(row.get("callback_ordinal", 0)),
+                row["upstream_name"],
+                row["tool_name"],
+                row["request_digest"],
+                row.get("tool_qualified_name", f"{row['upstream_name']}__{row['tool_name']}"),
+                row["arguments_digest"],
+                row.get("status", "started"),
+                row["created_at"],
+                row["updated_at"],
+                payload,
+            )
+            saved = inserted or await conn.fetchrow(
+                "SELECT * FROM workflow_calls WHERE tenant_id=$1 AND call_key=$2",
+                row["tenant_id"],
+                row["call_key"],
+            )
+            if (
+                saved["workflow_call_id"] != row["workflow_call_id"]
+                or saved["business_execution_id"] != row["business_execution_id"]
+                or saved["outer_request_id"] != row["outer_request_id"]
+                or saved["request_digest"] != row["request_digest"]
+                or saved["arguments_digest"] != row["arguments_digest"]
+                or saved["upstream_name"] != row["upstream_name"]
+                or saved["tool_name"] != row["tool_name"]
+                or saved["tool_qualified_name"]
+                != row.get("tool_qualified_name", f"{row['upstream_name']}__{row['tool_name']}")
+                or saved["callback_ordinal"] != int(row.get("callback_ordinal", 0))
+            ):
+                raise BusinessExecutionConflict("call key is already bound to another invocation")
+        return (_decode_workflow_call(saved), inserted is not None)
+
+    async def list_workflow_calls(
+        self, tenant_id: str, business_execution_id: str
+    ) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                (
+                    "SELECT * FROM workflow_calls WHERE tenant_id=$1 AND "
+                    "business_execution_id=$2 ORDER BY created_at,workflow_call_id"
+                ),
+                tenant_id,
+                business_execution_id,
+            )
+        return [_decode_workflow_call(row) for row in rows]
+
+    async def update_workflow_call(self, workflow_call_id: str, fields: dict[str, Any]) -> bool:
+        allowed = {
+            "status",
+            "updated_at",
+            "run_id",
+            "sensitive_write_operation_id",
+            "approval_id",
+            "evidence",
+        }
+        if set(fields) - allowed:
+            raise ValueError("unsupported workflow call update field")
+        fields = dict(fields)
+        if "evidence" in fields:
+            fields["payload_json"] = _business_json(fields.pop("evidence"))
+        fields.setdefault("updated_at", datetime.now(UTC).isoformat())
+        values = list(fields.values()) + [workflow_call_id]
+        assignments = ", ".join(f"{key}=${index}" for index, key in enumerate(fields, 1))
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            result = await conn.execute(
+                f"UPDATE workflow_calls SET {assignments} WHERE workflow_call_id=${len(values)}",
+                *values,
+            )
+        return int(str(result).rsplit(" ", 1)[-1]) > 0
+
+    async def append_workflow_execution_event(self, event: dict[str, Any]) -> bool:
+        row = dict(event)
+        row.setdefault("event_id", uuid.uuid4().hex)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        evidence = _business_json(row.get("evidence", {}))
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """INSERT INTO workflow_execution_events VALUES ($1,$2,$3,$4,$5,$6,$7)
+                ON CONFLICT (tenant_id,business_execution_id,idempotency_key) DO NOTHING""",
+                row["event_id"],
+                row["tenant_id"],
+                row["business_execution_id"],
+                row["idempotency_key"],
+                row["event_type"],
+                row["created_at"],
+                evidence,
+            )
+            inserted = int(str(result).rsplit(" ", 1)[-1]) > 0
+            if not inserted:
+                saved = await conn.fetchrow(
+                    """SELECT event_type,evidence_json FROM workflow_execution_events
+                    WHERE tenant_id=$1 AND business_execution_id=$2 AND idempotency_key=$3""",
+                    row["tenant_id"],
+                    row["business_execution_id"],
+                    row["idempotency_key"],
+                )
+                if (
+                    saved is None
+                    or saved["event_type"] != row["event_type"]
+                    or saved["evidence_json"] != evidence
+                ):
+                    raise BusinessExecutionConflict(
+                        "workflow event idempotency key was reused with different content"
+                    )
+        return inserted
+
+    async def claim_workflow_write(self, execution_id: str, call_id: str, lease_until: str) -> bool:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """UPDATE workflow_executions SET active_write_call_id=$1,write_lease_until=$2
+                WHERE business_execution_id=$3 AND (active_write_call_id IS NULL OR
+                active_write_call_id=$1)""",
+                call_id,
+                lease_until,
+                execution_id,
+            )
+        return int(str(result).rsplit(" ", 1)[-1]) > 0
+
+    async def release_workflow_write(self, execution_id: str, call_id: str) -> bool:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                (
+                    "UPDATE workflow_executions SET "
+                    "active_write_call_id=NULL,write_lease_until=NULL WHERE "
+                    "business_execution_id=$1 AND active_write_call_id=$2"
+                ),
+                execution_id,
+                call_id,
+            )
+        return int(str(result).rsplit(" ", 1)[-1]) > 0
+
+    async def record_business_value_event(
+        self, event: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, bool]:
+        row = dict(event)
+        row.setdefault("event_id", uuid.uuid4().hex)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        evidence = _business_json(row.get("evidence", {}))
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            saved = await conn.fetchrow(
+                """INSERT INTO business_value_events
+                (event_id,tenant_id,business_execution_id,completion_key,upstream_name,outcome_namespace,outcome_digest,credited,created_at,evidence_json)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8,$9)
+                ON CONFLICT DO NOTHING RETURNING *""",
+                row["event_id"],
+                row["tenant_id"],
+                row["business_execution_id"],
+                row["completion_key"],
+                row["upstream_name"],
+                row.get("outcome_namespace"),
+                row.get("outcome_digest"),
+                row["created_at"],
+                evidence,
+            )
+            if not saved:
+                saved = await conn.fetchrow(
+                    """SELECT * FROM business_value_events WHERE
+                    (tenant_id=$1 AND business_execution_id=$2 AND completion_key=$3) OR
+                    ($4::text IS NOT NULL AND $5::text IS NOT NULL AND tenant_id=$1 AND
+                    upstream_name=$6 AND outcome_namespace=$4 AND outcome_digest=$5)
+                    ORDER BY created_at LIMIT 1""",
+                    row["tenant_id"],
+                    row["business_execution_id"],
+                    row["completion_key"],
+                    row.get("outcome_namespace"),
+                    row.get("outcome_digest"),
+                    row["upstream_name"],
+                )
+        return (
+            {**dict(saved), "evidence": json.loads(saved["evidence_json"])},
+            saved["event_id"] == row["event_id"],
+        )
+
+    async def list_business_value_events(
+        self, tenant_id: str, *, since: str | None = None, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                (
+                    "SELECT * FROM business_value_events WHERE tenant_id=$1 AND "
+                    "($2::text IS NULL OR created_at>=$2) ORDER BY created_at DESC "
+                    "LIMIT $3"
+                ),
+                tenant_id,
+                since,
+                max(1, min(limit, 10000)),
+            )
+        return [{**dict(row), "evidence": json.loads(row["evidence_json"])} for row in rows]

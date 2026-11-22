@@ -111,6 +111,87 @@ MIGRATIONS = (
                 FROM sensitive_write_audits""",
         ),
     ),
+    Migration(
+        3,
+        "durable business value definitions and attributed executions",
+        (
+            """CREATE TABLE IF NOT EXISTS integration_definition_versions (
+                tenant_id TEXT NOT NULL, upstream_name TEXT NOT NULL, revision TEXT NOT NULL,
+                definition_digest TEXT NOT NULL, definition_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, upstream_name, revision))""",
+            """CREATE TABLE IF NOT EXISTS integration_definition_publications (
+                event_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, upstream_name TEXT NOT NULL,
+                action TEXT NOT NULL, revision TEXT, actor_sub TEXT NOT NULL, created_at
+                TEXT NOT NULL,
+                evidence_json TEXT NOT NULL)""",
+            """CREATE INDEX IF NOT EXISTS idx_definition_publications_latest
+                ON integration_definition_publications (tenant_id, upstream_name,
+                created_at DESC, event_id DESC)""",
+            """CREATE TABLE IF NOT EXISTS workflow_executions (
+                business_execution_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                caller_sub TEXT NOT NULL,
+                client_id TEXT NOT NULL, kind TEXT NOT NULL, upstream_name TEXT NOT NULL,
+                definition_revision TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL, standalone_call_key TEXT, active_write_call_id TEXT,
+                write_lease_until TEXT, start_request_id TEXT, start_request_digest TEXT,
+                payload_json TEXT NOT NULL)""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_execution_start_request
+                ON workflow_executions (tenant_id,caller_sub,client_id,start_request_id)""",
+            """CREATE TABLE IF NOT EXISTS workflow_request_bindings (
+                tenant_id TEXT NOT NULL, business_execution_id TEXT NOT NULL,
+                outer_request_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL, created_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, business_execution_id, outer_request_id))""",
+            """CREATE TABLE IF NOT EXISTS workflow_calls (
+                workflow_call_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                business_execution_id TEXT NOT NULL,
+                call_key TEXT NOT NULL, outer_request_id TEXT NOT NULL, callback_ordinal
+                INTEGER NOT NULL,
+                upstream_name TEXT NOT NULL, tool_name TEXT NOT NULL, request_digest TEXT NOT NULL,
+                tool_qualified_name TEXT NOT NULL, arguments_digest TEXT NOT NULL,
+                status TEXT NOT NULL, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, payload_json TEXT NOT NULL, run_id TEXT,
+                sensitive_write_operation_id TEXT, approval_id TEXT)""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_calls_call_key
+                ON workflow_calls (tenant_id, call_key)""",
+            """CREATE INDEX IF NOT EXISTS idx_workflow_calls_execution
+                ON workflow_calls (tenant_id, business_execution_id, created_at)""",
+            """CREATE TABLE IF NOT EXISTS workflow_execution_events (
+                event_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, business_execution_id
+                TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL, event_type TEXT NOT NULL, created_at TEXT NOT NULL,
+                evidence_json TEXT NOT NULL)""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_events_idempotency
+                ON workflow_execution_events (tenant_id, business_execution_id, idempotency_key)""",
+            """CREATE TABLE IF NOT EXISTS business_value_events (
+                event_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, business_execution_id
+                TEXT NOT NULL,
+                completion_key TEXT NOT NULL, upstream_name TEXT NOT NULL, outcome_namespace TEXT,
+                outcome_digest TEXT, credited BOOLEAN NOT NULL, created_at TEXT NOT NULL,
+                evidence_json TEXT NOT NULL)""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_business_value_completion
+                ON business_value_events (tenant_id, business_execution_id, completion_key)""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_business_value_outcome_identity
+                ON business_value_events (tenant_id, upstream_name, outcome_namespace,
+                outcome_digest)
+                WHERE outcome_namespace IS NOT NULL AND outcome_digest IS NOT NULL""",
+            """CREATE OR REPLACE FUNCTION mcpcodeaway_reject_audit_mutation() RETURNS trigger
+                LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'append-only audit record'; END $$""",
+            """CREATE TRIGGER immutable_definition_versions
+                BEFORE UPDATE OR DELETE ON integration_definition_versions
+                FOR EACH ROW EXECUTE FUNCTION mcpcodeaway_reject_audit_mutation()""",
+            """CREATE TRIGGER append_only_definition_publications
+                BEFORE UPDATE OR DELETE ON integration_definition_publications
+                FOR EACH ROW EXECUTE FUNCTION mcpcodeaway_reject_audit_mutation()""",
+            """CREATE TRIGGER append_only_workflow_execution_events
+                BEFORE UPDATE OR DELETE ON workflow_execution_events
+                FOR EACH ROW EXECUTE FUNCTION mcpcodeaway_reject_audit_mutation()""",
+            """CREATE TRIGGER append_only_business_value_events
+                BEFORE UPDATE OR DELETE ON business_value_events
+                FOR EACH ROW EXECUTE FUNCTION mcpcodeaway_reject_audit_mutation()""",
+        ),
+    ),
 )
 
 EXPECTED_COLUMNS: dict[str, set[str]] = {
@@ -187,6 +268,90 @@ EXPECTED_COLUMNS: dict[str, set[str]] = {
         "expires_at",
         "updated_at",
     },
+    "integration_definition_versions": {
+        "tenant_id",
+        "upstream_name",
+        "revision",
+        "definition_digest",
+        "definition_json",
+        "created_at",
+    },
+    "integration_definition_publications": {
+        "event_id",
+        "tenant_id",
+        "upstream_name",
+        "action",
+        "revision",
+        "actor_sub",
+        "created_at",
+        "evidence_json",
+    },
+    "workflow_executions": {
+        "business_execution_id",
+        "tenant_id",
+        "caller_sub",
+        "client_id",
+        "kind",
+        "upstream_name",
+        "definition_revision",
+        "status",
+        "created_at",
+        "expires_at",
+        "standalone_call_key",
+        "active_write_call_id",
+        "write_lease_until",
+        "start_request_id",
+        "start_request_digest",
+        "payload_json",
+    },
+    "workflow_request_bindings": {
+        "tenant_id",
+        "business_execution_id",
+        "outer_request_id",
+        "request_digest",
+        "created_at",
+    },
+    "workflow_calls": {
+        "workflow_call_id",
+        "tenant_id",
+        "business_execution_id",
+        "call_key",
+        "outer_request_id",
+        "callback_ordinal",
+        "upstream_name",
+        "tool_name",
+        "request_digest",
+        "tool_qualified_name",
+        "arguments_digest",
+        "status",
+        "created_at",
+        "updated_at",
+        "payload_json",
+        "run_id",
+        "sensitive_write_operation_id",
+        "approval_id",
+    },
+    "workflow_execution_events": {
+        "event_id",
+        "tenant_id",
+        "business_execution_id",
+        "idempotency_key",
+        "event_type",
+        "created_at",
+        "evidence_json",
+    },
+    "business_value_events": {
+        "event_id",
+        "tenant_id",
+        "business_execution_id",
+        "completion_key",
+        "upstream_name",
+        "outcome_namespace",
+        "outcome_digest",
+        "credited",
+        "created_at",
+        "evidence_json",
+    },
 }
 
 EXPECTED_INDEXES: dict[str, tuple[str, bool]] = {
@@ -211,6 +376,20 @@ EXPECTED_INDEXES: dict[str, tuple[str, bool]] = {
     "sensitive_write_audits_pkey": ("sensitive_write_audits", True),
     "sensitive_write_audits_dedupe_key_key": ("sensitive_write_audits", True),
     "user_upstream_credentials_pkey": ("user_upstream_credentials", True),
+    "integration_definition_versions_pkey": ("integration_definition_versions", True),
+    "integration_definition_publications_pkey": ("integration_definition_publications", True),
+    "idx_definition_publications_latest": ("integration_definition_publications", False),
+    "workflow_executions_pkey": ("workflow_executions", True),
+    "idx_workflow_execution_start_request": ("workflow_executions", True),
+    "workflow_request_bindings_pkey": ("workflow_request_bindings", True),
+    "workflow_calls_pkey": ("workflow_calls", True),
+    "idx_workflow_calls_call_key": ("workflow_calls", True),
+    "idx_workflow_calls_execution": ("workflow_calls", False),
+    "workflow_execution_events_pkey": ("workflow_execution_events", True),
+    "idx_workflow_events_idempotency": ("workflow_execution_events", True),
+    "business_value_events_pkey": ("business_value_events", True),
+    "idx_business_value_completion": ("business_value_events", True),
+    "idx_business_value_outcome_identity": ("business_value_events", True),
 }
 
 
