@@ -19,7 +19,7 @@ from gateway.config import GatewaySettings
 from gateway.server import _is_dependency_connection_error, create_gateway_app
 from gateway.state import SQLiteAuditStore
 from gateway.telemetry import TelemetryRecorder
-from gateway.upstream_clients import validate_upstream_url
+from gateway.upstream_clients import _PINNED_DNS, _PinnedNetworkBackend, validate_upstream_url
 
 
 def _make_app(
@@ -205,7 +205,7 @@ def test_shared_dependency_connection_errors_are_recognized() -> None:
     assert not _is_dependency_connection_error(ValueError("bad input"))
 
 
-def test_validate_upstream_url_ssrf_rules() -> None:
+def test_validate_upstream_url_ssrf_rules(monkeypatch: pytest.MonkeyPatch) -> None:
     for bad in (
         "file:///etc/passwd",
         "ftp://example.com/spec.json",
@@ -232,11 +232,88 @@ def test_validate_upstream_url_ssrf_rules() -> None:
             validate_upstream_url(prod_bad, app_env="prod")
 
     validate_upstream_url("https://api.stripe.com/v1", app_env="prod")
+    monkeypatch.setattr(
+        "gateway.upstream_clients.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("10.20.0.14", 80))],
+    )
     validate_upstream_url(
         "http://billing.internal/openapi.json",
         app_env="prod",
         allowed_hosts=["billing.internal"],
     )
+
+
+@pytest.mark.asyncio
+async def test_pinned_connection_ignores_dns_change_after_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validated = ("8.8.8.8",)
+    monkeypatch.setattr(
+        "gateway.upstream_clients.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("8.8.8.8", 443))],
+    )
+    assert (
+        validate_upstream_url(
+            "https://api.example.test/tool",
+            app_env="prod",
+            resolve_dns=True,
+        )
+        == validated
+    )
+
+    monkeypatch.setattr(
+        "gateway.upstream_clients.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("127.0.0.1", 443))],
+    )
+
+    class Stream:
+        def get_extra_info(self, name: str):
+            return ("8.8.8.8", 443) if name == "server_addr" else None
+
+        async def aclose(self) -> None:
+            return None
+
+    class Backend:
+        def __init__(self) -> None:
+            self.hosts: list[str] = []
+
+        async def connect_tcp(self, host: str, _port: int, **_kwargs):
+            self.hosts.append(host)
+            return Stream()
+
+    backend = _PinnedNetworkBackend()
+    fake_backend = Backend()
+    backend._backend = fake_backend
+    token = _PINNED_DNS.set({"api.example.test": validated})
+    try:
+        stream = await backend.connect_tcp("api.example.test", 443)
+    finally:
+        _PINNED_DNS.reset(token)
+    assert fake_backend.hosts == ["8.8.8.8"]
+    assert stream.get_extra_info("server_addr") == ("8.8.8.8", 443)
+
+
+@pytest.mark.asyncio
+async def test_pinned_connection_rejects_unexpected_connected_peer() -> None:
+    class Stream:
+        def get_extra_info(self, name: str):
+            return ("127.0.0.1", 443) if name == "server_addr" else None
+
+        async def aclose(self) -> None:
+            return None
+
+    class Backend:
+        async def connect_tcp(self, *_args, **_kwargs):
+            return Stream()
+
+    backend = _PinnedNetworkBackend()
+    backend._backend = Backend()
+    token = _PINNED_DNS.set({"api.example.test": ("8.8.8.8",)})
+    try:
+        with pytest.raises(OSError, match="peer did not match"):
+            await backend.connect_tcp("api.example.test", 443)
+    finally:
+        _PINNED_DNS.reset(token)
 
 
 @pytest.mark.asyncio

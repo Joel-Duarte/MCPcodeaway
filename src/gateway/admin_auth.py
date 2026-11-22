@@ -101,6 +101,7 @@ class AdminSessionManager:
             "groups": list(identity.groups),
             "scopes": list(identity.scopes),
             "client_groups": list(identity.client_groups),
+            "group_membership_complete": identity.group_membership_complete,
             "exp": session_exp,
         }
         encoded = _b64u_encode(
@@ -138,6 +139,7 @@ class AdminSessionManager:
                 groups=list(payload.get("groups") or []),
                 scopes=list(payload.get("scopes") or []),
                 client_groups=list(payload.get("client_groups") or []),
+                group_membership_complete=bool(payload.get("group_membership_complete", True)),
                 claims=payload,
             )
         except Exception:

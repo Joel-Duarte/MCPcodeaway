@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import quote, urlparse
 
 import httpx
 import jwt
@@ -27,11 +30,18 @@ _TRACER = trace.get_tracer("mcpcodeaway.auth")
 class AuthError(Exception):
     """Authentication or authorization error mapped cleanly to HTTP responses."""
 
-    def __init__(self, status_code: int, detail: str, www_authenticate: str | None = None) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+        www_authenticate: str | None = None,
+        claims_challenge: str | None = None,
+    ) -> None:
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
         self.www_authenticate = www_authenticate
+        self.claims_challenge = claims_challenge
 
 
 class UserCredentialRequiredError(Exception):
@@ -67,6 +77,7 @@ class CallerIdentity(BaseModel):
     roles: list[str] = Field(default_factory=list)
     scopes: list[str] = Field(default_factory=list)
     client_groups: list[str] = Field(default_factory=list)
+    group_membership_complete: bool = True
     raw_token: str = Field(default="", exclude=True)
     claims: dict[str, Any] = Field(default_factory=dict)
 
@@ -327,6 +338,9 @@ def claims_to_identity(
     client_groups = _extract_str_list(
         claims, mapping.client_groups, "client_groups", "allowed_regions", "regions"
     )
+    overage = bool(claims.get("hasgroups")) or (
+        isinstance(claims.get("_claim_names"), dict) and "groups" in claims["_claim_names"]
+    )
     return CallerIdentity(
         sub=sub,
         tenant_id=tenant_id,
@@ -336,6 +350,7 @@ def claims_to_identity(
         roles=roles,
         scopes=scopes,
         client_groups=client_groups,
+        group_membership_complete=not overage,
         raw_token=raw_token,
         claims=claims,
     )
@@ -349,10 +364,12 @@ class OidcTokenValidator:
         settings: GatewaySettings,
         dev_keys: LocalDevKeyManager | None = None,
         http_client: httpx.AsyncClient | None = None,
+        group_resolver: Callable[[CallerIdentity], Awaitable[list[str]]] | None = None,
     ) -> None:
         self.settings = settings
         self.dev_keys = dev_keys
         self._http_client = http_client
+        self.group_resolver = group_resolver
         self._jwks_cache: dict[str, Any] | None = None
         self._jwks_expires_at: float = 0.0
 
@@ -464,6 +481,19 @@ class OidcTokenValidator:
             and identity.tenant_id not in self.settings.allowed_tenants
         ):
             raise AuthError(403, f"Tenant '{identity.tenant_id}' is not permitted")
+        if not identity.group_membership_complete and self.group_resolver is not None:
+            try:
+                identity.groups = await self.group_resolver(identity)
+                identity.group_membership_complete = True
+            except Exception as exc:
+                identity.groups = []
+                identity.group_membership_complete = False
+                log_event(
+                    "auth.group_overage_resolution_failed",
+                    level=logging.WARNING,
+                    tenant_id=identity.tenant_id,
+                    error_type=type(exc).__name__,
+                )
         return identity
 
     async def validate_authorization_header(self, auth_header: str | None) -> CallerIdentity:
@@ -499,6 +529,11 @@ class PolicyEvaluator:
                     f"caller has roles={identity.roles}). "
                     "Tell the user to request one of the required App Roles from their IdP admin."
                 ),
+            )
+        if upstream.allowed_groups and not identity.group_membership_complete:
+            return False, (
+                f"Caller group membership could not be resolved for '{upstream.name}'; "
+                "group-dependent access is denied."
             )
         if upstream.allowed_groups and not (set(identity.groups) & set(upstream.allowed_groups)):
             return (
@@ -612,6 +647,8 @@ class DelegatedTokenExchanger:
             started = time.perf_counter()
             dialect = dialect_override or self.settings.token_exchange_dialect
             token_endpoint = token_endpoint_override or self.settings.oidc_token_endpoint
+            if dialect == "entra_v2_obo" and token_endpoint:
+                token_endpoint = self._tenant_specific_endpoint(token_endpoint, identity)
             client_id = client_id_override or self.settings.oidc_client_id
             client_secret = (
                 client_secret_override
@@ -706,6 +743,26 @@ class DelegatedTokenExchanger:
                 expires_in=expires_in,
             )
 
+    def _tenant_specific_endpoint(self, endpoint: str, identity: CallerIdentity) -> str:
+        if "{tenant_id}" in endpoint:
+            endpoint = endpoint.replace("{tenant_id}", quote(identity.tenant_id, safe=""))
+        parsed = urlparse(endpoint)
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise AuthError(500, "Entra OBO token endpoint must be an absolute HTTPS URL")
+        if self.settings.app_env == "prod":
+            issuer_host = urlparse(self.settings.oidc_issuer).hostname
+            path_parts = [part for part in parsed.path.split("/") if part]
+            if (
+                parsed.hostname != issuer_host
+                or not path_parts
+                or path_parts[0] != identity.tenant_id
+            ):
+                raise AuthError(
+                    500,
+                    "Production Entra OBO requires a token endpoint for the verified caller tenant",
+                )
+        return endpoint
+
     async def _exchange_http(
         self,
         *,
@@ -744,6 +801,11 @@ class DelegatedTokenExchanger:
                 "client_secret": effective_client_secret,
             }
         elif dialect == "entra_v2_obo":
+            if "://" in scope and not scope.startswith(f"{audience}/"):
+                raise AuthError(
+                    500,
+                    "Entra OBO scope must target the configured downstream audience",
+                )
             form_data = {
                 "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
                 "assertion": identity.raw_token,
@@ -770,13 +832,106 @@ class DelegatedTokenExchanger:
                 )
 
         if resp.status_code >= 400:
-            raise AuthError(502, f"Token exchange failed ({resp.status_code}): {resp.text}")
+            challenge: str | None = None
+            try:
+                error_body = resp.json()
+                challenge_val = error_body.get("claims") if isinstance(error_body, dict) else None
+                if (
+                    isinstance(challenge_val, str)
+                    and challenge_val
+                    and re.fullmatch(r"[A-Za-z0-9_+/=-]{1,4096}", challenge_val)
+                ):
+                    challenge = challenge_val[:4096]
+            except (ValueError, json.JSONDecodeError):
+                pass
+            raise AuthError(
+                502,
+                f"Token exchange failed ({resp.status_code})",
+                www_authenticate=(
+                    f'Bearer claims="{challenge}"' if challenge is not None else None
+                ),
+                claims_challenge=challenge,
+            )
         body = resp.json()
         token = body.get("access_token")
         if not token:
             raise AuthError(502, "Token exchange response missing access_token")
         expires_in = int(body.get("expires_in", self.settings.token_cache_ttl_seconds))
         return str(token), expires_in
+
+
+class EntraGroupMembershipResolver:
+    """Resolve Entra group-overage claims using caller-delegated Microsoft Graph access."""
+
+    _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+    def __init__(
+        self,
+        *,
+        settings: GatewaySettings,
+        exchanger: DelegatedTokenExchanger,
+        cache: CacheBackend,
+        upstream_client: Any,
+    ) -> None:
+        self.settings = settings
+        self.exchanger = exchanger
+        self.cache = cache
+        self.upstream_client = upstream_client
+
+    async def __call__(self, identity: CallerIdentity) -> list[str]:
+        object_id = str(identity.claims.get("oid") or "")
+        if not object_id:
+            raise AuthError(403, "Entra group overage requires the verified oid claim")
+        cache_key = f"entra_groups:{identity.tenant_id}:{object_id}"
+        cached = await self.cache.get(cache_key)
+        if cached is not None:
+            parsed = json.loads(cached)
+            if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
+                return parsed
+
+        exchanged = await self.exchanger.exchange(
+            identity,
+            audience="https://graph.microsoft.com",
+            scope=self.settings.entra_graph_scope,
+            dialect_override="entra_v2_obo",
+        )
+        headers = {"Authorization": f"Bearer {exchanged.access_token}"}
+        next_url = (
+            f"{self._GRAPH_BASE}/users/{quote(object_id, safe='')}/"
+            "transitiveMemberOf/microsoft.graph.group?$select=id&$top=999"
+        )
+        groups: list[str] = []
+        while next_url:
+            parsed_url = urlparse(next_url)
+            if parsed_url.scheme != "https" or parsed_url.hostname != "graph.microsoft.com":
+                raise AuthError(502, "Microsoft Graph returned an untrusted pagination URL")
+            response = await self.upstream_client._request(
+                "GET", next_url, headers=headers, timeout_seconds=10.0
+            )
+            if response.status_code >= 400:
+                challenge = response.headers.get("WWW-Authenticate")
+                raise AuthError(
+                    403,
+                    f"Microsoft Graph group resolution failed ({response.status_code})",
+                    www_authenticate=challenge,
+                )
+            body = response.json()
+            rows = body.get("value") if isinstance(body, dict) else None
+            if not isinstance(rows, list):
+                raise AuthError(502, "Microsoft Graph group response was malformed")
+            for row in rows:
+                group_id = row.get("id") if isinstance(row, dict) else None
+                if isinstance(group_id, str) and group_id:
+                    groups.append(group_id)
+            next_url = str(body.get("@odata.nextLink") or "") if isinstance(body, dict) else ""
+
+        groups = sorted(set(groups))
+        await self.cache.set(
+            cache_key,
+            json.dumps(groups, separators=(",", ":")),
+            ttl_seconds=self.settings.entra_group_cache_ttl_seconds,
+        )
+        return groups
 
 
 class ClientCredentialsProvider:

@@ -11,6 +11,7 @@ import random
 import re
 import time
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -35,7 +36,7 @@ from gateway.errors import (
     UpstreamFailure,
     classify_upstream_error,
 )
-from gateway.observability import MetricsRegistry, log_event
+from gateway.observability import MetricsRegistry, get_request_context, log_event
 from gateway.secrets import CredentialVault, SecretResolver
 from gateway.state import CacheBackend
 from gateway.upstream_clients import DiscoveredTool, UpstreamClientManager, validate_upstream_url
@@ -323,6 +324,10 @@ def _apply_pre_call_abac(
     for rule in upstream.abac_rules:
         if not rule.enforce_on_args or not rule.arg_name:
             continue
+        if rule.claim == "groups" and not identity.group_membership_complete:
+            raise PermissionError(
+                "ABAC policy denied: caller group membership could not be resolved"
+            )
         allowed_vals = _resolve_identity_claim_values(identity, rule.claim)
         if "ALL" in allowed_vals or "*" in allowed_vals:
             continue
@@ -360,6 +365,10 @@ def _apply_post_call_abac_with_count(
     for rule in upstream.abac_rules:
         if not rule.filter_response_rows or not rule.row_field:
             continue
+        if rule.claim == "groups" and not identity.group_membership_complete:
+            raise PermissionError(
+                "ABAC policy denied: caller group membership could not be resolved"
+            )
         allowed_vals = _resolve_identity_claim_values(identity, rule.claim)
         if "ALL" in allowed_vals or "*" in allowed_vals:
             continue
@@ -429,6 +438,7 @@ class HostDispatcher:
         client_credentials: ClientCredentialsProvider | None = None,
         connect_signing_key: bytes | None = None,
         http_client: httpx.AsyncClient | None = None,
+        audit_store: Any | None = None,
     ) -> None:
         self.settings = settings
         self.policy = policy
@@ -446,7 +456,72 @@ class HostDispatcher:
         )
         self._connect_signing_key = connect_signing_key
         self._http_client = http_client
+        self.audit_store = audit_store
         self._refresh_locks: dict[str, asyncio.Lock] = {}
+
+    async def _prepare_sensitive_write_audit(
+        self,
+        identity: CallerIdentity,
+        tool: DiscoveredTool,
+        upstream: UpstreamConfig,
+        arguments: dict[str, Any],
+    ) -> str | None:
+        effect = upstream.tool_effects.get(tool.name, "write" if tool.mutating else "read")
+        if effect == "read" and not tool.mutating:
+            return None
+        if self.audit_store is None or not hasattr(
+            self.audit_store, "prepare_sensitive_write_audit"
+        ):
+            raise RuntimeError("Durable sensitive-write audit storage is unavailable")
+        correlation_id = get_request_context().get("request_id") or uuid.uuid4().hex
+        encoded_args = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(encoded_args.encode("utf-8")).hexdigest()
+        dedupe_key = hashlib.sha256(
+            "\0".join(
+                (
+                    identity.tenant_id,
+                    identity.sub,
+                    correlation_id,
+                    upstream.name,
+                    tool.name,
+                    digest,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        now = datetime.now(UTC).isoformat()
+        row, _ = await self.audit_store.prepare_sensitive_write_audit(
+            {
+                "operation_id": uuid.uuid4().hex,
+                "tenant_id": identity.tenant_id,
+                "caller_sub": identity.sub,
+                "upstream_name": upstream.name,
+                "tool_name": tool.name,
+                "request_digest": digest,
+                "correlation_id": correlation_id,
+                "dedupe_key": dedupe_key,
+                "created_at": now,
+            }
+        )
+        if row.get("request_digest") != digest:
+            raise PermissionError(
+                "Sensitive write request correlation was reused with new arguments"
+            )
+        operation_id = str(row["operation_id"])
+        if not await self.audit_store.claim_sensitive_write_audit(
+            operation_id, datetime.now(UTC).isoformat()
+        ):
+            raise PermissionError(
+                f"Duplicate sensitive write blocked; audit operation {operation_id} "
+                f"is {row.get('status', 'already claimed')}"
+            )
+        return operation_id
+
+    async def _finish_sensitive_write_audit(self, operation_id: str, status: str) -> bool:
+        if self.audit_store is None:
+            return False
+        return await self.audit_store.finish_sensitive_write_audit(
+            operation_id, status, datetime.now(UTC).isoformat()
+        )
 
     def _build_connect_url(self, identity: CallerIdentity, upstream: UpstreamConfig) -> str:
         base = self.settings.gateway_public_url.rstrip("/")
@@ -778,6 +853,10 @@ class HostDispatcher:
             cache_hit = False
             audience: str | None = None
             retry_attempts = 0
+            audit_operation_id: str | None = None
+            audit_claimed = False
+            audit_completed = False
+            upstream_execution_succeeded = False
             try:
                 if (
                     upstream.health_check.enabled
@@ -850,12 +929,26 @@ class HostDispatcher:
 
                 try:
                     await check_upstream_rate()
+                    audit_operation_id = await self._prepare_sensitive_write_audit(
+                        identity, tool, upstream, scoped_args
+                    )
+                    audit_claimed = audit_operation_id is not None
                     raw_result = await self.client_manager.call_tool(
                         upstream,
                         tool,
                         scoped_args,
                         auth_headers=auth_headers,
                     )
+                    upstream_execution_succeeded = True
+                    if audit_operation_id is not None:
+                        finalized = await self._finish_sensitive_write_audit(
+                            audit_operation_id, "succeeded"
+                        )
+                        if not finalized:
+                            raise RuntimeError(
+                                "Sensitive write completed but its audit status could not be saved"
+                            )
+                        audit_completed = True
                 except Exception as first_error:
                     first_failure = classify_upstream_error(
                         first_error, operation_is_read=operation_is_read
@@ -909,6 +1002,22 @@ class HostDispatcher:
                         ),
                     )
                 )
+                if audit_claimed and not audit_completed and audit_operation_id is not None:
+                    final_status = (
+                        "outcome_unknown"
+                        if failure.outcome_unknown or upstream_execution_succeeded
+                        else "failed"
+                    )
+                    try:
+                        await self._finish_sensitive_write_audit(audit_operation_id, final_status)
+                    except Exception as audit_error:
+                        log_event(
+                            "audit.sensitive_write_status_failed",
+                            level=logging.ERROR,
+                            operation_id=audit_operation_id,
+                            status=final_status,
+                            error_type=type(audit_error).__name__,
+                        )
                 safe_error = OutputRedactor.redact_text(failure.message)
                 record = SubcallRecord(
                     tool=tool.qualified_name,

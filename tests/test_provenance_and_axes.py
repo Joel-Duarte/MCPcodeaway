@@ -132,6 +132,29 @@ async def test_decoupled_execution_and_discovery_2x2_axes(tmp_path) -> None:
                     exec_res["result"]["structuredContent"]["result"]["customer_id"] == "CUST-1003"
                 )
 
+                explicit_classic = await gw.post(
+                    "/mcp?execution=classic",
+                    headers={
+                        "Authorization": f"Bearer {fin_token}",
+                        **request_headers("tools/call", tool_name="execute_code"),
+                    },
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 31,
+                        "method": "tools/call",
+                        "params": {
+                            "_meta": request_meta(),
+                            "name": "execute_code",
+                            "arguments": {"code": "1 + 1"},
+                        },
+                    },
+                )
+                assert explicit_classic.status_code == 200
+                assert (
+                    "disabled in traditional_discover mode"
+                    in explicit_classic.json()["error"]["message"]
+                )
+
                 def_cm = await _post_mcp(
                     gw,
                     fin_token,
@@ -281,7 +304,11 @@ async def test_provenance_envelope_and_grounding_policy(tmp_path) -> None:
         await backend_client.aclose()
 
 
-async def test_remote_worker_ws_auth_and_prod_fail_closed(tmp_path) -> None:
+async def test_remote_worker_ws_auth_and_prod_fail_closed(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "gateway.upstream_clients.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("8.8.8.8", 443))],
+    )
     port = _free_port()
     secret = "super-secret-ws-key"
     worker_app = create_sandbox_worker_app(min_processes=1, max_processes=2, worker_secret=secret)

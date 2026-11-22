@@ -356,6 +356,20 @@ class AuditStore(Protocol):
         self, operation: dict[str, Any]
     ) -> tuple[dict[str, Any], bool]: ...
 
+    async def prepare_sensitive_write_audit(
+        self, operation: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]: ...
+
+    async def claim_sensitive_write_audit(self, operation_id: str, started_at: str) -> bool: ...
+
+    async def finish_sensitive_write_audit(
+        self, operation_id: str, status: str, updated_at: str
+    ) -> bool: ...
+
+    async def get_sensitive_write_audit_by_dedupe_key(
+        self, dedupe_key: str
+    ) -> dict[str, Any] | None: ...
+
     async def get_operation(self, operation_id: str) -> dict[str, Any] | None: ...
 
     async def get_operation_by_dedupe_key(self, dedupe_key: str) -> dict[str, Any] | None: ...
@@ -542,6 +556,21 @@ class SQLiteAuditStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS sensitive_write_audits (
+                operation_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                caller_sub TEXT NOT NULL,
+                upstream_name TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                request_digest TEXT NOT NULL,
+                correlation_id TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )"""
         )
         conn.execute(
@@ -1410,6 +1439,75 @@ class SQLiteAuditStore:
             raise RuntimeError("Operation insert did not produce a durable row")
         return decoded, cursor.rowcount > 0
 
+    async def prepare_sensitive_write_audit(
+        self, operation: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        async with self._lock:
+            conn = self._ensure_conn()
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO sensitive_write_audits (
+                    operation_id, tenant_id, caller_sub, upstream_name, tool_name,
+                    request_digest, correlation_id, dedupe_key, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?)""",
+                (
+                    operation["operation_id"],
+                    operation["tenant_id"],
+                    operation["caller_sub"],
+                    operation["upstream_name"],
+                    operation["tool_name"],
+                    operation["request_digest"],
+                    operation["correlation_id"],
+                    operation["dedupe_key"],
+                    operation["created_at"],
+                    operation["created_at"],
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM sensitive_write_audits WHERE dedupe_key=?",
+                (operation["dedupe_key"],),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Sensitive write audit preparation was not durable")
+        return dict(row), cursor.rowcount > 0
+
+    async def claim_sensitive_write_audit(self, operation_id: str, started_at: str) -> bool:
+        async with self._lock:
+            conn = self._ensure_conn()
+            cursor = conn.execute(
+                "UPDATE sensitive_write_audits SET status='executing', updated_at=? "
+                "WHERE operation_id=? AND status='prepared'",
+                (started_at, operation_id),
+            )
+            conn.commit()
+        return cursor.rowcount == 1
+
+    async def finish_sensitive_write_audit(
+        self, operation_id: str, status: str, updated_at: str
+    ) -> bool:
+        if status not in {"succeeded", "failed", "outcome_unknown"}:
+            raise ValueError("invalid sensitive write audit status")
+        async with self._lock:
+            conn = self._ensure_conn()
+            cursor = conn.execute(
+                "UPDATE sensitive_write_audits SET status=?, updated_at=? "
+                "WHERE operation_id=? AND status='executing'",
+                (status, updated_at, operation_id),
+            )
+            conn.commit()
+        return cursor.rowcount == 1
+
+    async def get_sensitive_write_audit_by_dedupe_key(
+        self, dedupe_key: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            row = (
+                self._ensure_conn()
+                .execute("SELECT * FROM sensitive_write_audits WHERE dedupe_key=?", (dedupe_key,))
+                .fetchone()
+            )
+        return dict(row) if row is not None else None
+
     async def get_operation(self, operation_id: str) -> dict[str, Any] | None:
         async with self._lock:
             row = (
@@ -1709,6 +1807,21 @@ class PostgresAuditStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL
+            )"""
+        )
+        await pool.execute(
+            """CREATE TABLE IF NOT EXISTS sensitive_write_audits (
+                operation_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                caller_sub TEXT NOT NULL,
+                upstream_name TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                request_digest TEXT NOT NULL,
+                correlation_id TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )"""
         )
         await pool.execute(
@@ -2474,6 +2587,68 @@ class PostgresAuditStore:
         if decoded is None:
             raise RuntimeError("Operation insert did not produce a durable row")
         return decoded, inserted is not None
+
+    async def prepare_sensitive_write_audit(
+        self, operation: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        pool = await self._get_pool()
+        inserted = await pool.fetchrow(
+            """INSERT INTO sensitive_write_audits (
+                operation_id, tenant_id, caller_sub, upstream_name, tool_name,
+                request_digest, correlation_id, dedupe_key, status, created_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'prepared',$9,$9)
+            ON CONFLICT (dedupe_key) DO NOTHING RETURNING *""",
+            operation["operation_id"],
+            operation["tenant_id"],
+            operation["caller_sub"],
+            operation["upstream_name"],
+            operation["tool_name"],
+            operation["request_digest"],
+            operation["correlation_id"],
+            operation["dedupe_key"],
+            operation["created_at"],
+        )
+        row = inserted or await pool.fetchrow(
+            "SELECT * FROM sensitive_write_audits WHERE dedupe_key=$1",
+            operation["dedupe_key"],
+        )
+        if row is None:
+            raise RuntimeError("Sensitive write audit preparation was not durable")
+        return dict(row), inserted is not None
+
+    async def claim_sensitive_write_audit(self, operation_id: str, started_at: str) -> bool:
+        pool = await self._get_pool()
+        status = await pool.execute(
+            "UPDATE sensitive_write_audits SET status='executing', updated_at=$1 "
+            "WHERE operation_id=$2 AND status='prepared'",
+            started_at,
+            operation_id,
+        )
+        return status.endswith(" 1")
+
+    async def finish_sensitive_write_audit(
+        self, operation_id: str, status: str, updated_at: str
+    ) -> bool:
+        if status not in {"succeeded", "failed", "outcome_unknown"}:
+            raise ValueError("invalid sensitive write audit status")
+        pool = await self._get_pool()
+        result = await pool.execute(
+            "UPDATE sensitive_write_audits SET status=$1, updated_at=$2 "
+            "WHERE operation_id=$3 AND status='executing'",
+            status,
+            updated_at,
+            operation_id,
+        )
+        return result.endswith(" 1")
+
+    async def get_sensitive_write_audit_by_dedupe_key(
+        self, dedupe_key: str
+    ) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        row = await pool.fetchrow(
+            "SELECT * FROM sensitive_write_audits WHERE dedupe_key=$1", dedupe_key
+        )
+        return dict(row) if row is not None else None
 
     async def get_operation(self, operation_id: str) -> dict[str, Any] | None:
         pool = await self._get_pool()

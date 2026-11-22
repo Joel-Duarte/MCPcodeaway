@@ -314,6 +314,9 @@ class GatewaySettings(BaseSettings):
     oidc_token_endpoint: str | None = None
     oidc_client_id: str = "mcp-code-gateway-client"
     oidc_client_secret: str = ""
+    entra_group_overage_resolution_enabled: bool = False
+    entra_graph_scope: str = "https://graph.microsoft.com/.default"
+    entra_group_cache_ttl_seconds: int = Field(default=300, ge=30, le=3600)
     allowed_tenants: list[str] = Field(default_factory=lambda: ["tenant-acme-dev"])
     claim_mapping: ClaimMappingConfig = Field(default_factory=ClaimMappingConfig)
 
@@ -434,6 +437,24 @@ class GatewaySettings(BaseSettings):
                 benchmarks_api=True,
                 dev_auth=(self.auth_mode == "dev"),
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_entra_group_resolution(self) -> GatewaySettings:
+        if self.entra_group_overage_resolution_enabled:
+            if (
+                not self.oidc_token_endpoint
+                or not self.oidc_client_id
+                or not self.oidc_client_secret
+            ):
+                raise ValueError(
+                    "Entra group-overage resolution requires an OBO token endpoint, client ID, "
+                    "and confidential-client secret"
+                )
+            if not self.entra_graph_scope.startswith("https://graph.microsoft.com/"):
+                raise ValueError(
+                    "entra_graph_scope must request delegated permissions for Microsoft Graph"
+                )
         return self
 
     @property

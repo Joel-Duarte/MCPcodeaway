@@ -115,6 +115,16 @@ identity provider when enabled. Admin identities use the separate admin
 authentication flow in section 7. Admin roles do not make ordinary user calls
 skip the request, policy, or data-filtering checks.
 
+Entra group-overage markers (`hasgroups` or `_claim_names.groups`) mark group
+membership as incomplete. When `entra_group_overage_resolution_enabled` is on,
+the validator resolves transitive group IDs through Microsoft Graph using a
+tenant-specific OBO token and caches them by tenant and Entra object ID for the
+configured short TTL. Resolution failure leaves membership incomplete; any
+group-dependent server or ABAC rule denies access. Role and scope checks remain
+independent. Enabling this requires Graph delegated permissions and tenant
+admin consent for the configured `entra_graph_scope`; the gateway does not
+synchronize directory data.
+
 ## 3. Credential selection and linking
 
 After caller authorization, the dispatcher resolves downstream credentials from
@@ -130,7 +140,21 @@ the upstream's configured `auth_type`:
 
 Secret and URL validation is performed before outbound use. In particular,
 user/admin-supplied upstream URLs are checked by `validate_upstream_url`, and
-OpenAPI path parameter values are URL encoded.
+OpenAPI path parameter values are URL encoded. In production, HTTP upstream
+connections resolve and validate all IPv4 and IPv6 destinations for each
+request, connect only to those validated addresses, verify the connected peer,
+and do not follow redirects. Explicit `allowed_upstream_hosts` entries permit
+private corporate API addresses, while metadata, link-local, loopback, and
+other prohibited destinations remain blocked. The pinned upstream transport is
+separate from shared OIDC and credential HTTP clients.
+
+For Entra OBO, configure an HTTPS token endpoint on the same authority host as
+the validated OIDC issuer, with the verified tenant ID in the authority path
+or a `{tenant_id}` path placeholder. Configure an audience and a scope belonging
+to that same downstream resource (normally its `/.default` scope), and grant
+the confidential client the corresponding delegated permissions and consent.
+Claims challenges returned by the token authority are surfaced in
+`WWW-Authenticate`; OBO errors never fall back to client credentials.
 
 ### Per-user OAuth or API key link
 
@@ -177,6 +201,29 @@ can further select an execution strategy.
 | Hybrid | Both direct-call and `execute_code` tools are available. | Keep writes/direct operations available while enabling bundled read workflows. |
 | Auto | Send an intent or request a routing decision. | Choose a strategy from request/model/workload signals; record the decision and reason. |
 
+Mode resolution in the MCP endpoint is deterministic. An authorized operator
+force-mode header takes precedence; otherwise a caller's legacy `mode` query or
+`X-Gateway-Mode` selects a preset, while `execution` / `X-Execution-Mode` and
+`discovery_mode` / `X-Discovery-Mode` can override their respective axes. With
+no fixed execution request, the endpoint starts in Auto. For a targeted tool
+call, a configured per-tool override takes precedence over automatic selection.
+If no tool override applies, a non-`auto` upstream `preferred_mode` applies
+when the target upstream can be identified or all in-scope upstreams agree; an
+explicit discovery setting or intent discovery choice remains independent.
+Otherwise Auto tries the
+configured Classic-versus-Code experiment for eligible read-only workloads,
+then eligible model-profile and adaptive evidence, then the request/workload
+scorer. A/B assignment changes the execution axis only and retains the
+resolved discovery strategy. The selected
+mode and decision reason, and any experiment id and variant, are recorded with
+the execution telemetry.
+
+When a target tool is known, a `read_only_only` experiment checks that tool's
+effect classification. For untargeted workflows, it checks the full candidate
+upstream tool set and excludes mixed read/write upstreams. Auto strategy
+selection does not alter tool permissions, effects, credentials, or approval
+requirements.
+
 Discovery may be upfront (`tools/list`), deferred (`discover_tools` /
 `search_tools`), or intent-filtered. The catalog is populated from configured
 upstreams during startup or an admin refresh. HTTP MCP upstreams use MCP
@@ -222,6 +269,15 @@ approver cannot approve their own request; only one eligible group decision is
 needed. Code Mode cannot bypass a protected direct tool call. The state machine
 and edge cases are described in [state-machines.md](state-machines.md) and
 [approval-gate-enhancements.md](approval-gate-enhancements.md).
+
+Before dispatching a write or high-impact tool, the dispatcher durably records
+`prepared`, then atomically claims it as `executing`. It records `succeeded`,
+`failed`, or `outcome_unknown` after the attempt. The record contains tenant,
+caller, tool, request digest, and correlation ID, but not raw arguments or
+credentials. If the required audit store cannot prepare the record, the
+upstream side effect is not started. If final audit persistence fails after an
+upstream success, the operation is treated as uncertain and its existing claim
+prevents a duplicate execution with the same correlation and request.
 
 Owners: `gateway.server` approval request/continuation handlers, `gateway.state`
 durable nonce and approval state, and `web/app/pages/approvals.vue` for the

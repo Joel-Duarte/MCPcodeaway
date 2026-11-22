@@ -5,10 +5,11 @@ import pytest
 
 from benchmarks.live_llm_bench import export_adaptive_evidence
 from gateway.adaptive_execution import resolve_adaptive_recommendation, summarize_pairs
-from gateway.auth import LocalDevKeyManager
-from gateway.config import GatewaySettings
-from gateway.server import create_gateway_app
+from gateway.auth import CallerIdentity, LocalDevKeyManager
+from gateway.config import AbExperimentConfig, GatewaySettings, UpstreamConfig
+from gateway.server import GatewayRuntime, create_gateway_app
 from gateway.state import SQLiteAuditStore
+from gateway.upstream_clients import DiscoveredTool
 
 
 def _pair(repeats: int = 5, *, cheap_wrong: bool = False) -> list[dict]:
@@ -34,6 +35,214 @@ def _pair(repeats: int = 5, *, cheap_wrong: bool = False) -> list[dict]:
                 }
             )
     return rows
+
+
+@pytest.mark.asyncio
+async def test_ab_assignment_preserves_explicit_execution_and_discovery_axis(tmp_path) -> None:
+    settings = GatewaySettings(
+        auth_mode="dev",
+        sqlite_path=str(tmp_path / "ab-mode-precedence.db"),
+        upstreams_config_path=str(tmp_path / "missing-upstreams.yaml"),
+    )
+    runtime = GatewayRuntime(settings=settings, preloaded_tools={})
+    await runtime.store.init()
+    upstream = UpstreamConfig(
+        name="experiment_api",
+        type="mcp_http",
+        url="https://api.example.test/mcp",
+        auth_type="none",
+        allow_all_callers=True,
+        ab_experiment=AbExperimentConfig(
+            enabled=True,
+            experiment_id="exp_mode_axes",
+            codemode_traffic_pct=100,
+        ),
+    )
+    runtime.registry._static[upstream.name] = upstream
+    identity = CallerIdentity(sub="caller-1", tenant_id="tenant-1")
+
+    explicit = await runtime.resolve_dynamic_mode(
+        identity,
+        requested_exec="classic",
+        requested_disc="upfront",
+        requested_mode="traditional",
+        allowed_servers=None,
+        intent=None,
+        request_id="explicit-classic",
+        explicit_override=False,
+    )
+    assert explicit[:3] == ("classic", "upfront", "traditional")
+    assert explicit[3] == "explicit:traditional"
+    assert explicit[5] is None
+
+    assigned = await runtime.resolve_dynamic_mode(
+        identity,
+        requested_exec="auto",
+        requested_disc="deferred",
+        requested_mode="auto",
+        allowed_servers=None,
+        intent=None,
+        request_id="auto-deferred",
+        explicit_override=False,
+    )
+    assert assigned[:3] == ("codemode", "deferred", "codemode")
+    assert assigned[5:] == ("exp_mode_axes", "codemode")
+
+    runtime.registry._static[upstream.name] = upstream.model_copy(
+        update={"preferred_mode": "traditional_discover"}
+    )
+    preferred = await runtime.resolve_dynamic_mode(
+        identity,
+        requested_exec="auto",
+        requested_disc="upfront",
+        requested_mode="auto",
+        allowed_servers=None,
+        intent=None,
+        request_id="upstream-preference",
+        explicit_override=False,
+        target_tool="experiment_api__get_record",
+    )
+    assert preferred[:3] == ("classic", "deferred", "traditional_discover")
+    assert preferred[3] == "upstream_preference:experiment_api:traditional_discover"
+
+    shared_preference = await runtime.resolve_dynamic_mode(
+        identity,
+        requested_exec="auto",
+        requested_disc="upfront",
+        requested_mode="auto",
+        allowed_servers=None,
+        intent=None,
+        request_id="shared-upstream-preference",
+        explicit_override=False,
+    )
+    assert shared_preference[:3] == ("classic", "deferred", "traditional_discover")
+
+    explicit_discovery = await runtime.resolve_dynamic_mode(
+        identity,
+        requested_exec="auto",
+        requested_disc="upfront",
+        requested_mode="auto",
+        allowed_servers=None,
+        intent=None,
+        request_id="explicit-discovery",
+        explicit_override=False,
+        discovery_override=True,
+        target_tool="experiment_api__get_record",
+    )
+    assert explicit_discovery[:3] == ("classic", "upfront", "traditional")
+
+    runtime.registry._static[upstream.name] = upstream
+    runtime.catalog.list_accessible_tools = lambda *args, **kwargs: [
+        DiscoveredTool(
+            server=upstream.name,
+            name="write_record",
+            qualified_name=f"{upstream.name}__write_record",
+            mutating=True,
+        )
+    ]
+    write_request = await runtime.resolve_dynamic_mode(
+        identity,
+        requested_exec="auto",
+        requested_disc="upfront",
+        requested_mode="auto",
+        allowed_servers=None,
+        intent="update record",
+        request_id="read-only-experiment-write",
+        explicit_override=False,
+        target_tool=f"{upstream.name}__write_record",
+    )
+    assert write_request[5:] == (None, None)
+    assert not str(write_request[3]).startswith("ab_experiment:")
+    await runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_only_experiment_eligibility_is_per_target_tool(tmp_path) -> None:
+    runtime = GatewayRuntime(
+        settings=GatewaySettings(
+            auth_mode="dev",
+            sqlite_path=str(tmp_path / "ab-mixed-upstream.db"),
+            upstreams_config_path=str(tmp_path / "missing-upstreams.yaml"),
+        ),
+        preloaded_tools={},
+    )
+    await runtime.store.init()
+    upstream = UpstreamConfig(
+        name="mixed_api",
+        type="mcp_http",
+        url="https://api.example.test/mcp",
+        auth_type="none",
+        allow_all_callers=True,
+        ab_experiment=AbExperimentConfig(
+            enabled=True,
+            experiment_id="mixed_read_experiment",
+            codemode_traffic_pct=100,
+            read_only_only=True,
+        ),
+        tool_effects={"read_item": "read", "write_item": "write"},
+        mutating_tools=["write_item"],
+    )
+    runtime.registry._static[upstream.name] = upstream
+    runtime.catalog.set_server_tools(
+        upstream,
+        [
+            DiscoveredTool(
+                server="mixed_api",
+                name="read_item",
+                qualified_name="mixed_api__read_item",
+                input_schema={"type": "object", "properties": {}},
+                mutating=False,
+            ),
+            DiscoveredTool(
+                server="mixed_api",
+                name="write_item",
+                qualified_name="mixed_api__write_item",
+                input_schema={"type": "object", "properties": {}},
+                mutating=True,
+            ),
+        ],
+    )
+    identity = CallerIdentity(sub="caller-1", tenant_id="tenant-1")
+
+    read = await runtime.resolve_dynamic_mode(
+        identity,
+        requested_exec="auto",
+        requested_disc="upfront",
+        requested_mode="auto",
+        allowed_servers=None,
+        intent=None,
+        request_id="mixed-read",
+        explicit_override=False,
+        target_tool="mixed_api__read_item",
+    )
+    write = await runtime.resolve_dynamic_mode(
+        identity,
+        requested_exec="auto",
+        requested_disc="upfront",
+        requested_mode="auto",
+        allowed_servers=None,
+        intent=None,
+        request_id="mixed-write",
+        explicit_override=False,
+        target_tool="mixed_api__write_item",
+    )
+    mixed_code = await runtime.resolve_dynamic_mode(
+        identity,
+        requested_exec="auto",
+        requested_disc="upfront",
+        requested_mode="auto",
+        allowed_servers=None,
+        intent=None,
+        request_id="mixed-code-read-write",
+        explicit_override=False,
+        target_tool="mixed_api__read_item",
+        target_tools=["mixed_api__read_item", "mixed_api__write_item"],
+    )
+
+    assert read[5:] == ("mixed_read_experiment", "codemode")
+    assert write[5] is None
+    assert mixed_code[5] is None
+    await runtime.store.close()
 
 
 def test_quality_floor_beats_cheap_incorrect_arm() -> None:

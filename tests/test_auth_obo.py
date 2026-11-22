@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from urllib.parse import parse_qs
 
 import httpx
@@ -12,7 +13,9 @@ from fastapi import FastAPI
 
 from examples.mock_backends import build_synthetic_tools, create_mock_backends_app
 from gateway.auth import (
+    AuthError,
     DelegatedTokenExchanger,
+    EntraGroupMembershipResolver,
     LocalDevKeyManager,
     OidcTokenValidator,
     PolicyEvaluator,
@@ -91,6 +94,156 @@ def test_local_dev_key_manager_accepts_shared_rsa_private_key() -> None:
 def test_oidc_provider_claim_fixtures_map_roles_and_groups(claims, mapping, expected) -> None:
     identity = claims_to_identity(claims, mapping)
     assert (identity.sub, identity.tenant_id, identity.roles, identity.groups) == expected
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"sub": "user", "tid": "tenant", "hasgroups": True},
+        {
+            "sub": "user",
+            "tid": "tenant",
+            "_claim_names": {"groups": "src1"},
+            "_claim_sources": {"src1": {"endpoint": "https://graph.example.test"}},
+        },
+    ],
+)
+def test_entra_group_overage_is_detected_as_incomplete(claims) -> None:
+    identity = claims_to_identity(claims, ClaimMappingConfig())
+    assert identity.groups == []
+    assert identity.group_membership_complete is False
+
+
+def test_entra_group_resolution_requires_graph_obo_configuration() -> None:
+    with pytest.raises(ValueError, match="requires an OBO token endpoint"):
+        GatewaySettings(entra_group_overage_resolution_enabled=True)
+    configured = GatewaySettings(
+        entra_group_overage_resolution_enabled=True,
+        oidc_token_endpoint="https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+        oidc_client_id="gateway-client",
+        oidc_client_secret="configured-secret",
+    )
+    assert configured.entra_group_overage_resolution_enabled
+
+
+def test_unresolved_group_overage_denies_group_dependent_upstream_access() -> None:
+    policy = PolicyEvaluator(GatewaySettings(auth_mode="dev"))
+    identity = claims_to_identity(
+        {"sub": "user", "tid": "tenant", "hasgroups": True, "roles": ["admin"]},
+        ClaimMappingConfig(),
+    )
+    upstream = UpstreamConfig(
+        name="group_api",
+        type="mcp_http",
+        url="https://api.example.test/mcp",
+        allowed_groups=["allowed-group-id"],
+    )
+    allowed, reason = policy.can_access_upstream(identity, upstream)
+    assert not allowed
+    assert reason == (
+        "Caller group membership could not be resolved for 'group_api'; "
+        "group-dependent access is denied."
+    )
+
+
+@pytest.mark.asyncio
+async def test_entra_group_resolver_uses_tenant_user_scoped_cache() -> None:
+    settings = GatewaySettings(entra_graph_scope="https://graph.microsoft.com/.default")
+    cache = InMemoryCacheBackend()
+    exchanged_for: list[tuple[str, str, str]] = []
+
+    class Exchanger:
+        async def exchange(self, identity, audience, scope, **_kwargs):
+            exchanged_for.append((identity.tenant_id, audience, scope))
+            return type("Token", (), {"access_token": f"token-{identity.tenant_id}"})()
+
+    class Client:
+        async def _request(self, method, url, *, headers, **_kwargs):
+            assert method == "GET"
+            assert headers["Authorization"].startswith("Bearer token-")
+            return httpx.Response(200, json={"value": [{"id": "group-1"}]})
+
+    resolver = EntraGroupMembershipResolver(
+        settings=settings,
+        exchanger=Exchanger(),
+        cache=cache,
+        upstream_client=Client(),
+    )
+    first = claims_to_identity(
+        {"sub": "s", "tid": "tenant-a", "oid": "object-a"}, ClaimMappingConfig()
+    )
+    second = claims_to_identity(
+        {"sub": "s", "tid": "tenant-b", "oid": "object-a"}, ClaimMappingConfig()
+    )
+    assert await resolver(first) == ["group-1"]
+    assert await resolver(first) == ["group-1"]
+    assert await resolver(second) == ["group-1"]
+    assert exchanged_for == [
+        ("tenant-a", "https://graph.microsoft.com", settings.entra_graph_scope),
+        ("tenant-b", "https://graph.microsoft.com", settings.entra_graph_scope),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_untrusted_tenant_is_rejected_before_group_resolution() -> None:
+    settings = GatewaySettings(auth_mode="dev", allowed_tenants=["tenant-allowed"])
+    dev_keys = LocalDevKeyManager(issuer=settings.oidc_issuer)
+    resolved = False
+
+    async def group_resolver(_identity):
+        nonlocal resolved
+        resolved = True
+        return ["group"]
+
+    validator = OidcTokenValidator(settings, dev_keys=dev_keys, group_resolver=group_resolver)
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "iss": settings.oidc_issuer,
+            "aud": settings.oidc_audience,
+            "sub": "user",
+            "tid": "tenant-untrusted",
+            "hasgroups": True,
+            "iat": now,
+            "exp": now + 300,
+        },
+        dev_keys.private_pem,
+        algorithm="RS256",
+        headers={"kid": dev_keys.kid},
+    )
+    with pytest.raises(AuthError, match="not permitted"):
+        await validator.validate_token(token)
+    assert not resolved
+
+
+@pytest.mark.asyncio
+async def test_entra_obo_uses_verified_tenant_endpoint_and_propagates_claims_challenge() -> None:
+    identity = claims_to_identity(
+        {"sub": "user", "tid": "tenant-a", "oid": "object-a"}, ClaimMappingConfig()
+    )
+    seen: list[httpx.Request] = []
+
+    def challenged(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(400, json={"error": "interaction_required", "claims": "eyJ4IjoxfQ"})
+
+    settings = GatewaySettings(
+        token_exchange_dialect="entra_v2_obo",
+        oidc_token_endpoint="https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+        oidc_client_id="gateway",
+        oidc_client_secret="secret",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(challenged)) as client:
+        exchanger = DelegatedTokenExchanger(settings, InMemoryCacheBackend(), http_client=client)
+        with pytest.raises(AuthError) as caught:
+            await exchanger.exchange(
+                identity,
+                audience="api://downstream",
+                scope="api://downstream/.default",
+            )
+    assert seen[0].url.path == "/tenant-a/oauth2/v2.0/token"
+    assert caught.value.claims_challenge == "eyJ4IjoxfQ"
+    assert caught.value.www_authenticate == 'Bearer claims="eyJ4IjoxfQ"'
 
 
 def _build_auth_app(

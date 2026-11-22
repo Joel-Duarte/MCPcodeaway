@@ -64,6 +64,7 @@ from gateway.auth import (
     CallerIdentity,
     ClientCredentialsProvider,
     DelegatedTokenExchanger,
+    EntraGroupMembershipResolver,
     LocalDevKeyManager,
     OidcTokenValidator,
     PolicyEvaluator,
@@ -472,6 +473,13 @@ class GatewayRuntime:
             allowed_hosts=self.settings.allowed_upstream_hosts,
             ssrf_protection_enabled=self.settings.ssrf_protection_enabled,
         )
+        if self.settings.entra_group_overage_resolution_enabled:
+            self.validator.group_resolver = EntraGroupMembershipResolver(
+                settings=self.settings,
+                exchanger=self.exchanger,
+                cache=self.cache,
+                upstream_client=self.client_manager,
+            )
         self.upstream_health = UpstreamHealthMonitor(self.client_manager)
         self.process_stats = ProcessStatsCollector()
         self.admin_sessions = AdminSessionManager(self.settings)
@@ -516,6 +524,7 @@ class GatewayRuntime:
             client_credentials=self.client_credentials,
             connect_signing_key=self._connect_signing_key,
             http_client=http_client,
+            audit_store=self.store,
         )
         self.dispatcher.health_monitor = self.upstream_health
         if sandbox_backend is not None:
@@ -672,8 +681,10 @@ class GatewayRuntime:
         intent: str | None,
         request_id: str,
         explicit_override: bool,
+        discovery_override: bool = False,
         model_name: str | None = None,
         target_tool: str | None = None,
+        target_tools: list[str] | None = None,
         workload_profile: str | None = None,
     ) -> tuple[
         ExecutionMode,
@@ -706,9 +717,104 @@ class GatewayRuntime:
                     inferred_tool = t.qualified_name
                     break
 
+        if requested_exec == "auto" and inferred_tool and not explicit_override:
+            server_name = inferred_tool.split("__", 1)[0]
+            preference_upstreams = [
+                upstream for upstream in accessible_srvs if upstream.name == server_name
+            ]
+        elif requested_exec == "auto" and not explicit_override:
+            preference_upstreams = accessible_srvs
+        else:
+            preference_upstreams = []
+
+        preferred_modes = {upstream.preferred_mode for upstream in preference_upstreams}
+        preferred_mode = next(iter(preferred_modes)) if len(preferred_modes) == 1 else None
+        if preferred_mode in _MODE_TO_AXES and preferred_mode != "auto":
+            if all(upstream.preferred_mode == preferred_mode for upstream in preference_upstreams):
+                server_name = (
+                    inferred_tool.split("__", 1)[0]
+                    if inferred_tool
+                    else ",".join(upstream.name for upstream in preference_upstreams)
+                )
+                preferred_exec, preferred_disc = _MODE_TO_AXES[preferred_mode]
+                effective_disc = requested_disc if discovery_override else preferred_disc
+                effective_mode = _axis_to_gateway_mode(preferred_exec, effective_disc)
+                return (
+                    preferred_exec,
+                    effective_disc,
+                    effective_mode,
+                    f"upstream_preference:{server_name}:{preferred_mode}",
+                    None,
+                    None,
+                    None,
+                )
+
         recent = await self.store.list_runs(limit=50, tenant_id=identity.tenant_id)
-        if not explicit_override or requested_exec == "auto":
+        if requested_exec == "auto" and not explicit_override:
+            targeted_workflow = [
+                tool for tool in tools if target_tools and tool.qualified_name in target_tools
+            ]
+            target_effects_read_only = True
+            for tool in targeted_workflow:
+                tool_upstream = next(
+                    (srv for srv in accessible_srvs if srv.name == tool.server), None
+                )
+                if (
+                    tool_upstream is None
+                    or tool.mutating
+                    or tool_upstream.tool_effects.get(tool.name, "read") != "read"
+                ):
+                    target_effects_read_only = False
+                    break
+            targeted_workflow_is_read_only = bool(target_tools) and (
+                len(targeted_workflow) == len(set(target_tools)) and target_effects_read_only
+            )
             for upstream in accessible_srvs:
+                if inferred_tool and not inferred_tool.startswith(f"{upstream.name}__"):
+                    continue
+                experiment = upstream.ab_experiment
+                experiment_tools = [tool for tool in tools if tool.server == upstream.name]
+                if inferred_tool:
+                    targeted_tool = next(
+                        (tool for tool in experiment_tools if tool.qualified_name == inferred_tool),
+                        None,
+                    )
+                    target_name = inferred_tool.split("__", 1)[-1]
+                    target_effect = upstream.tool_effects.get(
+                        target_name,
+                        "write" if target_name in upstream.mutating_tools else "read",
+                    )
+                    target_is_mutating = (
+                        targeted_tool.mutating
+                        if targeted_tool is not None
+                        else target_name in upstream.mutating_tools
+                    )
+                    experiment_tools = [targeted_tool] if targeted_tool is not None else []
+                    target_is_read_only = target_effect == "read" and not target_is_mutating
+                else:
+                    target_is_read_only = False
+                if (
+                    experiment is not None
+                    and experiment.read_only_only
+                    and (
+                        not targeted_workflow_is_read_only
+                        if target_tools is not None
+                        else (
+                            not target_is_read_only
+                            if inferred_tool
+                            else any(
+                                tool.mutating
+                                or upstream.tool_effects.get(tool.name) in {"write", "high_impact"}
+                                for tool in experiment_tools
+                            )
+                        )
+                    )
+                ):
+                    continue
+                if target_tools is not None and not any(
+                    tool.qualified_name in target_tools for tool in experiment_tools
+                ):
+                    continue
                 split = resolve_ab_experiment_variant(
                     upstream,
                     identity,
@@ -719,8 +825,17 @@ class GatewayRuntime:
                 )
                 if split is not None:
                     var_mode, exp_id, variant_lbl, reason = split
-                    var_exec, var_disc = _MODE_TO_AXES[var_mode]
-                    return var_exec, var_disc, var_mode, reason, None, exp_id, variant_lbl
+                    var_exec = _MODE_TO_AXES[var_mode][0]
+                    effective_mode = _axis_to_gateway_mode(var_exec, requested_disc)
+                    return (
+                        var_exec,
+                        requested_disc,
+                        effective_mode,
+                        reason,
+                        None,
+                        exp_id,
+                        variant_lbl,
+                    )
 
         if requested_exec != "auto":
             return (
@@ -2341,16 +2456,28 @@ def create_gateway_app(
                 )
                 eff_exec, eff_disc_mode, effective_mode = _resolve_execution_and_discovery(
                     runtime.settings,
-                    query_mode=forced_mode,
-                    header_mode=None,
-                    query_execution=None if forced_mode else "auto",
-                    header_execution=None,
+                    query_mode=forced_mode or mode,
+                    header_mode=None if forced_mode or mode else x_gateway_mode,
+                    query_execution=(
+                        execution
+                        if execution is not None
+                        else ("auto" if not (forced_mode or mode or x_gateway_mode) else None)
+                    ),
+                    header_execution=None if forced_mode else x_execution_mode,
                     query_discovery_mode=discovery_mode,
                     header_discovery_mode=x_discovery_mode,
                     x_intent=x_intent,
                 )
                 requested_discovery = eff_disc_mode
-                has_explicit_mode = bool(forced_mode)
+                fixed_mode_values = (
+                    mode,
+                    execution,
+                    x_gateway_mode,
+                    x_execution_mode,
+                )
+                has_explicit_mode = bool(forced_mode) or any(
+                    value and value != "auto" for value in fixed_mode_values
+                )
                 mode_decision_reason: str | None = (
                     f"admin_force:{effective_mode}" if forced_mode else f"auto:{effective_mode}"
                 )
@@ -2555,6 +2682,7 @@ def create_gateway_app(
                     )
                 await runtime.ensure_catalog_for_identity(identity)
                 target_tool_hint: str | None = None
+                target_tools_hint: list[str] | None = None
                 if method == "tools/call" and isinstance(params, dict):
                     raw_tname = str(params.get("name") or "")
                     if raw_tname and raw_tname not in {
@@ -2565,15 +2693,18 @@ def create_gateway_app(
                         target_tool_hint = raw_tname
                     elif raw_tname == "execute_code":
                         code_str = str((params.get("arguments") or {}).get("code") or "")
-                        for t in runtime.catalog.list_accessible_tools(
-                            identity,
-                            runtime.policy,
-                            runtime.registry,
-                            allowed_servers=allowed_servers,
-                        ):
-                            if t.qualified_name in code_str:
-                                target_tool_hint = t.qualified_name
-                                break
+                        target_tools_hint = [
+                            t.qualified_name
+                            for t in runtime.catalog.list_accessible_tools(
+                                identity,
+                                runtime.policy,
+                                runtime.registry,
+                                allowed_servers=allowed_servers,
+                            )
+                            if t.qualified_name in code_str
+                        ]
+                        if target_tools_hint:
+                            target_tool_hint = target_tools_hint[0]
                 (
                     eff_exec,
                     eff_disc_mode,
@@ -2598,8 +2729,15 @@ def create_gateway_app(
                     intent=effective_intent,
                     request_id=req_corr_id,
                     explicit_override=has_explicit_mode,
+                    discovery_override=bool(
+                        discovery_mode
+                        or x_discovery_mode
+                        or effective_intent
+                        or runtime.settings.discovery_mode
+                    ),
                     model_name=effective_model_name,
                     target_tool=target_tool_hint,
+                    target_tools=target_tools_hint,
                     workload_profile=x_workload_profile,
                 )
                 if (

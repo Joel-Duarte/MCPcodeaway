@@ -8,11 +8,14 @@ import ipaddress
 import json
 import re
 import socket
+from contextvars import ContextVar
 from typing import Annotated, Any
 from urllib.parse import quote, urlparse
 
+import httpcore
 import httpx
 import yaml
+from httpcore._backends.auto import AutoBackend
 from mcp import Client, StdioServerParameters
 from opentelemetry import propagate
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
@@ -28,6 +31,62 @@ _CLOUD_METADATA_HOSTS = {
     "100.100.100.200",
     "fd00:ec2::254",
 }
+_PINNED_DNS: ContextVar[dict[str, tuple[str, ...]] | None] = ContextVar(
+    "gateway_pinned_dns", default=None
+)
+
+
+class _PinnedNetworkBackend:
+    """Connect sockets only to addresses resolved and checked for the active request."""
+
+    def __init__(self) -> None:
+        self._backend = AutoBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        key = host.strip("[]").lower().rstrip(".")
+        addresses = (_PINNED_DNS.get() or {}).get(key)
+        if not addresses:
+            raise OSError(f"No validated destination addresses for '{host}'")
+        last_error: Exception | None = None
+        for address in addresses:
+            try:
+                stream = await self._backend.connect_tcp(
+                    address,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (OSError, TimeoutError) as exc:
+                last_error = exc
+                continue
+            peer = stream.get_extra_info("server_addr")
+            try:
+                peer_ip = ipaddress.ip_address(str(peer[0]).split("%")[0]) if peer else None
+            except (ValueError, IndexError, TypeError):
+                peer_ip = None
+            if peer_ip is not None and str(peer_ip) in addresses:
+                return stream
+            await stream.aclose()
+            last_error = OSError("Connected peer did not match a validated destination address")
+        raise last_error or OSError(f"Could not connect to validated destination for '{host}'")
+
+    async def connect_unix_socket(
+        self, path: str, timeout: float | None = None, socket_options: Any = None
+    ) -> httpcore.AsyncNetworkStream:
+        return await self._backend.connect_unix_socket(
+            path, timeout=timeout, socket_options=socket_options
+        )
+
+    async def sleep(self, seconds: float) -> None:
+        await self._backend.sleep(seconds)
 
 
 def _check_resolved_ip(
@@ -61,10 +120,10 @@ def validate_upstream_url(
     block_private_ips_in_prod: bool = True,
     allowed_hosts: list[str] | None = None,
     resolve_dns: bool | None = None,
-) -> None:
-    """Reject unsafe URL schemes, cloud metadata hosts, and unallowlisted internal IPs."""
+) -> tuple[str, ...]:
+    """Reject unsafe destinations and return DNS addresses when resolution is requested."""
     if not url:
-        return
+        return ()
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
     if scheme not in {"http", "https"}:
@@ -84,8 +143,7 @@ def validate_upstream_url(
         raise ValueError(f"Blocked cloud metadata endpoint host '{host}' in upstream URL")
 
     allowset = {h.strip().lower().rstrip(".") for h in (allowed_hosts or []) if h.strip()}
-    if host in allowset:
-        return
+    explicitly_allowed = host in allowset
 
     if resolve_dns is None:
         resolve_dns = app_env == "prod" and block_private_ips_in_prod
@@ -96,40 +154,63 @@ def validate_upstream_url(
         ip_obj = None
 
     if ip_obj is not None:
-        _check_resolved_ip(
-            ip_obj,
-            host,
-            app_env=app_env,
-            block_private_ips_in_prod=block_private_ips_in_prod,
-        )
-    elif app_env == "prod" and block_private_ips_in_prod:
-        if host == "localhost" or host.endswith(
-            (".localhost", ".local", ".internal", ".nip.io", ".sslip.io", ".localtest.me")
+        addresses = (str(ip_obj),)
+    elif resolve_dns:
+        if (
+            host == "localhost"
+            or host.endswith(
+                (".localhost", ".local", ".internal", ".nip.io", ".sslip.io", ".localtest.me")
+            )
+            and not explicitly_allowed
         ):
             raise ValueError(
                 f"Blocked local/internal hostname '{host}' in prod; "
                 "add host to allowed_upstream_hosts"
             )
-        if resolve_dns:
+        try:
+            infos = socket.getaddrinfo(
+                host,
+                parsed.port or (443 if scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as exc:
+            raise ValueError(f"Could not resolve upstream hostname '{host}'") from exc
+        resolved: list[str] = []
+        for info in infos:
+            if not info[4]:
+                continue
             try:
-                infos = socket.getaddrinfo(host, None)
-            except socket.gaierror as exc:
-                raise ValueError(f"Could not resolve upstream hostname '{host}'") from exc
-            if not infos:
-                raise ValueError(f"Could not resolve upstream hostname '{host}'")
-            for info in infos:
-                sockaddr = info[4]
-                if sockaddr:
-                    try:
-                        resolved_ip = ipaddress.ip_address(str(sockaddr[0]).split("%")[0])
-                    except ValueError:
-                        continue
-                    _check_resolved_ip(
-                        resolved_ip,
-                        host,
-                        app_env=app_env,
-                        block_private_ips_in_prod=block_private_ips_in_prod,
-                    )
+                address = str(ipaddress.ip_address(str(info[4][0]).split("%")[0]))
+            except ValueError:
+                continue
+            if address not in resolved:
+                resolved.append(address)
+        addresses = tuple(resolved)
+        if not addresses:
+            raise ValueError(f"Could not resolve upstream hostname '{host}'")
+    else:
+        if (
+            app_env == "prod"
+            and block_private_ips_in_prod
+            and not explicitly_allowed
+            and host == "localhost"
+        ):
+            raise ValueError(f"Blocked local/internal hostname '{host}' in prod")
+        return ()
+
+    for address in addresses:
+        resolved_ip = ipaddress.ip_address(address)
+        if str(resolved_ip) in _CLOUD_METADATA_HOSTS:
+            raise ValueError(
+                f"Blocked cloud metadata endpoint IP '{resolved_ip}' for host '{host}'"
+            )
+        _check_resolved_ip(
+            resolved_ip,
+            host,
+            app_env=app_env,
+            block_private_ips_in_prod=block_private_ips_in_prod and not explicitly_allowed,
+        )
+    return addresses
 
 
 _MUTATING_PREFIXES = (
@@ -316,14 +397,54 @@ class UpstreamClientManager:
         self._block_private_ips_in_prod = block_private_ips_in_prod
         self._allowed_hosts = list(allowed_hosts or [])
         self._ssrf_protection_enabled = ssrf_protection_enabled
+        self._pinning_supported = False
+        self._source_ssl_context = self._extract_ssl_context(http_client)
+        if (
+            self._app_env == "prod"
+            and self._ssrf_protection_enabled
+            and http_client is not None
+            and self._source_ssl_context is None
+        ):
+            raise ValueError(
+                "Production upstream pinning requires a standard HTTPX transport so its "
+                "TLS context can be preserved"
+            )
+
+    @staticmethod
+    def _extract_ssl_context(client: httpx.AsyncClient | None) -> Any | None:
+        if client is None:
+            return None
+        transport = getattr(client, "_transport", None)
+        pool = getattr(transport, "_pool", None)
+        if not isinstance(transport, httpx.AsyncHTTPTransport) or not isinstance(
+            pool, httpcore.AsyncConnectionPool
+        ):
+            return None
+        return getattr(pool, "_ssl_context", None)
 
     def _get_client(self) -> httpx.AsyncClient:
-        if self._http_client is not None:
+        if self._http_client is not None and not (
+            self._app_env == "prod" and self._ssrf_protection_enabled
+        ):
             return self._http_client
         if self._owned_client is None:
+            transport = httpx.AsyncHTTPTransport(
+                verify=self._source_ssl_context if self._source_ssl_context is not None else True,
+                trust_env=False,
+                limits=httpx.Limits(
+                    max_connections=100,
+                    max_keepalive_connections=20,
+                    keepalive_expiry=0,
+                ),
+            )
+            pool = transport._pool
+            if isinstance(pool, httpcore.AsyncConnectionPool):
+                pool._network_backend = _PinnedNetworkBackend()
+                self._pinning_supported = True
             self._owned_client = httpx.AsyncClient(
                 timeout=120.0,
-                limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+                transport=transport,
+                trust_env=False,
             )
         return self._owned_client
 
@@ -334,17 +455,35 @@ class UpstreamClientManager:
             self._owned_client = None
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        pinned: dict[str, tuple[str, ...]] | None = None
         if self._ssrf_protection_enabled:
-            validate_upstream_url(
-                url,
-                app_env=self._app_env,
-                block_private_ips_in_prod=self._block_private_ips_in_prod,
-                allowed_hosts=self._allowed_hosts,
-            )
+            client = self._get_client()
+            if self._pinning_supported:
+                addresses = validate_upstream_url(
+                    url,
+                    app_env=self._app_env,
+                    block_private_ips_in_prod=self._block_private_ips_in_prod,
+                    allowed_hosts=self._allowed_hosts,
+                    resolve_dns=True,
+                )
+                host = (urlparse(url).hostname or "").strip("[]").lower().rstrip(".")
+                pinned = {host: addresses}
+            else:
+                if self._app_env == "prod":
+                    raise RuntimeError(
+                        "Production SSRF protection requires connection-time destination pinning"
+                    )
+                validate_upstream_url(
+                    url,
+                    app_env=self._app_env,
+                    block_private_ips_in_prod=self._block_private_ips_in_prod,
+                    allowed_hosts=self._allowed_hosts,
+                )
+        else:
+            client = self._get_client()
         headers = {str(k): str(v) for k, v in (kwargs.pop("headers", None) or {}).items()}
         headers.pop("Mcp-Session-Id", None)
         propagate.inject(headers)
-        client = self._get_client()
         timeout_seconds = kwargs.pop("timeout_seconds", None)
         if timeout_seconds is None:
             request = httpx.Request(method, url, headers=headers, **kwargs)
@@ -353,7 +492,12 @@ class UpstreamClientManager:
                 method, url, headers=headers, timeout=timeout_seconds, **kwargs
             )
         request.headers.pop("cookie", None)
-        return await client.send(request, follow_redirects=False)
+        context_token = _PINNED_DNS.set(pinned) if pinned is not None else None
+        try:
+            return await client.send(request, follow_redirects=False)
+        finally:
+            if context_token is not None:
+                _PINNED_DNS.reset(context_token)
 
     async def probe_health(self, url: str, *, timeout_seconds: float) -> httpx.Response:
         """Issue a bounded unauthenticated health request through SSRF validation."""
