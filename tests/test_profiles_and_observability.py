@@ -307,6 +307,7 @@ async def test_postgres_audit_store_crud_and_optional_dep(
 
     pool = FakePgPool()
     store = PostgresAuditStore("postgresql://user:pass@localhost/db", pool=pool)
+    assert store.dsn == "postgresql://user:pass@localhost/db?sslmode=verify-full"
     await store.init()
     assert len(pool.ddl) >= 7
     assert any("adaptive_evidence" in ddl for ddl in pool.ddl)
@@ -339,6 +340,15 @@ async def test_postgres_audit_store_crud_and_optional_dep(
     unconnected = PostgresAuditStore("postgresql://user:pass@localhost/db")
     with pytest.raises(RuntimeError, match="mcpcodeaway\\[postgres\\]"):
         await unconnected.init()
+
+
+def test_postgres_tls_mode_can_be_explicitly_configured() -> None:
+    assert PostgresAuditStore("postgresql://user:pass@localhost/db?sslmode=disable").dsn.endswith(
+        "?sslmode=disable"
+    )
+    assert PostgresAuditStore("host=db user=gateway dbname=app sslmode=verify-ca").dsn.endswith(
+        "sslmode=verify-ca"
+    )
 
 
 @pytest.mark.asyncio

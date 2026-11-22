@@ -115,3 +115,6 @@ smoke check confirms `/health` and `/ready` and observes Uvicorn's ASGI shutdown
 SIGTERM. The suite does not assert zero downtime, time a hard kill between upstream commit and
 HTTP response in Kubernetes, test exhaustion in the gateway process, or exercise a real
 corporate identity provider.
+
+For the K2 state classification and external PostgreSQL profile, see
+[Kubernetes K2](kubernetes-k2.md).

@@ -137,7 +137,7 @@ services:
       GATEWAY_SANDBOX_BACKEND: remote
       GATEWAY_SANDBOX_WORKER_URL: ws://sandbox-worker:8002/ws/execute
       GATEWAY_REDIS_URL: redis://redis:6379/0
-      GATEWAY_POSTGRES_DSN: ${GATEWAY_POSTGRES_DSN:-postgresql://gateway:${POSTGRES_PASSWORD:-local-compose-postgres-password}@postgres:5432/mcpcodeaway}
+      GATEWAY_POSTGRES_DSN: ${GATEWAY_POSTGRES_DSN:-postgresql://gateway:${POSTGRES_PASSWORD:-local-compose-postgres-password}@postgres:5432/mcpcodeaway?sslmode=disable}
       GATEWAY_SANDBOX_WORKER_SECRET: ${GATEWAY_SANDBOX_WORKER_SECRET:-local-compose-worker-secret-change-me}
       GATEWAY_PROVENANCE_SIGNING_SECRET: ${GATEWAY_PROVENANCE_SIGNING_SECRET:-dev-provenance-secret}
       GATEWAY_ADMIN_SESSION_SECRET: ${GATEWAY_ADMIN_SESSION_SECRET:-dev-admin-session-secret}

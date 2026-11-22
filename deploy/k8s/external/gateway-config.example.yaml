@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+  namespace: mcpcodeaway
+data:
+  GATEWAY_APP_ENV: prod
+  GATEWAY_AUTH_MODE: oidc
+  GATEWAY_PROFILE: production
+  GATEWAY_GATEWAY_PUBLIC_URL: https://gateway.example.invalid
+  GATEWAY_ADMIN_OIDC_REDIRECT_URI: https://gateway.example.invalid/auth/admin/callback
+  GATEWAY_REQUIRE_ADMIN_AUTH: "true"
+  GATEWAY_METRICS_REQUIRE_AUTH: "true"
+  GATEWAY_SSRF_PROTECTION_ENABLED: "true"
+  GATEWAY_BLOCK_PRIVATE_IPS_IN_PROD: "true"
+  GATEWAY_ALLOWED_TENANTS: '["replace-with-tenant-id"]'
+  GATEWAY_OIDC_AUDIENCE: replace-with-api-audience
+  GATEWAY_OIDC_ISSUER: https://identity.example.invalid/issuer
+  GATEWAY_OIDC_JWKS_URI: https://identity.example.invalid/jwks
+  GATEWAY_OIDC_TOKEN_ENDPOINT: https://identity.example.invalid/token
+  GATEWAY_OIDC_CLIENT_ID: replace-with-client-id
+  GATEWAY_ADMIN_OIDC_AUTHORIZATION_ENDPOINT: https://identity.example.invalid/authorize
+  GATEWAY_ADMIN_OIDC_API_SCOPE: replace-with-gateway-api-scope
+  GATEWAY_TOKEN_EXCHANGE_DIALECT: rfc8693

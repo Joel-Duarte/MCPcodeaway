@@ -33,6 +33,7 @@ spec:
       labels:
         app.kubernetes.io/name: gateway
     spec:
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
@@ -120,6 +121,9 @@ spec:
             - name: dev-key
               mountPath: /run/gateway-secrets
               readOnly: true
+            - name: postgres-ca
+              mountPath: /run/postgres-ca
+              readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
@@ -133,6 +137,13 @@ spec:
             items:
               - key: dev-oidc-private.pem
                 path: dev-oidc-private.pem
+        - name: postgres-ca
+          secret:
+            secretName: postgres-ca
+            optional: true
+            items:
+              - key: ca.crt
+                path: ca.crt
         - name: tmp
           emptyDir:
             sizeLimit: 128Mi

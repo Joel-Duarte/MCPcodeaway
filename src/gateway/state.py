@@ -13,6 +13,28 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+
+def _postgres_dsn_with_secure_tls_default(dsn: str) -> str:
+    """Default PostgreSQL connections to certificate and hostname verification.
+
+    asyncpg's default ``prefer`` mode can fall back to plaintext. Require
+    ``verify-full`` unless the operator explicitly selects an sslmode in the
+    connection string (for example, ``disable`` for disposable local fixtures).
+    """
+    if not dsn.strip():
+        return dsn
+    if "://" in dsn:
+        parsed = urlsplit(dsn)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        if any(key.lower() == "sslmode" for key, _ in query):
+            return dsn
+        query.append(("sslmode", "verify-full"))
+        return urlunsplit(parsed._replace(query=urlencode(query)))
+    if any(part.lower().startswith("sslmode=") for part in dsn.split()):
+        return dsn
+    return f"{dsn} sslmode=verify-full"
 
 
 class CacheBackend(Protocol):
@@ -1708,7 +1730,7 @@ class PostgresAuditStore:
     """Postgres-backed AuditStore for multi-replica production deployments."""
 
     def __init__(self, dsn: str = "", *, pool: Any = None) -> None:
-        self.dsn = dsn
+        self.dsn = _postgres_dsn_with_secure_tls_default(dsn)
         self._pool = pool
 
     async def _get_pool(self) -> Any:
@@ -1719,7 +1741,7 @@ class PostgresAuditStore:
                 raise RuntimeError(
                     "postgres_dsn requires optional dependency 'mcpcodeaway[postgres]' (asyncpg)."
                 ) from exc
-            self._pool = await asyncpg.create_pool(self.dsn)
+            self._pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=10)
         return self._pool
 
     async def health_check(self) -> bool:

@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gateway-postgres-connectivity-check
+  namespace: mcpcodeaway
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: postgres-check
+      image: registry.example.invalid/mcpcodeaway/gateway:replace-me
+      imagePullPolicy: IfNotPresent
+      command: ["python", "-c"]
+      args:
+        - |
+          import asyncio
+          import os
+          from gateway.state import PostgresAuditStore
+          async def main():
+              store = PostgresAuditStore(os.environ["GATEWAY_POSTGRES_DSN"])
+              try:
+                  healthy = await store.health_check()
+                  print("postgres_connectivity=passed" if healthy else "postgres_connectivity=failed")
+                  if not healthy:
+                      raise SystemExit(1)
+              finally:
+                  await store.close()
+          asyncio.run(main())
+      env:
+        - name: GATEWAY_POSTGRES_DSN
+          valueFrom:
+            secretKeyRef:
+              name: gateway-runtime-secrets
+              key: GATEWAY_POSTGRES_DSN
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 256Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
