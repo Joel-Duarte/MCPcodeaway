@@ -67,6 +67,15 @@ def _approx_tokens(value: Any) -> int:
     return max(1, math.ceil(len(text) / 4)) if text else 0
 
 
+def _expected_average_minutes(assumption: Any) -> float | None:
+    if not isinstance(assumption, dict) or assumption.get("kind") != "expected_average":
+        return None
+    value = assumption.get("minutes")
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
 class TelemetryRecorder:
     """Persists execution audit runs and computes summary metrics."""
 
@@ -325,6 +334,205 @@ class TelemetryRecorder:
             bucket["avg_duration_ms"] = round(total_ms / runs_cnt, 3) if runs_cnt else 0.0
 
         return {"total_runs": len(runs), "by_mode": by_mode}
+
+    async def business_value_report(
+        self, *, tenant_id: str, since: str | None = None, limit: int = 1000
+    ) -> dict[str, Any]:
+        """Aggregate durable outcomes by integration, definition, revision, and UTC day.
+
+        Gross manual baseline is not presented as net savings. Net estimate is only
+        calculated when both review and correction assumptions are explicit expected
+        averages. Actual review/rework capture and automation-cost inputs are not yet
+        in the ledger, so validated net savings and ROI remain unavailable.
+        """
+        if not tenant_id:
+            raise ValueError("business-value reports require an explicit tenant scope")
+        events = await self.store.list_business_value_events(tenant_id, since=since, limit=limit)
+        executions = await self.store.list_business_executions(tenant_id, since=since, limit=limit)
+        execution_status_counts = {
+            status: 0 for status in ("active", "completed", "outcome_unknown", "failed", "expired")
+        }
+        report_now = datetime.now(UTC)
+        for execution in executions:
+            status = str(execution.get("status") or "unknown")
+            if status == "active":
+                expires_at = execution.get("expires_at")
+                if isinstance(expires_at, str):
+                    try:
+                        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                        if expiry.tzinfo is None:
+                            expiry = expiry.replace(tzinfo=UTC)
+                        if expiry <= report_now:
+                            status = "expired"
+                    except ValueError:
+                        pass
+            execution_status_counts[status] = execution_status_counts.get(status, 0) + 1
+        grouped: dict[tuple[str, ...], dict[str, Any]] = {}
+        for event in events:
+            if not bool(event.get("credited")):
+                continue
+            evidence = event.get("evidence")
+            evidence = evidence if isinstance(evidence, dict) else {}
+            baseline = evidence.get("baseline_snapshot")
+            if not isinstance(baseline, dict):
+                continue
+            upstream = str(event.get("upstream_name") or "unknown")
+            integration_id = str(evidence.get("integration_id") or upstream)
+            integration_display_name = evidence.get("integration_display_name")
+            integration_display_name = (
+                integration_display_name if isinstance(integration_display_name, str) else None
+            )
+            selected_kind = str(evidence.get("selected_kind") or "unknown")
+            selected_id = str(evidence.get("selected_id") or "unknown")
+            revision = str(evidence.get("definition_revision") or "unknown")
+            created_at = str(event.get("created_at") or "")
+            try:
+                instant = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                if instant.tzinfo is None:
+                    instant = instant.replace(tzinfo=UTC)
+                utc_day = instant.astimezone(UTC).date().isoformat()
+            except ValueError:
+                utc_day = "unknown"
+            source = str(baseline.get("baseline_source") or "unknown")
+            confidence = str(baseline.get("confidence") or "unknown")
+            currency = baseline.get("currency")
+            currency = str(currency) if isinstance(currency, str) else None
+            key = (
+                integration_id,
+                upstream,
+                selected_kind,
+                selected_id,
+                revision,
+                source,
+                confidence,
+                currency or "",
+                utc_day,
+            )
+            bucket = grouped.setdefault(
+                key,
+                {
+                    "integration_id": integration_id,
+                    "integration_display_name": integration_display_name,
+                    "upstream_name": upstream,
+                    "integration_upstream_name": upstream,
+                    "selected_kind": selected_kind,
+                    "selected_id": selected_id,
+                    "definition_revision": revision,
+                    "period_utc": utc_day,
+                    "baseline_source": source,
+                    "baseline_confidence": confidence,
+                    "currency": currency,
+                    "completed_count": 0,
+                    "estimated_manual_baseline_minutes": 0.0,
+                    "validated_manual_baseline_minutes": 0.0,
+                    "estimated_minutes_saved": 0.0,
+                    "_estimated_savings_complete": True,
+                    "estimated_labor_value": 0.0,
+                    "_labor_value_complete": True,
+                },
+            )
+            bucket["completed_count"] += 1
+            try:
+                manual_minutes = float(baseline["manual_baseline_minutes"])
+            except (KeyError, TypeError, ValueError):
+                bucket["_estimated_savings_complete"] = False
+                bucket["_labor_value_complete"] = False
+                continue
+            bucket["estimated_manual_baseline_minutes"] += manual_minutes
+            if confidence in {"sampled", "validated"}:
+                bucket["validated_manual_baseline_minutes"] += manual_minutes
+            review = _expected_average_minutes(baseline.get("review_minutes"))
+            correction = _expected_average_minutes(baseline.get("correction_minutes"))
+            if review is None or correction is None:
+                bucket["_estimated_savings_complete"] = False
+                bucket["_labor_value_complete"] = False
+                continue
+            estimated_saved = manual_minutes - review - correction
+            bucket["estimated_minutes_saved"] += estimated_saved
+            hourly_cost = baseline.get("loaded_labor_cost_per_hour")
+            if not isinstance(hourly_cost, (int, float)) or isinstance(hourly_cost, bool):
+                bucket["_labor_value_complete"] = False
+                continue
+            bucket["estimated_labor_value"] += estimated_saved * float(hourly_cost) / 60.0
+
+        by_period: list[dict[str, Any]] = []
+        totals_by_currency: dict[str, dict[str, Any]] = {}
+        for key in sorted(grouped):
+            bucket = grouped[key]
+            currency_key = str(bucket["currency"] or "unpriced")
+            if not bucket.pop("_estimated_savings_complete"):
+                bucket["estimated_minutes_saved"] = None
+            else:
+                bucket["estimated_minutes_saved"] = round(bucket["estimated_minutes_saved"], 3)
+            if not bucket.pop("_labor_value_complete"):
+                bucket["estimated_labor_value"] = None
+            else:
+                bucket["estimated_labor_value"] = {
+                    "amount": round(bucket["estimated_labor_value"], 4),
+                    "currency": currency_key,
+                }
+            for metric in (
+                "estimated_manual_baseline_minutes",
+                "validated_manual_baseline_minutes",
+            ):
+                bucket[metric] = round(bucket[metric], 3)
+            totals = totals_by_currency.setdefault(
+                currency_key,
+                {
+                    "completed_count": 0,
+                    "estimated_manual_baseline_minutes": 0.0,
+                    "validated_manual_baseline_minutes": 0.0,
+                    "estimated_minutes_saved": 0.0,
+                    "_estimated_savings_complete": True,
+                },
+            )
+            totals["completed_count"] += bucket["completed_count"]
+            totals["estimated_manual_baseline_minutes"] += bucket[
+                "estimated_manual_baseline_minutes"
+            ]
+            totals["validated_manual_baseline_minutes"] += bucket[
+                "validated_manual_baseline_minutes"
+            ]
+            if bucket["estimated_minutes_saved"] is None:
+                totals["_estimated_savings_complete"] = False
+            elif totals["_estimated_savings_complete"]:
+                totals["estimated_minutes_saved"] += bucket["estimated_minutes_saved"]
+            by_period.append(bucket)
+
+        for totals in totals_by_currency.values():
+            totals["estimated_manual_baseline_minutes"] = round(
+                totals["estimated_manual_baseline_minutes"], 3
+            )
+            totals["validated_manual_baseline_minutes"] = round(
+                totals["validated_manual_baseline_minutes"], 3
+            )
+            if totals.pop("_estimated_savings_complete"):
+                totals["estimated_minutes_saved"] = round(totals["estimated_minutes_saved"], 3)
+            else:
+                totals["estimated_minutes_saved"] = None
+
+        return {
+            "tenant_scope": tenant_id,
+            "since": since,
+            "events_returned": len(events),
+            "truncated": len(events) >= limit,
+            "executions_returned": len(executions),
+            "executions_truncated": len(executions) >= limit,
+            "completed_count": sum(item["completed_count"] for item in by_period),
+            "execution_status_counts": execution_status_counts,
+            "by_integration_workflow_day": by_period,
+            "totals_by_currency": totals_by_currency,
+            "validated_minutes_saved": None,
+            "cost_coverage": {
+                "captured_categories": [],
+                "missing_categories": [
+                    "llm_inference",
+                    "gateway_operations",
+                    "upstream_or_vendor_costs",
+                ],
+                "roi_available": False,
+            },
+        }
 
     async def value_report(
         self,

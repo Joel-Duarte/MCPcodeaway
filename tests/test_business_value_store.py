@@ -231,6 +231,10 @@ async def test_workflow_calls_support_multiple_operations_write_lease_and_event_
         )
 
     await asyncio.gather(add_call("lookup", 0), add_call("create", 1))
+    _, inserted = await add_call("lookup", 0)
+    assert not inserted
+    with pytest.raises(BusinessExecutionConflict, match="call key is already bound"):
+        await add_call("replacement", 0)
     assert len(await store.list_workflow_calls("tenant-a", "flow-1")) == 2
     assert await store.claim_workflow_write("flow-1", "create", "2000-01-01T00:00:00+00:00")
     assert not await store.claim_workflow_write("flow-1", "other", "2099-01-01T00:00:00+00:00")
@@ -249,8 +253,66 @@ async def test_workflow_calls_support_multiple_operations_write_lease_and_event_
     await store.close()
 
 
+@pytest.mark.asyncio
+async def test_business_execution_listing_and_completion_projection_are_tenant_scoped(
+    tmp_path,
+) -> None:
+    store = SQLiteAuditStore(str(tmp_path / "business.db"))
+    await store.init()
+    base = {
+        "caller_sub": "user-a",
+        "client_id": "client-a",
+        "kind": "workflow",
+        "upstream_name": "crm",
+        "expires_at": "2099-01-01T00:00:00+00:00",
+    }
+    for execution_id, tenant, created_at in (
+        ("exec-old", "tenant-a", "2026-01-01T00:00:00+00:00"),
+        ("exec-new", "tenant-a", "2026-02-01T00:00:00+00:00"),
+        ("exec-other", "tenant-b", "2026-03-01T00:00:00+00:00"),
+    ):
+        await store.create_business_execution(
+            {
+                **base,
+                "business_execution_id": execution_id,
+                "tenant_id": tenant,
+                "created_at": created_at,
+                "metadata": {"baseline_id": execution_id},
+            }
+        )
+
+    listed = await store.list_business_executions("tenant-a")
+    assert [row["business_execution_id"] for row in listed] == ["exec-new", "exec-old"]
+    assert listed[0]["metadata"] == {"baseline_id": "exec-new"}
+    assert [
+        row["business_execution_id"]
+        for row in await store.list_business_executions(
+            "tenant-a", since="2026-02-01T00:00:00+00:00", limit=1
+        )
+    ] == ["exec-new"]
+    assert await store.list_business_executions("tenant-a", limit=0) == [listed[0]]
+
+    assert await store.update_business_execution_status(
+        "exec-new", "tenant-a", "completed", "2026-02-02T00:00:00+00:00"
+    )
+    completed = await store.get_business_execution("exec-new", "tenant-a", "user-a", "client-a")
+    assert completed["status"] == "completed"
+    assert completed["updated_at"] == "2026-02-02T00:00:00+00:00"
+    assert not await store.update_business_execution_status(
+        "exec-new", "tenant-a", "active", "2026-02-03T00:00:00+00:00"
+    )
+    assert not await store.update_business_execution_status(
+        "exec-new", "tenant-b", "completed", "2026-02-03T00:00:00+00:00"
+    )
+    with pytest.raises(ValueError, match="invalid business execution status"):
+        await store.update_business_execution_status(
+            "exec-old", "tenant-a", "credited", "2026-02-03T00:00:00+00:00"
+        )
+    await store.close()
+
+
 def test_postgres_migration_contract_includes_business_value_constraints() -> None:
-    assert MIGRATIONS[-1].version == 3
+    assert MIGRATIONS[-1].version == 4
     assert {
         "integration_definition_versions",
         "workflow_executions",
@@ -259,7 +321,12 @@ def test_postgres_migration_contract_includes_business_value_constraints() -> No
         "workflow_execution_events",
         "business_value_events",
     }.issubset(EXPECTED_COLUMNS)
-    statements = "\n".join(MIGRATIONS[-1].statements)
+    statements = "\n".join(
+        statement for migration in MIGRATIONS for statement in migration.statements
+    )
     assert "idx_workflow_calls_call_key" in statements
+    assert "idx_workflow_calls_callback_slot" in statements
     assert "idx_business_value_completion" in statements
     assert "idx_business_value_outcome_identity" in statements
+    workflow_execution_columns = EXPECTED_COLUMNS["workflow_executions"]
+    assert {"status", "created_at", "updated_at"}.issubset(workflow_execution_columns)

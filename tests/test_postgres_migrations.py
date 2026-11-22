@@ -20,6 +20,7 @@ from gateway.migrations import (
     upgrade,
     verify_schema,
 )
+from gateway.state import BusinessExecutionConflict, PostgresAuditStore
 
 
 class MigrationDatabase:
@@ -107,7 +108,7 @@ async def test_gateway_rejects_missing_or_unsupported_schema_without_ddl() -> No
             assert "to_regclass" in sql
             return None
 
-    with pytest.raises(RuntimeError, match="requires version 3"):
+    with pytest.raises(RuntimeError, match="requires version 4"):
         await verify_schema(MissingSchemaConnection())
 
     class NewerSchemaConnection:
@@ -115,9 +116,9 @@ async def test_gateway_rejects_missing_or_unsupported_schema_without_ddl() -> No
             if "to_regclass" in sql:
                 return "mcpcodeaway_schema_migrations"
             assert "MAX(version)" in sql
-            return 4
+            return 5
 
-    with pytest.raises(RuntimeError, match="requires version 3"):
+    with pytest.raises(RuntimeError, match="requires version 4"):
         await verify_schema(NewerSchemaConnection())
 
     class IncompatibleSchemaConnection:
@@ -129,7 +130,7 @@ async def test_gateway_rejects_missing_or_unsupported_schema_without_ddl() -> No
         async def fetch(self, _sql: str, _tables: list[str]) -> list[dict[str, str]]:
             return [{"table_name": "audit_runs", "column_name": "run_id"}]
 
-    with pytest.raises(RuntimeError, match="schema version 3 is incomplete"):
+    with pytest.raises(RuntimeError, match="schema version 4 is incomplete"):
         await verify_schema(IncompatibleSchemaConnection())
 
     class MissingSafetyIndexConnection:
@@ -160,7 +161,7 @@ async def test_gateway_rejects_missing_or_unsupported_schema_without_ddl() -> No
 
 
 def test_migration_list_is_ordered_and_token_cleanup_is_explicit() -> None:
-    assert [migration.version for migration in MIGRATIONS] == [1, 2, 3]
+    assert [migration.version for migration in MIGRATIONS] == [1, 2, 3, 4]
     assert any(
         "DELETE FROM user_upstream_credentials" in statement
         for statement in MIGRATIONS[1].statements
@@ -175,10 +176,10 @@ async def test_empty_database_migrations_are_versioned_and_repeatable() -> None:
     def connect(*args: Any, **kwargs: Any) -> Any:
         return _fake_connect(database, *args, **kwargs)
 
-    assert await upgrade("postgresql://migration", connect=connect) == (0, 3)
+    assert await upgrade("postgresql://migration", connect=connect) == (0, 4)
     first_run_statement_count = len(database.statements)
-    assert database.versions == [1, 2, 3]
-    assert await upgrade("postgresql://migration", connect=connect) == (3, 3)
+    assert database.versions == [1, 2, 3, 4]
+    assert await upgrade("postgresql://migration", connect=connect) == (4, 4)
     assert len(database.statements) == first_run_statement_count
 
 
@@ -193,8 +194,8 @@ async def test_existing_database_upgrade_keeps_rows_and_concurrent_jobs_serializ
         upgrade("postgresql://migration", connect=connect),
         upgrade("postgresql://migration", connect=connect),
     )
-    assert sorted(outcomes) == [(1, 3), (3, 3)]
-    assert database.versions == [1, 2, 3]
+    assert sorted(outcomes) == [(1, 4), (4, 4)]
+    assert database.versions == [1, 2, 3, 4]
     assert database.existing_rows == {
         "audit_runs": ["preexisting-run"],
         "sensitive_write_audits": ["preexisting-journal"],
@@ -239,7 +240,7 @@ async def test_failed_migration_rolls_back_token_cleanup_and_restart_can_retry(
     ]
 
     monkeypatch.setattr(migrations, "MIGRATIONS", original_migrations)
-    assert await upgrade("postgresql://migration", connect=connect) == (1, 3)
+    assert await upgrade("postgresql://migration", connect=connect) == (1, 4)
     assert database.user_credentials == [{"auth_kind": "user_api_key"}]
     assert database.gateway_secrets == [{"name": "unrelated-secret", "ciphertext": "opaque"}]
 
@@ -288,15 +289,87 @@ async def test_explicit_postgres_migrations_are_repeatable_and_concurrent() -> N
         versions = await conn.fetch(
             "SELECT version FROM mcpcodeaway_schema_migrations ORDER BY version"
         )
-        assert [row["version"] for row in versions] == [1, 2, 3]
+        assert [row["version"] for row in versions] == [1, 2, 3, 4]
         oauth_rows = await conn.fetchval(
             "SELECT COUNT(*) FROM user_upstream_credentials WHERE auth_kind='user_oauth'"
         )
         assert oauth_rows == 0
         view_exists = await conn.fetchval("SELECT to_regclass('sensitive_write_operations')")
         assert view_exists is not None
+        callback_slot_index = await conn.fetchval(
+            "SELECT to_regclass('idx_workflow_calls_callback_slot')"
+        )
+        assert callback_slot_index is not None
     finally:
         await conn.close()
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_postgres_workflow_callback_slot_is_immutable_and_idempotent() -> None:
+    dsn = os.getenv("MCP_TEST_POSTGRES_MIGRATION_DSN")
+    if not dsn:
+        pytest.skip("set MCP_TEST_POSTGRES_MIGRATION_DSN to a disposable migrated database")
+    pytest.importorskip("asyncpg", reason="install mcpcodeaway[postgres]")
+
+    store = PostgresAuditStore(dsn)
+    prefix = f"callback-slot-{os.urandom(8).hex()}"
+    execution_id = f"{prefix}-execution"
+    try:
+        await store.init()
+        await store.create_business_execution(
+            {
+                "business_execution_id": execution_id,
+                "tenant_id": prefix,
+                "caller_sub": "callback-slot-test-user",
+                "client_id": "callback-slot-test-client",
+                "kind": "workflow",
+                "upstream_name": "callback-slot-test-upstream",
+                "expires_at": "2099-01-01T00:00:00+00:00",
+                "metadata": {},
+            }
+        )
+        call = {
+            "workflow_call_id": f"{prefix}-call-0",
+            "tenant_id": prefix,
+            "business_execution_id": execution_id,
+            "call_key": f"{prefix}-key-0",
+            "outer_request_id": f"{prefix}-request",
+            "callback_ordinal": 0,
+            "upstream_name": "callback-slot-test-upstream",
+            "tool_name": "read_customer",
+            "request_digest": "body-digest",
+            "arguments_digest": "arguments-digest-a",
+        }
+        _, inserted = await store.create_workflow_call(call)
+        assert inserted
+        _, inserted = await store.create_workflow_call(call)
+        assert not inserted
+        with pytest.raises(BusinessExecutionConflict, match="call key is already bound"):
+            await store.create_workflow_call(
+                {
+                    **call,
+                    "workflow_call_id": f"{prefix}-call-diverged",
+                    "call_key": f"{prefix}-key-diverged",
+                    "tool_name": "read_order_history",
+                    "arguments_digest": "arguments-digest-b",
+                }
+            )
+        assert len(await store.list_workflow_calls(prefix, execution_id)) == 1
+    finally:
+        if store._pool is not None:
+            await store._pool.execute(
+                "DELETE FROM workflow_calls WHERE tenant_id=$1 AND business_execution_id=$2",
+                prefix,
+                execution_id,
+            )
+            await store._pool.execute(
+                "DELETE FROM workflow_executions WHERE tenant_id=$1 AND business_execution_id=$2",
+                prefix,
+                execution_id,
+            )
+        await store.close()
 
 
 @pytest.mark.integration
@@ -400,10 +473,10 @@ async def test_migration_cli_upgrades_v1_atomically_and_preserves_unrelated_stat
 
         success_code, success_stdout, _success_stderr = await run_cli()
         assert success_code == 0
-        assert "PostgreSQL schema version: 1 -> 2" in success_stdout
+        assert "PostgreSQL schema version: 1 -> 4" in success_stdout
         conn = await asyncpg.connect(schema_dsn)
         try:
-            assert await verify_schema(conn) == 3
+            assert await verify_schema(conn) == 4
             assert (
                 await conn.fetchval(
                     "SELECT COUNT(*) FROM user_upstream_credentials WHERE auth_kind='user_oauth'"

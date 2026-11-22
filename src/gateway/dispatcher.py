@@ -153,6 +153,9 @@ class SubcallRecord(BaseModel):
     schema_covered: bool | None = None
     is_mutating: bool | None = None
     invalid_arguments: int | None = None
+    workflow_call_id: str | None = None
+    sensitive_write_operation_id: str | None = None
+    sensitive_write_journal_status: str | None = None
 
 
 _ENTITY_ID_RE = re.compile(r"\b[A-Z]{2,6}-[A-Z0-9-]{2,}\b")
@@ -772,6 +775,7 @@ class HostDispatcher:
         budget: ExecutionBudget | None = None,
         code_mode_hints: bool = False,
         requester_confirmation_policy: ToolApprovalPolicy | None = None,
+        workflow_call_id: str | None = None,
     ) -> tuple[Any, SubcallRecord]:
         started = time.perf_counter()
         with _TRACER.start_as_current_span("gateway.downstream.call") as span:
@@ -1099,6 +1103,11 @@ class HostDispatcher:
                     upstream_status_code=failure.status_code,
                     schema_covered=tool.input_schema is not None and tool.output_schema is not None,
                     is_mutating=bool(tool.mutating),
+                    workflow_call_id=workflow_call_id,
+                    sensitive_write_operation_id=audit_operation_id,
+                    sensitive_write_journal_status=(
+                        "unknown" if audit_operation_id is not None else None
+                    ),
                 )
                 if self.metrics is not None:
                     self.metrics.inc_counter(
@@ -1215,5 +1224,10 @@ class HostDispatcher:
                 retry_attempts=retry_attempts,
                 schema_covered=tool.input_schema is not None and tool.output_schema is not None,
                 is_mutating=bool(tool.mutating),
+                workflow_call_id=workflow_call_id,
+                sensitive_write_operation_id=audit_operation_id,
+                sensitive_write_journal_status=(
+                    "succeeded" if audit_operation_id is not None and audit_completed else None
+                ),
             )
             return filtered, record

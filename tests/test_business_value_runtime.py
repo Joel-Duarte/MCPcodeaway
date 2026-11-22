@@ -5,6 +5,7 @@ import pytest
 from gateway.business_value_runtime import (
     build_workflow_call_key,
     canonical_json_digest,
+    encode_jsonrpc_request_id,
     required_evidence_satisfied,
     result_matches_predicate,
     terminal_completion_satisfied,
@@ -57,6 +58,7 @@ def test_canonical_digest_and_call_key_are_stable_and_body_bound() -> None:
     assert key == build_workflow_call_key(**base)
     assert key != build_workflow_call_key(**{**base, "request_digest": "b" * 64})
     assert key != build_workflow_call_key(**{**base, "callback_ordinal": 1})
+    assert key != build_workflow_call_key(**{**base, "client_id": "another-client"})
 
 
 def test_call_key_rejects_invalid_json_rpc_ids_and_ordinals() -> None:
@@ -73,6 +75,8 @@ def test_call_key_rejects_invalid_json_rpc_ids_and_ordinals() -> None:
 
     with pytest.raises(ValueError, match="non-negative"):
         build_workflow_call_key(**{**base, "outer_request_id": "req-1", "callback_ordinal": -1})
+    assert encode_jsonrpc_request_id(1) == "integer:1"
+    assert encode_jsonrpc_request_id("1") == "string:1"
 
 
 def test_predicates_and_workflow_completion_use_persisted_boolean_evidence() -> None:
@@ -82,6 +86,7 @@ def test_predicates_and_workflow_completion_use_persisted_boolean_evidence() -> 
         customer_result,
         ResultPredicate.model_validate({"path": "/customer/id", "type": "non_empty_string"}),
     )
+
     assert not result_matches_predicate(
         {"customer": {"id": " "}},
         ResultPredicate.model_validate({"path": "/customer/id", "type": "non_empty_string"}),
@@ -93,15 +98,17 @@ def test_predicates_and_workflow_completion_use_persisted_boolean_evidence() -> 
             "upstream_name": "support",
             "tool_qualified_name": "support__find_customer",
             "status": "succeeded",
-            "evidence_predicate_matched": True,
+            "evidence": {"evidence_predicate_matched": True},
         },
         {
             "call_key": "ticket-call",
             "upstream_name": "support",
             "tool_qualified_name": "support__create_ticket",
             "status": "succeeded",
-            "completion_predicate_matched": True,
-            "sensitive_write_journal_status": "succeeded",
+            "evidence": {
+                "completion_predicate_matched": True,
+                "sensitive_write_journal_status": "succeeded",
+            },
         },
     ]
     assert required_evidence_satisfied(workflow, calls)
@@ -118,20 +125,22 @@ def test_failed_or_missing_predicate_evidence_does_not_complete() -> None:
             "upstream_name": "support",
             "tool_qualified_name": "support__find_customer",
             "status": "succeeded",
-            "evidence_predicate_matched": False,
+            "evidence": {"evidence_predicate_matched": False},
         },
         {
             "call_key": "ticket-call",
             "upstream_name": "support",
             "tool_qualified_name": "support__create_ticket",
             "status": "succeeded",
-            "completion_predicate_matched": True,
-            "sensitive_write_journal_status": "succeeded",
+            "evidence": {
+                "completion_predicate_matched": True,
+                "sensitive_write_journal_status": "succeeded",
+            },
         },
     ]
     assert not required_evidence_satisfied(workflow, calls)
     assert terminal_completion_satisfied(workflow, calls)
 
-    calls[0]["evidence_predicate_matched"] = True
+    calls[0]["evidence"]["evidence_predicate_matched"] = True
     calls[0]["status"] = "failed"
     assert not required_evidence_satisfied(workflow, calls)

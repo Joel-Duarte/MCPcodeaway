@@ -10,6 +10,7 @@ import random
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from gateway.auth import CallerIdentity
@@ -158,6 +159,8 @@ class OperationRecovery:
             or (row.get("client_id") or "") != (identity.client_id or "")
         ):
             return None
+        if row.get("status") in _TERMINAL:
+            await self._sync_attributed_workflow_call(row)
         return row
 
     def status_result(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -168,6 +171,103 @@ class OperationRecovery:
         result["created_at"] = str(row["created_at"])
         result["updated_at"] = str(row["updated_at"])
         return result
+
+    async def _sync_attributed_workflow_call(self, operation: dict[str, Any]) -> None:
+        """Finalize the linked business call from a terminal recovery result.
+
+        The upstream result remains in the existing encrypted recovery envelope;
+        the business-value store receives only the evaluator's minimal evidence.
+        Terminal operation polling retries this synchronization if the worker's
+        first attempt could not persist attribution.
+        """
+        payload = self._decrypt(operation, "payload_ciphertext")
+        if not isinstance(payload, dict):
+            return
+        workflow_call_id = payload.get("workflow_call_id")
+        if not isinstance(workflow_call_id, str) or not workflow_call_id:
+            return
+        tenant_id = str(operation.get("tenant_id") or "")
+        link = await self.runtime.store.get_workflow_call_by_id(tenant_id, workflow_call_id)
+        if link is None:
+            return
+        execution_id = str(link["business_execution_id"])
+        call = await self.runtime.store.get_workflow_call(tenant_id, execution_id, workflow_call_id)
+        if call is None:
+            return
+        if call.get("status") == "started":
+            return
+        identity = CallerIdentity.model_validate(payload.get("identity", {}))
+        execution = await self.runtime.store.get_business_execution(
+            execution_id,
+            tenant_id,
+            identity.sub,
+            identity.client_id or "",
+        )
+        if execution is None:
+            return
+        stored = self._decrypt(operation, "result_ciphertext")
+        structured = stored.get("structuredContent") if isinstance(stored, dict) else None
+        structured = structured if isinstance(structured, dict) else {}
+        status = str(operation.get("status") or "")
+        if status not in _TERMINAL:
+            await self.runtime.store.update_workflow_call(
+                workflow_call_id,
+                {"status": "pending", "evidence": {"outcome_unknown": True}},
+            )
+            return
+        unknown = status in {"needs_attention", "cancelled"} or bool(
+            structured.get("outcome_unknown")
+        )
+        call_status = (
+            "outcome_unknown"
+            if unknown
+            else "succeeded"
+            if status == "completed" and structured.get("ok") is True
+            else "failed"
+        )
+        result = structured.get("result")
+        sensitive_write_operation_id = structured.get("sensitive_write_operation_id")
+        selected = execution["metadata"].get("selected_definition")
+        if not isinstance(selected, dict):
+            return
+        from gateway.integration_definition import IntegrationDefinition
+
+        manifest = IntegrationDefinition.model_validate(execution["metadata"]["pinned_definition"])
+        if execution["kind"] == "workflow":
+            selected_workflow = next(
+                (item for item in manifest.workflows if item.id == selected.get("id")), None
+            )
+            journal_required = (
+                selected_workflow.completion.require_sensitive_write_journal_status
+                if selected_workflow is not None
+                else None
+            )
+        else:
+            from gateway.integration_definition import StandaloneToolValueDefinition
+
+            standalone = StandaloneToolValueDefinition.model_validate(selected)
+            journal_required = standalone.completion.require_sensitive_write_journal_status
+        if journal_required == "succeeded" and (
+            not sensitive_write_operation_id
+            or structured.get("sensitive_write_journal_status") != "succeeded"
+        ):
+            unknown = True
+            call_status = "outcome_unknown"
+        tool = SimpleNamespace(qualified_name=call["tool_qualified_name"])
+        await self.runtime.finalize_attributed_call(
+            identity,
+            execution,
+            selected,
+            tool,
+            call,
+            result=result,
+            status=call_status,
+            run_id=structured.get("run_id"),
+            sensitive_write_operation_id=sensitive_write_operation_id,
+            outcome_unknown=unknown,
+        )
+        if not unknown:
+            await self.runtime.store.release_workflow_write(execution_id, workflow_call_id)
 
     async def begin_direct_call(
         self,
@@ -184,6 +284,7 @@ class OperationRecovery:
         experiment_id: str | None = None,
         ab_variant: str | None = None,
         model_name: str | None = None,
+        workflow_call_id: str | None = None,
     ) -> tuple[dict[str, Any], str]:
         await self.runtime.ensure_catalog_for_identity(identity)
         tool = self.runtime.catalog.get_tool(tool_name)
@@ -291,6 +392,7 @@ class OperationRecovery:
             "experiment_id": experiment_id,
             "ab_variant": ab_variant,
             "model_name": model_name,
+            "workflow_call_id": workflow_call_id,
         }
         row, created = await self.runtime.store.create_or_get_operation(
             {
@@ -321,6 +423,12 @@ class OperationRecovery:
         if not created:
             if row["request_digest"] != request_digest:
                 raise ValueError("Idempotency key was reused with different operation arguments")
+            prior_payload = self._decrypt(row, "payload_ciphertext")
+            prior_call_id = (
+                prior_payload.get("workflow_call_id") if isinstance(prior_payload, dict) else None
+            )
+            if workflow_call_id is not None and prior_call_id != workflow_call_id:
+                raise ValueError("Recovery operation is already bound to another attributed call")
             if row["status"] in _TERMINAL:
                 stored = self._decrypt(row, "result_ciphertext")
                 if isinstance(stored, dict):
@@ -375,6 +483,7 @@ class OperationRecovery:
                         model_name=model_name,
                         requester_confirmation_policy=requester_confirmation_policy,
                         request_timeout_seconds=float(policy.synchronous_budget_seconds),
+                        workflow_call_id=workflow_call_id,
                     ),
                     timeout=float(policy.synchronous_budget_seconds),
                 )
@@ -452,6 +561,7 @@ class OperationRecovery:
                 status="pending",
                 attempt_count=1,
                 updated_at=_iso(_now()),
+                result_ciphertext=self._encrypt(operation_id, identity.tenant_id, call_result),
                 next_attempt_at=_iso(next_at),
                 last_error_type=error_type,
                 last_error=safe_error,
@@ -666,6 +776,13 @@ class OperationRecovery:
                 state = status_result["result"].get(str(policy.status_field))
             normalized_state = str(state or "").casefold()
             if normalized_state in {v.casefold() for v in policy.status_success_values}:
+                prior_result = self._decrypt(row, "result_ciphertext")
+                prior_structured = (
+                    prior_result.get("structuredContent")
+                    if isinstance(prior_result, dict)
+                    else None
+                )
+                prior_structured = prior_structured if isinstance(prior_structured, dict) else {}
                 final = {
                     "ok": True,
                     "result": status_result["result"],
@@ -673,6 +790,12 @@ class OperationRecovery:
                     "operation_attempts": int(row["attempt_count"]),
                     "outcome_unknown": False,
                     "reconciled": True,
+                    "sensitive_write_operation_id": prior_structured.get(
+                        "sensitive_write_operation_id"
+                    ),
+                    "sensitive_write_journal_status": prior_structured.get(
+                        "sensitive_write_journal_status"
+                    ),
                 }
                 stored_result = self._tool_result(final)
                 await self.runtime.store.update_operation(
@@ -783,6 +906,7 @@ class OperationRecovery:
                         upstream.request_timeout_seconds,
                         remaining_seconds,
                     ),
+                    workflow_call_id=payload.get("workflow_call_id"),
                 ),
                 timeout=min(upstream.request_timeout_seconds, remaining_seconds),
             )
@@ -880,6 +1004,19 @@ class OperationRecovery:
                             )
                         except Exception:
                             pass
+                    try:
+                        latest = await self.runtime.store.get_operation(
+                            str(row.get("operation_id") or "")
+                        )
+                        if latest is not None:
+                            await self._sync_attributed_workflow_call(latest)
+                    except Exception as exc:
+                        log_event(
+                            "recovery.business_value_sync_failed",
+                            level="ERROR",
+                            operation_id=row.get("operation_id"),
+                            error_type=type(exc).__name__,
+                        )
                 if time.monotonic() - last_prune >= 60.0:
                     await self.runtime.store.prune_operations(now=_iso(_now()))
                     last_prune = time.monotonic()

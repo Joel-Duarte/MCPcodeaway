@@ -1,0 +1,435 @@
+"""Render a deliberately small, safe subset of declarative MCP App experiences.
+
+Supported nodes are ``heading`` and ``text`` with a plain-text ``text`` value;
+``text_input`` with ``id``, ``label``, optional ``required`` and bounded
+``max_length``; ``button`` with one safe action ID; and ``record`` with
+``data: "tool_result"``. The action ID is descriptive only: the single button
+can call only the experience's declared gateway tool through the standard MCP
+Apps host ``tools/call`` bridge. Input
+mapping values must be ``/form/<text_input id>`` JSON-Pointer-like references.
+
+No manifest HTML, JavaScript, CSS, event attributes, external URLs, resources,
+permissions, branching or arbitrary action code is accepted. The HTML and bridge
+are product-owned and all dynamic values are escaped or written with DOM
+``textContent``.
+"""
+
+from __future__ import annotations
+
+import html
+import json
+import re
+from typing import Any
+
+from jsonschema.validators import validator_for
+
+MCP_APP_MIME_TYPE = "text/html;profile=mcp-app"
+MCP_APP_EXTENSION = "io.modelcontextprotocol/ui"
+MCP_APP_PROTOCOL_VERSION = "2026-01-26"
+RENDERER_SCHEMA = "mcpcodeaway-ui/1"
+MAX_COMPONENTS = 40
+MAX_COMPONENT_TEXT = 2000
+MAX_SPEC_BYTES = 16_384
+MAX_HTML_BYTES = 65_536
+MAX_RESULT_TEXT = 12_000
+
+_RESOURCE_URI = re.compile(r"^ui://[a-z0-9][a-z0-9.-]*(?:/[A-Za-z0-9._~-]+)*$")
+_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_.-]*__[A-Za-z][A-Za-z0-9_.-]*$")
+_NODE_ID = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_FIELD_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,127}$")
+_ACTION_ID = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_URL_OR_ACTIVE_MARKUP = re.compile(
+    r"(?:\b[a-z][a-z0-9+.-]{1,20}:\s*//|\b(?:javascript|data|mailto)\s*:|"
+    r"\bwww\.|<|>|\bon[a-z]+\s*=)",
+    re.IGNORECASE,
+)
+_SECRET_NAME = re.compile(
+    r"(?:password|passwd|secret|token|credential|authorization|api[_-]?key|private[_-]?key)",
+    re.IGNORECASE,
+)
+
+_CSP_DOMAINS = {
+    "connect_domains": "connectDomains",
+    "resource_domains": "resourceDomains",
+    "frame_domains": "frameDomains",
+}
+
+
+def validate_experience(
+    experience: dict[str, Any], *, tool_input_schema: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Validate and normalize the supported declarative experience subset.
+
+    ``tool_input_schema`` is required for an interactive ``button`` and prevents
+    mappings from calling undeclared or secret-like tool parameters.
+    """
+    if not isinstance(experience, dict):
+        raise ValueError("experience must be an object")
+    allowed = {
+        "id",
+        "resource_uri",
+        "renderer_schema",
+        "tool",
+        "fallback",
+        "input_mapping",
+        "components",
+        "csp",
+    }
+    if set(experience) - allowed:
+        raise ValueError("experience contains unsupported fields")
+    normalized = dict(experience)
+    if normalized.get("renderer_schema") != RENDERER_SCHEMA:
+        raise ValueError(f"renderer_schema must be {RENDERER_SCHEMA}")
+    resource_uri = normalized.get("resource_uri")
+    if not isinstance(resource_uri, str) or not _RESOURCE_URI.fullmatch(resource_uri):
+        raise ValueError("resource_uri must be a local ui:// URI")
+    tool = normalized.get("tool")
+    if not isinstance(tool, str) or not _TOOL_NAME.fullmatch(tool):
+        raise ValueError("experience tool must be a qualified gateway tool name")
+    fallback = normalized.get("fallback")
+    if not isinstance(fallback, str) or not fallback.strip() or len(fallback) > 500:
+        raise ValueError("fallback must be non-empty plain text of at most 500 characters")
+    _validate_plain_text(fallback, "fallback")
+
+    csp = normalized.get("csp", {})
+    if not isinstance(csp, dict) or set(csp) - set(_CSP_DOMAINS):
+        raise ValueError("CSP may contain only connect_domains, resource_domains and frame_domains")
+    if any(not isinstance(values, list) or values for values in csp.values()):
+        raise ValueError("experience CSP domains must be empty lists")
+
+    components = normalized.get("components", [])
+    mapping = normalized.get("input_mapping", {})
+    if not isinstance(components, list) or len(components) > MAX_COMPONENTS:
+        raise ValueError(f"components must be a list of at most {MAX_COMPONENTS} nodes")
+    if not isinstance(mapping, dict) or len(mapping) > 32:
+        raise ValueError("input_mapping must be an object with at most 32 entries")
+    try:
+        spec_size = len(
+            json.dumps(
+                normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("experience must contain only JSON-compatible values") from exc
+    if spec_size > MAX_SPEC_BYTES:
+        raise ValueError(f"experience declarative data exceeds {MAX_SPEC_BYTES} bytes")
+
+    input_ids: set[str] = set()
+    button_count = 0
+    for index, node in enumerate(components):
+        if not isinstance(node, dict) or not isinstance(node.get("type"), str):
+            raise ValueError(f"component {index} must be an object with a type")
+        kind = node["type"]
+        schemas = {
+            "heading": {"type", "text"},
+            "text": {"type", "text"},
+            "text_input": {"type", "id", "label", "required", "max_length"},
+            "button": {"type", "label", "action"},
+            "record": {"type", "data"},
+        }
+        if kind not in schemas or set(node) - schemas[kind]:
+            raise ValueError(f"component {index} uses an unsupported node or property")
+        if kind in {"heading", "text"}:
+            text = node.get("text")
+            if not isinstance(text, str) or len(text) > MAX_COMPONENT_TEXT:
+                raise ValueError(f"component {index} text is invalid or too long")
+            _validate_plain_text(text, f"component {index} text")
+        elif kind == "text_input":
+            field_id = node.get("id")
+            label = node.get("label")
+            max_length = node.get("max_length", 256)
+            if not isinstance(field_id, str) or not _NODE_ID.fullmatch(field_id):
+                raise ValueError(f"component {index} has an invalid text input id")
+            if field_id in input_ids:
+                raise ValueError(f"duplicate text input id: {field_id}")
+            input_ids.add(field_id)
+            if not isinstance(label, str) or not label.strip() or len(label) > 200:
+                raise ValueError(f"component {index} has an invalid text input label")
+            _validate_plain_text(label, f"component {index} label")
+            if not isinstance(node.get("required", False), bool):
+                raise ValueError(f"component {index} required must be boolean")
+            if (
+                isinstance(max_length, bool)
+                or not isinstance(max_length, int)
+                or not 1 <= max_length <= 2000
+            ):
+                raise ValueError(f"component {index} max_length must be between 1 and 2000")
+        elif kind == "button":
+            button_count += 1
+            if button_count > 1:
+                raise ValueError("an experience supports one deterministic invoke_tool button")
+            label = node.get("label")
+            if not isinstance(label, str) or not label.strip() or len(label) > 100:
+                raise ValueError(f"component {index} has an invalid button label")
+            _validate_plain_text(label, f"component {index} button label")
+            if not isinstance(node.get("action"), str) or not _ACTION_ID.fullmatch(node["action"]):
+                raise ValueError("button action must be a safe action ID")
+        elif kind == "record" and node.get("data") != "tool_result":
+            raise ValueError("record nodes may display only tool_result")
+
+    if input_ids and not button_count:
+        raise ValueError(
+            "text inputs require an invoke_tool button; inert controls are not supported"
+        )
+    if button_count and tool_input_schema is None:
+        raise ValueError("interactive experiences require the catalog tool input schema")
+    if not button_count and mapping:
+        raise ValueError("input_mapping requires an invoke_tool button")
+    if button_count:
+        properties = (
+            tool_input_schema.get("properties") if isinstance(tool_input_schema, dict) else None
+        )
+        required = (
+            tool_input_schema.get("required", []) if isinstance(tool_input_schema, dict) else []
+        )
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            raise ValueError("tool input schema must declare properties and required fields")
+        validator_for(tool_input_schema).check_schema(tool_input_schema)
+        seen_inputs: set[str] = set()
+        for field_name, source in mapping.items():
+            if not isinstance(field_name, str) or not _FIELD_NAME.fullmatch(field_name):
+                raise ValueError("input_mapping contains an invalid tool field name")
+            if field_name not in properties:
+                raise ValueError(f"input_mapping references undeclared tool field: {field_name}")
+            property_schema = properties[field_name]
+            if not isinstance(property_schema, dict) or property_schema.get("type") != "string":
+                raise ValueError(
+                    f"input_mapping field must be a declared string property: {field_name}"
+                )
+            if _SECRET_NAME.search(field_name) or (
+                isinstance(property_schema, dict)
+                and (
+                    property_schema.get("writeOnly") is True
+                    or property_schema.get("format") == "password"
+                    or _SECRET_NAME.search(str(property_schema.get("format", "")))
+                )
+            ):
+                raise ValueError(f"input_mapping cannot expose secret-like field: {field_name}")
+            if not isinstance(source, str) or not source.startswith("/form/"):
+                raise ValueError("input_mapping values must point to a declared /form/<id>")
+            input_id = source.removeprefix("/form/")
+            if input_id not in input_ids or "/" in input_id or "~" in input_id:
+                raise ValueError(f"input_mapping references undeclared text input: {source}")
+            if input_id in seen_inputs:
+                raise ValueError("each text input may map to only one tool field")
+            seen_inputs.add(input_id)
+        missing_required = set(required) - set(mapping)
+        if missing_required:
+            raise ValueError(
+                "interactive action must map every required tool field: "
+                + ", ".join(sorted(str(value) for value in missing_required))
+            )
+    if input_ids != {value.removeprefix("/form/") for value in mapping.values()}:
+        if input_ids or mapping:
+            raise ValueError("every text input must map to exactly one tool field")
+    return normalized
+
+
+def render_mcp_app_resource(
+    experience: dict[str, Any], *, tool_input_schema: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Return a resources/read content item for a validated experience."""
+    spec = validate_experience(experience, tool_input_schema=tool_input_schema)
+    body = _render_html(spec)
+    if len(body.encode("utf-8")) > MAX_HTML_BYTES:
+        raise ValueError(f"rendered App exceeds {MAX_HTML_BYTES} bytes")
+    return {
+        "uri": spec["resource_uri"],
+        "mimeType": MCP_APP_MIME_TYPE,
+        "text": body,
+        "_meta": {
+            "ui": {
+                "csp": {
+                    "connectDomains": [],
+                    "resourceDomains": [],
+                    "frameDomains": [],
+                    "baseUriDomains": [],
+                },
+                "permissions": {},
+            }
+        },
+    }
+
+
+def describe_mcp_app_resource(
+    experience: dict[str, Any], *, tool_input_schema: dict[str, Any] | None = None
+) -> dict[str, str]:
+    """Return the resource descriptor suitable for a resources/list response."""
+    spec = validate_experience(experience, tool_input_schema=tool_input_schema)
+    return {
+        "uri": spec["resource_uri"],
+        "name": spec["id"],
+        "description": spec["fallback"],
+        "mimeType": MCP_APP_MIME_TYPE,
+    }
+
+
+def _validate_plain_text(value: str, label: str) -> None:
+    if _URL_OR_ACTIVE_MARKUP.search(value):
+        raise ValueError(f"{label} must not contain HTML, JavaScript, event attributes or URLs")
+
+
+def _render_html(spec: dict[str, Any]) -> str:
+    rendered_nodes: list[str] = []
+    input_mapping = {
+        source.removeprefix("/form/"): target for target, source in spec["input_mapping"].items()
+    }
+    has_action = False
+    has_record = False
+    for node in spec["components"]:
+        kind = node["type"]
+        if kind == "heading":
+            rendered_nodes.append(f"<h2>{html.escape(node['text'])}</h2>")
+        elif kind == "text":
+            rendered_nodes.append(f"<p>{html.escape(node['text'])}</p>")
+        elif kind == "text_input":
+            field_id = html.escape(node["id"], quote=True)
+            label = html.escape(node["label"])
+            required = " required" if node.get("required", False) else ""
+            maximum = int(node.get("max_length", 256))
+            rendered_nodes.append(
+                f'<label for="{field_id}">{label}</label>'
+                f'<input id="{field_id}" name="{field_id}" type="text" '
+                f'maxlength="{maximum}" autocomplete="off"{required}>'
+            )
+        elif kind == "button":
+            has_action = True
+            rendered_nodes.append(
+                f'<button id="mca-submit" type="submit">{html.escape(node["label"])}</button>'
+            )
+        elif kind == "record":
+            has_record = True
+            rendered_nodes.append('<pre id="mca-result" aria-live="polite"></pre>')
+    if has_action and not has_record:
+        rendered_nodes.append('<pre id="mca-result" aria-live="polite"></pre>')
+    fallback = html.escape(spec["fallback"])
+    form_start = '<form id="mca-form">' if has_action else '<section id="mca-view">'
+    form_end = "</form>" if has_action else "</section>"
+    config = {
+        "tool": "mca_attr__" + spec["tool"],
+        "inputMap": input_mapping,
+        "fallback": spec["fallback"],
+        "hasAction": has_action,
+    }
+    config_json = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+    config_json = (
+        config_json.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    )
+    return (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f"<title>{html.escape(spec['id'])}</title></head><body>"
+        f"{form_start}{''.join(rendered_nodes)}{form_end}"
+        f'<p id="mca-status" role="status" aria-live="polite">{fallback}</p>'
+        '<script type="application/json" id="mca-config">'
+        f"{config_json}</script><script>{_PRODUCT_BRIDGE_JS}</script></body></html>"
+    )
+
+
+_PRODUCT_BRIDGE_JS = r"""(() => {
+  'use strict';
+  const config = JSON.parse(document.getElementById('mca-config').textContent);
+  const status = document.getElementById('mca-status');
+  const resultNode = document.getElementById('mca-result');
+  let nextId = 1;
+  let hostCapabilities = {};
+  let toolInput = null;
+  const pending = new Map();
+  const setStatus = (value) => { status.textContent = String(value).slice(0, 2000); };
+  const showResult = (value) => {
+    if (resultNode) {
+      let text;
+      try { text = JSON.stringify(value, null, 2); } catch (_) { text = String(value); }
+      resultNode.textContent = (text || '').slice(0, 12000);
+    }
+  };
+  const request = (method, params) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error('Host request timed out'));
+    }, 15000);
+    pending.set(id, { resolve, reject, timer });
+    window.parent.postMessage({ jsonrpc: '2.0', id, method, params }, '*');
+  });
+  window.addEventListener('message', (event) => {
+    if (event.source !== window.parent || !event.data || typeof event.data !== 'object') return;
+    const message = event.data;
+    if (message.id !== undefined && pending.has(message.id)) {
+      const item = pending.get(message.id);
+      pending.delete(message.id);
+      clearTimeout(item.timer);
+      if (message.error) item.reject(new Error(message.error.message || 'Host request failed'));
+      else item.resolve(message.result || {});
+      return;
+    }
+    if (message.method === 'ui/notifications/tool-input') {
+      toolInput = message.params && message.params.arguments;
+      if (resultNode && toolInput && typeof toolInput === 'object') {
+        const values = toolInput.arguments && typeof toolInput.arguments === 'object'
+          ? toolInput.arguments : {};
+        for (const [inputId, fieldName] of Object.entries(config.inputMap)) {
+          const input = document.getElementById(inputId);
+          if (input && typeof values[fieldName] === 'string') {
+            input.value = values[fieldName].slice(0, input.maxLength || 2000);
+          }
+        }
+      }
+    } else if (message.method === 'ui/notifications/tool-result') {
+      showResult(message.params);
+    } else if (message.method === 'ui/notifications/tool-cancelled') {
+      setStatus('The host cancelled this tool call.');
+    }
+  });
+  const initialize = async () => {
+    try {
+      const result = await request('ui/initialize', {
+        protocolVersion: '2026-01-26',
+        appInfo: { name: 'MCPcodeaway declarative experience', version: '1.0.0' },
+        appCapabilities: { availableDisplayModes: ['inline'] }
+      });
+      hostCapabilities = result.hostCapabilities || {};
+      window.parent.postMessage(
+        { jsonrpc: '2.0', method: 'ui/notifications/initialized', params: {} }, '*');
+      if (!hostCapabilities.serverTools && config.hasAction) {
+        setStatus('This host does not support server tool calls. ' + config.fallback);
+      }
+    } catch (_) {
+      setStatus('The App host is unavailable. ' + config.fallback);
+    }
+  };
+  const form = document.getElementById('mca-form');
+  if (form) form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!hostCapabilities.serverTools) {
+      setStatus('The App host does not support server tool calls.');
+      return;
+    }
+    const businessExecutionId = toolInput && toolInput.business_execution_id;
+    if (typeof businessExecutionId !== 'string' || !businessExecutionId) {
+      setStatus('No active business execution is available. ' + config.fallback);
+      return;
+    }
+    const argumentsObject = {};
+    for (const [inputId, fieldName] of Object.entries(config.inputMap)) {
+      const input = document.getElementById(inputId);
+      if (input) argumentsObject[fieldName] = input.value;
+    }
+    const button = document.getElementById('mca-submit');
+    if (button) button.disabled = true;
+    setStatus('Sending request through the MCP host…');
+    try {
+      const response = await request('tools/call', {
+        name: config.tool,
+        arguments: { business_execution_id: businessExecutionId, arguments: argumentsObject }
+      });
+      showResult(response.structuredContent || response);
+      setStatus(response.isError ? 'The tool returned an error.' : 'Tool call completed.');
+    } catch (error) {
+      setStatus(String(error && error.message || 'Tool call failed.'));
+    } finally {
+      if (button) button.disabled = false;
+    }
+  });
+  initialize();
+})();"""

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import copy
 import hashlib
 import hmac
 import json
@@ -37,7 +38,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from opentelemetry import trace
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from gateway import __version__
 from gateway.ab_testing import (
@@ -70,6 +71,15 @@ from gateway.auth import (
     PolicyEvaluator,
     UserCredentialRequiredError,
 )
+from gateway.business_value_runtime import (
+    build_workflow_call_key,
+    canonical_json_digest,
+    encode_jsonrpc_request_id,
+    required_evidence_satisfied,
+    resolve_json_pointer,
+    result_matches_predicate,
+    terminal_completion_satisfied,
+)
 from gateway.catalog import (
     ToolCatalog,
     estimate_tokens,
@@ -99,6 +109,23 @@ from gateway.dispatcher import (
     build_provenance_envelope,
     summarize_value_shape,
 )
+from gateway.integration_definition import IntegrationDefinition
+from gateway.integration_validation import (
+    ATTRIBUTED_TOOL_PREFIX,
+    START_BUSINESS_EXECUTION_TOOL,
+    attributed_tool_name,
+    build_attributed_tool_definition,
+    build_start_business_execution_definition,
+    validate_attributed_arguments,
+    validate_definition_against_catalog,
+)
+from gateway.mcp_app_renderer import (
+    MCP_APP_EXTENSION,
+    MCP_APP_MIME_TYPE,
+    describe_mcp_app_resource,
+    render_mcp_app_resource,
+    validate_experience,
+)
 from gateway.mcp_protocol import (
     MCP_CLIENT_CAPABILITIES_META,
     MCP_PROTOCOL_VERSION,
@@ -127,6 +154,7 @@ from gateway.sandbox import (
 from gateway.secrets import CredentialVault, SecretResolver
 from gateway.state import (
     AuditStore,
+    BusinessExecutionConflict,
     CacheBackend,
     InMemoryCacheBackend,
     PostgresAuditStore,
@@ -168,6 +196,22 @@ class GatewayLifecycleState(StrEnum):
     STOPPING = "stopping"
     STOPPED = "stopped"
     FAILED = "failed"
+
+
+class IntegrationDefinitionDraftRequest(BaseModel):
+    """Strict request envelope for saving an authored manifest draft."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    definition: IntegrationDefinition
+
+
+class IntegrationDefinitionRevisionRequest(BaseModel):
+    """Strict request envelope for publishing or rolling back to one revision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    revision: str = Field(min_length=1, max_length=40)
 
 
 _GATEWAY_LIFECYCLE_TRANSITIONS: dict[GatewayLifecycleState, frozenset[GatewayLifecycleState]] = {
@@ -382,6 +426,16 @@ EXECUTE_CODE_DEF: dict[str, Any] = {
             "code": {
                 "type": "string",
                 "description": "Python script to execute inside the Monty sandbox.",
+            },
+            "business_execution_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": (
+                    "Optional gateway-issued ID returned by "
+                    "mcpcodeaway_start_business_execution. When supplied, all callbacks "
+                    "must belong to that selected execution."
+                ),
             },
             "servers": {
                 "type": "array",
@@ -1207,6 +1261,564 @@ class GatewayRuntime:
                 merged[k] = dict(v)
         return merged
 
+    async def business_value_tools_for_request(
+        self,
+        identity: CallerIdentity,
+        *,
+        allowed_servers: set[str] | None = None,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """Return only current, caller-accessible attributed tool definitions."""
+
+        if not hasattr(self.store, "list_current_published_integration_definitions"):
+            return None, []
+        await self.ensure_catalog_for_identity(identity)
+        rows = await self.store.list_current_published_integration_definitions(
+            identity.tenant_id or ""
+        )
+        accessible = self.catalog.list_accessible_tools(
+            identity,
+            self.policy,
+            self.registry,
+            allowed_servers=allowed_servers,
+        )
+        accessible_by_name = {tool.qualified_name: tool for tool in accessible}
+        visible_rows: list[dict[str, Any]] = []
+        wrapper_tools: dict[str, dict[str, Any]] = {}
+        catalog_names = {
+            tool.qualified_name
+            for server_name in self.registry.list_upstreams()
+            for tool in self.catalog.get_server_tools(server_name.name)
+        }
+        for row in rows:
+            try:
+                manifest = IntegrationDefinition.model_validate(row["definition"])
+                validate_definition_against_catalog(
+                    manifest,
+                    self.catalog,
+                    reserved_tool_names=catalog_names,
+                )
+            except (ValueError, KeyError):
+                continue
+            manifest_data = manifest.model_dump(mode="json")
+            eligible_workflows = [
+                workflow
+                for workflow in manifest_data["workflows"]
+                if set(workflow["participating_tools"]) <= set(accessible_by_name)
+            ]
+            eligible_standalone = [
+                value
+                for value in manifest_data["standalone_tool_values"]
+                if value["tool"] in accessible_by_name
+            ]
+            if not eligible_workflows and not eligible_standalone:
+                continue
+            visible_manifest = {
+                **manifest_data,
+                "workflows": eligible_workflows,
+                "standalone_tool_values": eligible_standalone,
+            }
+            visible_rows.append(
+                {
+                    **row,
+                    "definition": visible_manifest,
+                }
+            )
+            referenced_tools = {
+                tool_name
+                for workflow in eligible_workflows
+                for tool_name in workflow["participating_tools"]
+            } | {value["tool"] for value in eligible_standalone}
+            resource_by_tool: dict[str, str] = {}
+            ambiguous_experience_tools: set[str] = set()
+            for experience in manifest_data.get("experiences", []):
+                experience_tool = accessible_by_name.get(experience["tool"])
+                if experience["tool"] not in referenced_tools or experience_tool is None:
+                    continue
+                try:
+                    validate_experience(
+                        experience,
+                        tool_input_schema=experience_tool.input_schema,
+                    )
+                except ValueError:
+                    continue
+                if experience["tool"] in resource_by_tool:
+                    ambiguous_experience_tools.add(experience["tool"])
+                else:
+                    resource_by_tool[experience["tool"]] = experience["resource_uri"]
+            for ambiguous_tool in ambiguous_experience_tools:
+                resource_by_tool.pop(ambiguous_tool, None)
+            for tool_name in referenced_tools:
+                tool = accessible_by_name.get(tool_name)
+                if tool is None:
+                    continue
+                wrapper_tools[attributed_tool_name(tool_name)] = build_attributed_tool_definition(
+                    tool,
+                    resource_uri=resource_by_tool.get(tool_name),
+                )
+        start_tool = build_start_business_execution_definition(visible_rows)
+        return start_tool, [wrapper_tools[name] for name in sorted(wrapper_tools)]
+
+    async def business_value_resources_for_request(
+        self,
+        identity: CallerIdentity,
+        *,
+        allowed_servers: set[str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return only unambiguous, caller-accessible published App resources."""
+        _, wrappers = await self.business_value_tools_for_request(
+            identity,
+            allowed_servers=allowed_servers,
+        )
+        linked_uris = {
+            str(tool["_meta"]["ui"]["resourceUri"])
+            for tool in wrappers
+            if isinstance(tool.get("_meta"), dict)
+            and isinstance(tool["_meta"].get("ui"), dict)
+            and isinstance(tool["_meta"]["ui"].get("resourceUri"), str)
+        }
+        if not linked_uris:
+            return {}
+        rows = await self.store.list_current_published_integration_definitions(
+            identity.tenant_id or ""
+        )
+        resources: dict[str, dict[str, Any]] = {}
+        ambiguous: set[str] = set()
+        for row in rows:
+            if allowed_servers is not None and row["upstream_name"] not in allowed_servers:
+                continue
+            try:
+                manifest = IntegrationDefinition.model_validate(row["definition"])
+                validate_definition_against_catalog(manifest, self.catalog)
+            except (ValueError, KeyError):
+                continue
+            for experience in manifest.experiences:
+                if experience.resource_uri not in linked_uris:
+                    continue
+                tool = self.catalog.get_tool(experience.tool)
+                if tool is None:
+                    continue
+                try:
+                    experience_data = experience.model_dump(mode="json")
+                    content = render_mcp_app_resource(
+                        experience_data,
+                        tool_input_schema=tool.input_schema,
+                    )
+                    descriptor = describe_mcp_app_resource(
+                        experience_data,
+                        tool_input_schema=tool.input_schema,
+                    )
+                except ValueError:
+                    continue
+                if experience.resource_uri in resources:
+                    ambiguous.add(experience.resource_uri)
+                    continue
+                resources[experience.resource_uri] = {
+                    "descriptor": descriptor,
+                    "content": content,
+                }
+        for resource_uri in ambiguous:
+            resources.pop(resource_uri, None)
+        return resources
+
+    async def start_business_execution_for_identity(
+        self,
+        identity: CallerIdentity,
+        selection: dict[str, Any],
+        *,
+        request_id: str | int,
+        request_payload: dict[str, Any],
+        allowed_servers: set[str] | None,
+    ) -> dict[str, Any]:
+        """Create or replay an owner-bound execution pinned to a published definition."""
+
+        start_tool, _ = await self.business_value_tools_for_request(
+            identity,
+            allowed_servers=allowed_servers,
+        )
+        if start_tool is None:
+            raise ValueError("no eligible published business-value definition is available")
+        kind = selection.get("kind")
+        if kind not in {"workflow", "standalone_tool"}:
+            raise ValueError("kind must be workflow or standalone_tool")
+        selected_id = (
+            selection.get("workflow_id") if kind == "workflow" else selection.get("tool_value_id")
+        )
+        if not isinstance(selected_id, str):
+            raise ValueError("select exactly one published workflow or standalone tool value")
+        found: tuple[dict[str, Any], dict[str, Any]] | None = None
+        expected_prefix = "workflow_id" if kind == "workflow" else "tool_value_id"
+        if expected_prefix not in selection or len(selection) != 2:
+            raise ValueError("start request must contain only kind and its matching definition ID")
+        visible_ids = {
+            identifier
+            for variant in start_tool["inputSchema"]["oneOf"]
+            if variant["properties"]["kind"]["const"] == kind
+            for identifier in variant["properties"][expected_prefix].get("enum", [])
+        }
+        if selected_id not in visible_ids:
+            raise ValueError("selected business-value definition is unavailable")
+        for row in await self.store.list_current_published_integration_definitions(
+            identity.tenant_id or ""
+        ):
+            if allowed_servers is not None and row["upstream_name"] not in allowed_servers:
+                continue
+            manifest = row["definition"]
+            item_key = "workflows" if kind == "workflow" else "standalone_tool_values"
+            for item in manifest.get(item_key, []):
+                qualified_id = f"{row['upstream_name']}/{item['id']}"
+                if qualified_id == selected_id:
+                    found = row, item
+                    break
+            if found is not None:
+                break
+        if found is None:
+            raise ValueError("selected business-value definition is unavailable")
+        row, selected_definition = found
+        manifest = IntegrationDefinition.model_validate(row["definition"])
+        validate_definition_against_catalog(manifest, self.catalog)
+        if kind == "workflow":
+            ttl_minutes = selected_definition.get("execution", {}).get("absolute_ttl_minutes", 1440)
+        else:
+            ttl_minutes = 1440
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(minutes=int(ttl_minutes))
+        execution_id = uuid.uuid4().hex
+        baseline_snapshot = copy.deepcopy(selected_definition["business_value"])
+        metadata = {
+            "pinned_definition": row["definition"],
+            "selected_id": selected_id,
+            "selected_kind": kind,
+            "selected_definition": selected_definition,
+            "baseline_snapshot": baseline_snapshot,
+            "definition_digest": row["definition_digest"],
+        }
+        saved = await self.store.create_business_execution(
+            {
+                "business_execution_id": execution_id,
+                "tenant_id": identity.tenant_id or "",
+                "caller_sub": identity.sub,
+                "client_id": identity.client_id or "",
+                "kind": "standalone_tool" if kind == "standalone_tool" else "workflow",
+                "upstream_name": row["upstream_name"],
+                "definition_revision": row["revision"],
+                "status": "active",
+                "created_at": now.isoformat(),
+                "expires_at": expires_at.isoformat(),
+                "start_request_id": encode_jsonrpc_request_id(request_id),
+                "start_request_digest": canonical_json_digest(request_payload),
+                "metadata": metadata,
+            }
+        )
+        await self.store.append_workflow_execution_event(
+            {
+                "event_id": uuid.uuid4().hex,
+                "tenant_id": identity.tenant_id or "",
+                "business_execution_id": saved["business_execution_id"],
+                "idempotency_key": "execution-started-v1",
+                "event_type": "started",
+                "created_at": saved["created_at"],
+                "evidence": {
+                    "selected_id": selected_id,
+                    "selected_kind": kind,
+                    "definition_revision": saved["definition_revision"],
+                },
+            }
+        )
+        return {
+            "ok": True,
+            "business_execution_id": saved["business_execution_id"],
+            "kind": saved["kind"],
+            "selected_id": selected_id,
+            "definition_revision": saved["definition_revision"],
+            "expires_at": saved["expires_at"],
+        }
+
+    async def resolve_business_execution_for_tool(
+        self,
+        identity: CallerIdentity,
+        business_execution_id: str,
+        qualified_tool_name: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Validate owner, expiry, pinned schema and participation before attribution."""
+
+        row = await self.store.get_business_execution(
+            business_execution_id,
+            identity.tenant_id or "",
+            identity.sub,
+            identity.client_id or "",
+        )
+        if row is None:
+            raise PermissionError("business execution is invalid or not owned by this caller")
+        if row["status"] != "active" or datetime.fromisoformat(row["expires_at"]) <= datetime.now(
+            UTC
+        ):
+            raise PermissionError("business execution is expired or closed")
+        metadata = row["metadata"]
+        selected = metadata["selected_definition"]
+        if row["kind"] == "workflow":
+            participating = set(selected["participating_tools"])
+        else:
+            participating = {selected["tool"]}
+        if qualified_tool_name is not None and qualified_tool_name not in participating:
+            raise PermissionError(
+                f"tool {qualified_tool_name} is not part of the selected business execution"
+            )
+        manifest = IntegrationDefinition.model_validate(metadata["pinned_definition"])
+        validate_definition_against_catalog(manifest, self.catalog)
+        return row, selected
+
+    async def persist_attributed_call_intent(
+        self,
+        identity: CallerIdentity,
+        execution: dict[str, Any],
+        selected: dict[str, Any],
+        tool: DiscoveredTool,
+        *,
+        request_id: str | int,
+        request_digest: str,
+        arguments: dict[str, Any],
+        callback_ordinal: int = 0,
+    ) -> tuple[dict[str, Any], bool]:
+        """Bind the request body and persist a call intent before any upstream dispatch."""
+
+        request_key = encode_jsonrpc_request_id(request_id)
+        tenant_id = identity.tenant_id or ""
+        call_key = build_workflow_call_key(
+            outer_request_id=request_id,
+            request_digest=request_digest,
+            upstream_name=tool.server,
+            tool_name=tool.name,
+            arguments=arguments,
+            callback_ordinal=callback_ordinal,
+            business_execution_id=execution["business_execution_id"],
+            tenant_id=tenant_id,
+            caller_sub=identity.sub,
+            client_id=identity.client_id or "",
+        )
+        await self.store.bind_workflow_request(
+            tenant_id,
+            execution["business_execution_id"],
+            request_key,
+            request_digest,
+        )
+        call_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"mcpcodeaway:{tenant_id}:{execution['business_execution_id']}:{call_key}",
+        ).hex
+        evidence: dict[str, Any] = {}
+        metadata = execution["metadata"]
+        if execution["kind"] == "workflow":
+            workflow = next(
+                workflow
+                for workflow in IntegrationDefinition.model_validate(
+                    metadata["pinned_definition"]
+                ).workflows
+                if workflow.id == selected["id"]
+            )
+            requirement = next(
+                (item for item in workflow.required_evidence if item.tool == tool.qualified_name),
+                None,
+            )
+            if requirement is not None and requirement.result_when is not None:
+                evidence["evidence_predicate_path"] = requirement.result_when.path
+            if workflow.completion.tool == tool.qualified_name:
+                evidence["completion_predicate_path"] = workflow.completion.success_when.path
+        else:
+            standalone = selected
+            if standalone["completion"]["tool"] == tool.qualified_name:
+                evidence["completion_predicate_path"] = standalone["completion"]["success_when"][
+                    "path"
+                ]
+        call, created = await self.store.create_workflow_call(
+            {
+                "workflow_call_id": call_id,
+                "tenant_id": tenant_id,
+                "business_execution_id": execution["business_execution_id"],
+                "call_key": call_key,
+                "outer_request_id": request_key,
+                "callback_ordinal": callback_ordinal,
+                "upstream_name": tool.server,
+                "tool_name": tool.name,
+                "request_digest": request_digest,
+                "arguments_digest": canonical_json_digest(arguments),
+                "status": "started",
+                "evidence": evidence,
+            }
+        )
+        return call, created
+
+    async def finalize_attributed_call(
+        self,
+        identity: CallerIdentity,
+        execution: dict[str, Any],
+        selected: dict[str, Any],
+        tool: DiscoveredTool,
+        call: dict[str, Any],
+        *,
+        result: Any,
+        status: str,
+        run_id: str | None = None,
+        sensitive_write_operation_id: str | None = None,
+        outcome_unknown: bool = False,
+    ) -> dict[str, Any] | None:
+        """Persist boolean predicate evidence and insert completion at most once."""
+
+        metadata = execution["metadata"]
+        manifest = IntegrationDefinition.model_validate(metadata["pinned_definition"])
+        if execution["kind"] == "workflow":
+            workflow = next(w for w in manifest.workflows if w.id == selected["id"])
+            evidence_rule = next(
+                (item for item in workflow.required_evidence if item.tool == tool.qualified_name),
+                None,
+            )
+            evidence_predicate = evidence_rule.result_when if evidence_rule is not None else None
+            completion_tool = workflow.completion.tool
+            completion_predicate = workflow.completion.success_when
+            journal_required = workflow.completion.require_sensitive_write_journal_status
+            dedupe = workflow.dedupe
+        else:
+            from gateway.integration_definition import StandaloneToolValueDefinition
+
+            standalone = StandaloneToolValueDefinition.model_validate(selected)
+            evidence_predicate = None
+            completion_tool = standalone.completion.tool
+            completion_predicate = standalone.completion.success_when
+            journal_required = standalone.completion.require_sensitive_write_journal_status
+            dedupe = standalone.dedupe
+
+        call_evidence: dict[str, Any] = {"outcome_unknown": outcome_unknown}
+        if evidence_predicate is not None:
+            call_evidence["evidence_predicate_matched"] = result_matches_predicate(
+                result, evidence_predicate
+            )
+        if tool.qualified_name == completion_tool:
+            matched = result_matches_predicate(result, completion_predicate)
+            call_evidence["completion_predicate_matched"] = matched
+            if journal_required == "succeeded":
+                call_evidence["sensitive_write_journal_status"] = (
+                    "succeeded"
+                    if sensitive_write_operation_id and status == "succeeded"
+                    else "unknown"
+                )
+            if matched and dedupe is not None:
+                dedupe_data = (
+                    dedupe.model_dump(mode="json") if hasattr(dedupe, "model_dump") else dedupe
+                )
+                values: dict[str, Any] = {}
+                for part in dedupe_data["identity_parts"]:
+                    found, value = resolve_json_pointer(result, part["path"])
+                    if not found or value is None:
+                        values = {}
+                        break
+                    values[part["path"]] = value
+                if values:
+                    call_evidence["outcome_namespace"] = dedupe_data["namespace"]
+                    call_evidence["outcome_digest"] = canonical_json_digest(values)
+        await self.store.update_workflow_call(
+            call["workflow_call_id"],
+            {
+                "status": status,
+                "run_id": run_id,
+                "sensitive_write_operation_id": sensitive_write_operation_id,
+                "evidence": call_evidence,
+            },
+        )
+        if outcome_unknown:
+            await self.store.update_business_execution_status(
+                execution["business_execution_id"],
+                identity.tenant_id or "",
+                "outcome_unknown",
+                datetime.now(UTC).isoformat(),
+            )
+        if status != "succeeded" or outcome_unknown:
+            return None
+        calls = await self.store.list_workflow_calls(
+            identity.tenant_id or "", execution["business_execution_id"]
+        )
+        if execution["kind"] == "workflow":
+            completion_satisfied = required_evidence_satisfied(
+                workflow, calls
+            ) and terminal_completion_satisfied(workflow, calls)
+        else:
+            completion_satisfied = any(
+                item.get("tool_qualified_name") == completion_tool
+                and item.get("status") == "succeeded"
+                and item.get("evidence", {}).get("completion_predicate_matched") is True
+                and (
+                    journal_required is None
+                    or item.get("evidence", {}).get("sensitive_write_journal_status") == "succeeded"
+                )
+                for item in calls
+            )
+        terminal_call = next(
+            (
+                item
+                for item in calls
+                if item.get("tool_qualified_name") == completion_tool
+                and item.get("status") == "succeeded"
+                and item.get("evidence", {}).get("completion_predicate_matched") is True
+                and (
+                    journal_required is None
+                    or item.get("evidence", {}).get("sensitive_write_journal_status")
+                    == journal_required
+                )
+            ),
+            None,
+        )
+        if not completion_satisfied or terminal_call is None:
+            return None
+        terminal_evidence = terminal_call.get("evidence", {})
+        if dedupe is not None and not terminal_evidence.get("outcome_digest"):
+            return None
+        baseline = metadata["baseline_snapshot"]
+        event = {
+            "event_id": uuid.uuid4().hex,
+            "tenant_id": identity.tenant_id or "",
+            "business_execution_id": execution["business_execution_id"],
+            "completion_key": "business-value-completion-v1",
+            "upstream_name": execution["upstream_name"],
+            "outcome_namespace": terminal_evidence.get("outcome_namespace"),
+            "outcome_digest": terminal_evidence.get("outcome_digest"),
+            "credited": 1,
+            "created_at": datetime.now(UTC).isoformat(),
+            "evidence": {
+                "definition_revision": execution["definition_revision"],
+                "selected_id": metadata.get("selected_id"),
+                "selected_kind": metadata.get("selected_kind"),
+                "integration_id": metadata.get("pinned_definition", {})
+                .get("integration", {})
+                .get("id"),
+                "integration_display_name": metadata.get("pinned_definition", {})
+                .get("integration", {})
+                .get("display_name"),
+                "baseline_snapshot": baseline,
+                "workflow_call_id": terminal_call["workflow_call_id"],
+                "required_evidence_satisfied": True,
+                "completion_predicate_matched": True,
+                "sensitive_write_operation_id": terminal_call.get("sensitive_write_operation_id"),
+            },
+        }
+        value_event, inserted = await self.store.record_business_value_event(event)
+        await self.store.update_business_execution_status(
+            execution["business_execution_id"],
+            identity.tenant_id or "",
+            "completed",
+            datetime.now(UTC).isoformat(),
+        )
+        if inserted:
+            await self.store.append_workflow_execution_event(
+                {
+                    "event_id": uuid.uuid4().hex,
+                    "tenant_id": identity.tenant_id or "",
+                    "business_execution_id": execution["business_execution_id"],
+                    "idempotency_key": "business-value-completion-v1",
+                    "event_type": "completed",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "evidence": event["evidence"],
+                }
+            )
+        return value_event
+
     def tools_for_mode(
         self,
         identity: CallerIdentity,
@@ -1405,6 +2017,13 @@ class GatewayRuntime:
                 guidance=guidance,
             )
 
+        start_tool, attributed_tools = await self.business_value_tools_for_request(
+            identity,
+            allowed_servers=effective_ceiling,
+        )
+        if start_tool is not None:
+            tools = [start_tool, *tools, *attributed_tools]
+
         if cursor is not None or limit is not None:
             offset = max(0, int(cursor)) if cursor else 0
             page_size = max(1, min(limit or len(tools) or 1, 200))
@@ -1469,6 +2088,7 @@ class GatewayRuntime:
         experiment_id: str | None = None,
         ab_variant: str | None = None,
         model_name: str | None = None,
+        attribution_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run Code Mode Python script in SandboxBackend and record audit telemetry."""
         started = time.perf_counter()
@@ -1491,6 +2111,7 @@ class GatewayRuntime:
                 experiment_id=experiment_id,
                 ab_variant=ab_variant,
                 model_name=model_name,
+                attribution_context=attribution_context,
             )
         finally:
             self.process_stats.active_executions = max(0, self.process_stats.active_executions - 1)
@@ -1513,6 +2134,7 @@ class GatewayRuntime:
         experiment_id: str | None = None,
         ab_variant: str | None = None,
         model_name: str | None = None,
+        attribution_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         await self.ensure_catalog_for_identity(identity)
         if allowed_servers is not None and servers is not None:
@@ -1543,7 +2165,10 @@ class GatewayRuntime:
 
         budget = ExecutionBudget(self.settings.max_calls_per_execution)
         tool_call_slots = asyncio.Semaphore(self.settings.max_concurrent_tool_calls_per_execution)
+        workflow_read_lock = asyncio.Lock()
         subcalls: list[SubcallRecord] = []
+        attributed_pending_calls: list[dict[str, Any]] = []
+        callback_ordinal = 0
         observed_tool_outputs: list[Any] = []
         observed_tool_shapes: dict[str, Any] = {}
         external_functions: dict[str, Callable[..., Any]] = {}
@@ -1558,17 +2183,170 @@ class GatewayRuntime:
 
             def _make_wrapper(t: DiscoveredTool, u: UpstreamConfig) -> Callable[..., Any]:
                 async def _wrapper(*args: Any, **kwargs: Any) -> Any:
+                    nonlocal callback_ordinal
                     bound = bind_positional_arguments(t, args, kwargs)
-                    async with tool_call_slots:
-                        res, rec = await self.dispatcher.invoke_tool(
+                    current_ordinal = callback_ordinal
+                    callback_ordinal += 1
+                    attributed_call: dict[str, Any] | None = None
+                    attributed_execution: dict[str, Any] | None = None
+                    attributed_selected: dict[str, Any] | None = None
+                    attributed_is_write = False
+                    write_claimed = False
+                    if attribution_context is not None:
+                        (
+                            attributed_execution,
+                            attributed_selected,
+                        ) = await self.resolve_business_execution_for_tool(
                             identity,
-                            t,
-                            u,
-                            bound,
-                            budget=budget,
-                            code_mode_hints=True,
+                            str(attribution_context["business_execution_id"]),
+                            t.qualified_name,
                         )
+                        attributed_call, created_call = await self.persist_attributed_call_intent(
+                            identity,
+                            attributed_execution,
+                            attributed_selected,
+                            t,
+                            request_id=attribution_context["request_id"],
+                            request_digest=attribution_context["request_digest"],
+                            arguments=bound,
+                            callback_ordinal=current_ordinal,
+                        )
+                        tool_upstream = self.registry.get(t.server) or u
+                        attributed_is_write = (
+                            t.mutating
+                            or tool_upstream.tool_effects.get(
+                                t.name, "write" if t.mutating else "read"
+                            )
+                            != "read"
+                        )
+                        prior_status = str(attributed_call.get("status") or "started")
+                        prior_evidence = attributed_call.get("evidence", {})
+                        if (
+                            not created_call
+                            and attributed_is_write
+                            and (
+                                prior_status
+                                in {"started", "succeeded", "pending", "outcome_unknown"}
+                                or prior_evidence.get("outcome_unknown") is True
+                            )
+                        ):
+                            raise RuntimeError(
+                                "This attributed write is already active, completed or unresolved; "
+                                "the gateway will not dispatch it again."
+                            )
+                        if not created_call and prior_evidence.get("outcome_unknown") is True:
+                            raise RuntimeError(
+                                "This attributed call is unresolved and must be reconciled "
+                                "before retry."
+                            )
+                        if not created_call:
+                            await self.store.update_workflow_call(
+                                attributed_call["workflow_call_id"], {"status": "started"}
+                            )
+                        if attributed_is_write:
+                            lease_until = datetime.now(UTC) + timedelta(
+                                seconds=tool_upstream.request_timeout_seconds + 15
+                            )
+                            write_claimed = await self.store.claim_workflow_write(
+                                attributed_execution["business_execution_id"],
+                                attributed_call["workflow_call_id"],
+                                lease_until.isoformat(),
+                            )
+                            if not write_claimed:
+                                await self.store.update_workflow_call(
+                                    attributed_call["workflow_call_id"],
+                                    {"status": "failed", "evidence": {"write_blocked": True}},
+                                )
+                                raise RuntimeError(
+                                    "Another workflow write is active or unresolved."
+                                )
+
+                    workflow_settings = (
+                        attributed_selected.get("execution", {})
+                        if attribution_context is not None
+                        and attributed_execution is not None
+                        and attributed_execution["kind"] == "workflow"
+                        and attributed_selected is not None
+                        else {}
+                    )
+                    serialize_read = (
+                        attribution_context is not None
+                        and not attributed_is_write
+                        and workflow_settings.get("allow_parallel_reads") is False
+                    )
+                    try:
+                        if serialize_read:
+                            async with workflow_read_lock:
+                                async with tool_call_slots:
+                                    res, rec = await self.dispatcher.invoke_tool(
+                                        identity,
+                                        t,
+                                        u,
+                                        bound,
+                                        budget=budget,
+                                        code_mode_hints=True,
+                                        workflow_call_id=(
+                                            attributed_call["workflow_call_id"]
+                                            if attributed_call is not None
+                                            else None
+                                        ),
+                                    )
+                        else:
+                            async with tool_call_slots:
+                                res, rec = await self.dispatcher.invoke_tool(
+                                    identity,
+                                    t,
+                                    u,
+                                    bound,
+                                    budget=budget,
+                                    code_mode_hints=True,
+                                    workflow_call_id=(
+                                        attributed_call["workflow_call_id"]
+                                        if attributed_call is not None
+                                        else None
+                                    ),
+                                )
+                    except Exception as exc:
+                        if attributed_call is not None:
+                            failure_unknown = attributed_is_write and not isinstance(
+                                exc, (KeyError, ValueError, RuntimeError)
+                            )
+                            await self.store.update_workflow_call(
+                                attributed_call["workflow_call_id"],
+                                {
+                                    "status": "outcome_unknown" if failure_unknown else "failed",
+                                    "evidence": {"outcome_unknown": failure_unknown},
+                                },
+                            )
+                            if write_claimed and not failure_unknown:
+                                await self.store.release_workflow_write(
+                                    attributed_execution["business_execution_id"],
+                                    attributed_call["workflow_call_id"],
+                                )
+                        raise
                     subcalls.append(rec)
+                    if attributed_call is not None:
+                        outcome_unknown = bool(rec.outcome_unknown)
+                        call_status = (
+                            "outcome_unknown"
+                            if outcome_unknown
+                            else "succeeded"
+                            if rec.status == "ok"
+                            else "failed"
+                        )
+                        attributed_pending_calls.append(
+                            {
+                                "execution": attributed_execution,
+                                "selected": attributed_selected,
+                                "tool": t,
+                                "call": attributed_call,
+                                "result": res,
+                                "status": call_status,
+                                "sensitive_write_operation_id": rec.sensitive_write_operation_id,
+                                "outcome_unknown": outcome_unknown,
+                                "write_claimed": write_claimed,
+                            }
+                        )
                     if isinstance(res, dict) and "_dispatch_error" in res:
                         raise RuntimeError(res["_dispatch_error"])
                     observed_tool_outputs.append(res)
@@ -1731,6 +2509,27 @@ class GatewayRuntime:
             monty_spawn_ms=sandbox_res.monty_spawn_ms,
             monty_exec_ms=sandbox_res.monty_exec_ms,
         )
+        business_value_event: dict[str, Any] | None = None
+        for attributed_call in attributed_pending_calls:
+            value_event = await self.finalize_attributed_call(
+                identity,
+                attributed_call["execution"],
+                attributed_call["selected"],
+                attributed_call["tool"],
+                attributed_call["call"],
+                result=attributed_call["result"],
+                status=attributed_call["status"],
+                run_id=run["run_id"],
+                sensitive_write_operation_id=attributed_call["sensitive_write_operation_id"],
+                outcome_unknown=attributed_call["outcome_unknown"],
+            )
+            if attributed_call["write_claimed"] and not attributed_call["outcome_unknown"]:
+                await self.store.release_workflow_write(
+                    attributed_call["execution"]["business_execution_id"],
+                    attributed_call["call"]["workflow_call_id"],
+                )
+            if value_event is not None:
+                business_value_event = value_event
         total_saved = self._record_execution_metrics(
             identity=identity,
             mode=mode,
@@ -1755,6 +2554,8 @@ class GatewayRuntime:
         payload["raw_upstream_bytes"] = run["raw_upstream_bytes"]
         payload["returned_bytes"] = run["returned_bytes"]
         payload["estimated_tokens_saved"] = run["estimated_tokens_saved"]
+        if business_value_event is not None:
+            payload["business_value_completion"] = business_value_event
         if execution_cancelled:
             raise asyncio.CancelledError
         return payload
@@ -1774,6 +2575,7 @@ class GatewayRuntime:
         model_name: str | None = None,
         requester_confirmation_policy: ToolApprovalPolicy | None = None,
         request_timeout_seconds: float | None = None,
+        workflow_call_id: str | None = None,
     ) -> dict[str, Any]:
         """Invoke a single upstream tool directly (traditional / traditional_discover / hybrid)."""
         started = time.perf_counter()
@@ -1788,7 +2590,7 @@ class GatewayRuntime:
                 raise PermissionError(
                     f"Server '{tool.server}' is outside the request-level server ceiling"
                 )
-            if mode == "hybrid" and not tool.mutating:
+            if mode == "hybrid" and not tool.mutating and workflow_call_id is None:
                 raise PermissionError(
                     f"Non-mutating tool '{tool_name}' should run via execute_code in hybrid mode"
                 )
@@ -1819,6 +2621,7 @@ class GatewayRuntime:
                 arguments,
                 code_mode_hints=False,
                 requester_confirmation_policy=requester_confirmation_policy,
+                workflow_call_id=workflow_call_id,
             )
             duration_ms = round((time.perf_counter() - started) * 1000, 3)
             ok = rec.status == "ok"
@@ -1858,6 +2661,9 @@ class GatewayRuntime:
                 "outcome_unknown": rec.outcome_unknown,
                 "upstream_status_code": rec.upstream_status_code,
                 "run_id": run["run_id"],
+                "workflow_call_id": rec.workflow_call_id,
+                "sensitive_write_operation_id": rec.sensitive_write_operation_id,
+                "sensitive_write_journal_status": rec.sensitive_write_journal_status,
                 "raw_upstream_bytes": run["raw_upstream_bytes"],
                 "returned_bytes": run["returned_bytes"],
                 "duration_ms": duration_ms,
@@ -2567,6 +3373,16 @@ def create_gateway_app(
                     if isinstance(client_capabilities, dict)
                     else None
                 )
+                mcp_app_capability = (
+                    client_extensions.get(MCP_APP_EXTENSION)
+                    if isinstance(client_extensions, dict)
+                    else None
+                )
+                supports_mcp_apps = bool(
+                    isinstance(mcp_app_capability, dict)
+                    and isinstance(mcp_app_capability.get("mimeTypes"), list)
+                    and MCP_APP_MIME_TYPE in mcp_app_capability["mimeTypes"]
+                )
                 supports_tasks = (
                     isinstance(client_extensions, dict) and MCP_TASKS_EXTENSION in client_extensions
                 )
@@ -2657,6 +3473,51 @@ def create_gateway_app(
                         resp.headers["X-Gateway-Model"] = effective_model_name
                     return resp
 
+                if method in {"resources/list", "resources/read"} and not supports_mcp_apps:
+                    return _finish(
+                        _jsonrpc_err(
+                            req_id,
+                            -32021,
+                            "The MCP Apps extension with text/html;profile=mcp-app is required.",
+                        ),
+                        status_label="capability_required",
+                    )
+
+                if method in {"resources/list", "resources/read"}:
+                    app_resources = await runtime.business_value_resources_for_request(
+                        identity,
+                        allowed_servers=allowed_servers,
+                    )
+                    if method == "resources/list":
+                        return _finish(
+                            _jsonrpc_ok(
+                                req_id,
+                                {
+                                    "resources": [
+                                        app_resources[uri]["descriptor"]
+                                        for uri in sorted(app_resources)
+                                    ]
+                                },
+                            ),
+                            status_label="ok",
+                        )
+                    resource_uri = params.get("uri") if isinstance(params, dict) else None
+                    if not isinstance(resource_uri, str) or not resource_uri:
+                        return _finish(
+                            _jsonrpc_err(req_id, -32602, "resources/read requires a URI."),
+                            status_label="error",
+                        )
+                    resource = app_resources.get(resource_uri)
+                    if resource is None:
+                        return _finish(
+                            _jsonrpc_err(req_id, -32002, "UI resource not found."),
+                            status_label="not_found",
+                        )
+                    return _finish(
+                        _jsonrpc_ok(req_id, {"contents": [resource["content"]]}),
+                        status_label="ok",
+                    )
+
                 if method in {"tasks/get", "tasks/update", "tasks/cancel"}:
                     task_id = str(params.get("taskId") or "")
                     row = await runtime.recovery.get_owned(identity, task_id)
@@ -2681,6 +3542,11 @@ def create_gateway_app(
                     return _finish(_jsonrpc_ok(req_id, {}))
 
                 if method == "server/discover":
+                    advertised_extensions = {MCP_TASKS_EXTENSION: {}}
+                    if supports_mcp_apps:
+                        advertised_extensions[MCP_APP_EXTENSION] = {
+                            "mimeTypes": [MCP_APP_MIME_TYPE]
+                        }
                     return _finish(
                         _jsonrpc_ok(
                             req_id,
@@ -2688,7 +3554,7 @@ def create_gateway_app(
                                 "supportedVersions": [MCP_PROTOCOL_VERSION],
                                 "capabilities": {
                                     "tools": {},
-                                    "extensions": {MCP_TASKS_EXTENSION: {}},
+                                    "extensions": advertised_extensions,
                                 },
                                 "_meta": {
                                     MCP_SERVER_INFO_META: {
@@ -2824,6 +3690,14 @@ def create_gateway_app(
                     )
                     listed.setdefault("ttlMs", 0)
                     listed.setdefault("cacheScope", "private")
+                    if not supports_mcp_apps:
+                        for tool_definition in listed.get("tools", []):
+                            metadata = tool_definition.get("_meta")
+                            if not isinstance(metadata, dict):
+                                continue
+                            metadata.pop("ui", None)
+                            if not metadata:
+                                tool_definition.pop("_meta", None)
                     return _finish(
                         _jsonrpc_ok(req_id, listed),
                         discovery_operation="listing",
@@ -2834,6 +3708,97 @@ def create_gateway_app(
                 if method == "tools/call":
                     tool_name = str(params.get("name") or "")
                     arguments = dict(params.get("arguments") or {})
+                    attributed_context: dict[str, Any] | None = None
+
+                    if tool_name == START_BUSINESS_EXECUTION_TOOL:
+                        try:
+                            started_execution = await runtime.start_business_execution_for_identity(
+                                identity,
+                                arguments,
+                                request_id=req_id,
+                                request_payload=payload,
+                                allowed_servers=allowed_servers,
+                            )
+                        except BusinessExecutionConflict as exc:
+                            return _finish(
+                                _jsonrpc_err(req_id, -32602, str(exc)), status_label="error"
+                            )
+                        except (PermissionError, ValueError) as exc:
+                            return _finish(
+                                _jsonrpc_err(req_id, -32602, str(exc)), status_label="error"
+                            )
+                        return _finish(
+                            _jsonrpc_ok(
+                                req_id,
+                                {
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": json.dumps(started_execution),
+                                        }
+                                    ],
+                                    "structuredContent": started_execution,
+                                },
+                            ),
+                            status_label="ok",
+                        )
+
+                    if tool_name.startswith(ATTRIBUTED_TOOL_PREFIX):
+                        original_tool_name = tool_name[len(ATTRIBUTED_TOOL_PREFIX) :]
+                        business_execution_id = arguments.get("business_execution_id")
+                        original_arguments = arguments.get("arguments")
+                        if (
+                            not original_tool_name
+                            or set(arguments) != {"business_execution_id", "arguments"}
+                            or not isinstance(business_execution_id, str)
+                            or not isinstance(original_arguments, dict)
+                        ):
+                            return _finish(
+                                _jsonrpc_err(
+                                    req_id,
+                                    -32602,
+                                    "Attributed calls require a business execution ID and an "
+                                    "arguments object.",
+                                ),
+                                status_label="error",
+                            )
+                        try:
+                            (
+                                execution_row,
+                                selected_definition,
+                            ) = await runtime.resolve_business_execution_for_tool(
+                                identity,
+                                business_execution_id,
+                                original_tool_name,
+                            )
+                            await runtime.ensure_catalog_for_identity(identity)
+                            wrapped_tool = runtime.catalog.get_tool(original_tool_name)
+                            if wrapped_tool is None:
+                                raise ValueError("attributed tool is no longer available")
+                            validate_attributed_arguments(
+                                wrapped_tool.input_schema,
+                                original_arguments,
+                            )
+                        except BusinessExecutionConflict as exc:
+                            return _finish(
+                                _jsonrpc_err(req_id, -32602, str(exc)), status_label="error"
+                            )
+                        except PermissionError as exc:
+                            return _finish(
+                                _jsonrpc_err(req_id, -31003, str(exc)), status_label="error"
+                            )
+                        except (KeyError, ValueError) as exc:
+                            return _finish(
+                                _jsonrpc_err(req_id, -32602, str(exc)), status_label="error"
+                            )
+                        attributed_context = {
+                            "execution": execution_row,
+                            "selected": selected_definition,
+                            "request_id": req_id,
+                            "request_digest": canonical_json_digest(payload),
+                        }
+                        tool_name = original_tool_name
+                        arguments = original_arguments
 
                     if tool_name == "get_operation_status":
                         operation_id = str(arguments.get("operation_id") or "")
@@ -2965,6 +3930,39 @@ def create_gateway_app(
                                 ),
                                 status_label="error",
                             )
+                        code_attribution: dict[str, Any] | None = None
+                        business_execution_id = arguments.get("business_execution_id")
+                        if business_execution_id is not None:
+                            if not isinstance(business_execution_id, str):
+                                return _finish(
+                                    _jsonrpc_err(
+                                        req_id,
+                                        -32602,
+                                        "business_execution_id must be a string.",
+                                    ),
+                                    status_label="error",
+                                )
+                            try:
+                                (
+                                    execution_row,
+                                    selected_definition,
+                                ) = await runtime.resolve_business_execution_for_tool(
+                                    identity,
+                                    business_execution_id,
+                                    None,
+                                )
+                            except PermissionError as exc:
+                                return _finish(
+                                    _jsonrpc_err(req_id, -31003, str(exc)),
+                                    status_label="error",
+                                )
+                            code_attribution = {
+                                "business_execution_id": business_execution_id,
+                                "execution": execution_row,
+                                "selected": selected_definition,
+                                "request_id": req_id,
+                                "request_digest": canonical_json_digest(payload),
+                            }
                         res = await runtime.execute_code_for_identity(
                             identity,
                             code,
@@ -2980,6 +3978,7 @@ def create_gateway_app(
                             experiment_id=experiment_id,
                             ab_variant=ab_variant,
                             model_name=effective_model_name,
+                            attribution_context=code_attribution,
                         )
                         return _finish(
                             _jsonrpc_ok(
@@ -2995,7 +3994,7 @@ def create_gateway_app(
                             status_label="ok" if res["ok"] else "error",
                         )
 
-                    if eff_exec == "codemode":
+                    if eff_exec == "codemode" and attributed_context is None:
                         return _finish(
                             _jsonrpc_err(
                                 req_id,
@@ -3389,6 +4388,118 @@ def create_gateway_app(
                                 ),
                                 status_label="approval_replay",
                             )
+                    attributed_call: dict[str, Any] | None = None
+                    attributed_write_claimed = False
+                    attributed_is_write = False
+                    if attributed_context is not None:
+                        if target_tool is None or target_upstream is None:
+                            return _finish(
+                                _jsonrpc_err(req_id, -32602, "Attributed tool is unavailable."),
+                                status_label="error",
+                            )
+                        try:
+                            (
+                                attributed_call,
+                                created_call,
+                            ) = await runtime.persist_attributed_call_intent(
+                                identity,
+                                attributed_context["execution"],
+                                attributed_context["selected"],
+                                target_tool,
+                                request_id=attributed_context["request_id"],
+                                request_digest=attributed_context["request_digest"],
+                                arguments=arguments,
+                            )
+                        except BusinessExecutionConflict as exc:
+                            return _finish(
+                                _jsonrpc_err(req_id, -32602, str(exc)), status_label="error"
+                            )
+                        attributed_is_write = (
+                            target_tool.mutating
+                            or target_upstream.tool_effects.get(
+                                target_tool.name,
+                                "write" if target_tool.mutating else "read",
+                            )
+                            != "read"
+                        )
+                        prior_status = str(attributed_call.get("status") or "started")
+                        prior_evidence = attributed_call.get("evidence", {})
+                        prior_unknown = bool(
+                            prior_evidence.get("outcome_unknown")
+                            or prior_status == "outcome_unknown"
+                        )
+                        if (
+                            not created_call
+                            and attributed_is_write
+                            and (
+                                prior_unknown or prior_status in {"started", "succeeded", "pending"}
+                            )
+                        ):
+                            message = (
+                                "This write already has an unresolved or completed logical call. "
+                                "Use its existing recovery/status path; the gateway will not "
+                                "dispatch it again."
+                            )
+                            return _finish(
+                                _jsonrpc_err(req_id, -32602, message), status_label="replay_blocked"
+                            )
+                        if not created_call and prior_unknown:
+                            return _finish(
+                                _jsonrpc_err(
+                                    req_id,
+                                    -32602,
+                                    "The read outcome is unresolved; the existing call must be "
+                                    "reconciled before retry.",
+                                ),
+                                status_label="replay_blocked",
+                            )
+                        if not created_call:
+                            await runtime.store.update_workflow_call(
+                                attributed_call["workflow_call_id"],
+                                {"status": "started"},
+                            )
+                        if attributed_is_write:
+                            lease_until = datetime.now(UTC) + timedelta(
+                                seconds=target_upstream.request_timeout_seconds + 15
+                            )
+                            attributed_write_claimed = await runtime.store.claim_workflow_write(
+                                attributed_context["execution"]["business_execution_id"],
+                                attributed_call["workflow_call_id"],
+                                lease_until.isoformat(),
+                            )
+                            if not attributed_write_claimed:
+                                await runtime.store.update_workflow_call(
+                                    attributed_call["workflow_call_id"],
+                                    {"status": "failed", "evidence": {"write_blocked": True}},
+                                )
+                                return _finish(
+                                    _jsonrpc_err(
+                                        req_id,
+                                        -32010,
+                                        "Another workflow write is active or unresolved.",
+                                    ),
+                                    status_label="write_blocked",
+                                )
+
+                    async def finish_attributed_error(*, unknown: bool) -> None:
+                        if attributed_context is None or attributed_call is None:
+                            return
+                        await runtime.finalize_attributed_call(
+                            identity,
+                            attributed_context["execution"],
+                            attributed_context["selected"],
+                            target_tool,
+                            attributed_call,
+                            result=None,
+                            status="outcome_unknown" if unknown else "failed",
+                            outcome_unknown=unknown,
+                        )
+                        if attributed_write_claimed and not unknown:
+                            await runtime.store.release_workflow_write(
+                                attributed_context["execution"]["business_execution_id"],
+                                attributed_call["workflow_call_id"],
+                            )
+
                     try:
                         recovery_enabled = bool(
                             target_tool is not None
@@ -3416,6 +4527,11 @@ def create_gateway_app(
                                 experiment_id=experiment_id,
                                 ab_variant=ab_variant,
                                 model_name=effective_model_name,
+                                workflow_call_id=(
+                                    attributed_call["workflow_call_id"]
+                                    if attributed_call is not None
+                                    else None
+                                ),
                             )
                         else:
                             res = await runtime.call_direct_tool_for_identity(
@@ -3430,9 +4546,15 @@ def create_gateway_app(
                                 ab_variant=ab_variant,
                                 model_name=effective_model_name,
                                 requester_confirmation_policy=requester_confirmation_policy,
+                                workflow_call_id=(
+                                    attributed_call["workflow_call_id"]
+                                    if attributed_call is not None
+                                    else None
+                                ),
                             )
                             recovery_status = "ok" if res.get("ok") else "error"
                     except KeyError as exc:
+                        await finish_attributed_error(unknown=False)
                         if (
                             manager_approval_record is not None
                             and manager_approval_record["status"] == "approved"
@@ -3444,6 +4566,7 @@ def create_gateway_app(
                             )
                         return _finish(_jsonrpc_err(req_id, -32601, str(exc)), status_label="error")
                     except PermissionError as exc:
+                        await finish_attributed_error(unknown=False)
                         if (
                             manager_approval_record is not None
                             and manager_approval_record["status"] == "approved"
@@ -3455,6 +4578,7 @@ def create_gateway_app(
                             )
                         return _finish(_jsonrpc_err(req_id, -31003, str(exc)), status_label="error")
                     except (ValueError, RuntimeError) as exc:
+                        await finish_attributed_error(unknown=False)
                         if (
                             manager_approval_record is not None
                             and manager_approval_record["status"] == "approved"
@@ -3466,6 +4590,7 @@ def create_gateway_app(
                             )
                         return _finish(_jsonrpc_err(req_id, -32602, str(exc)), status_label="error")
                     except Exception as exc:
+                        await finish_attributed_error(unknown=attributed_is_write)
                         if (
                             manager_approval_record is None
                             or manager_approval_record["status"] != "approved"
@@ -3488,6 +4613,57 @@ def create_gateway_app(
                             _jsonrpc_err(req_id, -32603, "Approved tool execution failed."),
                             status_label="error",
                         )
+
+                    if attributed_context is not None and attributed_call is not None:
+                        pending_recovery = recovery_status in {"task", "pending"}
+                        result_value = res.get("result") if isinstance(res, dict) else None
+                        attributed_unknown = bool(
+                            pending_recovery
+                            or (isinstance(res, dict) and res.get("outcome_unknown"))
+                        )
+                        call_status = (
+                            "pending"
+                            if pending_recovery
+                            else "outcome_unknown"
+                            if attributed_unknown
+                            else "succeeded"
+                            if isinstance(res, dict) and res.get("ok") is True
+                            else "failed"
+                        )
+                        value_event = await runtime.finalize_attributed_call(
+                            identity,
+                            attributed_context["execution"],
+                            attributed_context["selected"],
+                            target_tool,
+                            attributed_call,
+                            result=result_value,
+                            status=call_status,
+                            run_id=(res.get("run_id") if isinstance(res, dict) else None),
+                            sensitive_write_operation_id=(
+                                res.get("sensitive_write_operation_id")
+                                if isinstance(res, dict)
+                                else None
+                            ),
+                            outcome_unknown=attributed_unknown,
+                        )
+                        if attributed_write_claimed and not attributed_unknown:
+                            await runtime.store.release_workflow_write(
+                                attributed_context["execution"]["business_execution_id"],
+                                attributed_call["workflow_call_id"],
+                            )
+                        res = {
+                            "ok": bool(isinstance(res, dict) and res.get("ok")),
+                            "result": result_value,
+                            "business_execution_id": attributed_context["execution"][
+                                "business_execution_id"
+                            ],
+                            "workflow_call_id": attributed_call["workflow_call_id"],
+                            "completion_recorded": bool(
+                                value_event is not None
+                                and value_event.get("business_execution_id")
+                                == attributed_context["execution"]["business_execution_id"]
+                            ),
+                        }
 
                     if (
                         manager_approval_record is not None
@@ -3642,6 +4818,103 @@ def create_gateway_app(
             raise HTTPException(status_code=403, detail="Cross-tenant audit access denied.")
         return identity.tenant_id
 
+    def _integration_definition_tenant(identity: CallerIdentity | None) -> str:
+        scoped = _resolve_audit_tenant_scope(identity, None)
+        tenant = scoped or (identity.tenant_id if identity is not None else None)
+        if not tenant:
+            tenant = next(iter(runtime.settings.allowed_tenants), None)
+        if not tenant:
+            raise HTTPException(status_code=401, detail="Tenant identity is required.")
+        return tenant
+
+    def _reject_integration_definition_tenant_override(request: Request) -> None:
+        if "tenant_id" in request.query_params:
+            raise HTTPException(
+                status_code=400,
+                detail="tenant_id cannot be selected on integration-definition routes.",
+            )
+
+    def _integration_definition_content_digest(definition: IntegrationDefinition) -> str:
+        authored = definition.model_dump(mode="json", exclude_none=True)
+        authored.pop("publication", None)
+        integration = authored.get("integration")
+        if isinstance(integration, dict):
+            integration.pop("revision", None)
+            integration.pop("status", None)
+        return canonical_json_digest(authored)
+
+    async def _validate_admin_integration_definition(
+        definition: IntegrationDefinition,
+        upstream_name: str,
+        identity: CallerIdentity | None,
+    ) -> str:
+        if definition.integration.upstream_name != upstream_name:
+            raise HTTPException(
+                status_code=422,
+                detail="definition integration upstream does not match the route upstream.",
+            )
+        if runtime.registry.get(upstream_name) is None:
+            raise HTTPException(status_code=404, detail=f"Upstream '{upstream_name}' not found.")
+        catalog_identity = identity or runtime._dev_discovery_identity()
+        if catalog_identity is None:
+            raise HTTPException(
+                status_code=401,
+                detail="An authenticated administrator is required to validate the catalog.",
+            )
+        await runtime.ensure_catalog_for_identity(catalog_identity)
+        catalog_names = {
+            tool.qualified_name
+            for upstream in runtime.registry.list_upstreams()
+            for tool in runtime.catalog.get_server_tools(upstream.name)
+        }
+        try:
+            validate_definition_against_catalog(
+                definition,
+                runtime.catalog,
+                reserved_tool_names=catalog_names,
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _integration_definition_content_digest(definition)
+
+    async def _definition_revision(
+        tenant_id: str,
+        upstream_name: str,
+        revision: str,
+    ) -> dict[str, Any]:
+        row = await runtime.store.get_integration_definition_version(
+            tenant_id, upstream_name, revision
+        )
+        if row is None:
+            raise HTTPException(
+                status_code=404, detail="Integration definition revision not found."
+            )
+        try:
+            definition = IntegrationDefinition.model_validate(row["definition"])
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Stored integration definition is invalid and cannot be published.",
+            ) from exc
+        return {**row, "definition_model": definition}
+
+    def _integration_definition_api_row(
+        row: dict[str, Any], *, is_current: bool = False
+    ) -> dict[str, Any]:
+        view = copy.deepcopy(row)
+        definition = view.get("definition")
+        if isinstance(definition, dict):
+            integration = definition.get("integration")
+            if isinstance(integration, dict):
+                try:
+                    integration["revision"] = int(view["revision"])
+                except (KeyError, TypeError, ValueError):
+                    pass
+                if is_current:
+                    integration["status"] = "published"
+        view["is_current"] = is_current
+        return view
+
     if features.metrics:
 
         @app.get("/metrics", response_class=PlainTextResponse)
@@ -3792,6 +5065,74 @@ def create_gateway_app(
         return tool
 
     if features.admin_read:
+
+        @app.get("/admin/business-value/report")
+        async def admin_business_value_report(
+            since: str | None = Query(default=None, max_length=64),
+            limit: int = Query(default=1000, ge=1, le=10_000),
+            tenant_id: str | None = Query(default=None, min_length=1, max_length=120),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            if identity is None:
+                if tenant_id is not None:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Tenant switching requires an authenticated administrator.",
+                    )
+                effective_tenant = next(iter(runtime.settings.allowed_tenants), None)
+            else:
+                effective_tenant = _resolve_audit_tenant_scope(identity, tenant_id)
+                effective_tenant = effective_tenant or identity.tenant_id
+            if not effective_tenant:
+                raise HTTPException(status_code=401, detail="Tenant identity is required.")
+            return await runtime.telemetry.business_value_report(
+                tenant_id=effective_tenant,
+                since=since,
+                limit=limit,
+            )
+
+        @app.get("/admin/integration-definitions/{upstream_name}")
+        async def get_admin_integration_definitions(
+            upstream_name: str,
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            versions = await runtime.store.list_integration_definition_versions(
+                tenant_id, upstream_name
+            )
+            current = await runtime.store.get_current_published_integration_definition(
+                tenant_id, upstream_name
+            )
+            current_revision = current["revision"] if current else None
+            return {
+                "upstream_name": upstream_name,
+                "current_revision": current_revision,
+                "current": (
+                    _integration_definition_api_row(current, is_current=True) if current else None
+                ),
+                "versions": [
+                    _integration_definition_api_row(
+                        row, is_current=row["revision"] == current_revision
+                    )
+                    for row in versions
+                ],
+            }
 
         @app.get("/admin/pricing/models")
         async def admin_list_model_pricing(
@@ -4467,6 +5808,188 @@ def create_gateway_app(
             return {"approval": _approval_public_record(decided)}
 
     if features.admin_write:
+
+        @app.post("/admin/integration-definitions/validate")
+        async def validate_admin_integration_definition(
+            definition: IntegrationDefinition,
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            upstream_name = definition.integration.upstream_name
+            digest = await _validate_admin_integration_definition(
+                definition, upstream_name, identity
+            )
+            return {
+                "valid": True,
+                "upstream_name": upstream_name,
+                "definition_digest": digest,
+                "tool_count": len(definition.tool_refs),
+                "workflow_count": len(definition.workflows),
+                "standalone_tool_value_count": len(definition.standalone_tool_values),
+            }
+
+        @app.post("/admin/integration-definitions/drafts")
+        async def create_admin_integration_definition_draft(
+            body: IntegrationDefinitionDraftRequest,
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            definition = body.definition.model_copy(
+                update={
+                    "integration": body.definition.integration.model_copy(
+                        update={"status": "draft", "revision": 1}
+                    ),
+                    "publication": None,
+                }
+            )
+            upstream_name = definition.integration.upstream_name
+            if runtime.registry.get(upstream_name) is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Upstream '{upstream_name}' not found."
+                )
+            tenant_id = _integration_definition_tenant(identity)
+            digest = _integration_definition_content_digest(definition)
+            saved = await runtime.store.save_integration_definition_version(
+                {
+                    "tenant_id": tenant_id,
+                    "upstream_name": upstream_name,
+                    "definition_digest": digest,
+                    "definition": definition.model_dump(mode="json", exclude_none=True),
+                }
+            )
+            return {
+                "saved": True,
+                "tenant_id": tenant_id,
+                "upstream_name": upstream_name,
+                "revision": saved["revision"],
+                "definition_digest": saved["definition_digest"],
+                "validator_version": "1.0",
+                "definition": _integration_definition_api_row(saved)["definition"],
+            }
+
+        @app.post("/admin/integration-definitions/{upstream_name}/publish")
+        async def publish_admin_integration_definition(
+            upstream_name: str,
+            body: IntegrationDefinitionRevisionRequest,
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            row = await _definition_revision(tenant_id, upstream_name, body.revision)
+            definition: IntegrationDefinition = row["definition_model"]
+            digest = await _validate_admin_integration_definition(
+                definition, upstream_name, identity
+            )
+            if digest != row["definition_digest"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Stored definition digest does not match its authored content.",
+                )
+            current = await runtime.store.get_current_published_integration_definition(
+                tenant_id, upstream_name
+            )
+            previous_revision = current["revision"] if current else None
+            event = {
+                "event_id": uuid.uuid4().hex,
+                "tenant_id": tenant_id,
+                "upstream_name": upstream_name,
+                "action": "publish",
+                "revision": body.revision,
+                "actor_sub": identity.sub if identity else "local-admin",
+                "created_at": datetime.now(UTC).isoformat(),
+                "evidence": {
+                    "previous_revision": previous_revision,
+                    "target_revision": body.revision,
+                },
+            }
+            try:
+                await runtime.store.append_integration_definition_publication(event)
+            except (BusinessExecutionConflict, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {
+                "published": True,
+                "tenant_id": tenant_id,
+                "upstream_name": upstream_name,
+                "revision": body.revision,
+                "previous_revision": previous_revision,
+                "definition_digest": digest,
+            }
+
+        @app.post("/admin/integration-definitions/{upstream_name}/rollback")
+        async def rollback_admin_integration_definition(
+            upstream_name: str,
+            body: IntegrationDefinitionRevisionRequest,
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            current = await runtime.store.get_current_published_integration_definition(
+                tenant_id, upstream_name
+            )
+            if current is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cannot roll back an integration with no current publication.",
+                )
+            if current["revision"] == body.revision:
+                raise HTTPException(
+                    status_code=409, detail="Rollback target is already the current revision."
+                )
+            row = await _definition_revision(tenant_id, upstream_name, body.revision)
+            definition: IntegrationDefinition = row["definition_model"]
+            digest = await _validate_admin_integration_definition(
+                definition, upstream_name, identity
+            )
+            if digest != row["definition_digest"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Stored definition digest does not match its authored content.",
+                )
+            event = {
+                "event_id": uuid.uuid4().hex,
+                "tenant_id": tenant_id,
+                "upstream_name": upstream_name,
+                "action": "rollback",
+                "revision": body.revision,
+                "actor_sub": identity.sub if identity else "local-admin",
+                "created_at": datetime.now(UTC).isoformat(),
+                "evidence": {
+                    "previous_revision": current["revision"],
+                    "target_revision": body.revision,
+                },
+            }
+            try:
+                await runtime.store.append_integration_definition_publication(event)
+            except (BusinessExecutionConflict, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {
+                "rolled_back": True,
+                "tenant_id": tenant_id,
+                "upstream_name": upstream_name,
+                "revision": body.revision,
+                "previous_revision": current["revision"],
+                "definition_digest": digest,
+            }
 
         @app.put("/admin/upstreams/{name}/tools/{tool_name}/guidance")
         async def save_admin_tool_guidance(

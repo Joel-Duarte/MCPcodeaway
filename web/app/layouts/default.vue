@@ -40,6 +40,12 @@ const navigation = [
     icon: "models",
   },
   {
+    label: "Business Value",
+    to: "/business-value",
+    group: "Optimize",
+    icon: "analytics",
+  },
+  {
     label: "Upstreams Catalog",
     to: "/upstreams",
     group: "Govern",

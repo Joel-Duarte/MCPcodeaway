@@ -278,10 +278,17 @@ async def test_tool_callbacks_are_bounded_per_execution(tmp_path) -> None:
         peak_calls = 0
 
         async def _measure_callback_concurrency(
-            identity, tool, upstream, arguments, *, budget=None, code_mode_hints=False
+            identity,
+            tool,
+            upstream,
+            arguments,
+            *,
+            budget=None,
+            code_mode_hints=False,
+            workflow_call_id=None,
         ):
             nonlocal active_calls, peak_calls
-            _ = (identity, budget, code_mode_hints)
+            _ = (identity, budget, code_mode_hints, workflow_call_id)
             active_calls += 1
             peak_calls = max(peak_calls, active_calls)
             try:

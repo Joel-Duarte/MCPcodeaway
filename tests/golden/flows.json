@@ -102,6 +102,35 @@
       "expected_rpc_error_code": -32602
     }
   ],
+  "business_value_flows": [
+    {
+      "id": "support_workflow_requires_all_lookups_and_ticket",
+      "expected_required_tools": [
+        "support_api__find_customer",
+        "support_api__get_account",
+        "support_api__get_order_history"
+      ],
+      "expected_completion_tool": "support_api__create_ticket",
+      "expected_manual_baseline_minutes": 5,
+      "expected_credited_completions": 1
+    },
+    {
+      "id": "support_workflow_ticket_without_order_lookup_is_incomplete",
+      "missing_required_tool": "support_api__get_order_history",
+      "expected_completion_recorded": false,
+      "expected_credited_completions": 0
+    },
+    {
+      "id": "support_workflow_code_mode_tracks_each_callback",
+      "expected_callback_ordinals": [0, 1, 2, 3],
+      "expected_credited_completions": 1
+    },
+    {
+      "id": "standalone_value_rejects_second_logical_invocation",
+      "expected_second_invocation_rpc_error": -32602,
+      "expected_upstream_calls": 1
+    }
+  ],
   "recovery_flows": [
     {
       "id": "read_retries_once_then_succeeds",

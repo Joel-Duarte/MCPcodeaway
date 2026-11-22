@@ -331,6 +331,14 @@ class AuditStore(Protocol):
 
     async def create_business_execution(self, execution: dict[str, Any]) -> dict[str, Any]: ...
 
+    async def list_business_executions(
+        self, tenant_id: str, *, since: str | None = None, limit: int = 1000
+    ) -> list[dict[str, Any]]: ...
+
+    async def update_business_execution_status(
+        self, business_execution_id: str, tenant_id: str, status: str, updated_at: str
+    ) -> bool: ...
+
     async def get_business_execution(
         self, business_execution_id: str, tenant_id: str, caller_sub: str, client_id: str
     ) -> dict[str, Any] | None: ...
@@ -348,6 +356,14 @@ class AuditStore(Protocol):
     async def list_workflow_calls(
         self, tenant_id: str, business_execution_id: str
     ) -> list[dict[str, Any]]: ...
+
+    async def get_workflow_call_by_id(
+        self, tenant_id: str, workflow_call_id: str
+    ) -> dict[str, Any] | None: ...
+
+    async def get_workflow_call(
+        self, tenant_id: str, business_execution_id: str, workflow_call_id: str
+    ) -> dict[str, Any] | None: ...
 
     async def update_workflow_call(self, workflow_call_id: str, fields: dict[str, Any]) -> bool: ...
 
@@ -766,7 +782,10 @@ class SQLiteAuditStore:
                 business_execution_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
                 caller_sub TEXT NOT NULL,
                 client_id TEXT NOT NULL, kind TEXT NOT NULL, upstream_name TEXT NOT NULL,
-                definition_revision TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL,
+                definition_revision TEXT,
+                status TEXT NOT NULL CHECK (status IN (
+                    'active','completed','outcome_unknown','failed','expired')),
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL, standalone_call_key TEXT, active_write_call_id TEXT,
                 write_lease_until TEXT, start_request_id TEXT, start_request_digest TEXT,
                 payload_json TEXT NOT NULL,
@@ -789,6 +808,9 @@ class SQLiteAuditStore:
                 sensitive_write_operation_id TEXT, approval_id TEXT,
                 UNIQUE (tenant_id, call_key)
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_calls_callback_slot
+                ON workflow_calls (tenant_id, business_execution_id, outer_request_id,
+                                   callback_ordinal);
             CREATE INDEX IF NOT EXISTS idx_workflow_calls_execution
                 ON workflow_calls (tenant_id, business_execution_id, created_at);
             CREATE TABLE IF NOT EXISTS workflow_execution_events (
@@ -2109,6 +2131,14 @@ class SQLiteAuditStore:
         row = dict(execution)
         row.setdefault("created_at", datetime.now(UTC).isoformat())
         payload = _business_json(row.get("metadata", {}))
+        if row.get("status", "active") not in {
+            "active",
+            "completed",
+            "outcome_unknown",
+            "failed",
+            "expired",
+        }:
+            raise ValueError("invalid business execution status")
         if row.get("start_request_id") is not None and not row.get("start_request_digest"):
             raise ValueError("a start request ID requires its exact request body digest")
         async with self._lock:
@@ -2132,9 +2162,9 @@ class SQLiteAuditStore:
             conn.execute(
                 """INSERT INTO workflow_executions
                 (business_execution_id,tenant_id,caller_sub,client_id,kind,upstream_name,
-                 definition_revision,status,created_at,expires_at,start_request_id,
+                 definition_revision,status,created_at,updated_at,expires_at,start_request_id,
                  start_request_digest,payload_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     row["business_execution_id"],
                     row["tenant_id"],
@@ -2145,6 +2175,7 @@ class SQLiteAuditStore:
                     row.get("definition_revision"),
                     row.get("status", "active"),
                     row["created_at"],
+                    row.get("updated_at", row["created_at"]),
                     row["expires_at"],
                     request_id,
                     row.get("start_request_digest"),
@@ -2157,6 +2188,51 @@ class SQLiteAuditStore:
                 (row["business_execution_id"],),
             ).fetchone()
         return {**dict(saved), "metadata": json.loads(saved["payload_json"])}
+
+    async def list_business_executions(
+        self, tenant_id: str, *, since: str | None = None, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = (
+                self._ensure_conn()
+                .execute(
+                    """SELECT * FROM workflow_executions WHERE tenant_id=?
+                AND (? IS NULL OR created_at>=?) ORDER BY created_at DESC,business_execution_id
+                LIMIT ?""",
+                    (tenant_id, since, since, max(1, min(limit, 10000))),
+                )
+                .fetchall()
+            )
+        return [{**dict(row), "metadata": json.loads(row["payload_json"])} for row in rows]
+
+    async def update_business_execution_status(
+        self, business_execution_id: str, tenant_id: str, status: str, updated_at: str
+    ) -> bool:
+        allowed = {"active", "completed", "outcome_unknown", "failed", "expired"}
+        if status not in allowed:
+            raise ValueError("invalid business execution status")
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT status FROM workflow_executions WHERE tenant_id=? "
+                "AND business_execution_id=?",
+                (tenant_id, business_execution_id),
+            ).fetchone()
+            if current is None:
+                conn.commit()
+                return False
+            current_status = str(current["status"])
+            if current_status in {"completed", "failed", "expired"} and status != current_status:
+                conn.commit()
+                return False
+            cursor = conn.execute(
+                "UPDATE workflow_executions SET status=?,updated_at=? "
+                "WHERE tenant_id=? AND business_execution_id=?",
+                (status, updated_at, tenant_id, business_execution_id),
+            )
+            conn.commit()
+        return bool(cursor.rowcount)
 
     async def get_business_execution(
         self, business_execution_id: str, tenant_id: str, caller_sub: str, client_id: str
@@ -2273,8 +2349,25 @@ class SQLiteAuditStore:
                 "SELECT * FROM workflow_calls WHERE tenant_id=? AND call_key=?",
                 (row["tenant_id"], row["call_key"]),
             ).fetchone()
+            if saved is None:
+                saved = conn.execute(
+                    "SELECT * FROM workflow_calls WHERE tenant_id=? AND business_execution_id=? "
+                    "AND outer_request_id=? AND callback_ordinal=?",
+                    (
+                        row["tenant_id"],
+                        row["business_execution_id"],
+                        row["outer_request_id"],
+                        int(row.get("callback_ordinal", 0)),
+                    ),
+                ).fetchone()
+            if saved is None:
+                conn.rollback()
+                raise BusinessExecutionConflict(
+                    "workflow call identity conflicts with an existing call"
+                )
             if (
                 saved["workflow_call_id"] != row["workflow_call_id"]
+                or saved["call_key"] != row["call_key"]
                 or saved["business_execution_id"] != row["business_execution_id"]
                 or saved["outer_request_id"] != row["outer_request_id"]
                 or saved["request_digest"] != row["request_digest"]
@@ -2307,6 +2400,35 @@ class SQLiteAuditStore:
                 .fetchall()
             )
         return [_decode_workflow_call(row) for row in rows]
+
+    async def get_workflow_call_by_id(
+        self, tenant_id: str, workflow_call_id: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            row = (
+                self._ensure_conn()
+                .execute(
+                    "SELECT * FROM workflow_calls WHERE tenant_id=? AND workflow_call_id=?",
+                    (tenant_id, workflow_call_id),
+                )
+                .fetchone()
+            )
+        return _decode_workflow_call(row) if row else None
+
+    async def get_workflow_call(
+        self, tenant_id: str, business_execution_id: str, workflow_call_id: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            row = (
+                self._ensure_conn()
+                .execute(
+                    """SELECT * FROM workflow_calls WHERE tenant_id=? AND business_execution_id=?
+                AND workflow_call_id=?""",
+                    (tenant_id, business_execution_id, workflow_call_id),
+                )
+                .fetchone()
+            )
+        return _decode_workflow_call(row) if row else None
 
     async def update_workflow_call(self, workflow_call_id: str, fields: dict[str, Any]) -> bool:
         allowed = {
@@ -3598,6 +3720,14 @@ class PostgresAuditStore:
         row = dict(execution)
         row.setdefault("created_at", datetime.now(UTC).isoformat())
         payload = _business_json(row.get("metadata", {}))
+        if row.get("status", "active") not in {
+            "active",
+            "completed",
+            "outcome_unknown",
+            "failed",
+            "expired",
+        }:
+            raise ValueError("invalid business execution status")
         if row.get("start_request_id") is not None and not row.get("start_request_digest"):
             raise ValueError("a start request ID requires its exact request body digest")
         pool = await self._get_pool()
@@ -3605,9 +3735,9 @@ class PostgresAuditStore:
             saved = await conn.fetchrow(
                 """INSERT INTO workflow_executions
                 (business_execution_id,tenant_id,caller_sub,client_id,kind,upstream_name,
-                 definition_revision,status,created_at,expires_at,start_request_id,
+                 definition_revision,status,created_at,updated_at,expires_at,start_request_id,
                  start_request_digest,payload_json)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                 ON CONFLICT (tenant_id,caller_sub,client_id,start_request_id) DO NOTHING
                 RETURNING *""",
                 row["business_execution_id"],
@@ -3619,6 +3749,7 @@ class PostgresAuditStore:
                 row.get("definition_revision"),
                 row.get("status", "active"),
                 row["created_at"],
+                row.get("updated_at", row["created_at"]),
                 row["expires_at"],
                 row.get("start_request_id"),
                 row.get("start_request_digest"),
@@ -3640,6 +3771,40 @@ class PostgresAuditStore:
             elif saved is None:
                 raise RuntimeError("business execution ID already exists")
         return {**dict(saved), "metadata": json.loads(saved["payload_json"])}
+
+    async def list_business_executions(
+        self, tenant_id: str, *, since: str | None = None, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT * FROM workflow_executions WHERE tenant_id=$1
+                AND ($2::TEXT IS NULL OR created_at >= $2)
+                ORDER BY created_at DESC,business_execution_id LIMIT $3""",
+                tenant_id,
+                since,
+                max(1, min(limit, 10000)),
+            )
+        return [{**dict(row), "metadata": json.loads(row["payload_json"])} for row in rows]
+
+    async def update_business_execution_status(
+        self, business_execution_id: str, tenant_id: str, status: str, updated_at: str
+    ) -> bool:
+        allowed = {"active", "completed", "outcome_unknown", "failed", "expired"}
+        if status not in allowed:
+            raise ValueError("invalid business execution status")
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            result = await conn.execute(
+                """UPDATE workflow_executions SET status=$1,updated_at=$2
+                WHERE tenant_id=$3 AND business_execution_id=$4
+                AND (status NOT IN ('completed','failed','expired') OR status=$1)""",
+                status,
+                updated_at,
+                tenant_id,
+                business_execution_id,
+            )
+        return result.endswith(" 1")
 
     async def get_business_execution(
         self, business_execution_id: str, tenant_id: str, caller_sub: str, client_id: str
@@ -3729,7 +3894,7 @@ class PostgresAuditStore:
                 """INSERT INTO workflow_calls
                 (workflow_call_id,tenant_id,business_execution_id,call_key,outer_request_id,callback_ordinal,upstream_name,tool_name,request_digest,tool_qualified_name,arguments_digest,status,created_at,updated_at,payload_json)
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-                ON CONFLICT (tenant_id,call_key) DO NOTHING RETURNING *""",
+                ON CONFLICT DO NOTHING RETURNING *""",
                 row["workflow_call_id"],
                 row["tenant_id"],
                 row["business_execution_id"],
@@ -3746,13 +3911,30 @@ class PostgresAuditStore:
                 row["updated_at"],
                 payload,
             )
-            saved = inserted or await conn.fetchrow(
-                "SELECT * FROM workflow_calls WHERE tenant_id=$1 AND call_key=$2",
-                row["tenant_id"],
-                row["call_key"],
-            )
+            saved = inserted
+            if saved is None:
+                saved = await conn.fetchrow(
+                    "SELECT * FROM workflow_calls WHERE tenant_id=$1 AND call_key=$2",
+                    row["tenant_id"],
+                    row["call_key"],
+                )
+            if saved is None:
+                saved = await conn.fetchrow(
+                    """SELECT * FROM workflow_calls WHERE tenant_id=$1
+                       AND business_execution_id=$2 AND outer_request_id=$3
+                       AND callback_ordinal=$4""",
+                    row["tenant_id"],
+                    row["business_execution_id"],
+                    row["outer_request_id"],
+                    int(row.get("callback_ordinal", 0)),
+                )
+            if saved is None:
+                raise BusinessExecutionConflict(
+                    "workflow call identity conflicts with an existing call"
+                )
             if (
                 saved["workflow_call_id"] != row["workflow_call_id"]
+                or saved["call_key"] != row["call_key"]
                 or saved["business_execution_id"] != row["business_execution_id"]
                 or saved["outer_request_id"] != row["outer_request_id"]
                 or saved["request_digest"] != row["request_digest"]
@@ -3780,6 +3962,32 @@ class PostgresAuditStore:
                 business_execution_id,
             )
         return [_decode_workflow_call(row) for row in rows]
+
+    async def get_workflow_call_by_id(
+        self, tenant_id: str, workflow_call_id: str
+    ) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM workflow_calls WHERE tenant_id=$1 AND workflow_call_id=$2",
+                tenant_id,
+                workflow_call_id,
+            )
+        return _decode_workflow_call(row) if row else None
+
+    async def get_workflow_call(
+        self, tenant_id: str, business_execution_id: str, workflow_call_id: str
+    ) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT * FROM workflow_calls WHERE tenant_id=$1 AND business_execution_id=$2
+                AND workflow_call_id=$3""",
+                tenant_id,
+                business_execution_id,
+                workflow_call_id,
+            )
+        return _decode_workflow_call(row) if row else None
 
     async def update_workflow_call(self, workflow_call_id: str, fields: dict[str, Any]) -> bool:
         allowed = {

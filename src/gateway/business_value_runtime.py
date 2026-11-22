@@ -27,6 +27,18 @@ def canonical_json_digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def encode_jsonrpc_request_id(request_id: str | int) -> str:
+    """Preserve JSON-RPC ID type when storing it in a text key."""
+
+    if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
+        raise ValueError("attributed tool requests require a string or integer JSON-RPC ID")
+    if isinstance(request_id, str):
+        if not request_id:
+            raise ValueError("attributed tool requests require a non-empty JSON-RPC ID")
+        return "string:" + request_id
+    return f"integer:{request_id}"
+
+
 def build_workflow_call_key(
     *,
     outer_request_id: str | int,
@@ -35,6 +47,10 @@ def build_workflow_call_key(
     tool_name: str,
     arguments: dict[str, Any],
     callback_ordinal: int,
+    business_execution_id: str = "",
+    tenant_id: str = "",
+    caller_sub: str = "",
+    client_id: str = "",
 ) -> str:
     """Build the stable identity of one logical tool callback.
 
@@ -43,16 +59,17 @@ def build_workflow_call_key(
     distinguish calls carried by the same outer execution request.
     """
 
-    if isinstance(outer_request_id, bool) or not isinstance(outer_request_id, (str, int)):
-        raise ValueError("attributed tool requests require a string or integer JSON-RPC ID")
-    if isinstance(outer_request_id, str) and not outer_request_id:
-        raise ValueError("attributed tool requests require a non-empty JSON-RPC ID")
+    encode_jsonrpc_request_id(outer_request_id)
     if callback_ordinal < 0:
         raise ValueError("callback_ordinal must be non-negative")
     return canonical_json_digest(
         {
             "outer_request_id": outer_request_id,
             "request_digest": request_digest,
+            "business_execution_id": business_execution_id,
+            "tenant_id": tenant_id,
+            "caller_sub": caller_sub,
+            "client_id": client_id,
             "upstream_name": upstream_name,
             "tool_name": tool_name,
             "arguments_digest": canonical_json_digest(arguments),
@@ -85,6 +102,11 @@ def json_pointer_value(value: Any, pointer: str) -> Any:
         else:
             return _MISSING
     return current
+
+
+def resolve_json_pointer(value: Any, pointer: str) -> tuple[bool, Any]:
+    resolved = json_pointer_value(value, pointer)
+    return (resolved is not _MISSING, None if resolved is _MISSING else resolved)
 
 
 _MISSING = object()
@@ -158,7 +180,7 @@ def required_evidence_satisfied(workflow: WorkflowDefinition, calls: list[dict[s
                 continue
             if (
                 requirement.result_when is not None
-                and call.get("evidence_predicate_matched") is not True
+                and _call_evidence_value(call, "evidence_predicate_matched") is not True
             ):
                 continue
             count += 1
@@ -184,11 +206,18 @@ def terminal_completion_satisfied(
         )
         == workflow.completion.tool
         and call.get("status") == "succeeded"
-        and call.get("completion_predicate_matched") is True
+        and _call_evidence_value(call, "completion_predicate_matched") is True
         and (
             workflow.completion.require_sensitive_write_journal_status is None
-            or call.get("sensitive_write_journal_status")
+            or _call_evidence_value(call, "sensitive_write_journal_status")
             == workflow.completion.require_sensitive_write_journal_status
         )
         for call in calls
     )
+
+
+def _call_evidence_value(call: dict[str, Any], key: str) -> Any:
+    nested = call.get("evidence")
+    if isinstance(nested, dict) and key in nested:
+        return nested[key]
+    return call.get(key)

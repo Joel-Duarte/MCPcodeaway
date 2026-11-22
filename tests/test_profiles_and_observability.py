@@ -275,7 +275,7 @@ async def test_postgres_audit_store_crud_and_optional_dep(
                 if "to_regclass" in sql:
                     return "mcpcodeaway_schema_migrations"
                 if "MAX(version)" in sql:
-                    return 3
+                    return 4
                 raise AssertionError(f"Unexpected fetchval SQL: {sql}")
 
             async def fetch(self, sql: str, names: list[str]) -> list[dict[str, Any]]:

@@ -13,6 +13,7 @@ from gateway.integration_definition import (
     ResultPredicate,
     validate_result_predicate_schema,
 )
+from gateway.mcp_app_renderer import validate_experience
 from gateway.upstream_clients import compute_schema_digest
 
 ATTRIBUTED_TOOL_PREFIX = "mca_attr__"
@@ -96,14 +97,10 @@ def validate_definition_against_catalog(
 
     for experience in definition.experiences:
         tool = tools[experience.tool]
-        if experience.input_mapping:
-            properties = tool.input_schema.get("properties", {})
-            unknown = set(experience.input_mapping.values()) - set(properties)
-            if unknown:
-                raise ValueError(
-                    f"experience {experience.id} maps unknown input properties: "
-                    f"{', '.join(sorted(unknown))}"
-                )
+        validate_experience(
+            experience.model_dump(mode="json"),
+            tool_input_schema=tool.input_schema,
+        )
 
 
 def _validate_predicate(
@@ -135,6 +132,17 @@ def validate_attributed_input_schema(schema: dict[str, Any]) -> None:
     validator = validator_for(schema)
     validator.check_schema(schema)
     _reject_unresolved_refs(schema)
+
+
+def validate_attributed_arguments(schema: dict[str, Any], arguments: dict[str, Any]) -> None:
+    """Validate wrapper arguments against the unchanged original tool schema."""
+
+    validate_attributed_input_schema(schema)
+    validator = validator_for(schema)(schema)
+    error = next(validator.iter_errors(arguments), None)
+    if error is not None:
+        location = "/".join(str(part) for part in error.absolute_path) or "/"
+        raise ValueError(f"arguments do not match the current tool schema at {location}")
 
 
 def _reject_unresolved_refs(value: Any) -> None:
@@ -196,7 +204,26 @@ def build_attributed_tool_definition(
         "_meta": {"ui": metadata},
     }
     if "outputSchema" in original:
-        result["outputSchema"] = original["outputSchema"]
+        result["outputSchema"] = {
+            "type": "object",
+            "properties": {
+                "ok": {"type": "boolean"},
+                "result": {
+                    "anyOf": [original["outputSchema"], {"type": "null"}],
+                },
+                "business_execution_id": {"type": "string"},
+                "workflow_call_id": {"type": "string"},
+                "completion_recorded": {"type": "boolean"},
+            },
+            "required": [
+                "ok",
+                "result",
+                "business_execution_id",
+                "workflow_call_id",
+                "completion_recorded",
+            ],
+            "additionalProperties": False,
+        }
     return result
 
 

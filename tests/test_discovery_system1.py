@@ -460,7 +460,7 @@ async def test_modern_mcp_metadata_headers_and_discovery_contract(tmp_path) -> N
             assert legacy_followup.status_code == 400
             assert legacy_followup.json()["error"]["code"] == -32020
 
-            unknown_method = await client.post(
+            apps_without_capability = await client.post(
                 "/mcp",
                 headers={**headers, "Mcp-Method": "resources/list"},
                 json={
@@ -470,8 +470,8 @@ async def test_modern_mcp_metadata_headers_and_discovery_contract(tmp_path) -> N
                     "params": {"_meta": metadata},
                 },
             )
-            assert unknown_method.status_code == 404
-            assert unknown_method.json()["error"]["code"] == -32601
+            assert apps_without_capability.status_code == 200
+            assert apps_without_capability.json()["error"]["code"] == -32021
 
             modern_notification = await client.post(
                 "/mcp",

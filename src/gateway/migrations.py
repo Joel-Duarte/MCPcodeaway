@@ -132,7 +132,10 @@ MIGRATIONS = (
                 business_execution_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
                 caller_sub TEXT NOT NULL,
                 client_id TEXT NOT NULL, kind TEXT NOT NULL, upstream_name TEXT NOT NULL,
-                definition_revision TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL,
+                definition_revision TEXT,
+                status TEXT NOT NULL CHECK (status IN (
+                    'active','completed','outcome_unknown','failed','expired')),
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL, standalone_call_key TEXT, active_write_call_id TEXT,
                 write_lease_until TEXT, start_request_id TEXT, start_request_digest TEXT,
                 payload_json TEXT NOT NULL)""",
@@ -192,6 +195,15 @@ MIGRATIONS = (
                 FOR EACH ROW EXECUTE FUNCTION mcpcodeaway_reject_audit_mutation()""",
         ),
     ),
+    Migration(
+        4,
+        "bind each workflow callback slot to one logical call",
+        (
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_calls_callback_slot
+                ON workflow_calls (tenant_id, business_execution_id, outer_request_id,
+                                   callback_ordinal)""",
+        ),
+    ),
 )
 
 EXPECTED_COLUMNS: dict[str, set[str]] = {
@@ -213,6 +225,7 @@ EXPECTED_COLUMNS: dict[str, set[str]] = {
         "action_summary",
         "status",
         "created_at",
+        "updated_at",
         "expires_at",
         "decided_by",
         "decided_at",
@@ -296,6 +309,7 @@ EXPECTED_COLUMNS: dict[str, set[str]] = {
         "definition_revision",
         "status",
         "created_at",
+        "updated_at",
         "expires_at",
         "standalone_call_key",
         "active_write_call_id",
@@ -384,6 +398,7 @@ EXPECTED_INDEXES: dict[str, tuple[str, bool]] = {
     "workflow_request_bindings_pkey": ("workflow_request_bindings", True),
     "workflow_calls_pkey": ("workflow_calls", True),
     "idx_workflow_calls_call_key": ("workflow_calls", True),
+    "idx_workflow_calls_callback_slot": ("workflow_calls", True),
     "idx_workflow_calls_execution": ("workflow_calls", False),
     "workflow_execution_events_pkey": ("workflow_execution_events", True),
     "idx_workflow_events_idempotency": ("workflow_execution_events", True),
