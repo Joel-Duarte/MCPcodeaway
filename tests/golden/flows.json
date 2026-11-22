@@ -115,6 +115,23 @@
       "expected_credited_completions": 1
     },
     {
+      "id": "hr_fictional_user_update_verified_by_readback",
+      "persona": "hr_ops",
+      "employee_id": "EMP-01",
+      "expected_name": "Avery Morgan",
+      "expected_initial_role": "controller",
+      "updated_role": "senior_controller",
+      "expected_final_version": 2,
+      "expected_required_tools": [
+        "hr_directory__list_hr_employees",
+        "hr_directory__get_hr_employee",
+        "hr_directory__update_hr_employee"
+      ],
+      "expected_completion_tool": "hr_directory__get_hr_employee",
+      "expected_manual_baseline_minutes": 8,
+      "expected_credited_completions": 1
+    },
+    {
       "id": "support_workflow_ticket_without_order_lookup_is_incomplete",
       "missing_required_tool": "support_api__get_order_history",
       "expected_completion_recorded": false,

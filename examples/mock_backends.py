@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.security import APIKeyHeader
 from jwt.algorithms import RSAAlgorithm
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from gateway.auth import DEV_PERSONAS, LocalDevKeyManager, claims_to_identity
 from gateway.config import ClaimMappingConfig
@@ -65,6 +65,30 @@ class CustomerRecord(BaseModel):
     region: str
     contact_email: str
     tier: str
+
+
+class EmployeeRecord(BaseModel):
+    employee_id: str
+    name: str
+    email: str
+    department: str
+    role: str
+    region: str
+    manager_id: str
+    version: int
+
+
+class EmployeeListResponse(BaseModel):
+    items: list[EmployeeRecord]
+    count: int
+
+
+class EmployeeUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    department: str | None = Field(default=None, min_length=1, max_length=80)
+    role: str | None = Field(default=None, min_length=1, max_length=80)
+    manager_id: str | None = Field(default=None, min_length=1, max_length=40)
 
 
 class IdempotencyOperationRequest(BaseModel):
@@ -1293,6 +1317,103 @@ def create_mock_backends_app(
 
         return sub
 
+    def _build_hr_directory_subapp() -> FastAPI:
+        sub = FastAPI(
+            title="HR Directory API",
+            version="1.0.0",
+            servers=[{"url": "/hr"}],
+        )
+        employees: dict[str, dict[str, Any]] = {
+            "EMP-01": {
+                "employee_id": "EMP-01",
+                "name": "Avery Morgan",
+                "email": "avery.morgan@example.test",
+                "department": "finance",
+                "role": "controller",
+                "region": "EU",
+                "manager_id": "EMP-04",
+                "version": 1,
+            },
+            "EMP-02": {
+                "employee_id": "EMP-02",
+                "name": "Jordan Rivera",
+                "email": "jordan.rivera@example.test",
+                "department": "engineering",
+                "role": "sre",
+                "region": "US",
+                "manager_id": "EMP-04",
+                "version": 1,
+            },
+            "EMP-03": {
+                "employee_id": "EMP-03",
+                "name": "Casey Okafor",
+                "email": "casey.okafor@example.test",
+                "department": "sales_ops",
+                "role": "analyst",
+                "region": "EU",
+                "manager_id": "EMP-01",
+                "version": 1,
+            },
+            "EMP-04": {
+                "employee_id": "EMP-04",
+                "name": "Morgan Chen",
+                "email": "morgan.chen@example.test",
+                "department": "people_ops",
+                "role": "people_manager",
+                "region": "EU",
+                "manager_id": "EMP-04",
+                "version": 1,
+            },
+        }
+
+        @sub.get("/employees", operation_id="list_hr_employees")
+        async def list_employees(
+            limit: int = Query(default=25, ge=1, le=100),
+        ) -> EmployeeListResponse:
+            result = [EmployeeRecord(**row).model_dump() for row in employees.values()]
+            return EmployeeListResponse(items=result[:limit], count=len(result[:limit]))
+
+        @sub.get("/employees/{employee_id}", operation_id="get_hr_employee")
+        async def get_employee(employee_id: str) -> EmployeeRecord:
+            employee = employees.get(employee_id)
+            if employee is None:
+                raise HTTPException(status_code=404, detail=f"Employee '{employee_id}' not found")
+            return EmployeeRecord(**employee)
+
+        @sub.patch("/employees/{employee_id}", operation_id="update_hr_employee")
+        async def update_employee(employee_id: str, payload: EmployeeUpdate) -> EmployeeRecord:
+            employee = employees.get(employee_id)
+            if employee is None:
+                raise HTTPException(status_code=404, detail=f"Employee '{employee_id}' not found")
+            updates = payload.model_dump(exclude_unset=True)
+            if not updates:
+                raise HTTPException(
+                    status_code=422, detail="At least one employee field is required"
+                )
+            changed = any(employee[key] != value for key, value in updates.items())
+            employee.update(updates)
+            if changed:
+                employee["version"] += 1
+            return EmployeeRecord(**employee)
+
+        @sub.get("/summary", operation_id="list_hr_employees_summary")
+        async def get_summary() -> dict[str, Any]:
+            return {"service": "HR Directory API", "total_records": len(employees), "status": "ok"}
+
+        @sub.get("/health", operation_id="list_hr_employees_health")
+        async def get_health() -> dict[str, Any]:
+            return {"service": "HR Directory API", "healthy": True, "records": len(employees)}
+
+        @sub.get("/metrics", operation_id="list_hr_employees_metrics")
+        async def get_metrics() -> dict[str, Any]:
+            return {
+                "service": "HR Directory API",
+                "active_items": len(employees),
+                "latency_p50_ms": 12.4,
+            }
+
+        return sub
+
     app.mount(
         "/crm",
         _build_simple_enterprise_subapp(
@@ -1322,20 +1443,7 @@ def create_mock_backends_app(
             ],
         ),
     )
-    app.mount(
-        "/hr",
-        _build_simple_enterprise_subapp(
-            title="HR Directory API",
-            mount_prefix="/hr",
-            op_id="list_hr_employees",
-            path="/employees",
-            rows=[
-                {"emp_id": "EMP-01", "department": "finance", "role": "controller", "region": "EU"},
-                {"emp_id": "EMP-02", "department": "engineering", "role": "sre", "region": "US"},
-                {"emp_id": "EMP-03", "department": "sales_ops", "role": "analyst", "region": "EU"},
-            ],
-        ),
-    )
+    app.mount("/hr", _build_hr_directory_subapp())
     app.mount(
         "/devops",
         _build_simple_enterprise_subapp(

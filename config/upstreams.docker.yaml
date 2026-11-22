@@ -140,11 +140,22 @@ upstreams:
     openapi_spec_url: http://mock-backends:8001/hr/openapi.json
     auth_type: none
     preferred_mode: traditional
-    allowed_roles: [hr_ops, gateway_admin, admin]
+    allowed_roles: [hr_ops, hr_writer, gateway_admin, admin]
     allowed_groups: [hr, platform]
-    allowed_operations: [list_hr_employees, list_hr_employees_summary, list_hr_employees_health, list_hr_employees_metrics]
-    tool_effects: { list_hr_employees: read, list_hr_employees_summary: read, list_hr_employees_health: read, list_hr_employees_metrics: read }
-    mutating_tools: []
+    allowed_operations: [list_hr_employees, get_hr_employee, update_hr_employee, list_hr_employees_summary, list_hr_employees_health, list_hr_employees_metrics]
+    tool_effects: { list_hr_employees: read, get_hr_employee: read, update_hr_employee: write, list_hr_employees_summary: read, list_hr_employees_health: read, list_hr_employees_metrics: read }
+    tool_guidance:
+      list_hr_employees: { description: "List seeded fictional employees in the demo HR directory." }
+      get_hr_employee: { description: "Read one fictional employee record by ID.", parameter_hints: { employee_id: "Seeded employee ID, for example EMP-01." } }
+      update_hr_employee: { description: "Update a fictional employee's department, role, or manager; this is a demo write and requires requester confirmation.", parameter_hints: { employee_id: "Seeded employee ID, for example EMP-01.", role: "Optional new role.", department: "Optional new department.", manager_id: "Optional seeded manager ID." } }
+    tool_approval_policies:
+      list_hr_employees: { mode: none, version: 1 }
+      get_hr_employee: { mode: none, version: 1 }
+      update_hr_employee: { mode: requester_confirmation, version: 1, confirmation_message: "Confirm this change to a fictional employee record in the demo directory." }
+      list_hr_employees_summary: { mode: none, version: 1 }
+      list_hr_employees_health: { mode: none, version: 1 }
+      list_hr_employees_metrics: { mode: none, version: 1 }
+    mutating_tools: [update_hr_employee]
     enabled: true
 
   - name: devops_ci
