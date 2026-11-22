@@ -50,6 +50,15 @@ interface InspectResponse {
     upstream?: string;
     type: string;
     tool_count: number;
+    onboarding_guidance?: {
+      auth_discovery?: {
+        status: string;
+        source: string;
+        authorization_mode: string;
+        requires_operator_confirmation: boolean;
+        security_schemes: { name?: string; type?: string; header_name?: string }[];
+      };
+    };
     tools: {
       qualified_name: string;
       name: string;
@@ -82,6 +91,7 @@ const draftType = ref("openapi");
 const draftUrl = ref("http://localhost:8001");
 const draftSpecUrl = ref("http://localhost:8001/openapi.json");
 const draftAuthType = ref("none");
+const draftAuthorizationMode = ref("gateway");
 const draftAudience = ref("");
 const draftScope = ref("");
 const draftSecretEnv = ref("");
@@ -105,6 +115,15 @@ const draftUpstreamRateLimit = ref(120);
 const draftUpstreamConcurrency = ref(10);
 
 const inspectResult = ref<InspectResponse | null>(null);
+const authDiscoverySummary = computed(() => {
+  const discovery = inspectResult.value?.inspection.onboarding_guidance?.auth_discovery;
+  if (!discovery) return "";
+  const schemes = discovery.security_schemes
+    .map((scheme) => `${scheme.name}: ${scheme.type}${scheme.header_name ? `, ${scheme.header_name}` : ""}`)
+    .join("; ");
+  const evidence = schemes ? ` (${schemes})` : "";
+  return `Authentication evidence: ${discovery.status}${evidence}. A declared API key does not tell whether it is personal or shared. Confirm the credential owner and authorization mode below.`;
+});
 
 const abIntent = ref("reconcile inventory and summarize anomalies");
 const abSampleBytes = ref("12000");
@@ -132,6 +151,16 @@ const authOptions = [
   { value: "bearer_secret", label: "bearer_secret (Shared Bearer)" },
   { value: "none", label: "none" },
 ];
+const authorizationModeOptions = computed(() => {
+  const options = [{ value: "gateway", label: "Gateway role/group policy" }];
+  if (["delegated_token", "user_oauth", "user_api_key"].includes(draftAuthType.value)) {
+    options.unshift({ value: "upstream", label: "Upstream authorizes each user" });
+  }
+  if (["client_credentials", "api_key", "bearer_secret"].includes(draftAuthType.value)) {
+    options.unshift({ value: "shared_access", label: "Shared access for admitted callers" });
+  }
+  return options;
+});
 
 const modeOptions = [
   { value: "auto", label: "Auto — gateway picks per request / per tool (Recommended)" },
@@ -169,10 +198,37 @@ const approvalPoliciesValid = computed(() => Object.entries(draftToolEffects.val
   if (effect !== "high_impact") return true;
   return Boolean(draftToolApprovalGroups.value[tool]?.split(",").some((group) => group.trim()));
 }));
-const accessPolicyValid = computed(() => draftAllowAllCallers.value || selectedRoleSet.value.size > 0 || selectedGroupSet.value.size > 0);
+const accessPolicyValid = computed(() => {
+  if (draftAuthorizationMode.value === "upstream") return true;
+  if (draftAuthorizationMode.value === "shared_access") return draftAllowAllCallers.value;
+  return draftAllowAllCallers.value || selectedRoleSet.value.size > 0 || selectedGroupSet.value.size > 0;
+});
 const testCallResult = ref<string>("");
 const testCallBusy = ref(false);
 const availableRoles = ref<string[]>([]);
+
+function selectAuthType(value: string) {
+  draftAuthType.value = value;
+  draftRoles.value = "";
+  draftGroups.value = "";
+  if (["delegated_token", "user_oauth", "user_api_key"].includes(value)) {
+    draftAuthorizationMode.value = "upstream";
+    draftAllowAllCallers.value = false;
+  } else if (["client_credentials", "api_key", "bearer_secret"].includes(value)) {
+    draftAuthorizationMode.value = "shared_access";
+    draftAllowAllCallers.value = true;
+  } else {
+    draftAuthorizationMode.value = "gateway";
+    draftAllowAllCallers.value = false;
+  }
+}
+
+function selectAuthorizationMode(value: string) {
+  draftAuthorizationMode.value = value;
+  draftRoles.value = "";
+  draftGroups.value = "";
+  draftAllowAllCallers.value = value === "shared_access";
+}
 
 async function loadRoles() {
   rolesLoading.value = true;
@@ -227,16 +283,16 @@ function toggleRole(role: string) {
 
 const authHelpText = computed(() => {
   if (draftAuthType.value === "delegated_token") {
-    return "Exchanges the caller's JWT via Entra OBO or Keycloak RFC 8693 for a downstream token scoped to this user.";
+    return "Exchanges the caller's gateway token for a token scoped to this upstream. The upstream authorizes the user.";
   }
   if (draftAuthType.value === "client_credentials") {
-    return "Enforces user RBAC at the gateway, then fetches a machine-to-machine OAuth token via client_credentials.";
+    return "Uses a shared machine identity. Every authenticated gateway caller may use the enabled operations.";
   }
   if (draftAuthType.value === "user_oauth") {
     return "Prompts each user once to authorize via OAuth 2.0 PKCE and stores encrypted refresh tokens per user.";
   }
   if (draftAuthType.value === "user_api_key") {
-    return "Prompts each user to save their personal API key/PAT in the encrypted vault (never exposed to the LLM).";
+    return "Each user connects a personal API key. The gateway stores it encrypted per tenant, user, and upstream, then injects it only for that user's calls.";
   }
   if (draftAuthType.value === "api_key") {
     return "Injects a shared API key resolved via secret_ref (env://, file://, vault://, akv://, hcv://) on the gateway host.";
@@ -436,6 +492,7 @@ function buildUpstreamPayload(forInspection = false) {
     Boolean(draftOAuthClientId.value.trim()) ||
     Boolean(draftOAuthClientSecretRef.value.trim()) ||
     oauthScopesList.length > 0;
+  const usesSharedSecret = ["api_key", "bearer_secret"].includes(draftAuthType.value);
 
   return {
     name: draftName.value.trim(),
@@ -444,12 +501,13 @@ function buildUpstreamPayload(forInspection = false) {
     openapi_spec_url: specUrl,
     openapi_spec: inlineSpec,
     auth_type: draftAuthType.value,
+    authorization_mode: draftAuthorizationMode.value,
     downstream_audience: draftAudience.value.trim() || undefined,
     downstream_scope: draftScope.value.trim() || undefined,
-    secret_env_var: draftSecretEnv.value.trim() || undefined,
-    secret_ref: draftSecretRef.value.trim() || undefined,
+    secret_env_var: usesSharedSecret ? draftSecretEnv.value.trim() || undefined : undefined,
+    secret_ref: usesSharedSecret ? draftSecretRef.value.trim() || undefined : undefined,
     api_key_header: draftApiKeyHeader.value.trim() || "X-API-Key",
-    oauth: hasOAuthFields
+    oauth: hasOAuthFields && ["delegated_token", "client_credentials", "user_oauth"].includes(draftAuthType.value)
       ? {
           token_exchange_dialect: draftOAuthDialect.value.trim() || undefined,
           authorize_endpoint: draftOAuthAuthorizeEndpoint.value.trim() || undefined,
@@ -494,6 +552,7 @@ const yamlPreview = computed(() => {
     cfg.url ? `    url: ${cfg.url}` : "",
     cfg.openapi_spec_url ? `    openapi_spec_url: ${cfg.openapi_spec_url}` : "",
     `    auth_type: ${cfg.auth_type}`,
+    `    authorization_mode: ${cfg.authorization_mode}`,
     `    preferred_mode: ${cfg.preferred_mode}`,
     `    allowed_roles: [${cfg.allowed_roles.join(", ")}]`,
     `    allowed_groups: [${cfg.allowed_groups.join(", ")}]`,
@@ -650,7 +709,7 @@ async function handleRegister() {
     errorMessage.value = "Choose at least one approver group for each high impact operation.";
     return;
   }
-  if (rolesLoadError.value) {
+  if (draftAuthorizationMode.value === "gateway" && rolesLoadError.value) {
     errorMessage.value = "Role and group choices could not be loaded. Retry the lookup before saving access policy.";
     return;
   }
@@ -700,6 +759,7 @@ function applyImportedJson() {
     if (typeof parsed.url === "string") draftUrl.value = parsed.url;
     if (typeof parsed.openapi_spec_url === "string") draftSpecUrl.value = parsed.openapi_spec_url;
     if (typeof parsed.auth_type === "string") draftAuthType.value = parsed.auth_type;
+    if (typeof parsed.authorization_mode === "string") draftAuthorizationMode.value = parsed.authorization_mode;
     if (typeof parsed.downstream_audience === "string")
       draftAudience.value = parsed.downstream_audience;
     if (typeof parsed.downstream_scope === "string") draftScope.value = parsed.downstream_scope;
@@ -716,6 +776,18 @@ function applyImportedJson() {
     }
     if (Array.isArray(parsed.allowed_groups)) {
       draftGroups.value = parsed.allowed_groups.map((g) => String(g)).join(", ");
+    }
+    if (typeof parsed.allow_all_callers === "boolean") {
+      draftAllowAllCallers.value = parsed.allow_all_callers;
+    }
+    if (draftAuthorizationMode.value === "upstream") {
+      draftRoles.value = "";
+      draftGroups.value = "";
+      draftAllowAllCallers.value = false;
+    } else if (draftAuthorizationMode.value === "shared_access") {
+      draftRoles.value = "";
+      draftGroups.value = "";
+      draftAllowAllCallers.value = true;
     }
     if (parsed.openapi_spec && typeof parsed.openapi_spec === "object") {
       sourceKind.value = "openapi_inline";
@@ -961,6 +1033,9 @@ async function copyPromptText() {
           </h3>
           <span class="text-xs text-[#52525B]">{{ inspectResult.onboarding_audit.summary }}</span>
         </div>
+        <p v-if="authDiscoverySummary" class="text-xs leading-5 text-[#52525B]">
+          {{ authDiscoverySummary }}
+        </p>
         <div class="max-h-56 overflow-x-auto overflow-y-auto rounded border border-[#E4E4E7] table-scroll">
           <table class="w-full border-collapse text-left text-xs">
             <thead>
@@ -1016,7 +1091,7 @@ async function copyPromptText() {
           <Select
             :items="authOptions"
             :value="draftAuthType"
-            @value-change="(v) => { if (v) draftAuthType = String(v) }"
+            @value-change="(v) => { if (v) selectAuthType(String(v)) }"
           >
             <SelectTrigger>
               <SelectValue />
@@ -1088,7 +1163,36 @@ async function copyPromptText() {
           </div>
         </Field>
 
-        <div class="sm:col-span-2 space-y-2">
+        <Field>
+          <FieldLabel>Who authorizes the user?</FieldLabel>
+          <Select
+            :items="authorizationModeOptions"
+            :value="draftAuthorizationMode"
+            @value-change="(v) => { if (v) selectAuthorizationMode(String(v)) }"
+          >
+            <SelectTrigger>
+              <SelectValue />
+              <AppIcon name="chevron-down" :size="14" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem v-for="mode in authorizationModeOptions" :key="mode.value" :value="mode.value">
+                {{ mode.label }}
+                <SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator>
+              </SelectItem>
+            </SelectContent>
+          </Select>
+          <FieldDescription v-if="draftAuthorizationMode === 'upstream'">
+            The gateway sends a user-scoped credential. The upstream decides whether this user may call each operation; gateway groups are not required.
+          </FieldDescription>
+          <FieldDescription v-else-if="draftAuthorizationMode === 'shared_access'">
+            The upstream sees a shared service identity. Callers admitted by any configured client or scope limits may use the enabled operations; finer user permissions must be enforced upstream using another user-aware mechanism.
+          </FieldDescription>
+          <FieldDescription v-else>
+            The gateway checks the configured caller roles or groups before exposing and invoking this upstream.
+          </FieldDescription>
+        </Field>
+
+        <div v-if="draftAuthorizationMode === 'gateway'" class="sm:col-span-2 space-y-2">
           <div class="text-xs font-medium text-[#09090B]">Allowed RBAC roles (click to toggle)</div>
           <p class="text-[11px] text-[#71717A]">Enter verified roles from your identity provider. The gateway evaluates these against the authenticated caller.</p>
           <Input v-model="draftRoles" aria-label="Allowed role names" placeholder="role_one, role_two" class="min-h-11 font-mono-data text-xs" />
@@ -1283,7 +1387,7 @@ async function copyPromptText() {
               <AppIcon name="flask" :size="15" />
               <span>Estimate Code Mode vs Classic</span>
             </Button>
-            <Button v-if="dynamicPermitted" data-variant="primary" :disabled="!approvalPoliciesValid || !accessPolicyValid || rolesLoading || Boolean(rolesLoadError)" data-agent-confirm="Register or update this upstream service in the gateway?" pending-announcement="Registering upstream" @click="handleRegister">
+            <Button v-if="dynamicPermitted" data-variant="primary" :disabled="!approvalPoliciesValid || !accessPolicyValid || (draftAuthorizationMode === 'gateway' && (rolesLoading || Boolean(rolesLoadError)))" data-agent-confirm="Register or update this upstream service in the gateway?" pending-announcement="Registering upstream" @click="handleRegister">
               Save Upstream
             </Button>
             <Button @click="copyYaml">

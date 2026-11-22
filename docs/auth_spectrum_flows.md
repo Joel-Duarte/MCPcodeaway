@@ -94,3 +94,11 @@ sequenceDiagram
 | **Downstream uses per-user OAuth (non-Entra)** | `user_oauth` | PKCE `/auth/connect/{upstream}`; auto-refresh while the process has the connection; PostgreSQL mode requires reconnect after restart/replica change | [`test_auth_spectrum_golden.py`](../tests/test_auth_spectrum_golden.py) (`external_oauth`) |
 | **Downstream uses per-user PAT** | `user_api_key` | User saves PAT in `/auth/connect/{upstream}` or `/connections` UI; isolated per `(tenant, sub)` | [`test_auth_spectrum_golden.py`](../tests/test_auth_spectrum_golden.py) (`external_pat`) |
 | **Open internal sandbox** | `none` | No downstream creds; gated strictly by gateway OIDC + RBAC | [`test_auth_spectrum_golden.py`](../tests/test_auth_spectrum_golden.py) (`sandbox_open`) |
+
+## 4. Authorization ownership
+
+Caller authentication at the gateway and authorization at an upstream are separate decisions. The gateway always validates its inbound caller token. For `authorization_mode: upstream`, the gateway sends a user-scoped delegated token or a credential connected by that user, and the upstream decides whether each call is permitted. The gateway does not require local group membership for this mode. Its configured `allowed_operations`, read-only production setting, and explicit approval gates remain gateway safety controls.
+
+For `authorization_mode: shared_access`, the upstream receives a service credential and cannot identify the individual caller. This mode explicitly gives every caller admitted by any configured client or scope limits access to the configured operations. Do not use it when the upstream relies on user-specific permissions unless the gateway has a separately configured authorization policy. User API keys are resolved only from the encrypted connection for `(tenant_id, user_sub, upstream_name)`; missing or rejected keys never fall back to a shared secret.
+
+OpenAPI `securitySchemes` describe declared authentication mechanisms but do not say whether an API key is personal or shared. MCP authentication is reported from an observed HTTP challenge when available; successful tool discovery is not proof that the service is public or that the user is authorized for every tool. Operators confirm the credential owner and authorization mode during onboarding.

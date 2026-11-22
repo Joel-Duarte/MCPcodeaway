@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 from examples.mock_backends import build_synthetic_tools, create_mock_backends_app
 from gateway.auth import LocalDevKeyManager
@@ -18,7 +19,7 @@ from gateway.config import GatewaySettings, UpstreamConfig, UpstreamRegistry
 from gateway.mcp_protocol import request_headers, request_meta
 from gateway.server import GatewayRuntime, create_gateway_app
 from gateway.state import SQLiteAuditStore
-from gateway.upstream_clients import DiscoveredTool
+from gateway.upstream_clients import DiscoveredTool, build_onboarding_guidance
 
 
 def test_demo_upstream_tool_details_and_approval_policies_are_complete() -> None:
@@ -65,6 +66,47 @@ def test_production_upstreams_require_access_and_operation_allowlists(tmp_path: 
     )
     with pytest.raises(ValueError, match="allowed_roles or allowed_groups"):
         UpstreamRegistry(settings)
+
+
+def test_production_accepts_explicit_upstream_authorization_without_gateway_groups(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "upstreams.yaml"
+    path.write_text(
+        "upstreams:\n"
+        "  - name: user_api\n"
+        "    type: openapi\n"
+        "    url: https://api.example.test\n"
+        "    auth_type: user_api_key\n"
+        "    authorization_mode: upstream\n"
+        "    allowed_operations: [read_profile]\n"
+        "    tool_effects: {read_profile: read}\n"
+        "    mutating_tools: []\n",
+        encoding="utf-8",
+    )
+    settings = GatewaySettings(app_env="prod", auth_mode="oidc", upstreams_config_path=str(path))
+
+    registry = UpstreamRegistry(settings)
+
+    assert registry.get("user_api") is not None
+
+
+def test_onboarding_treats_api_key_scheme_as_ambiguous_and_explains_auth_owner() -> None:
+    upstream = UpstreamConfig(
+        name="personal_api",
+        type="openapi",
+        url="https://api.example.test",
+        auth_type="user_api_key",
+        authorization_mode="upstream",
+    )
+    security_schemes = [{"name": "personalKey", "type": "apiKey", "header_name": "X-Personal-Key"}]
+
+    guidance = build_onboarding_guidance(upstream, [], security_schemes)
+
+    assert guidance["auth_discovery"]["status"] == "declared"
+    assert guidance["auth_discovery"]["requires_operator_confirmation"] is True
+    assert any("Confirm Who Owns the API Key" == item["title"] for item in guidance["checklist"])
+    assert any(item["field"] == "authorization_mode" for item in guidance["checklist"])
 
 
 async def test_upstream_mode_change_survives_catalog_refresh_and_rejects_read_only(
@@ -179,6 +221,14 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
             "result": {"content": [{"type": "text", "text": json.dumps({"extra": True})}]},
         }
 
+    @extra_app.post("/protected/mcp")
+    async def protected_mcp():
+        return JSONResponse(
+            {"detail": "authentication required"},
+            status_code=401,
+            headers={"WWW-Authenticate": 'Bearer realm="private"'},
+        )
+
     @extra_app.get("/orders/{order_id}")
     async def get_order(order_id: str, include_items: bool = False):
         return {"order_id": order_id, "include_items": include_items, "total": 199.5}
@@ -243,6 +293,19 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
             ins_body = inspect_resp.json()
             assert ins_body["inspection"]["tool_count"] == 1
             assert "upstreams:" in ins_body["inspection"]["yaml_snippet"]
+
+            challenge = await gw.post(
+                "/admin/upstreams/inspect",
+                json={
+                    "name": "protected_mcp",
+                    "type": "mcp_http",
+                    "url": "http://127.0.0.1:8001/extra-srv/protected/mcp",
+                    "auth_type": "none",
+                },
+            )
+            assert challenge.status_code == 400
+            assert "Bearer authentication challenge" in challenge.json()["detail"]
+            assert "realm" not in challenge.json()["detail"]
 
             add_sw = await gw.post(
                 "/admin/upstreams",

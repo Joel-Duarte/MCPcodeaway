@@ -521,7 +521,7 @@ class OidcTokenValidator:
 
 
 class PolicyEvaluator:
-    """Gateway policy enforcement point for team/role/client/environment RBAC."""
+    """Gateway policy enforcement for gateway-owned authorization modes."""
 
     def __init__(self, settings: GatewaySettings) -> None:
         self.settings = settings
@@ -531,7 +531,12 @@ class PolicyEvaluator:
     ) -> tuple[bool, str]:
         if not upstream.enabled:
             return False, f"Upstream '{upstream.name}' is disabled"
-        if upstream.allowed_roles and not (set(identity.roles) & set(upstream.allowed_roles)):
+        gateway_authz = upstream.authorization_mode == "gateway"
+        if (
+            gateway_authz
+            and upstream.allowed_roles
+            and not (set(identity.roles) & set(upstream.allowed_roles))
+        ):
             return (
                 False,
                 (
@@ -541,12 +546,16 @@ class PolicyEvaluator:
                     "Tell the user to request one of the required App Roles from their IdP admin."
                 ),
             )
-        if upstream.allowed_groups and not identity.group_membership_complete:
+        if gateway_authz and upstream.allowed_groups and not identity.group_membership_complete:
             return False, (
                 f"Caller group membership could not be resolved for '{upstream.name}'; "
                 "group-dependent access is denied."
             )
-        if upstream.allowed_groups and not (set(identity.groups) & set(upstream.allowed_groups)):
+        if (
+            gateway_authz
+            and upstream.allowed_groups
+            and not (set(identity.groups) & set(upstream.allowed_groups))
+        ):
             return (
                 False,
                 (
@@ -604,7 +613,7 @@ class PolicyEvaluator:
         has_write_scope = any(
             scope == "mcp.write" or scope.endswith(".write") for scope in identity.scopes
         )
-        if not has_write_role or not has_write_scope:
+        if upstream.authorization_mode == "gateway" and (not has_write_role or not has_write_scope):
             return (
                 False,
                 (

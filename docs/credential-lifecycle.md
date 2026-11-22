@@ -2,7 +2,7 @@
 
 ## Authority and credential types
 
-Identity and authorization remain with the configured identity provider and each upstream policy system. MCPcodeaway validates the caller and enforces applicable decisions for each request; it does not issue user identities or make upstream authorization decisions authoritative.
+The configured identity provider authenticates callers to MCPcodeaway. Each upstream remains authoritative for user permissions when it receives a user-scoped delegated token or a per-user connection. The gateway's `authorization_mode` makes this ownership explicit: `upstream` uses user-scoped credentials without local group filtering; `shared_access` uses a shared service credential for all admitted callers; `gateway` preserves the existing role/group authorization policy. Global operation allowlists and safety approvals remain separate gateway controls.
 
 | Credential | Owner and scope | Storage and expiry | Revocation and deletion |
 |---|---|---|---|
@@ -13,6 +13,8 @@ Identity and authorization remain with the configured identity provider and each
 | OAuth client secret | Application/upstream configuration, not user delegated identity | Resolve from environment, file, AKV, or HCV references. `vault://` gateway-secret resolution is rejected for OAuth client secrets. It is not copied into OAuth token records or PostgreSQL. | Rotate at the provider and configured secret source. Update deployment configuration and restart/reload as required. |
 | OAuth client identifier and provider metadata | Public application configuration | Client ID, endpoints, scopes, and token header settings are upstream configuration. They are not credentials. | Update authoritative upstream configuration. |
 | Client-credentials access token | Application identity for a particular upstream | Transient process/cache state. The application secret stays in its configured external secret source; access tokens are not persisted in PostgreSQL. | Token expiry/cache eviction or application credential rotation. |
+
+For `user_api_key`, the dispatcher resolves the credential only by the authenticated caller's tenant, subject, and upstream. It injects the configured header on the upstream request; callers cannot choose another user's key through tool arguments or metadata. Missing or rejected per-user credentials fail closed and never fall back to a configured shared key. The key is stored encrypted only after the user explicitly connects it and is removed by disconnect.
 
 ## PostgreSQL multi-replica behavior
 

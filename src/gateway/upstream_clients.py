@@ -1064,8 +1064,27 @@ def build_onboarding_guidance(
         for s in security_schemes
     )
     has_apikey_scheme = any(s.get("type") == "apiKey" for s in security_schemes)
+    has_declared_security = bool(security_schemes)
 
-    if has_oauth_scheme or upstream.auth_type == "delegated_token":
+    if has_apikey_scheme:
+        checklist.append(
+            {
+                "target": "operator",
+                "severity": "required",
+                "field": "auth_type",
+                "title": "Confirm Who Owns the API Key",
+                "detail": (
+                    "OpenAPI declares an API key, but cannot tell whether it is a personal key "
+                    "or a shared service key. Choose user_api_key for per-user credentials or "
+                    "api_key with shared_access only when every admitted caller may use the "
+                    "enabled operations."
+                ),
+            }
+        )
+
+    if upstream.auth_type == "delegated_token" or (
+        has_oauth_scheme and upstream.auth_type == "none"
+    ):
         checklist.append(
             {
                 "target": "corporate_idp",
@@ -1103,7 +1122,7 @@ def build_onboarding_guidance(
             }
         )
 
-    if has_apikey_scheme or upstream.auth_type in {"api_key", "bearer_secret"}:
+    if upstream.auth_type in {"api_key", "bearer_secret"}:
         header_hint = next(
             (s.get("header_name") for s in security_schemes if s.get("header_name")),
             upstream.api_key_header,
@@ -1120,20 +1139,38 @@ def build_onboarding_guidance(
                 ),
             }
         )
+
+    if upstream.auth_type == "user_api_key":
         checklist.append(
             {
-                "target": "gateway",
-                "severity": "recommended",
-                "field": "abac_rules",
-                "title": "Enforce Host-Side RBAC & Row-Level ABAC on Shared-Key Upstream",
+                "target": "user_connection",
+                "severity": "required",
+                "field": "user_api_key",
+                "title": "Each User Connects a Personal API Key",
                 "detail": (
-                    "Shared API keys carry no caller identity; configure allowed_roles plus "
-                    "abac_rules (e.g. client_groups -> region) so HostDispatcher filters rows."
+                    "The gateway stores the key encrypted for this tenant, user, and upstream, "
+                    "then injects it only for that user's calls. No shared-key fallback is used."
                 ),
             }
         )
-
-    if not upstream.allowed_roles and not upstream.allowed_groups:
+    elif upstream.auth_type == "user_oauth":
+        checklist.append(
+            {
+                "target": "user_connection",
+                "severity": "required",
+                "field": "user_oauth",
+                "title": "Each User Connects Their Upstream Account",
+                "detail": (
+                    "Use OAuth authorization code with PKCE for each user. The upstream "
+                    "authorizes the resulting user-scoped token."
+                ),
+            }
+        )
+    if (
+        upstream.authorization_mode == "gateway"
+        and not upstream.allowed_roles
+        and not upstream.allowed_groups
+    ):
         checklist.append(
             {
                 "target": "gateway",
@@ -1143,6 +1180,34 @@ def build_onboarding_guidance(
                 "detail": (
                     "Set allowed_roles / allowed_groups before production promotion so "
                     "unrelated agent personas cannot discover or invoke this upstream."
+                ),
+            }
+        )
+
+    if upstream.authorization_mode == "upstream":
+        checklist.append(
+            {
+                "target": "operator",
+                "severity": "recommended",
+                "field": "authorization_mode",
+                "title": "Upstream Authorization Is Authoritative",
+                "detail": (
+                    "The gateway will send a user-scoped credential and will not filter tools "
+                    "by local groups. The upstream must enforce user permissions on each call."
+                ),
+            }
+        )
+    elif upstream.authorization_mode == "shared_access":
+        checklist.append(
+            {
+                "target": "operator",
+                "severity": "required",
+                "field": "authorization_mode",
+                "title": "Confirm Shared Access Scope",
+                "detail": (
+                    "The upstream sees one shared service identity. Every authenticated caller "
+                    "can invoke the enabled operations; the upstream cannot distinguish them "
+                    "unless another user identity is supplied."
                 ),
             }
         )
@@ -1196,6 +1261,21 @@ def build_onboarding_guidance(
     )
     return {
         "recommended_mode": rec_mode,
+        "auth_discovery": {
+            "status": (
+                "declared"
+                if has_declared_security
+                else "not_observed"
+                if upstream.type == "mcp_http"
+                else "not_declared"
+            ),
+            "source": (
+                "openapi_security_schemes" if upstream.type == "openapi" else "mcp_tools_discovery"
+            ),
+            "security_schemes": security_schemes,
+            "authorization_mode": upstream.authorization_mode,
+            "requires_operator_confirmation": True,
+        },
         "detected_security_schemes": security_schemes,
         "missing_output_schema_tools": missing_out,
         "checklist": checklist,

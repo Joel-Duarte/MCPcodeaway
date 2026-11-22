@@ -33,6 +33,7 @@ UpstreamAuthType = Literal[
     "user_api_key",
     "none",
 ]
+UpstreamAuthorizationMode = Literal["gateway", "upstream", "shared_access"]
 
 _SLUG_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -210,6 +211,7 @@ class UpstreamConfig(BaseModel):
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     auth_type: UpstreamAuthType = "delegated_token"
+    authorization_mode: UpstreamAuthorizationMode = "gateway"
     downstream_audience: str | None = None
     downstream_scope: str | None = None
     secret_env_var: str | None = None
@@ -261,6 +263,35 @@ class UpstreamConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_recovery_policies(self) -> UpstreamConfig:
+        user_scoped_auth = {"delegated_token", "user_oauth", "user_api_key"}
+        shared_auth = {"client_credentials", "api_key", "bearer_secret"}
+        if self.auth_type in user_scoped_auth and (self.secret_ref or self.secret_env_var):
+            raise ValueError(
+                f"auth_type='{self.auth_type}' cannot configure a shared secret_ref or "
+                "secret_env_var"
+            )
+        if self.authorization_mode == "upstream":
+            if self.auth_type not in user_scoped_auth:
+                raise ValueError(
+                    "authorization_mode='upstream' requires delegated_token, user_oauth, "
+                    "or user_api_key authentication"
+                )
+            if self.allowed_roles or self.allowed_groups or self.allow_all_callers:
+                raise ValueError(
+                    "authorization_mode='upstream' cannot be combined with gateway caller "
+                    "role/group allowlists or allow_all_callers"
+                )
+        elif self.authorization_mode == "shared_access":
+            if self.auth_type not in shared_auth:
+                raise ValueError(
+                    "authorization_mode='shared_access' requires client_credentials, api_key, "
+                    "or bearer_secret authentication"
+                )
+            if self.allowed_roles or self.allowed_groups or not self.allow_all_callers:
+                raise ValueError(
+                    "authorization_mode='shared_access' requires allow_all_callers=true and "
+                    "cannot use gateway role/group allowlists"
+                )
         for tool_name, policy in self.tool_recovery_policies.items():
             if not policy.enabled:
                 continue
@@ -631,7 +662,10 @@ class UpstreamRegistry:
         for item in items:
             cfg = UpstreamConfig.model_validate(item)
             if self.settings.app_env == "prod" and cfg.enabled and not cfg.demo_only:
-                if not cfg.allowed_roles and not cfg.allowed_groups and not cfg.allow_all_callers:
+                has_gateway_access_policy = (
+                    bool(cfg.allowed_roles) or bool(cfg.allowed_groups) or cfg.allow_all_callers
+                )
+                if cfg.authorization_mode == "gateway" and not has_gateway_access_policy:
                     raise ValueError(
                         f"Production upstream '{cfg.name}' must set allowed_roles or "
                         "allowed_groups, or explicitly set allow_all_callers: true."

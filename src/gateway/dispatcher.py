@@ -998,20 +998,43 @@ class HostDispatcher:
                             )
             except Exception as exc:
                 duration_ms = round((time.perf_counter() - started) * 1000, 3)
-                failure = (
-                    UpstreamFailure(
+                operation_is_read = (
+                    upstream.tool_effects.get(tool.name, "read" if not tool.mutating else "write")
+                    == "read"
+                )
+                if isinstance(exc, UserCredentialRequiredError):
+                    failure = UpstreamFailure(
                         error_type="user_credential_required",
                         message=str(exc),
                     )
-                    if isinstance(exc, UserCredentialRequiredError)
-                    else classify_upstream_error(
-                        exc,
-                        operation_is_read=(
-                            upstream.tool_effects.get(tool.name) == "read"
-                            or (tool.name not in upstream.tool_effects and not tool.mutating)
-                        ),
-                    )
-                )
+                elif isinstance(exc, httpx.HTTPStatusError) and (
+                    upstream.auth_type in {"user_api_key", "user_oauth"}
+                    or upstream.authorization_mode == "upstream"
+                ):
+                    status = exc.response.status_code
+                    if status == 401 and upstream.auth_type in {"user_api_key", "user_oauth"}:
+                        failure = UpstreamFailure(
+                            error_type="user_credential_rejected",
+                            message=(
+                                f"The connected credential for '{upstream.name}' was rejected. "
+                                "Reconnect this upstream from Connections and try again."
+                            ),
+                            status_code=status,
+                        )
+                    elif status == 403:
+                        failure = UpstreamFailure(
+                            error_type="upstream_access_denied",
+                            message=(
+                                f"You are authenticated to '{upstream.name}', but your account "
+                                "is not authorized for this operation. Ask the upstream owner "
+                                "to grant access."
+                            ),
+                            status_code=status,
+                        )
+                    else:
+                        failure = classify_upstream_error(exc, operation_is_read=operation_is_read)
+                else:
+                    failure = classify_upstream_error(exc, operation_is_read=operation_is_read)
                 if audit_claimed and not audit_completed and audit_operation_id is not None:
                     final_status = (
                         "outcome_unknown"

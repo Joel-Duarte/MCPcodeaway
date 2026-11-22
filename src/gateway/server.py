@@ -4187,6 +4187,18 @@ def create_gateway_app(
                 )
         try:
             inspection = await inspect_upstream(cfg, runtime.client_manager, auth_headers=headers)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            detail = f"Schema inspection received HTTP {status} from upstream '{cfg.name}'."
+            challenge = exc.response.headers.get("WWW-Authenticate", "")
+            scheme = challenge.split(maxsplit=1)[0] if challenge else ""
+            if scheme and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", scheme):
+                detail += f" The upstream advertised a {scheme} authentication challenge."
+            if status == 401:
+                detail += " Configure the upstream credential type and retry inspection."
+            elif status == 403:
+                detail += " The inspection identity lacks access; use an authorized identity."
+            raise HTTPException(status_code=400, detail=detail) from exc
         except Exception as exc:
             raise HTTPException(
                 status_code=400, detail=f"Failed to inspect upstream '{cfg.name}': {exc}"
@@ -5869,12 +5881,17 @@ def create_gateway_app(
                         "or high impact."
                     ),
                 )
-            if not cfg.allowed_roles and not cfg.allowed_groups and not cfg.allow_all_callers:
+            if (
+                cfg.authorization_mode == "gateway"
+                and not cfg.allowed_roles
+                and not cfg.allowed_groups
+                and not cfg.allow_all_callers
+            ):
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        "Select allowed roles or groups, or explicitly set "
-                        "allow_all_callers to true."
+                        "Select gateway roles or groups, explicitly allow all callers, "
+                        "or choose upstream authorization/shared access."
                     ),
                 )
 

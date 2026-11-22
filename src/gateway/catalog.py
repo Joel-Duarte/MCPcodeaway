@@ -292,7 +292,7 @@ class ToolCatalog:
         allowed_servers: set[str] | None = None,
         guidance: dict[str, dict[str, Any]] | None = None,
     ) -> list[DiscoveredTool]:
-        """Return only tools authorized for this caller's roles, groups, client, and scopes."""
+        """Return tools allowed by gateway policy and the configured operation allowlists."""
         accessible: list[DiscoveredTool] = []
         for upstream in registry.list_upstreams():
             if allowed_servers is not None and upstream.name not in allowed_servers:

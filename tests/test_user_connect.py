@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.testclient import TestClient
 
 from gateway.auth import (
@@ -18,12 +19,185 @@ from gateway.auth import (
 )
 from gateway.config import GatewaySettings, UpstreamConfig, UpstreamOAuthConfig
 from gateway.dispatcher import HostDispatcher
+from gateway.mcp_protocol import (
+    MCP_CLIENT_CAPABILITIES_META,
+    MCP_PROTOCOL_VERSION,
+    MCP_PROTOCOL_VERSION_META,
+    MCP_SERVER_INFO_META,
+)
 from gateway.server import create_gateway_app
 from gateway.state import InMemoryCacheBackend
 
 
 def _b64_key(seed: bytes) -> str:
     return base64.urlsafe_b64encode(seed * 2).decode("ascii")
+
+
+def _mcp_user_call(
+    client: TestClient, token: str | None, tool_name: str, arguments: dict[str, str]
+) -> httpx.Response:
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+        "Mcp-Method": "tools/call",
+        "Mcp-Name": tool_name,
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments,
+                "_meta": {
+                    MCP_PROTOCOL_VERSION_META: MCP_PROTOCOL_VERSION,
+                    MCP_CLIENT_CAPABILITIES_META: {},
+                    MCP_SERVER_INFO_META: {"name": "personal-key-test", "version": "1.0"},
+                },
+            },
+        },
+    )
+
+
+def test_user_api_key_authz_flow_uses_personal_credential_without_upstream_oidc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owners = {"personal-key-a": "user-a", "personal-key-b": "user-b"}
+    observed_keys: list[str | None] = []
+    api = FastAPI(title="Personal Key API", version="1.0.0")
+
+    @api.get("/notes/{note_id}", operation_id="read_personal_note")
+    def read_personal_note(
+        note_id: str, x_personal_token: str | None = Header(default=None)
+    ) -> dict[str, str]:
+        observed_keys.append(x_personal_token)
+        owner = owners.get(x_personal_token or "")
+        if owner is None:
+            raise HTTPException(status_code=401, detail="Invalid personal key")
+        if note_id == "restricted" and owner != "user-b":
+            raise HTTPException(status_code=403, detail="This note belongs to another user")
+        return {"owner": owner, "note_id": note_id}
+
+    async def dispatch(request: httpx.Request) -> httpx.Response:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api), base_url="https://personal-api.test"
+        ) as upstream_client:
+            return await upstream_client.request(
+                request.method,
+                str(request.url),
+                headers=dict(request.headers),
+                content=request.content,
+            )
+
+    upstream_http = httpx.AsyncClient(transport=httpx.MockTransport(dispatch))
+    monkeypatch.setenv("SHARED_PERSONAL_KEY", "must-not-be-used-as-fallback")
+    cfg = UpstreamConfig(
+        name="personal_notes",
+        type="openapi",
+        url="https://personal-api.test",
+        openapi_spec_url="https://personal-api.test/openapi.json",
+        auth_type="user_api_key",
+        authorization_mode="upstream",
+        api_key_header="X-Personal-Token",
+        allowed_operations=["read_personal_note"],
+        tool_effects={"read_personal_note": "read"},
+    )
+    upstreams_path = tmp_path / "upstreams.yaml"
+    upstreams_path.write_text(
+        "upstreams:\n"
+        "  - name: personal_notes\n"
+        "    type: openapi\n"
+        "    url: https://personal-api.test\n"
+        "    openapi_spec_url: https://personal-api.test/openapi.json\n"
+        "    auth_type: user_api_key\n"
+        "    authorization_mode: upstream\n"
+        "    api_key_header: X-Personal-Token\n"
+        "    allowed_operations: [read_personal_note]\n"
+        "    tool_effects: {read_personal_note: read}\n",
+        encoding="utf-8",
+    )
+    settings = GatewaySettings(
+        app_env="sandbox",
+        auth_mode="dev",
+        allowed_tenants=["tenant-test"],
+        sqlite_path=str(tmp_path / "gateway.db"),
+        upstreams_config_path=str(upstreams_path),
+        credential_encryption_key=f"k1:{_b64_key(b'0123456789abcdef')}",
+        ssrf_protection_enabled=False,
+    )
+    dev_keys = LocalDevKeyManager(issuer=settings.oidc_issuer)
+    app = create_gateway_app(settings=settings, dev_keys=dev_keys, http_client=upstream_http)
+    token_a = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={"sub": "user-a", "tenant_id": "tenant-test", "groups": [], "roles": []},
+    )
+    token_b = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={"sub": "user-b", "tenant_id": "tenant-test", "groups": [], "roles": []},
+    )
+    token_unmapped = dev_keys.issue_user_token(
+        persona="finance_analyst",
+        overrides={"sub": "user-c", "tenant_id": "tenant-test", "groups": [], "roles": []},
+    )
+    tool_name = "personal_notes__read_personal_note"
+
+    assert cfg.authorization_mode == "upstream"
+    with TestClient(app) as client:
+        unauthenticated = _mcp_user_call(client, None, tool_name, {"note_id": "private"})
+        assert unauthenticated.status_code == 401
+
+        missing = _mcp_user_call(client, token_unmapped, tool_name, {"note_id": "private"})
+        assert "/auth/connect/personal_notes?ticket=" in missing.text
+        assert observed_keys == []
+
+        for token, key in ((token_a, "personal-key-a"), (token_b, "personal-key-b")):
+            connected = client.post(
+                "/me/connections/personal_notes/secret",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"api_key": key},
+            )
+            assert connected.status_code == 200
+
+        private_a = _mcp_user_call(
+            client,
+            token_a,
+            tool_name,
+            {"note_id": "private", "api_key": "personal-key-b"},
+        )
+        assert private_a.status_code == 200
+        assert "user-a" in private_a.text
+        assert "personal-key-b" not in private_a.text
+        assert observed_keys[-1] == "personal-key-a"
+
+        forbidden_a = _mcp_user_call(client, token_a, tool_name, {"note_id": "restricted"})
+        assert forbidden_a.status_code == 200
+        assert "not authorized for this operation" in forbidden_a.text
+        assert "another user" not in forbidden_a.text
+
+        allowed_b = _mcp_user_call(client, token_b, tool_name, {"note_id": "restricted"})
+        assert allowed_b.status_code == 200
+        assert "user-b" in allowed_b.text
+        assert observed_keys[-1] == "personal-key-b"
+
+        revoked = client.post(
+            "/me/connections/personal_notes/secret",
+            headers={"Authorization": f"Bearer {token_a}"},
+            json={"api_key": "revoked-personal-key"},
+        )
+        assert revoked.status_code == 200
+        rejected = _mcp_user_call(client, token_a, tool_name, {"note_id": "private"})
+        assert rejected.status_code == 200
+        assert "connected credential" in rejected.text
+        assert "must-not-be-used-as-fallback" not in rejected.text
+        assert observed_keys[-1] == "revoked-personal-key"
+
+    assert "must-not-be-used-as-fallback" not in observed_keys
 
 
 @pytest.mark.parametrize("status_code", [400, 503])

@@ -167,7 +167,7 @@ async def test_hitl_onboarding_guidance_curation_and_agent_prompt(tmp_path) -> N
                 guidance = inspection["onboarding_guidance"]
                 targets = {(c["target"], c["field"]) for c in guidance["checklist"]}
                 assert ("corporate_idp", "downstream_audience") in targets
-                assert ("gateway", "secret_env_var") in targets
+                assert ("operator", "auth_type") in targets
                 assert ("target_backend", "outputSchema") in targets
                 assert ("gateway", "allowed_operations") in targets
                 assert "list_orders" in guidance["missing_output_schema_tools"]

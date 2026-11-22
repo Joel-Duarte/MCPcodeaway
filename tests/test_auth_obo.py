@@ -146,6 +146,68 @@ def test_unresolved_group_overage_denies_group_dependent_upstream_access() -> No
     )
 
 
+def test_upstream_authorization_uses_user_credential_without_gateway_group_checks() -> None:
+    policy = PolicyEvaluator(
+        GatewaySettings(app_env="sandbox", read_only_prod=False, auth_mode="dev")
+    )
+    identity = claims_to_identity({"sub": "user", "tid": "tenant"}, ClaimMappingConfig())
+    upstream = UpstreamConfig(
+        name="personal_api",
+        type="openapi",
+        url="https://api.example.test",
+        auth_type="user_api_key",
+        authorization_mode="upstream",
+        mutating_tools=["write_record"],
+    )
+
+    assert policy.can_access_upstream(identity, upstream) == (True, "allowed")
+    assert policy.can_execute_tool(identity, upstream, "write_record", is_mutating=True) == (
+        True,
+        "allowed",
+    )
+
+
+def test_shared_access_requires_explicit_shared_credential_mode() -> None:
+    identity = claims_to_identity({"sub": "user", "tid": "tenant"}, ClaimMappingConfig())
+    policy = PolicyEvaluator(GatewaySettings(app_env="sandbox", auth_mode="dev"))
+    upstream = UpstreamConfig(
+        name="shared_api",
+        type="openapi",
+        url="https://api.example.test",
+        auth_type="api_key",
+        authorization_mode="shared_access",
+        allow_all_callers=True,
+        mutating_tools=["write_record"],
+    )
+
+    assert policy.can_access_upstream(identity, upstream) == (True, "allowed")
+    with pytest.raises(ValueError, match="allow_all_callers=true"):
+        UpstreamConfig(
+            name="implicit_shared_api",
+            type="openapi",
+            url="https://api.example.test",
+            auth_type="api_key",
+            authorization_mode="shared_access",
+        )
+    with pytest.raises(ValueError, match="requires delegated_token"):
+        UpstreamConfig(
+            name="wrong_upstream_mode",
+            type="openapi",
+            url="https://api.example.test",
+            auth_type="api_key",
+            authorization_mode="upstream",
+        )
+    with pytest.raises(ValueError, match="cannot configure a shared secret_ref"):
+        UpstreamConfig(
+            name="user_key_with_shared_fallback",
+            type="openapi",
+            url="https://api.example.test",
+            auth_type="user_api_key",
+            authorization_mode="upstream",
+            secret_ref="env://SHARED_KEY",
+        )
+
+
 @pytest.mark.asyncio
 async def test_entra_group_resolver_uses_tenant_user_scoped_cache() -> None:
     settings = GatewaySettings(entra_graph_scope="https://graph.microsoft.com/.default")
