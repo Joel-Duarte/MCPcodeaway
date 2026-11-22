@@ -15,7 +15,6 @@ from urllib.parse import quote, urlencode
 ROOT = Path(__file__).resolve().parent.parent
 COMPOSE_FILE = ROOT / "docker-compose.acceptance.yml"
 TLS_COMPOSE_FILE = ROOT / "docker-compose.postgres-tls.yml"
-PROJECT = "mcpcodeaway-local-acceptance"
 TESTS = [
     "tests/test_auth_obo.py",
     "tests/test_mock_oidc_provider.py",
@@ -129,6 +128,7 @@ def main() -> int:
     parser.add_argument("--with-tcp-tls", action="store_true")
     args = parser.parse_args()
     env = os.environ.copy()
+    project = f"mcpcodeaway-acceptance-{secrets.token_hex(8)}"
     use_postgres = (
         args.with_postgres
         or args.with_postgres_tls
@@ -160,7 +160,7 @@ def main() -> int:
             f"postgresql://gateway_test:{quote(env['MCP_TEST_POSTGRES_PASSWORD'], safe='')}@"
             f"127.0.0.1:{port}/mcpcodeaway_acceptance?{tls_query}"
         )
-        env["MCP_TEST_POSTGRES_COMPOSE_PROJECT"] = PROJECT
+        env["MCP_TEST_POSTGRES_COMPOSE_PROJECT"] = project
         env["MCP_TEST_POSTGRES_COMPOSE_FILES"] = os.pathsep.join(map(str, compose_files))
 
     try:
@@ -171,7 +171,7 @@ def main() -> int:
             compose_command.extend(
                 [
                     "-p",
-                    PROJECT,
+                    project,
                     "up",
                     "-d",
                     "--wait",
@@ -192,7 +192,7 @@ def main() -> int:
         command = ["uv", "run"]
         if use_postgres:
             command.extend(["--extra", "postgres"])
-        command.extend(["pytest", "-q", *TESTS])
+        command.extend(["pytest", "-q", "-rs", *TESTS])
         if args.with_postgres_tls:
             command.append("tests/test_postgres_tls_acceptance.py")
         if args.with_tcp_tls:
@@ -210,7 +210,7 @@ def main() -> int:
             cleanup_command = ["docker", "compose"]
             for compose_file in compose_files:
                 cleanup_command.extend(["-f", str(compose_file)])
-            cleanup_command.extend(["-p", PROJECT, "down", "--volumes", "--remove-orphans"])
+            cleanup_command.extend(["-p", project, "down", "--volumes", "--remove-orphans"])
             subprocess.run(
                 cleanup_command,
                 cwd=ROOT,

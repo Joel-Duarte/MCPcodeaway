@@ -1741,7 +1741,13 @@ class PostgresAuditStore:
                 raise RuntimeError(
                     "postgres_dsn requires optional dependency 'mcpcodeaway[postgres]' (asyncpg)."
                 ) from exc
-            self._pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=10)
+            self._pool = await asyncpg.create_pool(
+                self.dsn,
+                min_size=1,
+                max_size=10,
+                timeout=10.0,
+                command_timeout=30.0,
+            )
         return self._pool
 
     async def health_check(self) -> bool:

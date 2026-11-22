@@ -31,6 +31,11 @@ pytestmark = [
 ]
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = ROOT / "docker-compose.acceptance.yml"
+COMPOSE_FILES = [
+    Path(path)
+    for path in os.getenv("MCP_TEST_POSTGRES_COMPOSE_FILES", str(COMPOSE_FILE)).split(os.pathsep)
+    if path
+]
 COMPOSE_PROJECT = os.getenv("MCP_TEST_POSTGRES_COMPOSE_PROJECT", "mcpcodeaway-local-acceptance")
 TIMEOUT = 20
 
@@ -219,8 +224,12 @@ class LocalWriteServer:
 
 
 def compose(*args: str) -> None:
+    command = ["docker", "compose"]
+    for compose_file in COMPOSE_FILES:
+        command.extend(["-f", str(compose_file)])
+    command.extend(["-p", COMPOSE_PROJECT, *args])
     subprocess.run(
-        ["docker", "compose", "-f", str(COMPOSE_FILE), "-p", COMPOSE_PROJECT, *args],
+        command,
         cwd=ROOT,
         text=True,
         capture_output=True,
