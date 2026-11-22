@@ -6,6 +6,8 @@ interface DemoModelProfile {
   codemode_success_rate: number;
   traditional_success_rate: number;
   traditional_turns: number;
+  input_token_range: [number, number];
+  output_token_range: [number, number];
 }
 
 interface RecoveryLabScenario {
@@ -48,6 +50,10 @@ const newModelName = ref("");
 const newCodeSuccessRate = ref(0.95);
 const newTradSuccessRate = ref(0.90);
 const newTradTurns = ref(3);
+const newInputTokenMin = ref(400);
+const newInputTokenMax = ref(1200);
+const newOutputTokenMin = ref(100);
+const newOutputTokenMax = ref(300);
 
 function readNumber(value: string, previous: number): number {
   return value === "" ? previous : Number(value);
@@ -65,6 +71,8 @@ function addModelProfile() {
     codemode_success_rate: Math.min(1, Math.max(0, Number(newCodeSuccessRate.value) || 0.95)),
     traditional_success_rate: Math.min(1, Math.max(0, Number(newTradSuccessRate.value) || 0.90)),
     traditional_turns: Math.max(1, Math.min(12, Math.round(Number(newTradTurns.value) || 3))),
+    input_token_range: [newInputTokenMin.value, newInputTokenMax.value],
+    output_token_range: [newOutputTokenMin.value, newOutputTokenMax.value],
   });
   newModelName.value = "";
   notice.value = `Added '${name}'. Click 'Save Model Profiles' to persist.`;
@@ -383,7 +391,7 @@ onMounted(() => {
     <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
       <h2 class="text-sm font-semibold text-[#09090B]">Synthetic Evidence Profiles</h2>
       <p class="mb-4 text-xs text-[#71717A]">
-        These profiles feed generated paired report data and label mock traffic. They are not LLM measurements and never affect routing recommendations.
+        These synthetic profiles drive repeatable token samples within each model’s input/output ranges and vary outcomes, latency, calls, and turns. They are not LLM measurements; illustrative recommendations never affect live routing.
       </p>
       <div class="overflow-x-auto">
         <table class="w-full text-left text-xs tabular-nums">
@@ -393,6 +401,8 @@ onMounted(() => {
               <th class="py-2 pr-3 font-medium">Code Mode Success (0-1)</th>
               <th class="py-2 pr-3 font-medium">Classic Success (0-1)</th>
               <th class="py-2 pr-3 font-medium">Classic Avg Turns</th>
+              <th class="py-2 pr-3 font-medium">Input Tokens · Min / Max</th>
+              <th class="py-2 pr-3 font-medium">Output Tokens · Min / Max</th>
               <th class="py-2 text-right font-medium">Actions</th>
             </tr>
           </thead>
@@ -408,6 +418,8 @@ onMounted(() => {
               <td class="py-2 pr-3">
                 <Input :model-value="String(m.traditional_turns)" @update:model-value="m.traditional_turns = readNumber($event, m.traditional_turns)" type="number" min="1" max="12" class="w-24 font-mono-data text-xs" />
               </td>
+              <td class="py-2 pr-3"><div class="flex gap-1"><Input :model-value="String(m.input_token_range[0])" :aria-label="`${m.model} input tokens minimum`" @update:model-value="m.input_token_range[0] = readNumber($event, m.input_token_range[0])" type="number" min="1" max="100000" class="w-24 font-mono-data text-xs" /><Input :model-value="String(m.input_token_range[1])" :aria-label="`${m.model} input tokens maximum`" @update:model-value="m.input_token_range[1] = readNumber($event, m.input_token_range[1])" type="number" min="1" max="100000" class="w-24 font-mono-data text-xs" /></div></td>
+              <td class="py-2 pr-3"><div class="flex gap-1"><Input :model-value="String(m.output_token_range[0])" :aria-label="`${m.model} output tokens minimum`" @update:model-value="m.output_token_range[0] = readNumber($event, m.output_token_range[0])" type="number" min="1" max="100000" class="w-24 font-mono-data text-xs" /><Input :model-value="String(m.output_token_range[1])" :aria-label="`${m.model} output tokens maximum`" @update:model-value="m.output_token_range[1] = readNumber($event, m.output_token_range[1])" type="number" min="1" max="100000" class="w-24 font-mono-data text-xs" /></div></td>
               <td class="py-2 text-right">
                 <button type="button" class="text-xs font-medium text-[#DC2626] hover:underline" @click="removeModelProfile(m.model)">Delete</button>
               </td>
@@ -420,6 +432,10 @@ onMounted(() => {
         <Field><FieldLabel>Code success</FieldLabel><Input :model-value="String(newCodeSuccessRate)" @update:model-value="newCodeSuccessRate = readNumber($event, newCodeSuccessRate)" type="number" step="0.05" min="0" max="1" class="w-24 text-xs" /></Field>
         <Field><FieldLabel>Classic success</FieldLabel><Input :model-value="String(newTradSuccessRate)" @update:model-value="newTradSuccessRate = readNumber($event, newTradSuccessRate)" type="number" step="0.05" min="0" max="1" class="w-24 text-xs" /></Field>
         <Field><FieldLabel>Classic turns</FieldLabel><Input :model-value="String(newTradTurns)" @update:model-value="newTradTurns = readNumber($event, newTradTurns)" type="number" min="1" max="12" class="w-20 text-xs" /></Field>
+        <Field><FieldLabel>Input tokens min</FieldLabel><Input :model-value="String(newInputTokenMin)" @update:model-value="newInputTokenMin = readNumber($event, newInputTokenMin)" type="number" min="1" max="100000" class="w-28 text-xs" /></Field>
+        <Field><FieldLabel>Input tokens max</FieldLabel><Input :model-value="String(newInputTokenMax)" @update:model-value="newInputTokenMax = readNumber($event, newInputTokenMax)" type="number" min="1" max="100000" class="w-28 text-xs" /></Field>
+        <Field><FieldLabel>Output tokens min</FieldLabel><Input :model-value="String(newOutputTokenMin)" @update:model-value="newOutputTokenMin = readNumber($event, newOutputTokenMin)" type="number" min="1" max="100000" class="w-28 text-xs" /></Field>
+        <Field><FieldLabel>Output tokens max</FieldLabel><Input :model-value="String(newOutputTokenMax)" @update:model-value="newOutputTokenMax = readNumber($event, newOutputTokenMax)" type="number" min="1" max="100000" class="w-28 text-xs" /></Field>
         <Button type="submit" data-variant="primary">Add model</Button>
       </form>
     </div>

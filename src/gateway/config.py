@@ -96,6 +96,13 @@ class ToolApprovalPolicy(BaseModel):
         return self
 
 
+class ToolGuidanceConfig(BaseModel):
+    """Operator-authored tool description and parameter hints shipped with an upstream."""
+
+    description: str = Field(default="", max_length=400)
+    parameter_hints: dict[str, str] = Field(default_factory=dict, max_length=24)
+
+
 class ToolRecoveryPolicy(BaseModel):
     """Opt-in bounded recovery contract for a single mutating upstream tool."""
 
@@ -218,6 +225,7 @@ class UpstreamConfig(BaseModel):
     allowed_operations: list[str] | None = None
     excluded_operations: list[str] = Field(default_factory=list)
     tool_effects: dict[str, Literal["read", "write", "high_impact"]] = Field(default_factory=dict)
+    tool_guidance: dict[str, ToolGuidanceConfig] = Field(default_factory=dict)
     preferred_mode: GatewayMode | None = None
     tool_mode_overrides: dict[str, GatewayMode] = Field(default_factory=dict)
     tool_approval_policies: dict[str, ToolApprovalPolicy] = Field(default_factory=dict)
@@ -656,7 +664,36 @@ class UpstreamRegistry:
         """Return effective upstreams respecting prod stdio restrictions."""
         merged: dict[str, UpstreamConfig] = dict(self._static)
         if self.settings.dynamic_upstreams_permitted:
-            merged.update(self._dynamic)
+            for name, dynamic_cfg in self._dynamic.items():
+                static_cfg = merged.get(name)
+                if static_cfg is None:
+                    merged[name] = dynamic_cfg
+                    continue
+
+                overrides: dict[str, Any] = {}
+                for field in (
+                    "preferred_mode",
+                    "ab_experiment",
+                    "request_timeout_seconds",
+                    "max_requests_per_minute",
+                    "max_concurrent_calls",
+                    "health_check",
+                    "enabled",
+                ):
+                    value = getattr(dynamic_cfg, field)
+                    if value is not None:
+                        overrides[field] = value
+                for field in (
+                    "tool_mode_overrides",
+                    "tool_approval_policies",
+                    "tool_recovery_policies",
+                    "tool_guidance",
+                ):
+                    overrides[field] = {
+                        **getattr(static_cfg, field),
+                        **getattr(dynamic_cfg, field),
+                    }
+                merged[name] = static_cfg.model_copy(update=overrides)
         result: list[UpstreamConfig] = []
         for cfg in merged.values():
             if not include_disabled and not cfg.enabled:

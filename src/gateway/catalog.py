@@ -301,7 +301,18 @@ class ToolCatalog:
                 continue
             for tool in self._tools_by_server.get(upstream.name, []):
                 if policy.can_execute_tool(identity, upstream, tool.name, tool.mutating)[0]:
-                    entry = (guidance or {}).get(tool.qualified_name)
+                    configured = upstream.tool_guidance.get(tool.name)
+                    entry = configured.model_dump() if configured is not None else None
+                    saved = (guidance or {}).get(tool.qualified_name)
+                    if saved:
+                        entry = {
+                            **(entry or {}),
+                            **saved,
+                            "parameter_hints": {
+                                **((entry or {}).get("parameter_hints") or {}),
+                                **(saved.get("parameter_hints") or {}),
+                            },
+                        }
                     accessible.append(
                         _apply_tool_guidance(tool, ToolGuidance.model_validate(entry))
                         if entry

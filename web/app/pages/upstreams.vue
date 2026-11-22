@@ -56,11 +56,11 @@ function serverStats(u: UpstreamEntry) {
 }
 
 async function setUpstreamPreferredMode(u: UpstreamEntry, mode: string) {
-  await _apiFetch(`/admin/upstreams/${encodeURIComponent(u.name)}/mode`, {
+  const res = await _apiFetch<{ preferred_mode: string }>(`/admin/upstreams/${encodeURIComponent(u.name)}/mode`, {
     method: "PATCH",
     body: { preferred_mode: mode },
   });
-  u.preferred_mode = mode;
+  if (res) u.preferred_mode = res.preferred_mode;
 }
 
 async function setToolModeOverride(u: UpstreamEntry, toolName: string, mode: string) {
@@ -467,7 +467,9 @@ onMounted(() => {
                     <select
                       :value="u.preferred_mode || 'auto'"
                       aria-label="Server preferred mode"
-                      class="rounded border border-[#D4D4D8] bg-white px-2 py-1 text-xs font-mono-data"
+                      :disabled="!upstreamsData.dynamic_upstreams_permitted"
+                      :title="upstreamsData.dynamic_upstreams_permitted ? 'Set the preferred execution mode for this MCP server' : 'Modes are read-only here; change config/upstreams.yaml and deploy the configuration'"
+                      class="rounded border border-[#D4D4D8] bg-white px-2 py-1 text-xs font-mono-data disabled:cursor-not-allowed disabled:bg-[#F4F4F5] disabled:text-[#71717A]"
                       @change="(e) => { const el = e.target as HTMLSelectElement; const next = el.value; el.value = u.preferred_mode || 'auto'; promptModeChange('server', u, next); }"
                     >
                       <option value="auto">auto</option>
@@ -575,6 +577,8 @@ onMounted(() => {
       :upstream="selectedTool.upstream"
       :tool="selectedTool.tool"
       :opener="selectedTool.opener"
+      :upstream-config="upstreamsData?.upstreams.find((upstream) => upstream.name === selectedTool?.upstream) || {}"
+      :demo-mode="upstreamsData?.profile === 'demo'"
     />
 
     <Dialog v-model:open="deleteDialogOpen">

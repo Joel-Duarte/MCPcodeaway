@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
+from pydantic import BaseModel, Field, model_validator
 
 from gateway.mcp_protocol import request_headers, request_meta
 
@@ -19,6 +20,29 @@ if TYPE_CHECKING:
     from gateway.server import GatewayRuntime
 
 DemoTier = Literal["light", "enterprise", "stress"]
+
+
+class DemoModelProfile(BaseModel):
+    model: str = Field(min_length=1, max_length=160)
+    codemode_success_rate: float = Field(default=0.9, ge=0, le=1)
+    traditional_success_rate: float = Field(default=0.9, ge=0, le=1)
+    traditional_turns: int = Field(default=3, ge=1, le=12)
+    input_token_range: tuple[int, int] = Field(default=(400, 1200))
+    output_token_range: tuple[int, int] = Field(default=(100, 300))
+
+    @model_validator(mode="after")
+    def validate_ranges(self) -> DemoModelProfile:
+        if any(
+            value < 1 or value > 100_000
+            for value in (*self.input_token_range, *self.output_token_range)
+        ):
+            raise ValueError("Token range values must be between 1 and 100000")
+        if self.input_token_range[0] > self.input_token_range[1]:
+            raise ValueError("input_token_range minimum must not exceed its maximum")
+        if self.output_token_range[0] > self.output_token_range[1]:
+            raise ValueError("output_token_range minimum must not exceed its maximum")
+        return self
+
 
 _TIER_TIMING: dict[str, tuple[float, float]] = {
     "light": (2.0, 0.45),
@@ -61,27 +85,35 @@ class DemoTrafficRunner:
         self.last_error = ""
         self.model_profiles: list[dict[str, Any]] = [
             {
-                "model": "claude-sonnet-4-5",
-                "codemode_success_rate": 0.98,
-                "traditional_success_rate": 0.95,
+                "model": "claude-sonnet-5.5",
+                "codemode_success_rate": 0.96,
+                "traditional_success_rate": 0.88,
+                "input_token_range": (700, 2200),
+                "output_token_range": (140, 480),
                 "traditional_turns": 4,
             },
             {
-                "model": "gpt-4o",
-                "codemode_success_rate": 0.92,
-                "traditional_success_rate": 0.94,
+                "model": "gpt-6.1-sol",
+                "codemode_success_rate": 0.84,
+                "traditional_success_rate": 0.92,
+                "input_token_range": (500, 1900),
+                "output_token_range": (100, 390),
                 "traditional_turns": 3,
             },
             {
-                "model": "gemini-2.5-pro",
-                "codemode_success_rate": 0.96,
-                "traditional_success_rate": 0.90,
+                "model": "gemini-4-hydrogen",
+                "codemode_success_rate": 0.76,
+                "traditional_success_rate": 0.88,
+                "input_token_range": (350, 1500),
+                "output_token_range": (90, 340),
                 "traditional_turns": 4,
             },
             {
-                "model": "llama-3.3-70b",
-                "codemode_success_rate": 0.45,
-                "traditional_success_rate": 0.88,
+                "model": "qwen3.5-9b",
+                "codemode_success_rate": 0.92,
+                "traditional_success_rate": 0.72,
+                "input_token_range": (220, 1050),
+                "output_token_range": (60, 260),
                 "traditional_turns": 2,
             },
         ]
@@ -116,25 +148,63 @@ class DemoTrafficRunner:
         workloads = (
             "single_read",
             "small_fanout",
+            "large_fanout",
             "data_reconciliation",
             "large_data_reconciliation",
+            "batch_compute",
             "sequential_workflow",
+            "mutating_workflow",
+            "large_payload_processing",
         )
-        thresholds = (0.1, 0.3, 0.5, 0.7, 0.9)
+        workload_scale = {
+            "single_read": 0.6,
+            "small_fanout": 1.0,
+            "large_fanout": 1.8,
+            "data_reconciliation": 1.4,
+            "large_data_reconciliation": 2.4,
+            "batch_compute": 1.5,
+            "sequential_workflow": 1.7,
+            "mutating_workflow": 1.2,
+            "large_payload_processing": 2.8,
+        }
         created_at = datetime.now(UTC).isoformat()
         rows: list[dict[str, Any]] = []
         for profile in self.model_profiles:
             model = str(profile.get("model") or "demo-model").strip().lower()
             for workload in workloads:
-                for repeat, threshold in enumerate(thresholds):
+                for repeat in range(5):
                     for mode in ("traditional", "codemode"):
                         key = f"{model}:{workload}:{repeat}:{mode}"
-                        rate_key = (
-                            "traditional_success_rate"
-                            if mode == "traditional"
-                            else "codemode_success_rate"
+                        rng = random.Random(f"demo-evidence-v2:{key}")
+                        rate = float(
+                            profile.get(
+                                "traditional_success_rate"
+                                if mode == "traditional"
+                                else "codemode_success_rate",
+                                0.9,
+                            )
                         )
-                        correct = threshold <= float(profile.get(rate_key, 0.9))
+                        correct = rng.random() < rate
+                        grounded = rng.random() < min(0.995, rate + 0.06)
+                        input_range = profile.get("input_token_range", (400, 1200))
+                        output_range = profile.get("output_token_range", (100, 300))
+                        scale = workload_scale[workload]
+                        mode_scale = 1.0 if mode == "traditional" else rng.uniform(0.42, 0.95)
+                        input_tokens = round(
+                            rng.randint(int(input_range[0]), int(input_range[1]))
+                            * scale
+                            * mode_scale
+                        )
+                        output_tokens = round(
+                            rng.randint(int(output_range[0]), int(output_range[1]))
+                            * (1.0 if mode == "traditional" else rng.uniform(0.65, 1.2))
+                        )
+                        classic_turns = int(profile.get("traditional_turns", 3))
+                        turns = (
+                            rng.randint(max(1, classic_turns - 1), min(12, classic_turns + 1))
+                            if mode == "traditional"
+                            else rng.randint(1, max(2, (classic_turns + 1) // 2))
+                        )
                         rows.append(
                             {
                                 "version": 1,
@@ -144,23 +214,28 @@ class DemoTrafficRunner:
                                 "workload": workload,
                                 "scenario_id": workload,
                                 "repeat_id": f"demo-repeat-{repeat}",
-                                "fixture_id": "demo-simulator-v1",
+                                "fixture_id": "demo-simulator-v2",
                                 "discovery_config": {
-                                    "runner_version": "demo-traffic-v1",
+                                    "runner_version": "demo-traffic-v2",
                                     "model_source": "demo-simulator",
                                 },
                                 "mode": mode,
                                 "correct": correct,
-                                "grounded": correct,
-                                "input_tokens": 480 if mode == "traditional" else 290,
-                                "output_tokens": 90 if mode == "traditional" else 70,
-                                "wall_ms": 280 if mode == "traditional" else 190,
-                                "upstream_calls": 3 if mode == "traditional" else 2,
-                                "turns": int(profile.get("traditional_turns", 3))
+                                "grounded": grounded,
+                                "input_tokens": input_tokens,
+                                "output_tokens": output_tokens,
+                                "wall_ms": rng.randint(180, 1500)
+                                * (1.0 if mode == "traditional" else rng.uniform(0.55, 1.1)),
+                                "upstream_calls": rng.randint(2, 5)
                                 if mode == "traditional"
-                                else 1,
-                                "recovery_count": 0,
-                                "runtime_failure": not correct,
+                                else rng.randint(1, 3),
+                                "turns": turns,
+                                "recovery_count": rng.choices([0, 1, 2], weights=[0.75, 0.2, 0.05])[
+                                    0
+                                ]
+                                if workload == "mutating_workflow"
+                                else 0,
+                                "runtime_failure": not (correct and grounded),
                             }
                         )
         return rows

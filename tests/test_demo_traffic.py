@@ -134,16 +134,28 @@ def test_demo_workflow_evidence_contains_matched_pairs_for_multiple_workloads() 
         dev_keys=LocalDevKeyManager(),
     )
     rows = DemoTrafficRunner(runtime).simulated_workflow_evidence()
-    assert len(rows) == 4 * 5 * 5 * 2
+    assert len(rows) == 4 * 9 * 5 * 2
     assert {row["workload"] for row in rows} == {
         "single_read",
         "small_fanout",
+        "large_fanout",
         "data_reconciliation",
         "large_data_reconciliation",
+        "batch_compute",
         "sequential_workflow",
+        "mutating_workflow",
+        "large_payload_processing",
     }
     assert {row["discovery_config"]["model_source"] for row in rows} == {"demo-simulator"}
     assert {row["mode"] for row in rows} == {"traditional", "codemode"}
+    assert len({(row["model"], row["input_tokens"]) for row in rows}) > 20
+    assert {row["model"] for row in rows} == {
+        "claude-sonnet-5.5",
+        "gpt-6.1-sol",
+        "gemini-4-hydrogen",
+        "qwen3.5-9b",
+    }
+    assert all(row["input_tokens"] > 0 and row["output_tokens"] > 0 for row in rows)
 
 
 def test_demo_traffic_cases_match_additive_golden_catalog() -> None:
@@ -265,6 +277,18 @@ async def test_gateway_demo_burst_exercises_write_and_failure_spectrum(tmp_path:
         )
         assert len(operations) >= 4
         assert {row["status"] for row in operations} & {"pending", "working"}
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+        ) as metrics_client:
+            metrics = await metrics_client.get(
+                "/admin/operations/metrics", headers={"Authorization": f"Bearer {token}"}
+            )
+        assert metrics.status_code == 200
+        assert metrics.json()["open"] >= 1
+        assert any(
+            row["upstream_name"] == "recovery_workbench"
+            for row in metrics.json()["by_upstream_24h"]
+        )
         key_file = tmp_path / ".mcpcodeaway-demo-recovery-keys.json"
         assert key_file.exists()
         assert key_file.stat().st_mode & 0o077 == 0

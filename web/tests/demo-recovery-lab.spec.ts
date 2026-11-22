@@ -49,9 +49,9 @@ test("Demo Control runs the Recovery Lab and presents the gateway proof", async 
     if (path === "/admin/demo/recovery/run") return recoveryResult;
     if (path === "/admin/demo/golden-run") {
       return {
-        evidence_rows: 200,
+        evidence_rows: 360,
         models: 4,
-        workloads_per_model: 5,
+        workloads_per_model: 9,
         traffic_requests: 24,
         traffic_errors: 5,
         discovery_requests: 2,
@@ -145,6 +145,7 @@ test("Demo Control runs the Recovery Lab and presents the gateway proof", async 
     const generated = await agent.act({ steps: [{ ref: evidenceButton!.ref, action: "press" }] });
     expect(generated.ok, generated.error?.message).toBe(true);
     await vi.waitFor(() => expect(wrapper.text()).toContain("Golden run sent 24 mock MCP calls"));
+    expect(wrapper.text()).toContain("360 clearly labeled simulated report rows");
     expect(apiFetch).toHaveBeenCalledWith(
       "/admin/demo/golden-run",
       { method: "POST", timeout: 60000 }

@@ -18,8 +18,24 @@ interface RecoveryOperation {
   last_error: string | null;
 }
 
+interface OperationMetrics {
+  by_status: Record<string, number>;
+  recent_by_status: Record<string, number>;
+  attempts: number;
+  open: number;
+  needs_attention: number;
+  completed_24h: number;
+  failed_24h: number;
+  cancelled_24h: number;
+  failure_rate_24h_pct: number | null;
+  oldest_open_at: string | null;
+  by_upstream_24h: { upstream_name: string; status: string; count: number; attempts: number }[];
+  upstream_health: { server: string; status: string; checked_at: string; error_type: string | null; consecutive_failures: number }[];
+}
+
 const { apiFetch, session } = useAdminApi();
 const operations = ref<RecoveryOperation[]>([]);
+const metrics = ref<OperationMetrics | null>(null);
 const statusFilter = ref("all");
 const loading = ref(true);
 const errorMessage = ref("");
@@ -42,10 +58,14 @@ async function loadOperations(silent = false) {
   if (!silent) loading.value = true;
   errorMessage.value = "";
   try {
-    const response = await apiFetch<{ operations: RecoveryOperation[] }>(
-      `/admin/operations?status=${encodeURIComponent(statusFilter.value)}`,
-    );
+    const [response, summary] = await Promise.all([
+      apiFetch<{ operations: RecoveryOperation[] }>(
+        `/admin/operations?status=${encodeURIComponent(statusFilter.value)}`,
+      ),
+      apiFetch<OperationMetrics>("/admin/operations/metrics"),
+    ]);
     operations.value = response.operations;
+    metrics.value = summary;
   } catch (error) {
     errorMessage.value = extractErrorMessage(error);
   } finally {
@@ -92,6 +112,38 @@ onUnmounted(() => {
         <Button class="min-h-11" :disabled="loading" @click="loadOperations">Refresh</Button>
       </div>
     </header>
+
+    <div v-if="metrics && (metrics.needs_attention > 0 || metrics.failed_24h > 0)" role="alert" class="flex flex-col gap-2 rounded-lg border border-[#FDE68A] bg-[#FFFBEB] px-4 py-3 text-xs text-[#92400E] sm:flex-row sm:items-center sm:justify-between">
+      <span>{{ metrics.needs_attention }} operation(s) need attention and {{ metrics.failed_24h }} failed in the last 24 hours.</span>
+      <div class="flex flex-wrap gap-2"><Button class="min-h-11 shrink-0" @click="statusFilter = metrics.needs_attention ? 'needs_attention' : 'failed'">Inspect affected operations</Button><NuxtLink to="/upstreams" class="inline-flex min-h-11 items-center px-2 font-medium text-[#0F766E] underline underline-offset-2">Upstream health</NuxtLink></div>
+    </div>
+
+    <section v-if="metrics" aria-label="Recovery metrics" class="overflow-hidden rounded-lg border border-[#E4E4E7] bg-white">
+      <div class="grid grid-cols-2 divide-x divide-y divide-[#E4E4E7] sm:grid-cols-3 sm:divide-y-0 lg:grid-cols-6">
+        <div class="p-3"><div class="text-xs text-[#52525B]">Open now</div><div class="mt-1 tabular-nums text-lg font-semibold text-[#09090B]">{{ metrics.open }}</div></div>
+        <div class="p-3"><div class="text-xs text-[#52525B]">Needs attention</div><div class="mt-1 tabular-nums text-lg font-semibold" :class="metrics.needs_attention ? 'text-[#B91C1C]' : 'text-[#09090B]'">{{ metrics.needs_attention }}</div></div>
+        <div class="p-3"><div class="text-xs text-[#52525B]">Completed · 24h</div><div class="mt-1 tabular-nums text-lg font-semibold text-[#09090B]">{{ metrics.completed_24h }}</div></div>
+        <div class="p-3"><div class="text-xs text-[#52525B]">Failed · 24h</div><div class="mt-1 tabular-nums text-lg font-semibold" :class="metrics.failed_24h ? 'text-[#B91C1C]' : 'text-[#09090B]'">{{ metrics.failed_24h }}</div></div>
+        <div class="p-3"><div class="text-xs text-[#52525B]">Failure rate · 24h</div><div class="mt-1 tabular-nums text-lg font-semibold text-[#09090B]">{{ metrics.failure_rate_24h_pct == null ? "—" : `${metrics.failure_rate_24h_pct}%` }}</div></div>
+        <div class="p-3"><div class="text-xs text-[#52525B]">Attempts · retained</div><div class="mt-1 tabular-nums text-lg font-semibold text-[#09090B]">{{ metrics.attempts }}</div></div>
+      </div>
+      <div class="flex flex-col gap-1 border-t border-[#E4E4E7] px-3 py-2 text-xs text-[#52525B] sm:flex-row sm:justify-between">
+        <span>24h totals use operation updates in the last 24 hours; failure rate uses completed, failed, and cancelled operations.</span>
+        <span v-if="metrics.oldest_open_at" class="tabular-nums">Oldest open: {{ formatTime(metrics.oldest_open_at) }}</span>
+      </div>
+    </section>
+
+    <section v-if="metrics?.upstream_health.length" aria-label="Configured upstream health checks" class="overflow-hidden rounded-lg border border-[#E4E4E7] bg-white">
+      <div class="flex flex-col gap-2 border-b border-[#E4E4E7] px-4 py-3 sm:flex-row sm:items-center sm:justify-between"><div><h2 class="text-[15px] font-semibold text-[#09090B]">Configured upstream health checks</h2><p class="mt-1 text-xs text-[#52525B]">Probe results are shown only for upstreams with a health check configured.</p></div><NuxtLink to="/upstreams" class="inline-flex min-h-11 items-center font-medium text-[#0F766E] underline underline-offset-2">Review upstreams</NuxtLink></div>
+      <div v-if="metrics.upstream_health.some((row) => row.status === 'unhealthy' || row.status === 'degraded')" role="alert" class="border-b border-[#FDE68A] bg-[#FFFBEB] px-4 py-2 text-xs text-[#92400E]">{{ metrics.upstream_health.filter((row) => row.status === 'unhealthy' || row.status === 'degraded').length }} configured upstream health check(s) are degraded or unhealthy. Review probe status and recovery activity together.</div>
+      <div class="overflow-x-auto"><table class="w-full min-w-[520px] text-left text-xs"><thead class="bg-[#F4F4F5] text-[#52525B]"><tr><th class="px-4 py-2">Upstream</th><th class="px-4 py-2">Health</th><th class="px-4 py-2">Consecutive failures</th><th class="px-4 py-2">Last checked</th><th class="px-4 py-2">Error type</th></tr></thead><tbody class="divide-y divide-[#E4E4E7]"><tr v-for="row in metrics.upstream_health" :key="row.server"><td class="px-4 py-2 font-medium text-[#09090B]">{{ row.server }}</td><td class="px-4 py-2 capitalize" :class="row.status === 'unhealthy' ? 'text-[#B91C1C]' : row.status === 'degraded' ? 'text-[#92400E]' : 'text-[#047857]'">{{ row.status }}</td><td class="px-4 py-2 tabular-nums">{{ row.consecutive_failures }}</td><td class="px-4 py-2 tabular-nums text-[#52525B]">{{ formatTime(row.checked_at) }}</td><td class="px-4 py-2 text-[#52525B]">{{ row.error_type || "—" }}</td></tr></tbody></table></div>
+    </section>
+    <p v-else-if="metrics" class="text-xs text-[#71717A]">No upstream health probes are configured. Recovery metrics reflect operation outcomes; configure health checks under <NuxtLink to="/upstreams" class="font-medium text-[#0F766E] underline underline-offset-2">Upstreams</NuxtLink> to show availability here.</p>
+
+    <section v-if="metrics?.by_upstream_24h.length" class="overflow-hidden rounded-lg border border-[#E4E4E7] bg-white">
+      <div class="border-b border-[#E4E4E7] px-4 py-3"><h2 class="text-[15px] font-semibold text-[#09090B]">Upstream recovery activity · 24h</h2><p class="mt-1 text-xs text-[#52525B]">Operation state updates grouped by upstream. This shows recovery workload; use upstream health and alert views for live availability.</p></div>
+      <div class="overflow-x-auto"><table class="w-full min-w-[520px] text-left text-xs"><thead class="bg-[#F4F4F5] text-[#52525B]"><tr><th class="px-4 py-2">Upstream</th><th class="px-4 py-2">State</th><th class="px-4 py-2 text-right">Operations</th><th class="px-4 py-2 text-right">Attempts</th></tr></thead><tbody class="divide-y divide-[#E4E4E7]"><tr v-for="row in metrics.by_upstream_24h" :key="`${row.upstream_name}:${row.status}`"><td class="px-4 py-2 font-medium text-[#09090B]">{{ row.upstream_name }}</td><td class="px-4 py-2 capitalize">{{ row.status.replaceAll("_", " ") }}</td><td class="px-4 py-2 text-right tabular-nums">{{ row.count }}</td><td class="px-4 py-2 text-right tabular-nums">{{ row.attempts }}</td></tr></tbody></table></div>
+    </section>
 
     <div v-if="errorMessage" role="alert" class="flex flex-col gap-2 rounded-lg border border-[#FECACA] bg-[#FEF2F2] px-4 py-3 text-[13px] text-[#991B1B] sm:flex-row sm:items-center sm:justify-between">
       <span>{{ errorMessage }}</span>

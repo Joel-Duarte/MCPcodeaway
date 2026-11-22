@@ -10,7 +10,7 @@ import { computed, onMounted, ref, watch } from "vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
 
 interface Arm { correct_pct: number; grounded_pct: number; verified_pct: number; mean_cost_usd: number | null; mean_provider_tokens: number | null; p95_wall_ms: number | null; mean_upstream_calls: number | null; mean_recovery: number | null }
-interface Row { model: string; workload: string; pairs: number; qualification?: string; latest_evidence_at?: string | null; evidence_tier?: string; traditional: Arm | null; codemode: Arm | null; recommended_mode: string | null; reason: string }
+interface Row { model: string; workload: string; pairs: number; qualification?: string; latest_evidence_at?: string | null; evidence_tier?: string; traditional: Arm | null; codemode: Arm | null; recommended_mode: string | null; simulated_recommendation?: string | null; simulated_recommendation_reason?: string; reason: string }
 const { apiFetch } = useAdminApi();
 const { selectedRange } = useReportRange();
 const route = useRoute();
@@ -35,9 +35,10 @@ const evidenceItems = [
 ];
 const filtered = computed(() => rows.value.filter((r) => {
   const text = `${r.model} ${workloadLabel(r.workload)}`.toLowerCase();
+  const recommendation = r.evidence_tier === "demo_simulated" ? r.simulated_recommendation : r.recommended_mode;
   return (!query.value || text.includes(query.value.toLowerCase())) &&
     (modelFilter.value === "all" || modelFilter.value === r.model) &&
-    (recommendationFilter.value === "all" || (r.recommended_mode || "none") === recommendationFilter.value) &&
+    (recommendationFilter.value === "all" || (recommendation || "none") === recommendationFilter.value) &&
     (modeFilter.value === "all" || (modeFilter.value === "traditional" ? !!r.traditional : !!r.codemode));
 }));
 const fmt = (n: number | null | undefined, d = 1) => n == null ? "Unknown" : Number(n).toLocaleString("en-US", { maximumFractionDigits: d });
@@ -52,6 +53,13 @@ const workloadLabel = (value: string) => ({
   mutating_workflow: "Mutating workflow", large_payload_processing: "Large payload processing",
 }[value] || value);
 function toggle(key: string) { expanded.value = expanded.value.includes(key) ? expanded.value.filter((x) => x !== key) : [...expanded.value, key]; }
+const recommendationLabel = (row: Row) => {
+  const recommendation = row.evidence_tier === "demo_simulated" ? row.simulated_recommendation : row.recommended_mode;
+  const mode = recommendation === "codemode" ? "Code Mode" : recommendation === "traditional" ? "Classic" : "No recommendation";
+  return recommendation
+    ? `${row.evidence_tier === "demo_simulated" ? "Illustrative" : "Recommended"}: ${mode}`
+    : mode;
+};
 let requestSequence = 0;
 async function load() {
   const requestId = ++requestSequence;
@@ -114,7 +122,7 @@ watch(selectedTab, (value) => {
           </Select></div>
         </div>
     </template>
-    <p v-if="!loading && rows.some((row) => row.evidence_tier === 'demo_simulated')" class="rounded-lg border border-[#FDE68A] bg-[#FFFBEB] px-3 py-2 text-xs text-[#92400E]">Simulated demo evidence is shown for interface and workflow exploration. It is excluded from adaptive routing recommendations.</p>
+    <p v-if="!loading && rows.some((row) => row.evidence_tier === 'demo_simulated')" class="rounded-lg border border-[#FDE68A] bg-[#FFFBEB] px-3 py-2 text-xs leading-5 text-[#92400E]">Demo rows use deterministic per-model and per-workload token, latency, turn, and outcome variation with configured model prices. “Illustrative” recommendations exercise report logic only; simulated rows never change live routing. Use real paired evidence to validate production recommendations.</p>
     <Tabs v-model:value="selectedTab" class="space-y-4">
       <TabsList aria-label="Model performance views" class="flex min-h-11 gap-1 border-b border-[#E4E4E7]">
         <TabsTab value="routing" class="min-h-11 border-b-2 px-4 text-sm data-[selected]:border-[#0F766E] data-[selected]:font-semibold data-[selected]:text-[#0F766E]">Routing</TabsTab>
@@ -129,22 +137,22 @@ watch(selectedTab, (value) => {
             <Button class="flex min-h-11 w-full flex-col items-start justify-center text-left focus-visible:outline-2 focus-visible:outline-[#0F766E]" :aria-label="`${row.model} ${workloadLabel(row.workload)} details`" :aria-expanded="expanded.includes(`${row.model}:${row.workload}`)" @click="toggle(`${row.model}:${row.workload}`)">
               <span class="font-medium text-[#09090B]">{{ row.model }}<span v-if="row.evidence_tier === 'demo_simulated'" class="ml-2 rounded border border-[#FDE68A] px-1.5 py-0.5 text-[10px] text-[#92400E]">simulated</span></span>
               <span class="text-sm text-[#52525B]">{{ workloadLabel(row.workload) }} · {{ row.pairs }} matched pairs</span>
-              <span class="mt-1 text-xs text-[#52525B]">{{ row.recommended_mode ? `Recommended: ${row.recommended_mode === 'codemode' ? 'Code Mode' : 'Classic'}` : "No recommendation" }} · verified {{ fmt(row.traditional?.verified_pct) }}% / {{ fmt(row.codemode?.verified_pct) }}%</span>
+              <span class="mt-1 text-xs text-[#52525B]">{{ recommendationLabel(row) }} · verified {{ fmt(row.traditional?.verified_pct) }}% / {{ fmt(row.codemode?.verified_pct) }}%</span>
             </Button>
             <dl v-if="expanded.includes(`${row.model}:${row.workload}`)" class="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 border-t border-[#E4E4E7] pt-3 text-xs">
               <div><dt class="text-[#71717A]">Cost / completion · Classic / Code</dt><dd class="tabular-nums">{{ cost(row.traditional) }} / {{ cost(row.codemode) }}</dd></div>
               <div><dt class="text-[#71717A]">p95 wall time · Classic / Code</dt><dd class="tabular-nums">{{ fmt(row.traditional?.p95_wall_ms) }} / {{ fmt(row.codemode?.p95_wall_ms) }} ms</dd></div>
               <div><dt class="text-[#71717A]">Upstream calls · Classic / Code</dt><dd class="tabular-nums">{{ fmt(row.traditional?.mean_upstream_calls) }} / {{ fmt(row.codemode?.mean_upstream_calls) }}</dd></div>
               <div><dt class="text-[#71717A]">Recovery events per workflow · Classic / Code</dt><dd class="tabular-nums">{{ fmt(row.traditional?.mean_recovery) }} / {{ fmt(row.codemode?.mean_recovery) }}</dd></div>
-              <div class="col-span-2"><dt class="text-[#71717A]">Decision reason</dt><dd>{{ row.reason }} · {{ row.evidence_tier || "exact" }} tier · {{ row.qualification || "sparse" }} · {{ row.latest_evidence_at || "age unknown" }}</dd></div>
+              <div class="col-span-2"><dt class="text-[#71717A]">Decision reason</dt><dd>{{ row.evidence_tier === 'demo_simulated' ? (row.simulated_recommendation_reason || row.reason) : row.reason }}<span v-if="row.evidence_tier === 'demo_simulated'"> · illustrative only, excluded from live routing</span> · {{ row.evidence_tier || "exact" }} tier · {{ row.qualification || "sparse" }} · {{ row.latest_evidence_at || "age unknown" }}</dd></div>
             </dl>
           </article>
         </div>
         <div class="hidden overflow-x-auto rounded-lg border border-[#E4E4E7] bg-white md:block">
           <table class="w-full min-w-[760px] border-collapse text-left text-xs">
             <thead class="bg-[#F4F4F5] text-[#52525B]"><tr><th class="px-3 py-3">Model / workload</th><th class="px-3 py-3 text-right">Matched pairs</th><th class="px-3 py-3 text-right">Verified rate</th><th class="px-3 py-3 text-right">Cost / completion</th><th class="px-3 py-3 text-right">p95 wall time</th><th class="px-3 py-3">Recommendation</th></tr></thead>
-            <tbody><template v-for="row in filtered" :key="`${row.model}:${row.workload}`"><tr class="border-t border-[#E4E4E7] hover:bg-[#FAFAFA]"><td class="px-3 py-3"><Button class="min-h-11 text-left font-medium text-[#09090B] underline decoration-[#A1A1AA] underline-offset-2 focus-visible:outline-2 focus-visible:outline-[#0F766E]" :aria-label="`${row.model} ${workloadLabel(row.workload)} details`" :aria-expanded="expanded.includes(`${row.model}:${row.workload}`)" @click="toggle(`${row.model}:${row.workload}`)">{{ row.model }}<span v-if="row.evidence_tier === 'demo_simulated'" class="ml-2 rounded border border-[#FDE68A] px-1.5 py-0.5 text-[10px] text-[#92400E]">simulated</span><span class="block font-normal text-[#71717A]">{{ workloadLabel(row.workload) }}</span></Button></td><td class="px-3 py-3 text-right tabular-nums">{{ row.pairs }}</td><td class="px-3 py-3 text-right tabular-nums">Classic {{ fmt(row.traditional?.verified_pct) }}% · Code {{ fmt(row.codemode?.verified_pct) }}%</td><td class="px-3 py-3 text-right tabular-nums">{{ cost(row.traditional) }} · {{ cost(row.codemode) }}</td><td class="px-3 py-3 text-right tabular-nums">{{ fmt(row.traditional?.p95_wall_ms) }} · {{ fmt(row.codemode?.p95_wall_ms) }} ms</td><td class="px-3 py-3">{{ row.recommended_mode === 'codemode' ? "Code Mode" : row.recommended_mode === 'traditional' ? "Classic" : "No recommendation" }}</td></tr>
-              <tr v-if="expanded.includes(`${row.model}:${row.workload}`)" class="border-t border-[#E4E4E7] bg-[#FAFAFA]"><td colspan="6" class="px-4 py-4"><p class="font-medium text-[#09090B]">{{ row.reason }}</p><p class="mt-1 text-[#71717A]">{{ row.evidence_tier || "exact" }} tier · {{ row.qualification || "sparse" }} · {{ row.latest_evidence_at || "age unknown" }}</p><p class="mt-2 text-[#52525B]">Calls per completion: {{ fmt(row.traditional?.mean_upstream_calls) }} / {{ fmt(row.codemode?.mean_upstream_calls) }} · Recovery events per workflow: {{ fmt(row.traditional?.mean_recovery) }} / {{ fmt(row.codemode?.mean_recovery) }}</p><p class="mt-1 text-[#71717A]">Correct and grounded: {{ fmt(row.traditional?.correct_pct) }}% / {{ fmt(row.traditional?.grounded_pct) }}% · {{ fmt(row.codemode?.correct_pct) }}% / {{ fmt(row.codemode?.grounded_pct) }}%</p></td></tr>
+            <tbody><template v-for="row in filtered" :key="`${row.model}:${row.workload}`"><tr class="border-t border-[#E4E4E7] hover:bg-[#FAFAFA]"><td class="px-3 py-3"><Button class="min-h-11 text-left font-medium text-[#09090B] underline decoration-[#A1A1AA] underline-offset-2 focus-visible:outline-2 focus-visible:outline-[#0F766E]" :aria-label="`${row.model} ${workloadLabel(row.workload)} details`" :aria-expanded="expanded.includes(`${row.model}:${row.workload}`)" @click="toggle(`${row.model}:${row.workload}`)">{{ row.model }}<span v-if="row.evidence_tier === 'demo_simulated'" class="ml-2 rounded border border-[#FDE68A] px-1.5 py-0.5 text-[10px] text-[#92400E]">simulated</span><span class="block font-normal text-[#71717A]">{{ workloadLabel(row.workload) }}</span></Button></td><td class="px-3 py-3 text-right tabular-nums">{{ row.pairs }}</td><td class="px-3 py-3 text-right tabular-nums">Classic {{ fmt(row.traditional?.verified_pct) }}% · Code {{ fmt(row.codemode?.verified_pct) }}%</td><td class="px-3 py-3 text-right tabular-nums">{{ cost(row.traditional) }} · {{ cost(row.codemode) }}</td><td class="px-3 py-3 text-right tabular-nums">{{ fmt(row.traditional?.p95_wall_ms) }} · {{ fmt(row.codemode?.p95_wall_ms) }} ms</td><td class="px-3 py-3">{{ recommendationLabel(row) }}</td></tr>
+              <tr v-if="expanded.includes(`${row.model}:${row.workload}`)" class="border-t border-[#E4E4E7] bg-[#FAFAFA]"><td colspan="6" class="px-4 py-4"><p class="font-medium text-[#09090B]">{{ row.evidence_tier === 'demo_simulated' ? (row.simulated_recommendation_reason || row.reason) : row.reason }}</p><p v-if="row.evidence_tier === 'demo_simulated'" class="mt-1 text-[#92400E]">Illustrative only; this result cannot affect live routing.</p><p class="mt-1 text-[#71717A]">{{ row.evidence_tier || "exact" }} tier · {{ row.qualification || "sparse" }} · {{ row.latest_evidence_at || "age unknown" }}</p><p class="mt-2 text-[#52525B]">Calls per completion: {{ fmt(row.traditional?.mean_upstream_calls) }} / {{ fmt(row.codemode?.mean_upstream_calls) }} · Recovery events per workflow: {{ fmt(row.traditional?.mean_recovery) }} / {{ fmt(row.codemode?.mean_recovery) }}</p><p class="mt-1 text-[#71717A]">Correct and grounded: {{ fmt(row.traditional?.correct_pct) }}% / {{ fmt(row.traditional?.grounded_pct) }}% · {{ fmt(row.codemode?.correct_pct) }}% / {{ fmt(row.codemode?.grounded_pct) }}%</p></td></tr>
             </template></tbody>
           </table>
         </div>

@@ -239,14 +239,45 @@ async def test_demo_workflow_evidence_is_reported_but_never_recommended(tmp_path
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://gateway"
         ) as client:
+            profiles = await client.get("/admin/demo/models", headers=headers)
+            profile_list = profiles.json()["models"]
+            profile = profile_list[0]
+            profile["input_token_range"] = [710, 2220]
+            profile["output_token_range"] = [150, 490]
+            updated = await client.post(
+                "/admin/demo/models", headers=headers, json={"models": profile_list}
+            )
+            assert updated.status_code == 200
+            assert updated.json()["models"][0]["input_token_range"] == [710, 2220]
+            assert updated.json()["models"][0]["output_token_range"] == [150, 490]
+            invalid_profile = {**profile, "input_token_range": [2220, 710]}
+            invalid = await client.post(
+                "/admin/demo/models",
+                headers=headers,
+                json={"models": [invalid_profile, *profile_list[1:]]},
+            )
+            assert invalid.status_code == 422
             seeded = await client.post("/admin/demo/workflow-evidence", headers=headers)
             assert seeded.status_code == 200, seeded.text
-            assert seeded.json()["evidence_rows"] == 200
+            assert seeded.json()["evidence_rows"] == 360
+            assert seeded.json()["workloads_per_model"] == 9
             report = await client.get("/admin/adaptive-execution/report", headers=headers)
             rows = report.json()["rows"]
-            assert len(rows) == 20
+            assert len(rows) == 36
             assert all(row["evidence_tier"] == "demo_simulated" for row in rows)
             assert all(row["recommended_mode"] is None for row in rows)
+            assert {row["simulated_recommendation"] for row in rows} == {
+                "codemode",
+                "traditional",
+                None,
+            }
+            assert any(row["traditional"]["mean_cost_usd"] is not None for row in rows)
+            assert any(
+                row["traditional"]["mean_provider_tokens"]
+                != row["codemode"]["mean_provider_tokens"]
+                for row in rows
+                if row["traditional"] and row["codemode"]
+            )
             stored = await app.state.runtime.store.list_adaptive_evidence("tenant-acme-dev")
             assert stored == []
 

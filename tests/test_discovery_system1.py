@@ -105,7 +105,10 @@ async def test_tool_guidance_reaches_discovery_and_classic_tools_for_one_tenant(
         ) as client:
             original = (await client.get(endpoint, headers=viewer_headers)).json()
             assert original["can_edit"] is False
-            assert original["guidance"] is None
+            assert original["guidance"]["description"]
+            assert original["guidance"]["parameter_hints"]["customer_id"]
+            assert original["mutating"] is False
+            assert original["effect"] == "read"
             assert (
                 await client.put(endpoint, headers=viewer_headers, json=edits)
             ).status_code == 403
@@ -116,7 +119,11 @@ async def test_tool_guidance_reaches_discovery_and_classic_tools_for_one_tenant(
             saved = await client.put(endpoint, headers=admin_headers, json=edits)
             assert saved.json()["guidance"] == edits
             updated = (await client.get(endpoint, headers=viewer_headers)).json()
-            assert updated["guidance"] == edits
+            assert updated["guidance"]["description"] == edits["description"]
+            assert (
+                updated["guidance"]["parameter_hints"]["customer_id"]
+                == edits["parameter_hints"]["customer_id"]
+            )
             assert updated["input_schema"] == original["input_schema"]
             assert updated["output_schema"] == original["output_schema"]
 
@@ -146,7 +153,7 @@ async def test_tool_guidance_reaches_discovery_and_classic_tools_for_one_tenant(
             assert reset.json()["guidance"] is None
             classic = await _mcp_post(client, finance, "tools/list", query="mode=traditional")
             definition = next(t for t in classic["result"]["tools"] if t["name"] == tool)
-            assert definition["description"] == original["description"]
+            assert definition["description"] == original["guidance"]["description"]
 
 
 async def test_list_servers_ceiling_and_execute_code_scoping(tmp_path) -> None:

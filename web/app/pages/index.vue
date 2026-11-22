@@ -76,6 +76,15 @@ interface AnalyticsSummary {
   };
 }
 
+interface RecoverySummary {
+  open: number;
+  needs_attention: number;
+  completed_24h: number;
+  failed_24h: number;
+  failure_rate_24h_pct: number | null;
+  upstream_health: { status: string }[];
+}
+
 const { apiFetch, setRuntimeMeta } = useAdminApi();
 const { status: demoStatus, busy: demoBusy, runBurst } = useDemoTraffic();
 const {
@@ -97,6 +106,7 @@ const errorMessage = ref("");
 const runtimeData = ref<RuntimeTelemetryResponse | null>(null);
 const valueData = ref<AuditValueResponse | null>(null);
 const analyticsData = ref<AnalyticsSummary | null>(null);
+const recoveryData = ref<RecoverySummary | null>(null);
 
 let refreshDebounce: ReturnType<typeof setTimeout> | null = null;
 
@@ -109,6 +119,11 @@ async function fetchOverview() {
     ]);
     valueData.value = val;
     analyticsData.value = ana;
+    try {
+      recoveryData.value = await apiFetch<RecoverySummary>("/admin/operations/metrics");
+    } catch {
+      recoveryData.value = null;
+    }
     try {
       const rt = await apiFetch<RuntimeTelemetryResponse>("/admin/telemetry/runtime", {}, true);
       runtimeData.value = rt;
@@ -309,6 +324,14 @@ function formatUsd(n: number | undefined): string {
             <NuxtLink to="/settings" class="font-medium underline">Rules</NuxtLink>
           </div>
         </div>
+      </section>
+
+      <section v-if="recoveryData" aria-label="Operations recovery summary" class="flex flex-col gap-3 rounded-lg border border-[#E4E4E7] bg-white px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+        <div class="min-w-0">
+          <h2 class="text-[15px] font-semibold text-[#09090B]">Operations recovery</h2>
+          <p class="mt-1 text-xs text-[#52525B] tabular-nums">{{ recoveryData.open }} open · {{ recoveryData.needs_attention }} needs attention · {{ recoveryData.completed_24h }} completed / {{ recoveryData.failed_24h }} failed in 24h<span v-if="recoveryData.failure_rate_24h_pct != null"> · {{ recoveryData.failure_rate_24h_pct }}% terminal failure rate</span><span v-if="recoveryData.upstream_health.some((row) => row.status === 'unhealthy' || row.status === 'degraded')"> · {{ recoveryData.upstream_health.filter((row) => row.status === 'unhealthy' || row.status === 'degraded').length }} upstream checks impaired</span></p>
+        </div>
+        <NuxtLink to="/operations" class="inline-flex min-h-11 shrink-0 items-center font-medium text-[#0F766E] underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">Review recovery activity</NuxtLink>
       </section>
 
       <section aria-label="Gateway value summary" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">

@@ -21,6 +21,37 @@ from gateway.state import SQLiteAuditStore
 from gateway.upstream_clients import DiscoveredTool
 
 
+def test_demo_upstream_tool_details_and_approval_policies_are_complete() -> None:
+    config_path = Path(__file__).parents[1] / "config" / "upstreams.yaml"
+    registry = UpstreamRegistry(
+        GatewaySettings(app_env="sandbox", auth_mode="dev", upstreams_config_path=str(config_path))
+    )
+    demo_names = {
+        "snowflake_ledger",
+        "billing_legacy_eu",
+        "billing_legacy_us",
+        "ops_ticketing",
+        "recovery_workbench",
+    }
+
+    for upstream in registry.list_upstreams():
+        if upstream.name not in demo_names:
+            continue
+        assert upstream.allowed_operations is not None
+        assert set(upstream.tool_guidance) == set(upstream.allowed_operations)
+        assert set(upstream.tool_approval_policies) == set(upstream.allowed_operations)
+        for tool_name in upstream.allowed_operations:
+            guidance = upstream.tool_guidance[tool_name]
+            assert guidance.description
+            assert guidance.parameter_hints
+            expected_mode = {
+                "read": "none",
+                "write": "requester_confirmation",
+                "high_impact": "manager_approval",
+            }[upstream.tool_effects[tool_name]]
+            assert upstream.tool_approval_policies[tool_name].mode == expected_mode
+
+
 def test_production_upstreams_require_access_and_operation_allowlists(tmp_path: Path) -> None:
     path = tmp_path / "upstreams.yaml"
     settings = GatewaySettings(
@@ -34,6 +65,77 @@ def test_production_upstreams_require_access_and_operation_allowlists(tmp_path: 
     )
     with pytest.raises(ValueError, match="allowed_roles or allowed_groups"):
         UpstreamRegistry(settings)
+
+
+async def test_upstream_mode_change_survives_catalog_refresh_and_rejects_read_only(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "upstreams.yaml"
+    config_path.write_text(
+        "upstreams:\n"
+        "  - name: mode_fixture\n"
+        "    type: mcp_http\n"
+        "    url: http://127.0.0.1:9/mcp\n"
+        "    auth_type: none\n"
+        "    allowed_operations: [read_fixture]\n"
+        "    tool_effects: {read_fixture: read}\n"
+        "    preferred_mode: traditional\n",
+        encoding="utf-8",
+    )
+    settings = GatewaySettings(
+        app_env="sandbox",
+        auth_mode="dev",
+        sqlite_path=str(tmp_path / "mode.db"),
+        upstreams_config_path=str(config_path),
+    )
+    app = create_gateway_app(settings=settings)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gw"
+        ) as client:
+            runtime = app.state.runtime
+            await runtime.store.save_dynamic_upstream(
+                "mode_fixture",
+                {
+                    "name": "mode_fixture",
+                    "type": "mcp_http",
+                    "url": "http://127.0.0.1:9/mcp",
+                    "auth_type": "none",
+                    "allowed_operations": [],
+                    "tool_effects": {},
+                    "preferred_mode": "traditional",
+                },
+            )
+            await runtime.registry.refresh()
+            changed = await client.patch(
+                "/admin/upstreams/mode_fixture/mode",
+                json={"preferred_mode": "codemode"},
+            )
+            assert changed.status_code == 200, changed.text
+            assert changed.json()["preferred_mode"] == "codemode"
+
+            await runtime.registry.refresh()
+            listed = await client.get("/admin/upstreams?q=mode_fixture")
+            assert listed.status_code == 200, listed.text
+            assert listed.json()["upstreams"][0]["preferred_mode"] == "codemode"
+            assert listed.json()["upstreams"][0]["allowed_operations"] == ["read_fixture"]
+            assert listed.json()["upstreams"][0]["tool_effects"] == {"read_fixture": "read"}
+
+            runtime.settings.allow_dynamic_upstreams = False
+            read_only = await client.patch(
+                "/admin/upstreams/mode_fixture/mode",
+                json={"preferred_mode": "traditional"},
+            )
+            assert read_only.status_code == 403
+            assert "config/upstreams.yaml" in read_only.json()["detail"]
+
+            runtime.settings.allow_dynamic_upstreams = True
+            invalid = await client.patch(
+                "/admin/upstreams/mode_fixture/mode",
+                json={"preferred_mode": "made_up_mode"},
+            )
+            assert invalid.status_code == 422
 
 
 async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) -> None:

@@ -364,6 +364,8 @@ class AuditStore(Protocol):
         self, tenant_id: str, *, statuses: list[str] | None, limit: int = 100
     ) -> list[dict[str, Any]]: ...
 
+    async def get_operation_metrics(self, tenant_id: str, *, since: str) -> dict[str, Any]: ...
+
     async def claim_operations(
         self, *, limit: int, now: str, lease_expires_at: str
     ) -> list[dict[str, Any]]: ...
@@ -1443,6 +1445,47 @@ class SQLiteAuditStore:
             rows = self._ensure_conn().execute(query, args).fetchall()
         return [decoded for row in rows if (decoded := self._decode_operation(row)) is not None]
 
+    async def get_operation_metrics(self, tenant_id: str, *, since: str) -> dict[str, Any]:
+        async with self._lock:
+            conn = self._ensure_conn()
+            counts = conn.execute(
+                """SELECT status, COUNT(*) AS count, COALESCE(SUM(attempt_count), 0) AS attempts
+                FROM recovery_operations WHERE tenant_id=? GROUP BY status""",
+                (tenant_id,),
+            ).fetchall()
+            recent = conn.execute(
+                """SELECT status, COUNT(*) AS count FROM recovery_operations
+                WHERE tenant_id=? AND updated_at>=? GROUP BY status""",
+                (tenant_id, since),
+            ).fetchall()
+            upstream = conn.execute(
+                """SELECT upstream_name, status, COUNT(*) AS count,
+                COALESCE(SUM(attempt_count), 0) AS attempts FROM recovery_operations
+                WHERE tenant_id=? AND updated_at>=? GROUP BY upstream_name, status
+                ORDER BY upstream_name, status""",
+                (tenant_id, since),
+            ).fetchall()
+            oldest_open = conn.execute(
+                """SELECT MIN(created_at) AS oldest_open_at FROM recovery_operations
+                WHERE tenant_id=? AND status IN ('pending', 'working')""",
+                (tenant_id,),
+            ).fetchone()
+        return {
+            "by_status": {str(row["status"]): int(row["count"]) for row in counts},
+            "attempts": sum(int(row["attempts"]) for row in counts),
+            "recent_by_status": {str(row["status"]): int(row["count"]) for row in recent},
+            "oldest_open_at": oldest_open["oldest_open_at"] if oldest_open else None,
+            "by_upstream_24h": [
+                {
+                    "upstream_name": row["upstream_name"],
+                    "status": row["status"],
+                    "count": int(row["count"]),
+                    "attempts": int(row["attempts"]),
+                }
+                for row in upstream
+            ],
+        }
+
     async def claim_operations(
         self, *, limit: int, now: str, lease_expires_at: str
     ) -> list[dict[str, Any]]:
@@ -2466,6 +2509,48 @@ class PostgresAuditStore:
                 max(1, min(limit, 200)),
             )
         return [dict(row) for row in rows]
+
+    async def get_operation_metrics(self, tenant_id: str, *, since: str) -> dict[str, Any]:
+        pool = await self._get_pool()
+        counts = await pool.fetch(
+            """SELECT status, COUNT(*) AS count, COALESCE(SUM(attempt_count), 0) AS attempts
+            FROM recovery_operations WHERE tenant_id=$1 GROUP BY status""",
+            tenant_id,
+        )
+        recent = await pool.fetch(
+            """SELECT status, COUNT(*) AS count FROM recovery_operations
+            WHERE tenant_id=$1 AND updated_at >= $2 GROUP BY status""",
+            tenant_id,
+            since,
+        )
+        upstream = await pool.fetch(
+            """SELECT upstream_name, status, COUNT(*) AS count,
+            COALESCE(SUM(attempt_count), 0) AS attempts FROM recovery_operations
+            WHERE tenant_id=$1 AND updated_at >= $2 GROUP BY upstream_name, status
+            ORDER BY upstream_name, status""",
+            tenant_id,
+            since,
+        )
+        oldest_open = await pool.fetchval(
+            """SELECT MIN(created_at) FROM recovery_operations
+            WHERE tenant_id=$1 AND status IN ('pending', 'working')""",
+            tenant_id,
+        )
+        return {
+            "by_status": {str(row["status"]): int(row["count"]) for row in counts},
+            "attempts": sum(int(row["attempts"]) for row in counts),
+            "recent_by_status": {str(row["status"]): int(row["count"]) for row in recent},
+            "oldest_open_at": oldest_open.isoformat() if oldest_open else None,
+            "by_upstream_24h": [
+                {
+                    "upstream_name": row["upstream_name"],
+                    "status": row["status"],
+                    "count": int(row["count"]),
+                    "attempts": int(row["attempts"]),
+                }
+                for row in upstream
+            ],
+        }
 
     async def claim_operations(
         self, *, limit: int, now: str, lease_expires_at: str

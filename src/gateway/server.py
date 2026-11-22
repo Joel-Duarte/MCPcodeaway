@@ -87,7 +87,7 @@ from gateway.config import (
     UpstreamRegistry,
 )
 from gateway.crypto import EnvelopeCipher
-from gateway.demo_traffic import DemoTier, DemoTrafficRunner
+from gateway.demo_traffic import DemoModelProfile, DemoTier, DemoTrafficRunner
 from gateway.discovery import DiscoveryEngine
 from gateway.dispatcher import (
     ExecutionBudget,
@@ -3938,14 +3938,35 @@ def create_gateway_app(
             entries = await runtime.store.list_tool_guidance(
                 (caller.tenant_id or "") if caller else ""
             )
+            upstream = runtime.registry.get(name)
+            configured_guidance = (
+                upstream.tool_guidance.get(tool.name).model_dump()
+                if upstream and tool.name in upstream.tool_guidance
+                else None
+            )
+            saved_guidance = entries.get(tool_name)
+            guidance = configured_guidance
+            if saved_guidance:
+                guidance = {
+                    **(configured_guidance or {}),
+                    **saved_guidance,
+                    "parameter_hints": {
+                        **((configured_guidance or {}).get("parameter_hints") or {}),
+                        **(saved_guidance.get("parameter_hints") or {}),
+                    },
+                }
+            approval_policy = upstream.tool_approval_policies.get(tool.name, ToolApprovalPolicy())
+            effect = (upstream.tool_effects.get(tool.name) if upstream else None) or (
+                "write" if tool.mutating else "read"
+            )
             return {
                 "description": tool.description,
                 "input_schema": tool.input_schema,
                 "output_schema": tool.output_schema,
-                "guidance": entries.get(tool_name),
-                "approval_policy": runtime.registry.get(name)
-                .tool_approval_policies.get(tool.name, ToolApprovalPolicy())
-                .model_dump(),
+                "guidance": guidance,
+                "mutating": tool.mutating,
+                "effect": effect,
+                "approval_policy": approval_policy.model_dump(),
                 "can_edit": features.admin_write
                 and runtime.settings.dynamic_upstreams_permitted
                 and (caller is None or bool(set(caller.roles) & set(runtime.settings.admin_roles))),
@@ -4112,6 +4133,74 @@ def create_gateway_app(
                 }
             )
         return {"operations": visible, "count": len(visible)}
+
+    @app.get("/admin/operations/metrics")
+    async def get_admin_operation_metrics(
+        authorization: str | None = Header(default=None),
+        mcpcodeaway_admin_session: str | None = Cookie(default=None),
+    ) -> dict[str, Any]:
+        identity = await _authorize_control_plane(
+            authorization,
+            mcpcodeaway_admin_session,
+            require_admin_role=True,
+            allow_viewer=True,
+            allowed_roles=set(runtime.settings.admin_roles) | set(runtime.settings.viewer_roles),
+        )
+        if identity is None or not identity.tenant_id:
+            return {
+                "by_status": {
+                    "pending": 0,
+                    "working": 0,
+                    "completed": 0,
+                    "failed": 0,
+                    "needs_attention": 0,
+                    "cancelled": 0,
+                },
+                "recent_by_status": {"completed": 0, "failed": 0, "cancelled": 0},
+                "attempts": 0,
+                "open": 0,
+                "needs_attention": 0,
+                "completed_24h": 0,
+                "failed_24h": 0,
+                "cancelled_24h": 0,
+                "failure_rate_24h_pct": None,
+                "oldest_open_at": None,
+                "by_upstream_24h": [],
+                "upstream_health": [],
+            }
+        since = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        metrics = await runtime.store.get_operation_metrics(identity.tenant_id, since=since)
+        status_counts = metrics["by_status"]
+        recent_counts = metrics["recent_by_status"]
+        open_count = status_counts.get("pending", 0) + status_counts.get("working", 0)
+        terminal_recent = sum(
+            recent_counts.get(status, 0) for status in ("completed", "failed", "cancelled")
+        )
+        metrics.update(
+            {
+                "open": open_count,
+                "needs_attention": status_counts.get("needs_attention", 0),
+                "completed_24h": recent_counts.get("completed", 0),
+                "failed_24h": recent_counts.get("failed", 0),
+                "cancelled_24h": recent_counts.get("cancelled", 0),
+                "failure_rate_24h_pct": round(
+                    recent_counts.get("failed", 0) * 100 / terminal_recent, 1
+                )
+                if terminal_recent
+                else None,
+                "upstream_health": [
+                    {
+                        "server": row["server"],
+                        "status": row["status"],
+                        "checked_at": row["checked_at"],
+                        "error_type": row.get("error_type"),
+                        "consecutive_failures": int(row.get("consecutive_failures", 0)),
+                    }
+                    for row in runtime.upstream_health.list_statuses()
+                ],
+            }
+        )
+        return metrics
 
     if features.approval_api:
 
@@ -4640,7 +4729,7 @@ def create_gateway_app(
                 return {
                     "evidence_rows": len(evidence),
                     "models": len(runtime.demo_traffic.model_profiles),
-                    "workloads_per_model": 5,
+                    "workloads_per_model": len({row["workload"] for row in evidence}),
                     "pairs_per_workload": 5,
                     "source": "demo simulator; excluded from routing recommendations",
                     "traffic_requests": golden_run["traffic"]["sent"],
@@ -4996,7 +5085,23 @@ def create_gateway_app(
             _ensure_demo_traffic_allowed()
             models = payload.get("models")
             if isinstance(models, list):
-                runtime.demo_traffic.model_profiles = models
+                if len(models) > 32:
+                    raise HTTPException(
+                        status_code=422, detail="At most 32 demo model profiles are allowed."
+                    )
+                try:
+                    validated = [DemoModelProfile.model_validate(model) for model in models]
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                names = [profile.model.strip() for profile in validated]
+                if len(names) != len(set(names)):
+                    raise HTTPException(
+                        status_code=422, detail="Demo model profile names must be unique."
+                    )
+                runtime.demo_traffic.model_profiles = [
+                    profile.model_copy(update={"model": profile.model.strip()}).model_dump()
+                    for profile in validated
+                ]
             return {"models": runtime.demo_traffic.model_profiles}
 
         @app.get("/admin/ab/settings")
@@ -5148,6 +5253,8 @@ def create_gateway_app(
                 demo_evidence = demo_record.get("evidence", []) if demo_record else []
                 simulated = summarize_pairs(demo_evidence, days=days, pricing=pricing)
                 for row in simulated:
+                    row["simulated_recommendation"] = row.get("recommended_mode")
+                    row["simulated_recommendation_reason"] = row.get("reason")
                     row.update(
                         evidence_tier="demo_simulated",
                         qualification="simulated",
@@ -5549,14 +5656,32 @@ def create_gateway_app(
             await _authorize_control_plane(
                 authorization, mcpcodeaway_admin_session, require_admin_role=True
             )
+            if not runtime.settings.dynamic_upstreams_permitted:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "Upstream modes are managed through config/upstreams.yaml in this profile."
+                    ),
+                )
             cfg = runtime.registry.get(name)
             if cfg is None:
                 raise HTTPException(status_code=404, detail=f"Upstream '{name}' not found")
             mode_val = payload.get("preferred_mode") or "auto"
+            if mode_val not in {
+                "codemode",
+                "codemode_upfront",
+                "traditional",
+                "traditional_discover",
+                "hybrid",
+                "auto",
+            }:
+                raise HTTPException(
+                    status_code=422,
+                    detail="preferred_mode must be a supported gateway mode.",
+                )
             updated = cfg.model_copy(update={"preferred_mode": mode_val})
-            runtime.registry.upsert(updated)
-            if hasattr(runtime.store, "upsert_upstream"):
-                await runtime.store.upsert_upstream(updated.name, updated.model_dump())
+            await runtime.registry.save_upstream(updated)
+            await runtime.bump_catalog_epoch()
             return {"upstream": name, "preferred_mode": updated.preferred_mode}
 
         @app.patch("/admin/upstreams/{name}/tools/{tool_name}/mode")

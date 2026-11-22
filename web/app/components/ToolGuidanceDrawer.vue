@@ -8,6 +8,7 @@ import { Input } from "@ui-sdk/vue/input";
 import { Textarea } from "@ui-sdk/vue/textarea";
 import { computed, ref, watch } from "vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
+import { getMockToolExample } from "~/utils/mock-tool-examples";
 
 interface Guidance {
   description: string;
@@ -19,19 +20,27 @@ interface ToolDetails {
   input_schema: { properties?: Record<string, unknown> };
   output_schema: Record<string, unknown> | null;
   guidance: Guidance | null;
+  mutating: boolean;
+  effect: "read" | "write" | "high_impact";
   approval_policy: {
-    mode: "none" | "requester_confirmation";
+    mode: "none" | "requester_confirmation" | "manager_approval";
     version: number;
     confirmation_message: string;
+    approver_groups: string[];
   };
   can_edit: boolean;
 }
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   upstream: string;
   tool: string;
   opener: HTMLElement | null;
-}>();
+  upstreamConfig?: Record<string, unknown>;
+  demoMode?: boolean;
+}>(), {
+  upstreamConfig: () => ({}),
+  demoMode: false,
+});
 const open = defineModel<boolean>("open", { required: true });
 const { apiFetch } = useAdminApi();
 const details = ref<ToolDetails | null>(null);
@@ -44,11 +53,42 @@ const saved = ref(false);
 const approvalSaved = ref(false);
 const saving = ref(false);
 const savingApproval = ref(false);
+const demoArguments = ref("");
+const demoResult = ref("");
+const demoError = ref("");
+const runningDemo = ref(false);
 const loadAttempt = ref(0);
 const endpoint = computed(() =>
   `/admin/upstreams/${encodeURIComponent(props.upstream)}/tools/${encodeURIComponent(props.tool)}/guidance`
 );
 const parameters = computed(() => Object.keys(details.value?.input_schema.properties ?? {}));
+const example = computed(() => getMockToolExample(props.upstream, props.tool));
+const managerApprovalRequired = computed(
+  () => details.value?.approval_policy.mode === "manager_approval"
+);
+const canRunDemoExample = computed(() => Boolean(
+  props.demoMode && example.value && details.value && !details.value.mutating
+  && details.value.effect === "read" && details.value.approval_policy.mode === "none"
+));
+
+function parameterSchema(name: string): Record<string, unknown> {
+  const value = details.value?.input_schema.properties?.[name];
+  return value && typeof value === "object" ? value as Record<string, unknown> : {};
+}
+
+function parameterType(name: string): string {
+  const type = parameterSchema(name).type;
+  return Array.isArray(type) ? type.join(" | ") : String(type || "any");
+}
+
+function parameterDescription(name: string): string {
+  const schema = parameterSchema(name);
+  const description = typeof schema.description === "string" ? schema.description : "";
+  const required = (details.value?.input_schema as { required?: string[] } | undefined)?.required ?? [];
+  const requirement = required.includes(name) ? "Required" : "Optional";
+  const defaultValue = schema.default === undefined ? "" : ` · default: ${String(schema.default)}`;
+  return `${requirement}${defaultValue}${description ? ` · ${description}` : ""}`;
+}
 
 async function load(signal: AbortSignal) {
   details.value = null;
@@ -59,13 +99,51 @@ async function load(signal: AbortSignal) {
     if (signal.aborted) return;
     details.value = response;
     description.value = response.guidance?.description ?? "";
-    approvalMode.value = response.approval_policy.mode;
+    approvalMode.value = response.approval_policy.mode === "manager_approval"
+      ? "none"
+      : response.approval_policy.mode;
     confirmationMessage.value = response.approval_policy.confirmation_message;
     hints.value = Object.fromEntries(parameters.value.map((name) => [
       name, response.guidance?.parameter_hints[name] ?? "",
     ]));
+    demoArguments.value = JSON.stringify(example.value?.arguments ?? {}, null, 2);
+    demoResult.value = "";
+    demoError.value = "";
   } catch (err) {
     if (!signal.aborted) error.value = extractErrorMessage(err);
+  }
+}
+
+async function runDemoExample() {
+  if (!canRunDemoExample.value || runningDemo.value) return;
+  demoError.value = "";
+  demoResult.value = "";
+  let parsedArguments: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(demoArguments.value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Arguments must be a JSON object.");
+    }
+    parsedArguments = parsed as Record<string, unknown>;
+  } catch (err) {
+    demoError.value = err instanceof Error ? err.message : "Enter valid JSON arguments.";
+    return;
+  }
+  runningDemo.value = true;
+  try {
+    const response = await apiFetch<{ result: unknown }>("/admin/upstreams/test-call", {
+      method: "POST",
+      body: {
+        upstream: props.upstreamConfig,
+        tool_name: props.tool,
+        arguments: parsedArguments,
+      },
+    });
+    demoResult.value = JSON.stringify(response?.result ?? null, null, 2);
+  } catch (err) {
+    demoError.value = extractErrorMessage(err);
+  } finally {
+    runningDemo.value = false;
   }
 }
 
@@ -160,20 +238,45 @@ async function save() {
       <form v-else class="flex min-h-0 flex-1 flex-col" @submit.prevent="save">
         <div class="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-5 sm:px-5" @input="saved = false; approvalSaved = false">
           <Field>
-            <FieldLabel class="text-sm font-medium">Tool description</FieldLabel>
+            <FieldLabel class="text-sm font-medium">Gateway tool description</FieldLabel>
             <Textarea v-model="description" :readonly="!details.can_edit" :disabled="saving" rows="3" maxlength="400" />
             <FieldDescription class="break-words text-xs text-zinc-600">
-              Leave blank to use the upstream description.
+              This is the gateway-curated description presented to MCP clients.
             </FieldDescription>
-            <p v-if="details.description" class="mt-1 break-words text-xs text-zinc-600">{{ details.description }}</p>
+            <p v-if="details.description" class="mt-1 break-words text-xs text-zinc-600"><span class="font-semibold">Upstream description:</span> {{ details.description }}</p>
           </Field>
 
           <section v-if="parameters.length" aria-labelledby="tool-parameter-hints" class="space-y-3 border-t border-zinc-200 pt-4">
             <h3 id="tool-parameter-hints" class="text-[0.9375rem] font-semibold">Parameter hints</h3>
             <Field v-for="parameter in parameters" :key="parameter">
-              <FieldLabel class="break-all text-sm font-medium">{{ parameter }} hint</FieldLabel>
+              <FieldLabel class="break-all text-sm font-medium">{{ parameter }} · {{ parameterType(parameter) }}</FieldLabel>
+              <FieldDescription class="break-words text-xs text-zinc-600">{{ parameterDescription(parameter) }}</FieldDescription>
               <Input v-model="hints[parameter]" :readonly="!details.can_edit" :disabled="saving" maxlength="160" class="min-h-11 sm:min-h-9" />
             </Field>
+          </section>
+
+          <section v-if="details.approval_policy.mode === 'manager_approval'" aria-labelledby="tool-manager-approval" class="space-y-2 border-t border-zinc-200 pt-4">
+            <h3 id="tool-manager-approval" class="text-[0.9375rem] font-semibold">Manager approval required</h3>
+            <p class="text-sm text-zinc-700">{{ details.approval_policy.confirmation_message }}</p>
+            <p class="text-xs text-zinc-600">Approver groups: {{ details.approval_policy.approver_groups.join(", ") || "Not configured" }}</p>
+            <p class="text-xs text-zinc-600">This gate is set by the upstream operation policy. It is not requester confirmation.</p>
+          </section>
+
+          <section v-if="example && demoMode" aria-labelledby="tool-demo-example" class="space-y-3 border-t border-zinc-200 pt-4">
+            <div>
+              <h3 id="tool-demo-example" class="text-[0.9375rem] font-semibold">Local mock example</h3>
+              <p class="mt-1 text-xs text-zinc-600">Example inputs target this repository’s seeded mock data. The button only runs read-only tools; write examples are display-only.</p>
+            </div>
+            <Field>
+              <FieldLabel class="text-sm font-medium">Example arguments (JSON)</FieldLabel>
+              <Textarea v-model="demoArguments" :readonly="runningDemo" rows="5" class="font-mono-data text-xs" />
+            </Field>
+            <Button v-if="canRunDemoExample" type="button" class="min-h-11 sm:min-h-9" :disabled="runningDemo" @click="runDemoExample">
+              {{ runningDemo ? "Calling mock upstream…" : "Run read-only example" }}
+            </Button>
+            <p v-else class="text-xs text-zinc-600">Write tools cannot be executed from this example panel.</p>
+            <p v-if="demoError" role="alert" class="break-words text-sm text-red-800">{{ demoError }}</p>
+            <pre v-if="demoResult" aria-label="Example result" class="max-h-64 overflow-auto rounded-md bg-zinc-100 p-3 text-xs">{{ demoResult }}</pre>
           </section>
 
           <section aria-labelledby="tool-approval-policy" class="space-y-3 border-t border-zinc-200 pt-4">
@@ -181,24 +284,25 @@ async function save() {
               <h3 id="tool-approval-policy" class="text-[0.9375rem] font-semibold">Requester confirmation</h3>
               <p class="mt-1 text-xs text-zinc-600">When enabled, direct calls pause for the MCP client to ask the caller before dispatch. Code Mode calls are rejected. This does not create an external manager approval.</p>
             </div>
-            <Field>
+            <Field v-if="!managerApprovalRequired">
               <FieldLabel class="text-sm font-medium">Policy</FieldLabel>
               <select v-model="approvalMode" :disabled="!details.can_edit || savingApproval" class="min-h-11 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700 sm:min-h-9">
                 <option value="none">No extra confirmation</option>
                 <option value="requester_confirmation">Ask caller before each call</option>
               </select>
             </Field>
-            <Field>
+            <Field v-if="!managerApprovalRequired">
               <FieldLabel class="text-sm font-medium">Prompt message</FieldLabel>
               <Textarea v-model="confirmationMessage" :readonly="!details.can_edit" :disabled="savingApproval" rows="2" maxlength="300" />
               <FieldDescription class="text-xs text-zinc-600">Optional. Use only with MCP clients that show the tool arguments beside this prompt. The gateway cannot verify that a person clicked.</FieldDescription>
             </Field>
-            <div v-if="details.can_edit" class="flex justify-end">
+            <div v-if="details.can_edit && !managerApprovalRequired" class="flex justify-end">
               <Button type="button" :disabled="savingApproval" class="min-h-11 sm:min-h-9" @click="saveApprovalPolicy">
                 {{ savingApproval ? "Saving policy…" : "Save confirmation policy" }}
               </Button>
             </div>
             <p v-if="approvalSaved" role="status" class="text-sm text-emerald-700">Confirmation policy saved.</p>
+            <p v-if="managerApprovalRequired" class="text-xs text-zinc-600">Manager approval is configured above. Change it through the upstream operation policy.</p>
           </section>
 
           <div class="space-y-2 border-t border-zinc-200 pt-3">

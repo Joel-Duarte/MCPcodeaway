@@ -23,6 +23,33 @@ upstreams:
       get_customer_balance: read
       get_trial_balance_lines: read
       compute_interest_penalty: read
+    tool_guidance:
+      query_debt_ledger:
+        description: Read ledger balances for matching customers; use the filters to keep results focused.
+        parameter_hints:
+          status: Optional ledger status filter, such as overdue or current.
+          region: Optional customer region filter, such as EU or US.
+          dataset: Use standard for demo examples; bulk returns a larger result set.
+      get_customer_balance:
+        description: Read one seeded customer's current balance and aging details.
+        parameter_hints:
+          customer_id: Required seeded customer identifier, for example CUST-1003.
+      get_trial_balance_lines:
+        description: Read trial-balance lines for reconciliation; enable the filter to focus on variances.
+        parameter_hints:
+          only_variances: Set true to return only lines with a non-zero variance.
+      compute_interest_penalty:
+        description: Calculate an estimated late-payment penalty without changing ledger data.
+        parameter_hints:
+          customer_id: Customer identifier associated with this estimate.
+          principal: Principal amount in the customer's currency.
+          days_past_due: Number of overdue days used in the simple-interest estimate.
+          annual_rate_pct: Optional annual rate percentage; defaults to 18.
+    tool_approval_policies:
+      query_debt_ledger: { mode: none, version: 1 }
+      get_customer_balance: { mode: none, version: 1 }
+      get_trial_balance_lines: { mode: none, version: 1 }
+      compute_interest_penalty: { mode: none, version: 1 }
     mutating_tools: []
     enabled: true
 
@@ -49,6 +76,19 @@ upstreams:
     tool_effects:
       list_eu_invoices: read
       get_eu_customer: read
+    tool_guidance:
+      list_eu_invoices:
+        description: Read EU invoice records; use status and dataset filters to narrow the result.
+        parameter_hints:
+          status: Optional invoice status filter, such as overdue or paid.
+          dataset: Use standard for the seeded demo set; bulk is intended for volume checks.
+      get_eu_customer:
+        description: Read a single EU customer record by its seeded customer identifier.
+        parameter_hints:
+          customer_id: EU customer identifier, for example CUST-1003.
+    tool_approval_policies:
+      list_eu_invoices: { mode: none, version: 1 }
+      get_eu_customer: { mode: none, version: 1 }
     mutating_tools: []
     enabled: true
 
@@ -75,6 +115,19 @@ upstreams:
     tool_effects:
       list_us_invoices: read
       get_us_customer: read
+    tool_guidance:
+      list_us_invoices:
+        description: Read US invoice records; use status and dataset filters to narrow the result.
+        parameter_hints:
+          status: Optional invoice status filter, such as overdue or paid.
+          dataset: Use standard for the seeded demo set; bulk is intended for volume checks.
+      get_us_customer:
+        description: Read a single US customer record by its seeded customer identifier.
+        parameter_hints:
+          customer_id: US customer identifier, for example CUST-1024.
+    tool_approval_policies:
+      list_us_invoices: { mode: none, version: 1 }
+      get_us_customer: { mode: none, version: 1 }
     mutating_tools: []
     enabled: true
 
@@ -104,13 +157,40 @@ upstreams:
       create_collection_case: high_impact
       search_sentry_errors: read
       get_github_release_commit: read
-    mutating_tools: [create_collection_case]
+    tool_guidance:
+      list_terminal_incidents:
+        description: Read terminal incidents across the seeded EU and US fleet.
+        parameter_hints:
+          status: Optional incident status filter, such as open or resolved.
+      get_terminal_health:
+        description: Read current health and active incident data for one terminal.
+        parameter_hints:
+          terminal_id: Terminal identifier, for example TERM-EU-44.
+      create_collection_case:
+        description: Request creation of a collections case; an operations manager must approve it.
+        parameter_hints:
+          customer_id: Customer to associate with the collections case.
+          reason: Brief business reason for the proposed case.
+          priority: Optional case priority; defaults to high.
+      search_sentry_errors:
+        description: Read the seeded Sentry event and release SHA associated with a terminal.
+        parameter_hints:
+          terminal_id: Terminal identifier associated with the incident.
+      get_github_release_commit:
+        description: Read pull-request and repository metadata for a release commit.
+        parameter_hints:
+          release_sha: Release SHA returned by search_sentry_errors.
     tool_approval_policies:
+      list_terminal_incidents: { mode: none, version: 1 }
+      get_terminal_health: { mode: none, version: 1 }
+      search_sentry_errors: { mode: none, version: 1 }
+      get_github_release_commit: { mode: none, version: 1 }
       create_collection_case:
         mode: manager_approval
         version: 1
         confirmation_message: Approve creation of this outbound collections case.
         approver_groups: [operations-approvers]
+    mutating_tools: [create_collection_case]
     enabled: true
 
   - name: recovery_workbench
@@ -125,6 +205,27 @@ upstreams:
     tool_effects:
       submit_change: write
       get_change_status: read
+    tool_guidance:
+      submit_change:
+        description: Submit a mock change using a stable idempotency key; this may enter recovery if the response is lost.
+        parameter_hints:
+          idempotency_key: Stable caller-generated key reused for safe retries of this same operation.
+          resource_id: Resource identifier to change, for example terminal/TERM-EU-44.
+          change: Short description of the requested change.
+          delay_ms: Optional simulated upstream delay from 0 to 2000 milliseconds.
+          simulate_failure: Optional demo fault that rejects before the change is committed.
+          simulate_lost_response: Optional demo fault that commits but drops the response.
+          simulate_pending: Optional demo fault that leaves the result pending for reconciliation.
+      get_change_status:
+        description: Read the upstream's status for a submitted change by its idempotency key.
+        parameter_hints:
+          idempotency_key: The same stable key supplied to submit_change.
+    tool_approval_policies:
+      submit_change:
+        mode: requester_confirmation
+        version: 1
+        confirmation_message: Confirm submission of this mock change to the recovery workbench.
+      get_change_status: { mode: none, version: 1 }
     mutating_tools: [submit_change]
     tool_recovery_policies:
       submit_change:
