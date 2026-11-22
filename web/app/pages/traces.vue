@@ -8,6 +8,7 @@ interface TraceRun {
   applied_mode?: string;
   recommended_mode?: string | null;
   mode_decision_reason?: string | null;
+  mode_decision_score?: number | null;
   ok: boolean;
   grounding_blocked?: boolean;
   duration_ms: number;
@@ -116,6 +117,47 @@ const totalP95 = computed(() => {
 const slowestRuns = computed(() =>
   [...runs.value].sort((a, b) => b.duration_ms - a.duration_ms).slice(0, 12)
 );
+
+const modeLabel = (mode?: string | null) => {
+  if (mode === "codemode" || mode?.startsWith("codemode")) return "Code Mode";
+  if (mode === "traditional" || mode === "classic") return "Classic";
+  return mode || "Unknown";
+};
+const adaptiveUnavailableLabel = (marker: string) => {
+  const status = marker.split(":")[1];
+  const messages: Record<string, string> = {
+    unknown_model: "No model name was available for evidence matching.",
+    unknown_workload: "The request did not match a supported workload profile.",
+    no_accessible_tools: "No accessible tools were available for adaptive routing.",
+    mutating_tools: "Adaptive recommendations apply only to read-only tools.",
+    insufficient_evidence: "There are not enough qualified matched runs for a recommendation.",
+    quality_gate: "The evidence did not meet the recommendation quality or regression gates.",
+    conflicting_evidence: "Qualified fallback cohorts disagree, so normal Auto routing applies.",
+  };
+  return messages[status] || marker.split(";").slice(1).join(";").trim() || "No eligible adaptive recommendation was available.";
+};
+const decisionExplanation = (run: TraceRun) => {
+  const reason = run.mode_decision_reason || "";
+  const [marker, ...details] = reason.split(";").map((part) => part.trim());
+  const detail = details.join("; ");
+  if (marker.startsWith("adaptive_unavailable:")) {
+    return `Adaptive routing was skipped. ${adaptiveUnavailableLabel(marker)}`;
+  }
+  if (marker.startsWith("adaptive_recommendation:") || marker.startsWith("adaptive_")) {
+    const parts = marker.split(":");
+    const tier = marker.startsWith("adaptive_recommendation:") ? parts[1] : parts[0].slice("adaptive_".length);
+    const workload = marker.startsWith("adaptive_recommendation:") ? parts[2] : parts[1];
+    const mode = parts.at(-1);
+    const tierLabel = tier === "workload_family" ? "workload-family" : tier === "model_wide" ? "model-wide" : "exact-workload";
+    return `Adaptive evidence selected ${modeLabel(mode)} from ${tierLabel} evidence for ${workloadLabel(workload)}. ${detail}`;
+  }
+  if (marker.startsWith("auto->")) {
+    const unavailable = details.find((part) => part.startsWith("adaptive_unavailable:"));
+    const autoDetails = details.filter((part) => !part.startsWith("adaptive_unavailable:"));
+    return `Normal Auto selected ${modeLabel(run.applied_mode || run.mode)}. ${autoDetails.join("; ") || marker}${unavailable ? ` Adaptive routing was skipped: ${adaptiveUnavailableLabel(unavailable)}` : ""}`;
+  }
+  return reason;
+};
 
 const timelineGroupsChart = computed(() => {
   const sorted = [...timelineGroups.value].sort((a, b) => b.runs - a.runs);
@@ -308,7 +350,13 @@ function otherStageMs(g: TimelineGroup): number {
                 <td class="px-4 py-2 font-mono-data text-xs text-[#09090B]">{{ r.run_id.slice(0, 12) }}</td>
                 <td class="px-4 py-2 text-xs text-[#52525B]">{{ (r.user_groups || []).join(", ") || "open" }} · {{ r.user_email || r.user_sub }}</td>
                 <td class="px-4 py-2 font-mono-data text-xs">{{ r.applied_mode || r.mode }}</td>
-                <td class="px-4 py-2 text-xs"><span>{{ r.recommended_mode || "No adaptive recommendation" }}</span><span v-if="r.mode_decision_reason" class="block max-w-[24rem] text-[10px] leading-4 text-[#71717A]">{{ r.mode_decision_reason }}</span></td>
+                <td class="px-4 py-2 text-xs">
+                  <span>Applied: {{ modeLabel(r.applied_mode || r.mode) }}</span>
+                  <span v-if="r.recommended_mode" class="block text-[#52525B]">Adaptive recommendation: {{ modeLabel(r.recommended_mode) }}<span v-if="r.mode_decision_reason?.includes('adaptive_recommendation:')"> · observed only</span></span>
+                  <span v-if="r.mode_decision_score != null" class="block tabular-nums text-[#52525B]">Auto suitability score: {{ r.mode_decision_score.toFixed(1) }} / 100</span>
+                  <span v-if="r.mode_decision_reason" class="block max-w-[24rem] break-words text-[10px] leading-4 text-[#71717A]">{{ decisionExplanation(r) }}</span>
+                  <span v-if="!r.recommended_mode && r.mode_decision_score == null" class="block text-[#71717A]">No adaptive recommendation recorded</span>
+                </td>
                 <td class="px-4 py-2 text-right tabular-nums">{{ r.subcall_count }}</td>
                 <td class="px-4 py-2 text-right font-semibold tabular-nums">{{ r.duration_ms.toFixed(1) }} ms</td>
                 <td class="px-4 py-2 text-right">

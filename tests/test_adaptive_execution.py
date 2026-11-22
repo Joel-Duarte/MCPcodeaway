@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from benchmarks.live_llm_bench import export_adaptive_evidence
-from gateway.adaptive_execution import summarize_pairs
+from gateway.adaptive_execution import resolve_adaptive_recommendation, summarize_pairs
 from gateway.auth import LocalDevKeyManager
 from gateway.config import GatewaySettings
 from gateway.server import create_gateway_app
@@ -147,6 +147,9 @@ async def test_adaptive_admin_api_viewer_and_tenant_boundaries(tmp_path) -> None
         overrides={"sub": "other-admin", "tenant_id": "tenant-other"},
     )
     evidence = _pair()
+    for row in evidence:
+        row["input_tokens"] = 100 if row["mode"] == "codemode" else 200
+        row["output_tokens"] = 0
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://gateway"
@@ -156,6 +159,7 @@ async def test_adaptive_admin_api_viewer_and_tenant_boundaries(tmp_path) -> None
                 headers={"Authorization": f"Bearer {viewer}"},
             )
             assert report.status_code == 200
+            assert report.json()["routing_window_days"] == 30
             denied = await client.post(
                 "/admin/adaptive-execution/evidence",
                 headers={"Authorization": f"Bearer {viewer}"},
@@ -179,12 +183,29 @@ async def test_adaptive_admin_api_viewer_and_tenant_boundaries(tmp_path) -> None
             )
             assert imported.status_code == 200, imported.text
             assert imported.json()["imported"] == len(evidence)
+            report = await client.get(
+                "/admin/adaptive-execution/report?window=1h",
+                headers={"Authorization": f"Bearer {viewer}"},
+            )
+            exact_row = report.json()["rows"][0]
+            assert exact_row["recommended_mode"] == "codemode"
+            assert exact_row["live_routing"]["recommended_mode"] == "codemode"
+            assert exact_row["live_routing"]["evidence_tier"] == "exact"
+            assert report.json()["routing_window_days"] == 30
             dedup = await client.post(
                 "/admin/adaptive-execution/evidence",
                 headers={"Authorization": f"Bearer {admin}"},
                 json={"evidence": evidence},
             )
             assert dedup.json()["imported"] == 0
+            retired_calibration = await client.get(
+                "/admin/ab/settings", headers={"Authorization": f"Bearer {admin}"}
+            )
+            assert retired_calibration.status_code == 404
+            retired_model_report = await client.get(
+                "/admin/ab/model-performance", headers={"Authorization": f"Bearer {admin}"}
+            )
+            assert retired_model_report.status_code == 404
             other = await client.get(
                 "/admin/adaptive-execution/report",
                 headers={"Authorization": f"Bearer {other_tenant_admin}"},
@@ -220,6 +241,57 @@ def test_exact_qualified_recommendation_is_not_discarded() -> None:
     result = summarize_pairs(rows)
     assert result[0]["pairs"] == 5
     assert result[0]["recommended_mode"] == "codemode"
+
+
+def test_live_resolver_returns_exact_recommendation_details() -> None:
+    rows = _pair()
+    for row in rows:
+        row["input_tokens"] = 100 if row["mode"] == "codemode" else 200
+        row["output_tokens"] = 0
+
+    decision = resolve_adaptive_recommendation(rows, "m", "single_read")
+
+    assert decision["recommended_mode"] == "codemode"
+    assert decision["evidence_tier"] == "exact"
+    assert decision["pairs"] == 5
+    assert decision["status"] == "recommended"
+
+
+def test_live_resolver_reports_workload_family_fallback() -> None:
+    rows = _pair()
+    for row in rows:
+        row["workload"] = "large_fanout"
+        row["input_tokens"] = 100 if row["mode"] == "codemode" else 200
+        row["output_tokens"] = 0
+
+    decision = resolve_adaptive_recommendation(rows, "m", "small_fanout")
+
+    assert decision["recommended_mode"] == "codemode"
+    assert decision["evidence_tier"] == "workload_family"
+    assert decision["evidence_workload"] == "large_fanout"
+    assert decision["pairs"] == 5
+
+
+def test_live_resolver_explains_sparse_and_conflicting_evidence() -> None:
+    sparse = resolve_adaptive_recommendation(_pair(3), "m", "single_read")
+    assert sparse["recommended_mode"] is None
+    assert sparse["status"] == "insufficient_evidence"
+
+    traditional = _pair()
+    codemode = _pair()
+    for row in traditional:
+        row["workload"] = "small_fanout"
+        row["input_tokens"] = 100 if row["mode"] == "traditional" else 200
+        row["output_tokens"] = 0
+    for row in codemode:
+        row["workload"] = "large_fanout"
+        row["evidence_id"] = f"large:{row['evidence_id']}"
+        row["input_tokens"] = 200 if row["mode"] == "traditional" else 100
+        row["output_tokens"] = 0
+
+    conflict = resolve_adaptive_recommendation(traditional + codemode, "m", "single_read")
+    assert conflict["recommended_mode"] is None
+    assert conflict["status"] == "conflicting_evidence"
 
 
 @pytest.mark.asyncio
@@ -328,16 +400,129 @@ async def test_adaptive_route_context_survives_discovery_execution_and_rollback(
         assert "adaptive_recommendation:exact:single_read:codemode" in observed[3]
         active = await resolve(method, active=True)
         assert active[0] == "codemode" and active[1] == "x_intent"
-        assert active[3] == "adaptive_exact:single_read:codemode"
+        assert active[3].startswith("adaptive_exact:single_read:codemode;")
+        assert "USD cost is at least 5% lower" in active[3]
     execution = await resolve("tools/call:execute_code", active=True)
-    assert execution[0] == "codemode" and execution[3] == "adaptive_exact:single_read:codemode"
+    assert execution[0] == "codemode"
+    assert execution[3].startswith("adaptive_exact:single_read:codemode;")
     rollback = await resolve("tools/list", active=False)
     assert "adaptive_recommendation:exact:single_read:codemode" in rollback[3]
     risky = await resolve("tools/call", active=True, write=True)
-    assert "adaptive_" not in str(risky[3])
+    assert "adaptive_unavailable:mutating_tools" in str(risky[3])
     explicit = await resolve("tools/call", active=True, explicit=True)
     assert explicit[3] == "explicit:traditional_discover"
     await runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_active_mcp_auto_routes_two_mock_models_to_opposite_winners(tmp_path) -> None:
+    from gateway.config import UpstreamConfig
+    from gateway.mcp_protocol import request_headers, request_meta
+    from gateway.upstream_clients import DiscoveredTool
+
+    keys = LocalDevKeyManager()
+    settings = GatewaySettings(
+        auth_mode="dev",
+        profile="demo",
+        sqlite_path=str(tmp_path / "two-model-routing.db"),
+        upstreams_config_path=str(tmp_path / "no-upstreams.yaml"),
+        allowed_tenants=["tenant-acme-dev"],
+    )
+    tool = DiscoveredTool(
+        server="ledger",
+        name="get_customer_balance",
+        qualified_name="ledger__get_customer_balance",
+        input_schema={
+            "type": "object",
+            "properties": {"customer_id": {"type": "string"}},
+            "required": ["customer_id"],
+        },
+    )
+    app = create_gateway_app(
+        settings=settings,
+        dev_keys=keys,
+        preloaded_tools={"ledger": [tool]},
+    )
+    admin = keys.issue_user_token(persona="gateway_admin", audience=settings.oidc_audience)
+    finance = keys.issue_user_token(persona="finance_analyst", audience=settings.oidc_audience)
+    headers = {"Authorization": f"Bearer {admin}"}
+    evidence = []
+    expected_winners = {
+        "mock-classic-wins": "traditional",
+        "mock-codemode-wins": "codemode",
+    }
+    for model, winner in expected_winners.items():
+        for row in _pair():
+            row["model"] = model
+            row["evidence_id"] = f"{model}:{row['evidence_id']}"
+            row["fixture_id"] = "mock-single-read"
+            row["input_tokens"] = 100 if row["mode"] == winner else 200
+            row["output_tokens"] = 0
+            evidence.append(row)
+
+    async with app.router.lifespan_context(app):
+        runtime = app.state.runtime
+        upstream = UpstreamConfig(
+            name="ledger",
+            type="mcp_http",
+            url="http://preloaded.local",
+            auth_type="none",
+            allowed_roles=["finance_analyst", "gateway_admin"],
+            allowed_operations=["get_customer_balance"],
+        )
+        runtime.registry._static["ledger"] = upstream
+        runtime.catalog.set_server_tools(upstream, [tool])
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            imported = await client.post(
+                "/admin/adaptive-execution/evidence",
+                headers=headers,
+                json={"evidence": evidence},
+            )
+            assert imported.status_code == 200, imported.text
+            assert imported.json()["imported"] == 20
+            active = await client.post(
+                "/admin/adaptive-execution/settings",
+                headers=headers,
+                json={"mode": "active"},
+            )
+            assert active.status_code == 200
+            report = await client.get("/admin/adaptive-execution/report", headers=headers)
+            reported_winners = {
+                row["model"]: row["live_routing"]["recommended_mode"]
+                for row in report.json()["rows"]
+                if row.get("live_routing")
+            }
+            assert reported_winners == expected_winners
+
+            for model, winner in expected_winners.items():
+                call_headers = {
+                    **request_headers("tools/list"),
+                    "Authorization": f"Bearer {finance}",
+                    "X-Model-Name": model,
+                    "X-Intent": "look up one customer balance",
+                }
+                result = await client.post(
+                    "/mcp?execution=auto&discovery_mode=x_intent",
+                    headers=call_headers,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": model,
+                        "method": "tools/list",
+                        "params": {"_meta": request_meta()},
+                    },
+                )
+                assert result.status_code == 200, result.text
+                decision = result.headers["x-gateway-mode-decision"]
+                assert decision.startswith(f"adaptive_exact:single_read:{winner};")
+                listed = result.json()["result"]["tools"]
+                names = {row["name"] for row in listed}
+                if winner == "codemode":
+                    assert "execute_code" in names
+                else:
+                    assert "ledger__get_customer_balance" in names
+                    assert "execute_code" not in names
 
 
 @pytest.mark.asyncio

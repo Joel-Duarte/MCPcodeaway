@@ -472,7 +472,7 @@ async def test_runtime_telemetry_analytics_cors_and_cross_tenant_isolation(
         await http_client.aclose()
 
 
-async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path) -> None:
+async def test_auto_mode_algorithm_and_onboarding_llm(tmp_path: Path) -> None:
     small = evaluate_mode_algorithm(
         tool_count=2,
         classic_schema_tokens=300,
@@ -822,9 +822,8 @@ async def test_ab_engine_algorithm_auto_split_and_onboarding_llm(tmp_path: Path)
                 headers={"Authorization": f"Bearer {adm_tok}"},
             )
             assert routing_models.status_code == 200
-            learned_map = routing_models.json()["learned_from_runs"]
-            assert learned_map["gemini-2.5-flash"]["score_delta"] > 0
-            assert learned_map["qwen/qwen3.5-9b"]["score_delta"] < 0
+            assert routing_models.json()["admin_overrides"] == {}
+            assert "learned_from_runs" not in routing_models.json()
 
             unauth_mcp = await gw.post(
                 "/mcp",

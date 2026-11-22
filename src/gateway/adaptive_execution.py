@@ -191,6 +191,146 @@ def summarize_pairs(
     return out
 
 
+def resolve_adaptive_recommendation(
+    evidence: list[dict[str, Any]],
+    model: str,
+    workload: str,
+    *,
+    pricing: dict[str, Any] | None = None,
+    days: int | None = 30,
+    summaries: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Resolve the adaptive recommendation and explain which evidence tier won."""
+    model_rows = [
+        row
+        for row in summaries or summarize_pairs(evidence, days=days, pricing=pricing)
+        if row["model"].lower() == model.lower()
+    ]
+    exact = next((row for row in model_rows if row["workload"] == workload), None)
+    selected = exact if exact and exact.get("recommended_mode") else None
+    tier = "exact"
+    exact_sparse = not exact or exact.get("pairs", 0) < 5
+    conflicting_fallback = False
+
+    family_map = {
+        "small_fanout": "fanout",
+        "large_fanout": "fanout",
+        "data_reconciliation": "reconciliation",
+        "large_data_reconciliation": "reconciliation",
+    }
+    family = family_map.get(workload)
+    if selected is None and exact_sparse:
+        siblings = [
+            row for row in model_rows if family and family_map.get(row["workload"]) == family
+        ]
+        family_qualified = [row for row in siblings if row.get("recommended_mode")]
+        family_winners = {row["recommended_mode"] for row in family_qualified}
+        if len(family_winners) == 1:
+            selected, tier = family_qualified[0], "workload_family"
+        elif len(family_winners) > 1:
+            conflicting_fallback = True
+        elif not family_qualified:
+            pooled = [
+                {
+                    **item,
+                    "scenario_id": f"{item.get('workload')}:{item.get('scenario_id')}",
+                    "workload": workload,
+                }
+                for item in evidence
+                if str(item.get("model") or "").lower() == model.lower()
+                and family
+                and family_map.get(item.get("workload")) == family
+            ]
+            pooled_winner = next(
+                (
+                    row
+                    for row in summarize_pairs(pooled, days=days, pricing=pricing)
+                    if row["workload"] == workload and row.get("recommended_mode")
+                ),
+                None,
+            )
+            if pooled_winner:
+                selected, tier = pooled_winner, "workload_family"
+            else:
+                qualified = [row for row in model_rows if row.get("recommended_mode")]
+                model_winners = {row["recommended_mode"] for row in qualified}
+                if len(model_winners) == 1:
+                    selected, tier = qualified[0], "model_wide"
+                elif len(model_winners) > 1:
+                    conflicting_fallback = True
+                elif not qualified:
+                    pooled_all = [
+                        {
+                            **item,
+                            "scenario_id": f"{item.get('workload')}:{item.get('scenario_id')}",
+                            "workload": workload,
+                        }
+                        for item in evidence
+                        if str(item.get("model") or "").lower() == model.lower()
+                    ]
+                    broad_winner = next(
+                        (
+                            row
+                            for row in summarize_pairs(pooled_all, days=days, pricing=pricing)
+                            if row["workload"] == workload and row.get("recommended_mode")
+                        ),
+                        None,
+                    )
+                    if broad_winner:
+                        selected, tier = broad_winner, "model_wide"
+
+    if selected:
+        return {
+            "recommended_mode": selected["recommended_mode"],
+            "evidence_tier": tier,
+            "evidence_model": selected["model"],
+            "evidence_workload": selected["workload"],
+            "pairs": selected["pairs"],
+            "qualification": selected["qualification"],
+            "latest_evidence_at": selected["latest_evidence_at"],
+            "traditional": selected["traditional"],
+            "codemode": selected["codemode"],
+            "reason": selected["reason"],
+            "status": "recommended",
+        }
+
+    reason = (
+        exact["reason"]
+        if exact and not exact_sparse
+        else (
+            "Qualified fallback cohorts disagree; normal Auto routing applies."
+            if conflicting_fallback
+            else "No qualified exact or consistent fallback evidence; normal Auto routing applies."
+        )
+    )
+    status = (
+        "quality_gate"
+        if exact and not exact_sparse
+        else "conflicting_evidence"
+        if conflicting_fallback
+        else "insufficient_evidence"
+    )
+    if (
+        exact
+        and exact.get("pairs", 0) >= 5
+        and exact.get("reason", "").startswith("Equal quality without")
+    ):
+        status = "quality_gate"
+    return {
+        "recommended_mode": None,
+        "evidence_tier": None,
+        "evidence_model": model,
+        "evidence_workload": workload,
+        "pairs": exact.get("pairs", 0) if exact else 0,
+        "qualification": exact.get("qualification", "sparse") if exact else "sparse",
+        "latest_evidence_at": exact.get("latest_evidence_at") if exact else None,
+        "traditional": exact.get("traditional") if exact else None,
+        "codemode": exact.get("codemode") if exact else None,
+        "reason": reason,
+        "status": status,
+    }
+
+
 def _mean_known(rows: list[dict[str, Any]], key: str) -> float | None:
     if not rows or any(not _finite_number(r.get(key)) for r in rows):
         return None

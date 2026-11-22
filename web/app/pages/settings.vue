@@ -30,13 +30,17 @@ interface AlertRules {
 
 const { apiFetch, session, authConfig, runtimeMeta, loadAuthState, setRuntimeMeta } = useAdminApi();
 type SettingsTab = "workspace" | "pricing" | "alerts" | "retention" | "routing" | "secrets";
-const activeSettingsTab = ref<SettingsTab>("workspace");
+const route = useRoute();
+const activeSettingsTab = ref<SettingsTab>(route.query.tab === "routing" ? "routing" : "workspace");
+watch(() => route.query.tab, (tab) => {
+  activeSettingsTab.value = tab === "routing" ? "routing" : "workspace";
+});
 const settingsTabs: { id: SettingsTab; label: string }[] = [
   { id: "workspace", label: "Workspace & access" },
   { id: "pricing", label: "Model pricing" },
   { id: "alerts", label: "Alerts & webhooks" },
   { id: "retention", label: "Audit & retention" },
-  { id: "routing", label: "Routing & calibration" },
+  { id: "routing", label: "Adaptive routing" },
   { id: "secrets", label: "Vault secrets" },
 ];
 function setSettingsTab(tab: SettingsTab) {
@@ -855,13 +859,12 @@ async function pruneAuditRuns() {
       <section v-else-if="activeSettingsTab === 'routing'" id="settings-panel-routing" role="tabpanel" class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
         <div>
           <h2 class="text-sm font-semibold text-[#09090B]">
-            Global adaptive routing for Auto upstreams
+            Adaptive execution routing
           </h2>
           <p class="mt-1 text-xs text-[#71717A]">
-            This is a gateway-wide evidence-based selector for requests resolved to Auto, such as `execution=auto` or a gateway default of Auto. It needs a model name, a known workload, and accessible read-only tools. Observe records the recommendation while leaving the normal Auto decision unchanged. Active can apply qualified paired evidence to eligible requests. Per-upstream preferred mode is configured separately; this setting does not change it. Explicit Classic or Code Mode, Hybrid, per-tool overrides, A/B experiments, and safety checks remain in control.
+            This controls whether qualified paired evidence can choose Classic or Code Mode for eligible Auto requests. Observe records the recommendation and leaves the normal Auto decision in place. Active applies the recommendation when the request has a known model and workload and only read-only tools. Explicit modes, upstream preferences, model overrides, A/B experiments, and safety checks still take precedence.
           </p>
         </div>
-        <DiscoveryReport policy-only />
         <div class="max-w-sm">
           <label class="block text-xs font-medium text-[#52525B]" for="adaptive-routing-mode">Routing mode</label>
           <select id="adaptive-routing-mode" v-model="adaptiveMode" class="mt-1 min-h-11 w-full rounded-md border border-[#D4D4D8] bg-white px-3 text-sm text-[#09090B] focus-visible:outline-2 focus-visible:outline-[#0F766E]">
@@ -870,7 +873,7 @@ async function pruneAuditRuns() {
           </select>
         </div>
         <div class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3 text-xs leading-5 text-[#52525B]">
-          Eligible requests resolve to Auto and include a model name, known workload, and accessible read-only tools. Real evidence needs at least five matched pairs within 30 days; the recommended arm must be at least 90% jointly correct and grounded. Simulated demo evidence is never eligible. Unknown, uncertain, mutating, stale, sparse, or conflicting evidence falls back to the normal Auto selector.
+          Live routing always uses real paired evidence from the last 30 days. A recommendation needs at least five matched pairs and at least 90% jointly correct and grounded results. Simulated demo evidence never qualifies. If the model, workload, or evidence is missing or does not qualify, the normal Auto selector remains in control. See Model Performance → Adaptive routing for the evidence and decision reason.
         </div>
         <div class="flex items-center gap-3">
           <Button data-variant="primary" :disabled="savingAdaptiveMode" @click="saveAdaptiveMode">
@@ -878,6 +881,11 @@ async function pruneAuditRuns() {
           </Button>
           <span v-if="statusMsg" role="status" class="text-xs text-[#0F766E]">{{ statusMsg }}</span>
         </div>
+        <section class="border-t border-[#E4E4E7] pt-3" aria-labelledby="discovery-policy-title">
+          <h3 id="discovery-policy-title" class="text-sm font-semibold text-[#09090B]">Tool discovery policy</h3>
+          <p class="mb-3 mt-1 text-xs text-[#52525B]">Discovery controls when tool definitions are shown. It is separate from execution routing between Classic and Code Mode.</p>
+          <DiscoveryReport policy-only />
+        </section>
       </section>
 
       <section v-else-if="activeSettingsTab === 'secrets'" id="settings-panel-secrets" role="tabpanel" class="space-y-4 rounded-lg border border-[#E4E4E7] bg-white p-5">

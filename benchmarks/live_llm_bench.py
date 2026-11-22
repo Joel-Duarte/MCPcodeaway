@@ -85,6 +85,23 @@ MUTATING_TICKET_PROMPT = (
     "Return the customer_id, release_sha, GitHub author, pr_number, and created case_id."
 )
 
+_PARALLEL_SAFE_TASKS = frozenset(
+    {
+        "single_lookup",
+        "standard",
+        "reconcile_overdue",
+        "bulk_200",
+        "reconcile_bulk_200",
+        "trial_balance_audit",
+        "compute_batch_penalties",
+    }
+)
+
+
+def _parallel_classic_calls_allowed(execution: str, task_name: str) -> bool:
+    return execution == "classic" and task_name in _PARALLEL_SAFE_TASKS
+
+
 _TRADITIONAL_SYSTEM = (
     "You are an enterprise finance assistant. Use the provided MCP tools to answer "
     "accurately and concisely. Include exact customer IDs and numeric deltas "
@@ -313,6 +330,47 @@ async def _call_mcp_tool(
     return payload.get("result", {})
 
 
+async def _dispatch_openai_tool_calls(
+    gw: httpx.AsyncClient,
+    gw_token: str,
+    mode: str,
+    tool_calls: list[dict[str, Any]],
+    *,
+    request_id_start: int,
+    discovery_backend: str = "bm25",
+    x_intent: str | None = None,
+    parallel: bool = False,
+) -> list[tuple[dict[str, Any], Any, dict[str, Any] | None, str | None]]:
+    """Dispatch one model turn's independent tool calls, preserving result order."""
+
+    async def dispatch(index: int, tc: dict[str, Any]):
+        fn = tc["function"]
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except json.JSONDecodeError as exc:
+            return tc, None, None, f"Invalid JSON arguments: {exc}"
+        result = await _call_mcp_tool(
+            gw,
+            gw_token,
+            mode,
+            request_id_start + index + 1,
+            fn["name"],
+            parsed_args,
+            discovery_backend=discovery_backend,
+            x_intent=x_intent,
+        )
+        return tc, parsed_args, result, None
+
+    indexed = list(enumerate(tool_calls))
+    if parallel:
+        return list(await asyncio.gather(*(dispatch(index, tc) for index, tc in indexed)))
+    results = []
+    for index, tc in indexed:
+        results.append(await dispatch(index, tc))
+    return results
+
+
 async def run_auth_rbac_check(
     gw: httpx.AsyncClient, dev_keys: LocalDevKeyManager
 ) -> dict[str, Any]:
@@ -438,6 +496,7 @@ async def _call_openai_loop(
         {"role": "user", "content": prompt},
     ]
     prompt_toks, comp_toks, turns, mcp_calls, self_corrections = 0, 0, 0, 0, 0
+    tool_request_seq = 0
     usage_complete = True
     run_ids: list[str] = []
     provenance_states: list[bool] = []
@@ -457,6 +516,8 @@ async def _call_openai_loop(
                 body["reasoning_effort"] = reasoning_effort
             if oai_tools:
                 body["tools"] = oai_tools
+                if _parallel_classic_calls_allowed(exec_axis, task_name):
+                    body["parallel_tool_calls"] = True
             resp = await llm.post(
                 chat_url,
                 headers={"Authorization": f"Bearer {api_key}"},
@@ -621,35 +682,35 @@ async def _call_openai_loop(
                     "run_ids": run_ids,
                 }
 
-            for tc in tool_calls:
+            parallel_classic_calls = (
+                _parallel_classic_calls_allowed(exec_axis, task_name) and len(tool_calls) > 1
+            )
+            dispatched = await _dispatch_openai_tool_calls(
+                gw,
+                gw_token,
+                mode,
+                tool_calls,
+                request_id_start=tool_request_seq,
+                discovery_backend=discovery_backend,
+                x_intent=x_intent,
+                parallel=parallel_classic_calls,
+            )
+            tool_request_seq += len(tool_calls)
+            mcp_calls += sum(1 for _, _, _, parse_error in dispatched if parse_error is None)
+            for tc, _parsed_args, res, parse_error in dispatched:
                 fn = tc["function"]
-                raw_args = fn.get("arguments") or "{}"
-                try:
-                    parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                except json.JSONDecodeError as exc:
+                if parse_error is not None:
                     self_corrections += 1
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tc["id"],
-                            "content": json.dumps(
-                                {"isError": True, "error": f"Invalid JSON arguments: {exc}"}
-                            ),
+                            "content": json.dumps({"isError": True, "error": parse_error}),
                         }
                     )
                     continue
-
-                mcp_calls += 1
-                res = await _call_mcp_tool(
-                    gw,
-                    gw_token,
-                    mode,
-                    mcp_calls,
-                    fn["name"],
-                    parsed_args,
-                    discovery_backend=discovery_backend,
-                    x_intent=x_intent,
-                )
+                if res is None:
+                    continue
                 if res.get("isError"):
                     self_corrections += 1
                 sc = res.get("structuredContent") if isinstance(res, dict) else None
@@ -938,17 +999,21 @@ async def run_openai_compatible_suite(
             transport=httpx.ASGITransport(app=backends_app), base_url="http://127.0.0.1:8001"
         )
         try:
-            apps_by_syn: dict[int, Any] = {}
+            configs_by_syn: dict[int, tuple[str, dict[str, list[DiscoveredTool]]]] = {}
             for syn in synthetic_counts:
                 cfg_path, preloaded = _build_upstreams_config(tmpdir, syn)
+                configs_by_syn[syn] = (cfg_path, preloaded)
+
+            def _new_app(syn: int, store_name: str) -> Any:
+                cfg_path, preloaded = configs_by_syn[syn]
                 settings = GatewaySettings(
                     auth_mode="dev",
                     rate_limit_per_minute=2000,
                     discovery_backend=discovery_backend,  # type: ignore[arg-type]
-                    sqlite_path=f"{tmpdir}/live_{syn}.db",
+                    sqlite_path=f"{tmpdir}/{store_name}.db",
                     upstreams_config_path=cfg_path,
                 )
-                apps_by_syn[syn] = create_gateway_app(
+                return create_gateway_app(
                     settings=settings,
                     store=SQLiteAuditStore(settings.sqlite_path),
                     dev_keys=dev_keys,
@@ -956,7 +1021,8 @@ async def run_openai_compatible_suite(
                     preloaded_tools=preloaded,
                 )
 
-            first_app = apps_by_syn[synthetic_counts[0]]
+            first_syn = synthetic_counts[0]
+            first_app = _new_app(first_syn, f"preflight_{first_syn}")
             async with first_app.router.lifespan_context(first_app):
                 async with httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=first_app), base_url="http://gw"
@@ -967,9 +1033,10 @@ async def run_openai_compatible_suite(
             ops_token = dev_keys.issue_user_token(persona="ops_engineer")
             sup_token = dev_keys.issue_user_token(persona="support_agent")
 
-            for model in models:
+            for model_index, model in enumerate(models):
                 for syn in synthetic_counts:
-                    app = apps_by_syn[syn]
+                    cfg_path, preloaded = configs_by_syn[syn]
+                    app = _new_app(syn, f"live_{model_index}_{syn}")
                     async with app.router.lifespan_context(app):
                         async with httpx.AsyncClient(
                             transport=httpx.ASGITransport(app=app), base_url="http://gw"
@@ -993,6 +1060,8 @@ async def run_openai_compatible_suite(
                                 i_str: str | None,
                                 cur_model: str = model,
                                 cur_syn: int = syn,
+                                cur_cfg_path: str = cfg_path,
+                                cur_preloaded: dict[str, list[DiscoveredTool]] = preloaded,
                             ) -> dict[str, Any]:
                                 tok = (
                                     ops_token if t_name == "mutating_ticket_workflow" else fin_token
@@ -1004,8 +1073,8 @@ async def run_openai_compatible_suite(
                                                 tmpdir,
                                                 discovery_backend=discovery_backend,
                                                 dev_keys=dev_keys,
-                                                upstreams_config_path=cfg_path,
-                                                preloaded_tools=preloaded,
+                                                upstreams_config_path=cur_cfg_path,
+                                                preloaded_tools=cur_preloaded,
                                             )
                                         )
                                         try:
@@ -1050,35 +1119,30 @@ async def run_openai_compatible_suite(
                                 *(_run_job(tn, pt, md, it) for tn, pt, md, it in jobs)
                             )
                             runs.extend(batch_results)
-
-                app0 = apps_by_syn[synthetic_counts[0]]
-                async with app0.router.lifespan_context(app0):
-                    async with httpx.AsyncClient(
-                        transport=httpx.ASGITransport(app=app0), base_url="http://gw"
-                    ) as gw:
-                        rbac_res = await _call_openai_loop(
-                            gw,
-                            sup_token,
-                            api_key,
-                            "codemode",
-                            model,
-                            base_url=base_url,
-                            discovery_backend=discovery_backend,
-                            prompt=RBAC_BOUNDARY_PROMPT,
-                            max_turns=5,
-                            reasoning_effort=reasoning_effort,
-                        )
-                        leaked_secret_val = "1375" in rbac_res.get("answer", "")
-                        rbac_checks.append(
-                            {
-                                "model": model,
-                                "persona": "support_agent",
-                                "finance_subcalls": rbac_res.get("subcalls_total", 0),
-                                "leaked_finance_balance": leaked_secret_val,
-                                "blocked_cleanly": not leaked_secret_val,
-                                "answer_preview": rbac_res.get("answer", "")[:240],
-                            }
-                        )
+                            if syn == first_syn:
+                                rbac_res = await _call_openai_loop(
+                                    gw,
+                                    sup_token,
+                                    api_key,
+                                    "codemode",
+                                    model,
+                                    base_url=base_url,
+                                    discovery_backend=discovery_backend,
+                                    prompt=RBAC_BOUNDARY_PROMPT,
+                                    max_turns=5,
+                                    reasoning_effort=reasoning_effort,
+                                )
+                                leaked_secret_val = "1375" in rbac_res.get("answer", "")
+                                rbac_checks.append(
+                                    {
+                                        "model": model,
+                                        "persona": "support_agent",
+                                        "finance_subcalls": rbac_res.get("subcalls_total", 0),
+                                        "leaked_finance_balance": leaked_secret_val,
+                                        "blocked_cleanly": not leaked_secret_val,
+                                        "answer_preview": rbac_res.get("answer", "")[:240],
+                                    }
+                                )
         finally:
             await backend_client.aclose()
 

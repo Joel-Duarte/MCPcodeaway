@@ -157,9 +157,75 @@ BM25 remains the default and ranks tools inside the gateway. In the latest synth
 
 ### Adaptive Execution Intelligence
 
-Run the live benchmark in at least five distinct invocations with the same model, workload, fixture, runner settings, and discovery configuration to build five matched repeats; save each report to a different file. For example: `python -m benchmarks.live_llm_bench --provider openai_compatible --base-url http://127.0.0.1:1234/v1 --models qwen/qwen3.5-9b --tasks standard --synthetic-tools 0,50 --output /tmp/workflow-1.json` and repeat with `/tmp/workflow-2.json`. Each report includes a versioned `adaptive_evidence` array with correctness, grounding, provider usage where reported, latency, call/recovery counts, and stable matching metadata; prompts and answers are excluded. Merge report arrays with `jq -s '{"evidence": map(.adaptive_evidence[]) }' /tmp/workflow-*.json > /tmp/adaptive-evidence.json`, configure model input/output prices in **Settings → Model pricing**, then POST that JSON to `/admin/adaptive-execution/evidence` with an admin bearer token. Imports are idempotent and scoped to the signed-in admin tenant. This admin endpoint is a trusted operator import for verified benchmark runner artifacts: it validates the versioned evidence shape, timestamps (allowing at most five minutes of clock skew), and nonnegative finite metrics, but it does not provide cryptographic provenance attestation across databases. Do not treat arbitrary client-submitted evidence as verified benchmark output.
+The adaptive router compares paired runs of the same model, workload, fixture, and runner configuration. It needs at least five matched pairs, then requires at least 90% of each arm's answers to be both correct and grounded. If only one arm clears that floor, that arm wins. If both clear it, higher verified quality wins; tied quality may be broken by a cost advantage of at least 5%, provided p95 time and upstream calls are no more than 20% higher and recovery is no more than 0.25 events per workflow higher. Set model input/output prices under **Settings → Model pricing** to compare USD cost; without complete prices, the report can compare provider-token usage when available. If evidence is sparse, stale, conflicting, or fails the gates, the router abstains and normal Auto scoring remains in control.
 
-Review **Model Performance → Routing** in Observe mode first. The router uses recent qualified evidence only after five matched pairs and a 90% jointly correct and grounded floor; Active can then be enabled under **Settings → Routing & calibration**. Active routing applies only to Auto requests with an explicitly supplied or deterministically inferred workload and entirely read-only accessible tools. Return to Observe at any time to roll back adaptive decisions.
+Evidence is considered from most specific to broadest: exact model and workload, a consistent qualified workload-family result when that workload has a family, then a consistent qualified result across that model's workloads. Fallbacks need a single winner; if qualified cohorts disagree, the router abstains instead of choosing a winner by majority.
+
+#### Reproduce the routing decision without a model account
+
+Run the controlled routing tests:
+
+```sh
+uv run pytest -q \
+  tests/test_adaptive_execution.py::test_live_resolver_returns_exact_recommendation_details \
+  tests/test_adaptive_execution.py::test_live_resolver_reports_workload_family_fallback \
+  tests/test_adaptive_execution.py::test_live_resolver_explains_sparse_and_conflicting_evidence \
+  tests/test_adaptive_execution.py::test_active_mcp_auto_routes_two_mock_models_to_opposite_winners \
+  tests/test_adaptive_execution.py::test_adaptive_route_context_survives_discovery_execution_and_rollback \
+  tests/test_benchmark.py::test_classic_parallel_tool_calls_are_dispatched_concurrently \
+  tests/test_benchmark.py::test_parallel_classic_calls_excludes_codemode_and_mutating_workflows
+```
+
+The runtime test feeds five matched repeats into the same resolver used by live Auto requests. Both arms are 100% correct and grounded, each takes 100 ms, uses one upstream call, and has no recovery. Its controlled fixture assigns Code Mode 100 input tokens and Classic 200, with equal configured token prices, so Code Mode's fixture cost is 50% lower. Observe records the exact Code Mode recommendation without applying it; Active returns Code Mode and explains that the cost advantage clears the 5% gate within regression limits. The test also checks fallback for mutating tools and that an explicit execution choice is not overridden. This proves the selection and application paths on a controlled fixture; it is not a measured claim that Code Mode is faster or better for a real model. The demo's generated evidence is simulated and cannot affect live routing.
+
+| Controlled test fixture | Verified quality | Input tokens per run | p95 wall time | Upstream calls | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Classic | 100% | 200 | 100 ms | 1 | Eligible |
+| Code Mode | 100% | 100 | 100 ms | 1 | Selected in Active mode |
+
+The router can select Classic as well. When Code Mode falls below the joint correctness-and-grounding floor while Classic clears it, the quality gate chooses Classic even if its token cost is higher. A workload-specific result can also differ from another workload for the same model; there is no global “Code Mode always wins” rule.
+
+#### Two-model mock request proof
+
+`test_active_mcp_auto_routes_two_mock_models_to_opposite_winners` runs the real Auto MCP request path against an isolated gateway and temporary store. It imports five paired, prompt-free fixture repeats per mock model. Both strategies have identical 100% verified quality, 100 ms latency, one upstream call, and no recovery; only provider-token usage differs:
+
+| Mock model | Classic input tokens | Code Mode input tokens | Active Auto result |
+| --- | ---: | ---: | --- |
+| `mock-classic-wins` | 100 | 200 | Traditional; direct tool schema, no `execute_code` |
+| `mock-codemode-wins` | 200 | 100 | Code Mode; `execute_code` schema |
+
+The test sends `tools/list` with `execution=auto`, the model name, and the same recognized read-only intent for each model. It asserts that the decision header names the expected exact-workload winner and that the returned tool surface changes accordingly. This demonstrates that Active applies different evidence-backed winners per model; the token values are controlled test inputs, not observed model performance and not persisted into the live demo tenant.
+
+| Workflow shape | Classic MCP | Code Mode |
+| --- | --- | --- |
+| Independent calls | A model and client that support parallel tool calls can send several `tools/call` requests at once. The gateway authorizes and limits each request separately. | One `execute_code` script can use `asyncio.gather(...)` for independent tool calls. |
+| Dependent calls | The client sends a call, returns its result to the model, then sends the next call the model chooses. This adds a model turn when the next arguments depend on that result. | The script can await the first result, compute the next arguments, and call again in the same execution without asking the model to plan another turn. |
+| Access and writes | The gateway checks each call against the caller's current roles, groups, and tool policy. | Each callback remains scoped to the caller. Gated writes are rejected from Code Mode, and live adaptive execution only routes recognized read-only workloads. |
+
+#### Compare execution, discovery, authorization, and parallel calls
+
+For an actual model, benchmark both execution modes while holding discovery fixed, then repeat with the other discovery mode. The runner also supports single lookups, reconciliations, bulk data, trial-balance lookups, batch calculations, and a separate mutating workflow. Run the same command five times and save each report separately so each cohort has five matched repeats:
+
+```sh
+for n in 1 2 3 4 5; do
+  uv run python -m benchmarks.live_llm_bench \
+    --provider openai_compatible \
+    --base-url http://127.0.0.1:1234/v1 \
+    --models qwen/qwen3.5-9b \
+    --modes classic:upfront,codemode:upfront,classic:deferred,codemode:deferred \
+    --tasks single_lookup,standard,bulk_200,trial_balance_audit,compute_batch_penalties,mutating_ticket_workflow \
+    --synthetic-tools 0,50 \
+    --output "/tmp/adaptive-run-${n}.json"
+done
+```
+
+Each report contains a prompt-free `adaptive_evidence` array with correctness, grounding, provider usage where reported, latency, call/recovery counts, and stable matching metadata. It also records AuthN/RBAC preflight checks separately: the finance persona must not see the support-only surface, and the support persona must not see finance tools. Authorization checks do not make unauthorized calls eligible for adaptive routing; each actual request is still scoped by the caller's current permissions.
+
+For non-mutating Classic tasks, the benchmark asks the model provider to allow parallel tool calls and dispatches multiple calls from the same response concurrently. It deliberately keeps the mutating workflow out of that path. The gateway still authorizes and limits each request separately. Dependent Classic steps remain turn-by-turn, while Code Mode can also perform a result-dependent next call inside its script. The harness tests cover concurrent dispatch and verify that Code Mode and mutating workflows are excluded from the Classic-parallel path.
+
+Merge report arrays with `jq -s '{"evidence": map(.adaptive_evidence[]) }' /tmp/adaptive-run-*.json > /tmp/adaptive-evidence.json`, then POST that file to `/admin/adaptive-execution/evidence` as an admin in the tenant where the benchmark will be used. Imports are idempotent and tenant-scoped. This endpoint is a trusted operator import for verified benchmark runner artifacts: it validates the versioned evidence shape, timestamps (allowing at most five minutes of clock skew), and nonnegative finite metrics, but it does not cryptographically attest provenance across databases. Do not treat arbitrary client-submitted evidence as verified benchmark output.
+
+Review **Model Performance → Adaptive routing** in Observe mode first. Live routing uses qualified evidence from the last 30 days, with at least five matched pairs and a 90% jointly correct-and-grounded floor. Active can then be enabled under **Settings → Adaptive routing**. It applies only to Auto requests with a known model, recognized workload, and read-only accessible tools. The report separates this live 30-day decision from metrics shown for the selected analysis window. Return to Observe at any time to stop applying adaptive decisions.
 
 ## Vendor-Agnostic Integrations & Scaling
 

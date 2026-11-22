@@ -222,10 +222,24 @@ class TelemetryRecorder:
         eff_output_tokens = max(0, int(returned_tokens))
         eff_total_tokens = eff_input_tokens + eff_output_tokens
         adaptive_marker = next(
-            (part for part in str(mode_decision_reason or "").split(";") if "adaptive_" in part),
+            (
+                part.strip()
+                for part in str(mode_decision_reason or "").split(";")
+                if part.strip().startswith(
+                    (
+                        "adaptive_recommendation:",
+                        "adaptive_exact:",
+                        "adaptive_workload_family:",
+                        "adaptive_model_wide:",
+                    )
+                )
+            ),
             "",
         )
-        recommended_mode = adaptive_marker.strip().split(":")[-1] if adaptive_marker else None
+        recommended_candidate = adaptive_marker.split(":")[-1] if adaptive_marker else None
+        recommended_mode = (
+            recommended_candidate if recommended_candidate in {"traditional", "codemode"} else None
+        )
         run = {
             "run_id": f"run_{uuid.uuid4().hex[:12]}",
             "created_at": datetime.now(UTC).isoformat(),

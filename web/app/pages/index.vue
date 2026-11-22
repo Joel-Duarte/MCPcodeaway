@@ -597,7 +597,7 @@ function formatUsd(n: number | undefined): string {
           <div class="flex flex-wrap items-start justify-between gap-2">
             <div>
               <h2 class="text-[15px] font-semibold text-[#09090B]">Execution mode distribution</h2>
-              <p class="mt-0.5 text-xs text-[#71717A]">Code Mode vs Classic share of observed requests (not calibration win rate).</p>
+              <p class="mt-0.5 text-xs text-[#71717A]">Code Mode vs Classic share of observed requests, not a recommendation score.</p>
             </div>
             <span class="text-xs tabular-nums text-[#71717A]">{{ formatInt(pairedModeRunCount) }} requests</span>
           </div>

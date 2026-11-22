@@ -43,7 +43,6 @@ from gateway import __version__
 from gateway.ab_testing import (
     OnboardingAbTestRequest,
     _run_matches_tool,
-    compute_empirical_model_delta,
     evaluate_mode_algorithm,
     resolve_ab_experiment_variant,
     run_onboarding_ab_test,
@@ -53,6 +52,7 @@ from gateway.adaptive_execution import (
     MAX_IMPORT_CLOCK_SKEW,
     WORKLOADS,
     infer_workload,
+    resolve_adaptive_recommendation,
     summarize_pairs,
 )
 from gateway.admin_auth import AdminSessionManager, create_admin_auth_router
@@ -782,6 +782,25 @@ class GatewayRuntime:
                     or f"Admin score override for '{model_name}' ({model_delta:+.1f})"
                 )
         adaptive_observation_note: str | None = None
+        if requested_exec == "auto":
+            if not model_name:
+                adaptive_observation_note = (
+                    "adaptive_unavailable:unknown_model; provide a model name for evidence routing"
+                )
+            elif not workload:
+                adaptive_observation_note = (
+                    "adaptive_unavailable:unknown_workload; "
+                    "request intent did not identify a supported read-only workload"
+                )
+            elif not tools:
+                adaptive_observation_note = (
+                    "adaptive_unavailable:no_accessible_tools; normal Auto routing applies"
+                )
+            elif any(t.mutating for t in tools):
+                adaptive_observation_note = (
+                    "adaptive_unavailable:mutating_tools; "
+                    "adaptive evidence routing is limited to read-only tools"
+                )
         if (
             requested_exec == "auto"
             and workload
@@ -801,92 +820,17 @@ class GatewayRuntime:
                 else "observe"
             )
             evidence = await self.store.list_adaptive_evidence(identity.tenant_id or "")
-            cutoff = datetime.now(UTC).timestamp() - 30 * 86400
-            evidence = [
-                r
-                for r in evidence
-                if _valid_run_timestamp(r.get("created_at"))
-                and datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00")).timestamp()
-                >= cutoff
-            ]
             pricing = await self.merged_model_pricing()
-            model_rows = [
-                r
-                for r in summarize_pairs(evidence, pricing=pricing)
-                if r["model"].lower() == model_name.lower()
-            ]
-            exact = [r for r in model_rows if r["workload"] == workload]
-            selected = exact[0] if exact and exact[0].get("recommended_mode") else None
-            tier = "exact"
-            exact_sparse = not exact or exact[0].get("pairs", 0) < 5
-            if selected is None and exact_sparse:
-                family_map = {
-                    "small_fanout": "fanout",
-                    "large_fanout": "fanout",
-                    "data_reconciliation": "reconciliation",
-                    "large_data_reconciliation": "reconciliation",
-                }
-                family = family_map.get(workload)
-                siblings = [
-                    r for r in model_rows if family and family_map.get(r["workload"]) == family
-                ]
-                family_qualified = [r for r in siblings if r.get("recommended_mode")]
-                winners = {r["recommended_mode"] for r in family_qualified}
-                if len(winners) == 1:
-                    selected, tier = family_qualified[0], "workload_family"
-                elif not family_qualified:
-                    pooled = [
-                        dict(
-                            item,
-                            scenario_id=f"{item.get('workload')}:{item.get('scenario_id')}",
-                            workload=workload,
-                        )
-                        for item in evidence
-                        if item.get("model", "").lower() == model_name.lower()
-                        and family
-                        and family_map.get(item.get("workload")) == family
-                    ]
-                    pooled_rows = summarize_pairs(pooled, pricing=pricing)
-                    pooled_winner = next(
-                        (
-                            r
-                            for r in pooled_rows
-                            if r["workload"] == workload and r.get("recommended_mode")
-                        ),
-                        None,
-                    )
-                    if pooled_winner:
-                        selected, tier = pooled_winner, "workload_family"
-                    else:
-                        qualified = [r for r in model_rows if r.get("recommended_mode")]
-                        model_winners = {r["recommended_mode"] for r in qualified}
-                        if len(model_winners) == 1:
-                            selected = qualified[0]
-                            tier = "model_wide"
-                        elif not qualified:
-                            pooled_all = [
-                                dict(
-                                    item,
-                                    scenario_id=f"{item.get('workload')}:{item.get('scenario_id')}",
-                                    workload=workload,
-                                )
-                                for item in evidence
-                                if item.get("model", "").lower() == model_name.lower()
-                            ]
-                            broad = summarize_pairs(pooled_all, pricing=pricing)
-                            pooled_winner = next(
-                                (
-                                    r
-                                    for r in broad
-                                    if r["workload"] == workload and r.get("recommended_mode")
-                                ),
-                                None,
-                            )
-                            if pooled_winner:
-                                selected, tier = pooled_winner, "model_wide"
-            if selected:
-                winner = selected["recommended_mode"]
-                adaptive_observation_note = f"adaptive_recommendation:{tier}:{workload}:{winner}"
+            route_decision = resolve_adaptive_recommendation(
+                evidence, model_name, workload, pricing=pricing, days=30
+            )
+            winner = route_decision["recommended_mode"]
+            if winner:
+                tier = route_decision["evidence_tier"]
+                adaptive_observation_note = (
+                    f"adaptive_recommendation:{tier}:{workload}:{winner}; "
+                    f"{route_decision['reason']} ({route_decision['pairs']} matched pairs)"
+                )
                 if adaptive_mode == "active":
                     routed: GatewayMode = "codemode" if winner == "codemode" else "traditional"
                     routed_exec = "codemode" if winner == "codemode" else "classic"
@@ -897,11 +841,17 @@ class GatewayRuntime:
                         routed_exec,
                         routed_disc,
                         routed,
-                        f"adaptive_{tier}:{workload}:{winner}",
+                        f"adaptive_{tier}:{workload}:{winner}; "
+                        f"{route_decision['reason']} ({route_decision['pairs']} matched pairs)",
                         None,
                         None,
                         None,
                     )
+            else:
+                adaptive_observation_note = (
+                    f"adaptive_unavailable:{route_decision['status']}; "
+                    f"{route_decision['reason']} ({route_decision['pairs']} exact matched pairs)"
+                )
 
         decision = evaluate_mode_algorithm(
             tool_count=tool_count,
@@ -915,13 +865,19 @@ class GatewayRuntime:
             model_score_delta=model_delta,
             model_score_reason=model_reason,
         )
+        factor_details = "; ".join(
+            f"{factor.name} ({factor.delta:+.1f}): {factor.detail}" for factor in decision.factors
+        )
+        decision_reason = decision.reason
+        if factor_details:
+            decision_reason = f"{decision_reason}; Factors: {factor_details}"
         return (
             decision.execution,
             decision.discovery_mode,
             decision.gateway_mode,
-            f"{decision.reason}; {adaptive_observation_note}"
+            f"{decision_reason}; {adaptive_observation_note}"
             if adaptive_observation_note
-            else decision.reason,
+            else decision_reason,
             decision.score,
             None,
             None,
@@ -1096,6 +1052,7 @@ class GatewayRuntime:
             "abac_rows_filtered": int(run.get("abac_rows_filtered", 0)),
             "redactions_count": int(run.get("redactions_count", 0)),
             "mode_decision_reason": run.get("mode_decision_reason"),
+            "mode_decision_score": run.get("mode_decision_score"),
         }
 
     async def _publish_live_summary(self, run: dict[str, Any], identity: CallerIdentity) -> None:
@@ -4028,16 +3985,7 @@ def create_gateway_app(
             saved: dict[str, Any] = {}
             if hasattr(runtime.store, "get_setting"):
                 saved = await runtime.store.get_setting("model_routing_scores") or {}
-            recent = await runtime.store.list_runs(limit=250)
-            seen_models = sorted(
-                {str(r.get("model_name")).strip() for r in recent if r.get("model_name")}
-            )
-            learned: dict[str, Any] = {}
-            for m_name in seen_models:
-                emp = compute_empirical_model_delta(recent, m_name)
-                if emp is not None:
-                    learned[m_name] = {"score_delta": emp[0], "reason": emp[1]}
-            return {"admin_overrides": saved, "learned_from_runs": learned}
+            return {"admin_overrides": saved}
 
     async def _inspect_candidate(
         cfg: UpstreamConfig, authorization: str | None
@@ -5104,101 +5052,6 @@ def create_gateway_app(
                 ]
             return {"models": runtime.demo_traffic.model_profiles}
 
-        @app.get("/admin/ab/settings")
-        async def admin_ab_settings_get(
-            authorization: str | None = Header(default=None),
-            mcpcodeaway_admin_session: str | None = Cookie(default=None),
-        ) -> dict[str, Any]:
-            await _authorize_control_plane(
-                authorization,
-                mcpcodeaway_admin_session,
-                require_admin_role=True,
-                allow_viewer=True,
-            )
-            pts = float(getattr(runtime, "ab_turn_penalty_pts", 8.0))
-            tok_per_pt = int(getattr(runtime, "ab_tokens_per_penalty_pt", 150))
-            runs_per_arm = int(getattr(runtime, "ab_calibration_runs_per_arm", 50))
-            return {
-                "turn_penalty_pts": pts,
-                "tokens_per_penalty_pt": tok_per_pt,
-                "calibration_runs_per_arm": runs_per_arm,
-            }
-
-        @app.post("/admin/ab/settings")
-        async def admin_ab_settings_update(
-            payload: dict[str, Any],
-            authorization: str | None = Header(default=None),
-            mcpcodeaway_admin_session: str | None = Cookie(default=None),
-        ) -> dict[str, Any]:
-            await _authorize_control_plane(
-                authorization, mcpcodeaway_admin_session, require_admin_role=True
-            )
-            pts = max(0.0, min(50.0, float(payload.get("turn_penalty_pts", 8.0))))
-            tok_per_pt = max(0, min(2000, int(payload.get("tokens_per_penalty_pt", 150))))
-            runs_per_arm = max(5, min(500, int(payload.get("calibration_runs_per_arm", 50))))
-            runtime.ab_turn_penalty_pts = pts
-            runtime.ab_tokens_per_penalty_pt = tok_per_pt
-            runtime.ab_calibration_runs_per_arm = runs_per_arm
-            return {
-                "turn_penalty_pts": pts,
-                "tokens_per_penalty_pt": tok_per_pt,
-                "calibration_runs_per_arm": runs_per_arm,
-            }
-
-        @app.get("/admin/ab/model-performance")
-        async def admin_ab_model_performance(
-            window: str = Query(default="24h"),
-            limit: int = Query(default=1000, ge=1, le=5000),
-            authorization: str | None = Header(default=None),
-            mcpcodeaway_admin_session: str | None = Cookie(default=None),
-        ) -> dict[str, Any]:
-            from gateway.ab_testing import summarize_model_tool_performance, summarize_rollups
-
-            identity = await _authorize_control_plane(
-                authorization,
-                mcpcodeaway_admin_session,
-                require_admin_role=True,
-                allow_viewer=True,
-            )
-            effective_tenant = _resolve_audit_tenant_scope(identity, None)
-            pts = float(getattr(runtime, "ab_turn_penalty_pts", 8.0))
-            tok_per_pt = int(getattr(runtime, "ab_tokens_per_penalty_pt", 150))
-            window_hours = {"1h": 1, "24h": 24, "7d": 168, "30d": 720}.get(window, 24)
-            cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = getattr(
-                runtime, "_perf_cache", {}
-            )
-            if not hasattr(runtime, "_perf_cache"):
-                runtime._perf_cache = cache
-            ck = (effective_tenant or "*", window_hours, pts, tok_per_pt)
-            now = time.monotonic()
-            cached = cache.get(ck)
-            if cached is not None and (now - cached[0]) < 2.5:
-                return cached[1]
-
-            rows: list[dict[str, Any]] = []
-            if hasattr(runtime.store, "query_tool_model_rollups"):
-                rollups = await runtime.store.query_tool_model_rollups(
-                    tenant_id=effective_tenant, hours=window_hours
-                )
-                if rollups:
-                    rows = summarize_rollups(
-                        rollups, turn_penalty_pts=pts, tokens_per_penalty_pt=tok_per_pt
-                    )
-            if not rows:
-                runs = await runtime.store.list_runs(limit=limit, tenant_id=effective_tenant)
-                rows = summarize_model_tool_performance(
-                    runs, turn_penalty_pts=pts, tokens_per_penalty_pt=tok_per_pt
-                )
-
-            payload_out = {
-                "window": window if window in {"1h", "24h", "7d", "30d"} else "24h",
-                "turn_penalty_pts": pts,
-                "tokens_per_penalty_pt": tok_per_pt,
-                "rows": rows,
-            }
-            cache[ck] = (now, payload_out)
-            return payload_out
-
         @app.get("/admin/discovery/report")
         async def admin_discovery_report(
             limit: int = Query(default=100, ge=0, le=1000),
@@ -5246,6 +5099,30 @@ def create_gateway_app(
             days = {"1h": 1 / 24, "24h": 1, "7d": 7, "30d": 30, "all": None}.get(window, 30)
             pricing = await runtime.merged_model_pricing()
             rows = summarize_pairs(evidence, days=days, pricing=pricing)
+            live_rows = summarize_pairs(evidence, days=30, pricing=pricing)
+            live_decisions = {
+                (row["model"].lower(), row["workload"]): resolve_adaptive_recommendation(
+                    evidence,
+                    row["model"],
+                    row["workload"],
+                    pricing=pricing,
+                    days=30,
+                    summaries=live_rows,
+                )
+                for row in live_rows
+            }
+            for row in rows:
+                row["live_routing"] = live_decisions.get(
+                    (row["model"].lower(), row["workload"]),
+                    resolve_adaptive_recommendation(
+                        evidence,
+                        row["model"],
+                        row["workload"],
+                        pricing=pricing,
+                        days=30,
+                        summaries=live_rows,
+                    ),
+                )
             if runtime.settings.effective_profile_name == "demo":
                 demo_record = await runtime.store.get_setting(
                     f"demo_adaptive_evidence:{tenant or ''}"
@@ -5265,6 +5142,7 @@ def create_gateway_app(
             return {
                 "window": window if window in {"1h", "24h", "7d", "30d", "all"} else "30d",
                 "rows": rows,
+                "routing_window_days": 30,
                 "adaptive_mode": (
                     await runtime.store.get_setting(f"adaptive_execution:{tenant or ''}") or {}
                 ).get("mode", "observe"),

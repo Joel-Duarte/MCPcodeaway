@@ -47,13 +47,13 @@ test("Model Performance exposes named filters, expandable workload details, and 
   await nextTick();
 
   const labels = agent.snapshot().filter((entry) => !entry.offPage).map((entry) => entry.label);
-  for (const label of ["Search model or workload", "Model", "Recommendation", "Evidence arm", "Model performance views"]) {
+  for (const label of ["Search model or workload", "Model", "Selected-window analysis", "Evidence arm", "Model performance views"]) {
     expect(labels, `Missing named control '${label}'; snapshot: ${JSON.stringify(labels)}`).toContain(label);
   }
   expect(wrapper.text()).toContain("Large data reconciliation");
   expect(wrapper.text()).toContain("Recommended: Code Mode");
   const filter = agent.snapshot().find(
-    (entry) => entry.component === "select" && entry.label === "Recommendation"
+    (entry) => entry.component === "select" && entry.label === "Selected-window analysis"
   );
   const filterResult = await agent.act({
     steps: [{ ref: filter!.ref, action: "setValue", args: ["codemode"] }],
@@ -66,7 +66,7 @@ test("Model Performance exposes named filters, expandable workload details, and 
   expect(rowControl).toBeDefined();
   const details = await agent.act({ steps: [{ ref: rowControl!.ref, action: "press" }] });
   expect(details.ok, details.error?.message).toBe(true);
-  expect(wrapper.text()).toContain("Decision reason");
+  expect(wrapper.text()).toContain("Selected-window analysis:");
 
   const tabs = agent.snapshot().find((entry) => entry.component === "tabs");
   const efficiency = await agent.act({
