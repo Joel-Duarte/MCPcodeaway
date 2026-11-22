@@ -1315,8 +1315,10 @@ async def inspect_upstream(
         "selected_operations": [t.name for t in tools],
         "schema_digest": digest,
         "mutating_tools": [t.name for t in tools if t.mutating],
-        "tools": [t.model_dump() for t in tools],
-        "all_tools": [t.model_dump() for t in all_tools],
+        "tools": [{**t.model_dump(), "schema_sha256": compute_schema_digest([t])} for t in tools],
+        "all_tools": [
+            {**t.model_dump(), "schema_sha256": compute_schema_digest([t])} for t in all_tools
+        ],
         "onboarding_guidance": guidance,
         "yaml_snippet": yaml_snippet,
     }

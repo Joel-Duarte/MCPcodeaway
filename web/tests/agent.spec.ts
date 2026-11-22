@@ -77,7 +77,8 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
     "Base / MCP Endpoint URL",
     "Inspect Schema",
     "Define REST endpoints",
-    "3. Test & Save",
+    "3. Build workflows",
+    "4. Test & Save",
   ]) {
     expect(labels, `Missing control '${requiredLabel}' in agent snapshot`).toContain(requiredLabel);
   }
@@ -116,14 +117,20 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
   expect(accessPolicy.ok, accessPolicy.error?.message).toBe(true);
 
   const navStep3 = await agent.act({
-    steps: [{ ref: "3. Test & Save", action: "press" }],
+    steps: [{ ref: "3. Build workflows", action: "press" }],
   });
   expect(navStep3.ok, navStep3.error?.message).toBe(true);
-  const step3Labels = agent
+  expect(wrapper.text()).toContain("No catalog tools are available");
+
+  const navStep4 = await agent.act({
+    steps: [{ ref: "4. Test & Save", action: "press" }],
+  });
+  expect(navStep4.ok, navStep4.error?.message).toBe(true);
+  const step4Labels = agent
     .snapshot()
     .filter((entry) => !entry.offPage && entry.component !== "more")
     .map((entry) => entry.label);
-  expect(step3Labels).toContain("Save Upstream");
+  expect(step4Labels).toContain("Save Upstream");
 
   const denied = await agent.act({
     steps: [{ ref: "Save Upstream", action: "press" }],

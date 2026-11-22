@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed, onMounted, ref, watch } from "vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
 
 interface AbFactor {
@@ -62,6 +63,7 @@ interface InspectResponse {
     tools: {
       qualified_name: string;
       name: string;
+      schema_sha256: string;
       description?: string;
       mutating: boolean;
       input_schema?: { properties?: Record<string, { type?: string }> };
@@ -76,8 +78,54 @@ interface InspectResponse {
 
 const { apiFetch } = useAdminApi();
 
-type OnboardingStep = "connect" | "policy" | "publish";
+type OnboardingStep = "connect" | "policy" | "workflows" | "publish";
 type SchemaInspectionState = "idle" | "inspecting" | "verified" | "failed";
+
+interface WorkflowDraft {
+  id: string;
+  name: string;
+  description: string;
+  tools: string[];
+  requiredTools: string[];
+  evidencePredicates: Record<string, { path: string; type: string }>;
+  completionTool: string;
+  completionPath: string;
+  completionType: string;
+  manualMinutes: number;
+  baselineSource: string;
+  confidence: string;
+  effectiveFrom: string;
+  evidenceNote: string;
+}
+
+interface ExistingWorkflowSummary {
+  id: string;
+  name: string;
+  description: string;
+  participating_tools: string[];
+  required_evidence: { tool: string }[];
+  completion: { tool: string };
+  business_value: { manual_baseline_minutes: number; baseline_source: string; confidence: string };
+}
+
+function newWorkflowDraft(index: number): WorkflowDraft {
+  return {
+    id: `workflow_${index}`,
+    name: `Workflow ${index}`,
+    description: "",
+    tools: [],
+    requiredTools: [],
+    evidencePredicates: {},
+    completionTool: "",
+    completionPath: "/status",
+    completionType: "non_empty_string",
+    manualMinutes: 5,
+    baselineSource: "administrator_estimate",
+    confidence: "unvalidated",
+    effectiveFrom: "",
+    evidenceNote: "",
+  };
+}
 
 const dynamicPermitted = ref(false);
 const upstreamsLoadError = ref("");
@@ -115,6 +163,12 @@ const draftUpstreamRateLimit = ref(120);
 const draftUpstreamConcurrency = ref(10);
 
 const inspectResult = ref<InspectResponse | null>(null);
+const workflowDrafts = ref<WorkflowDraft[]>([newWorkflowDraft(1)]);
+const workflowDraftSequence = ref(1);
+const existingWorkflows = ref<ExistingWorkflowSummary[]>([]);
+const existingWorkflowLoadError = ref("");
+const workflowSaveBusy = ref(false);
+const workflowPublishMessage = ref("");
 const authDiscoverySummary = computed(() => {
   const discovery = inspectResult.value?.inspection.onboarding_guidance?.auth_discovery;
   if (!discovery) return "";
@@ -622,6 +676,20 @@ async function handleInspect() {
       method: "POST",
       body: buildUpstreamPayload(true),
     });
+    existingWorkflows.value = [];
+    existingWorkflowLoadError.value = "";
+    try {
+      const definitions = await apiFetch<{ current?: { definition?: { workflows?: ExistingWorkflowSummary[] } } | null }>(
+        `/admin/integration-definitions/${encodeURIComponent(draftName.value.trim())}`,
+      );
+      existingWorkflows.value = definitions.current?.definition?.workflows || [];
+    } catch (err) {
+      existingWorkflowLoadError.value = extractErrorMessage(err);
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    for (const workflow of workflowDrafts.value) {
+      if (!workflow.effectiveFrom) workflow.effectiveFrom = today;
+    }
     schemaInspectionState.value = "verified";
     const inspectedName =
       inspectResult.value.inspection.name ||
@@ -729,6 +797,176 @@ async function handleRegister() {
     }
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
+  }
+}
+
+function addWorkflowDraft() {
+  workflowDraftSequence.value += 1;
+  workflowDrafts.value.push(newWorkflowDraft(workflowDraftSequence.value));
+}
+
+function removeWorkflowDraft(workflowId: string) {
+  if (workflowDrafts.value.length > 1) {
+    workflowDrafts.value = workflowDrafts.value.filter((workflow) => workflow.id !== workflowId);
+  }
+}
+
+function toggleWorkflowTool(workflow: WorkflowDraft, toolName: string) {
+  if (workflow.tools.includes(toolName)) {
+    workflow.tools = workflow.tools.filter((name) => name !== toolName);
+    workflow.requiredTools = workflow.requiredTools.filter((name) => name !== toolName);
+    const predicates = { ...workflow.evidencePredicates };
+    delete predicates[toolName];
+    workflow.evidencePredicates = predicates;
+    if (workflow.completionTool === toolName) workflow.completionTool = "";
+    return;
+  }
+  workflow.tools = [...workflow.tools, toolName];
+}
+
+function moveWorkflowTool(workflow: WorkflowDraft, index: number, direction: -1 | 1) {
+  const destination = index + direction;
+  if (destination < 0 || destination >= workflow.tools.length) return;
+  const tools = [...workflow.tools];
+  [tools[index], tools[destination]] = [tools[destination], tools[index]];
+  workflow.tools = tools;
+}
+
+function setWorkflowBaselineSource(workflow: WorkflowDraft, source: string) {
+  workflow.baselineSource = source;
+  workflow.confidence = source === "administrator_estimate"
+    ? "unvalidated"
+    : source === "sampled_manual_measurement" ? "sampled" : "validated";
+}
+
+function toggleEvidencePredicate(workflow: WorkflowDraft, toolName: string, enabled: boolean) {
+  const predicates = { ...workflow.evidencePredicates };
+  if (enabled) predicates[toolName] = { path: "/status", type: "non_empty_string" };
+  else delete predicates[toolName];
+  workflow.evidencePredicates = predicates;
+}
+
+function workflowDefinitionPayload() {
+  if (!inspectResult.value) throw new Error("Inspect the tool catalog before defining workflows.");
+  if (existingWorkflowLoadError.value) throw new Error("Retry schema inspection so the current published workflows can be preserved before saving.");
+  const inspectedTools = inspectResult.value.inspection.tools;
+  const toolsByName = new Map(inspectedTools.map((tool) => [tool.qualified_name, tool]));
+  const cleanId = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48);
+  const workflows = workflowDrafts.value.map((workflow, index) => {
+    const id = cleanId(workflow.name) || `workflow_${index + 1}`;
+    if (!workflow.name.trim() || !workflow.description.trim()) throw new Error("Give each workflow a name and explain what business activity it measures.");
+    if (!workflow.tools.length) throw new Error(`Add at least one catalog tool to '${workflow.name}'.`);
+    if (!workflow.completionTool || !workflow.tools.includes(workflow.completionTool)) throw new Error(`Choose a terminal outcome tool that appears in '${workflow.name}'.`);
+    if (!workflow.completionPath.trim()) throw new Error(`Choose the result field that confirms '${workflow.name}' completed.`);
+    if (!Number.isFinite(workflow.manualMinutes) || workflow.manualMinutes <= 0) throw new Error(`Enter a human baseline greater than zero minutes for '${workflow.name}'.`);
+    if (!workflow.effectiveFrom) throw new Error(`Choose when the baseline for '${workflow.name}' takes effect.`);
+    const requiredEvidence = workflow.requiredTools.map((tool) => ({
+      tool,
+      min_successful_calls: 1,
+      ...(workflow.evidencePredicates[tool] ? { result_when: workflow.evidencePredicates[tool] } : {}),
+    }));
+    return {
+      id,
+      name: workflow.name.trim(),
+      description: workflow.description.trim(),
+      participating_tools: workflow.tools,
+      required_evidence: requiredEvidence,
+      completion: {
+        kind: "terminal_tool_result",
+        tool: workflow.completionTool,
+        success_when: {
+          path: workflow.completionPath.trim(),
+          type: workflow.completionType,
+          ...(workflow.completionType === "boolean" ? { equals: true } : {}),
+        },
+      },
+      business_value: {
+        manual_baseline_minutes: workflow.manualMinutes,
+        baseline_source: workflow.baselineSource,
+        confidence: workflow.confidence,
+        effective_from: workflow.effectiveFrom,
+        evidence_note: workflow.evidenceNote.trim() || undefined,
+      },
+    };
+  });
+  if (new Set(workflows.map((workflow) => workflow.id)).size !== workflows.length) {
+    throw new Error("Workflow names must produce unique IDs. Give each workflow a distinct name.");
+  }
+  const referencedNames = [...new Set(workflows.flatMap((workflow) => workflow.participating_tools))];
+  const toolRefs = referencedNames.map((name) => {
+    const tool = toolsByName.get(name);
+    if (!tool) throw new Error(`Tool '${name}' is no longer in the inspected catalog. Inspect again.`);
+    return { name, schema_sha256: tool.schema_sha256 };
+  });
+  const integrationId = cleanId(draftName.value) || "integration";
+  return {
+    manifest_version: "1.0",
+    integration: {
+      id: integrationId,
+      display_name: draftName.value.trim(),
+      upstream_name: draftName.value.trim(),
+      status: "draft",
+      revision: 1,
+    },
+    tool_refs: toolRefs,
+    experiences: [],
+    workflows,
+    standalone_tool_values: [],
+  };
+}
+
+async function handleSaveWorkflows() {
+  workflowSaveBusy.value = true;
+  workflowPublishMessage.value = "";
+  errorMessage.value = "";
+  try {
+    const definition = workflowDefinitionPayload();
+    await handleRegister();
+    if (!registeredUpstream.value) throw new Error(errorMessage.value || "Save the upstream before publishing its workflows.");
+    const current = await apiFetch<{ current?: { definition?: Record<string, unknown> } | null }>(
+      `/admin/integration-definitions/${encodeURIComponent(draftName.value.trim())}`,
+    );
+    const currentDefinition = current.current?.definition || {};
+    const publishedDefinition = { ...currentDefinition };
+    delete publishedDefinition.publication;
+    const existingWorkflows = Array.isArray(currentDefinition.workflows) ? currentDefinition.workflows as { id?: string }[] : [];
+    const authoredIds = new Set(definition.workflows.map((workflow) => workflow.id));
+    const mergedWorkflows = [
+      ...existingWorkflows.filter((workflow) => !workflow.id || !authoredIds.has(workflow.id)),
+      ...definition.workflows,
+    ];
+    const existingRefs = Array.isArray(currentDefinition.tool_refs) ? currentDefinition.tool_refs as { name: string; schema_sha256: string }[] : [];
+    const refsByName = new Map(existingRefs.map((reference) => [reference.name, reference]));
+    for (const reference of definition.tool_refs) refsByName.set(reference.name, reference);
+    const existingIntegration = currentDefinition.integration && typeof currentDefinition.integration === "object"
+      ? currentDefinition.integration as { id?: string }
+      : {};
+    const completeDefinition = {
+      ...publishedDefinition,
+      ...definition,
+      integration: { ...definition.integration, ...(existingIntegration.id ? { id: existingIntegration.id } : {}) },
+      tool_refs: [...refsByName.values()],
+      workflows: mergedWorkflows,
+    };
+    const validation = await apiFetch<{ valid: boolean }>("/admin/integration-definitions/validate", {
+      method: "POST",
+      body: completeDefinition,
+    });
+    if (!validation.valid) throw new Error("The gateway could not validate this workflow definition.");
+    const draft = await apiFetch<{ revision: string }>("/admin/integration-definitions/drafts", {
+      method: "POST",
+      body: { definition: completeDefinition },
+    });
+    await apiFetch(`/admin/integration-definitions/${encodeURIComponent(draftName.value.trim())}/publish`, {
+      method: "POST",
+      body: { revision: draft.revision },
+    });
+    workflowPublishMessage.value = `Published ${definition.workflows.length} workflow${definition.workflows.length === 1 ? "" : "s"} for ${draftName.value.trim()}.`;
+    statusMessage.value = workflowPublishMessage.value;
+  } catch (err) {
+    errorMessage.value = extractErrorMessage(err);
+  } finally {
+    workflowSaveBusy.value = false;
   }
 }
 
@@ -847,7 +1085,7 @@ async function copyPromptText() {
           Onboarding
         </h1>
         <p class="mt-0.5 text-[13px] text-[#52525B]">
-          Connect an API or MCP server, set who can use it and how it runs, then test and save it.
+          Connect an API or MCP server, set access rules, describe business workflows from its tools, then test and publish.
         </p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
@@ -905,12 +1143,20 @@ async function copyPromptText() {
           2. Policy &amp; Mode
         </Button>
         <Button
+          :data-variant="onboardingStep === 'workflows' ? 'primary' : undefined"
+          :disabled="!schemaVerified"
+          class="text-xs"
+          @click="goToOnboardingStep('workflows')"
+        >
+          3. Build workflows
+        </Button>
+        <Button
           :data-variant="onboardingStep === 'publish' ? 'primary' : undefined"
           :disabled="!schemaVerified"
           class="text-xs"
           @click="goToOnboardingStep('publish')"
         >
-          3. Test &amp; Save
+          4. Test &amp; Save
         </Button>
       </div>
     </section>
@@ -1021,7 +1267,7 @@ async function copyPromptText() {
             Schema verified. Policy &amp; Guardrails are unlocked.
           </span>
           <Button data-variant="primary" :disabled="!schemaVerified" @click="goToOnboardingStep('policy')">
-            Next: Policy &amp; Guardrails →
+            Next: Policy &amp; Guardrails
           </Button>
         </div>
       </div>
@@ -1352,8 +1598,184 @@ async function copyPromptText() {
       </section>
 
       <div class="flex flex-wrap items-center justify-between gap-2 border-t border-[#E4E4E7] pt-4">
-        <Button @click="goToOnboardingStep('connect')">← Back: Connect</Button>
-        <Button data-variant="primary" :disabled="!schemaVerified" @click="goToOnboardingStep('publish')">Next: Test &amp; Publish →</Button>
+        <Button @click="goToOnboardingStep('connect')">Back to Connect</Button>
+        <Button data-variant="primary" :disabled="!schemaVerified" @click="goToOnboardingStep('workflows')">Next: Build workflows</Button>
+      </div>
+    </div>
+
+    <div v-else-if="onboardingStep === 'workflows'" class="space-y-5 rounded-lg border border-[#E4E4E7] bg-white p-5">
+      <div class="flex flex-col gap-3 border-b border-[#E4E4E7] pb-4 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <h2 class="text-[15px] font-semibold text-[#09090B]">Step 3 — Define business workflows</h2>
+          <p class="mt-1 max-w-3xl text-[13px] leading-5 text-[#52525B]">Choose tools from this catalog and arrange them to explain the business activity. The displayed order is for people to understand the flow; calls may happen in any order. Required evidence and the terminal result determine whether a run receives credit.</p>
+        </div>
+        <Button class="min-h-11 shrink-0" @click="addWorkflowDraft">Add another workflow</Button>
+      </div>
+
+      <div v-if="!inspectResult?.inspection.tools.length" class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-4 text-sm text-[#52525B]">
+        No catalog tools are available. Return to Connect &amp; Inspect and verify the upstream schema.
+      </div>
+      <div v-else class="space-y-6">
+        <section class="space-y-2 border-b border-[#E4E4E7] pb-4" aria-labelledby="existing-workflows-title">
+          <h3 id="existing-workflows-title" class="text-xs font-semibold text-[#09090B]">Published workflows for this upstream</h3>
+          <p v-if="existingWorkflowLoadError" class="text-xs leading-5 text-[#991B1B]">Could not load the existing workflow list: {{ existingWorkflowLoadError }}. Retry schema inspection before publishing changes.</p>
+          <p v-else-if="!existingWorkflows.length" class="text-xs text-[#71717A]">No published workflows are configured yet. Add one or more below.</p>
+          <ul v-else class="divide-y divide-[#E4E4E7] border-y border-[#E4E4E7]">
+            <li v-for="published in existingWorkflows" :key="published.id" class="py-3 text-xs">
+              <div class="font-medium text-[#09090B]">{{ published.name }} <span class="font-normal text-[#71717A]">· {{ published.business_value.manual_baseline_minutes }} min manual baseline</span></div>
+              <p class="mt-1 leading-5 text-[#52525B]">{{ published.description }} Tools: {{ published.participating_tools.map((name) => name.replace(`${draftName}__`, "")).join(", ") }}. Required evidence: {{ published.required_evidence.map((item) => item.tool.replace(`${draftName}__`, "")).join(", ") || "terminal outcome only" }}. Completion: {{ published.completion.tool.replace(`${draftName}__`, "") }}. {{ published.business_value.baseline_source.replaceAll("_", " ") }}, {{ published.business_value.confidence }}.</p>
+              <p class="mt-1 text-[#71717A]">Use the same workflow name below to replace its definition; other published workflows will be retained.</p>
+            </li>
+          </ul>
+        </section>
+        <section v-for="(workflow, workflowIndex) in workflowDrafts" :key="workflow.id" class="space-y-4" :class="workflowIndex ? 'border-t border-[#E4E4E7] pt-5' : ''">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h3 class="text-sm font-semibold text-[#09090B]">Workflow {{ workflowIndex + 1 }}</h3>
+            <Button v-if="workflowDrafts.length > 1" class="min-h-11 text-xs" @click="removeWorkflowDraft(workflow.id)">Remove workflow</Button>
+          </div>
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field>
+              <FieldLabel>Workflow name</FieldLabel>
+              <Input v-model="workflow.name" :aria-label="`Workflow ${workflowIndex + 1} name`" placeholder="Update and verify a customer record" class="min-h-11" />
+              <FieldDescription>Use a name an administrator will recognize in reports.</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>Human time for this activity (minutes)</FieldLabel>
+              <Input v-model.number="workflow.manualMinutes" :aria-label="`Workflow ${workflowIndex + 1} human baseline minutes`" type="number" min="0.1" step="0.1" class="min-h-11 tabular-nums" />
+              <FieldDescription>This is the manual baseline used when a workflow completes.</FieldDescription>
+            </Field>
+            <Field class="sm:col-span-2">
+              <FieldLabel>What business activity does this measure?</FieldLabel>
+              <Input v-model="workflow.description" :aria-label="`Workflow ${workflowIndex + 1} description`" placeholder="Find a customer, update their account, then confirm the saved record." class="min-h-11" />
+            </Field>
+          </div>
+
+          <div class="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(17rem,0.8fr)]">
+            <div class="space-y-3">
+              <div>
+                <h4 class="text-xs font-semibold text-[#09090B]">Choose and arrange catalog tools</h4>
+                <p class="mt-1 text-xs leading-5 text-[#52525B]">Use the up/down controls to organize the flow. This order does not constrain runtime calls.</p>
+              </div>
+              <div class="flex flex-wrap gap-2">
+                <button v-for="tool in inspectResult.inspection.tools" :key="tool.qualified_name" type="button" :disabled="draftToolEffects[tool.name] === 'disabled' && !workflow.tools.includes(tool.qualified_name)" class="min-h-11 max-w-full rounded-md border px-3 py-2 text-left text-xs transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E] disabled:cursor-not-allowed disabled:bg-[#F4F4F5] disabled:text-[#71717A]" :class="workflow.tools.includes(tool.qualified_name) ? 'border-[#0F766E] bg-[#F0FDFA] text-[#0F766E]' : 'border-[#D4D4D8] bg-white text-[#09090B] hover:bg-[#F4F4F5]'" :aria-pressed="workflow.tools.includes(tool.qualified_name)" :title="draftToolEffects[tool.name] === 'disabled' && !workflow.tools.includes(tool.qualified_name) ? 'Enable this operation in Policy & Mode before adding it.' : undefined" @click="toggleWorkflowTool(workflow, tool.qualified_name)">
+                  {{ workflow.tools.includes(tool.qualified_name) ? 'Remove' : draftToolEffects[tool.name] === 'disabled' ? 'Enable in Policy' : 'Add' }} {{ tool.name }}
+                </button>
+              </div>
+              <ol v-if="workflow.tools.length" :aria-label="`Workflow ${workflowIndex + 1} flow order`" class="divide-y divide-[#E4E4E7] border-y border-[#E4E4E7]">
+                <li v-for="(toolName, toolIndex) in workflow.tools" :key="toolName" class="flex flex-col gap-2 py-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div class="flex min-w-0 items-start gap-3">
+                    <span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[#F4F4F5] text-xs font-medium tabular-nums text-[#52525B]">{{ toolIndex + 1 }}</span>
+                    <div class="min-w-0">
+                      <div class="break-all font-mono-data text-xs text-[#09090B]">{{ toolName }}</div>
+                      <label class="mt-1 flex min-h-11 items-center gap-2 text-xs text-[#52525B] sm:min-h-9">
+                        <Checkbox :checked="workflow.requiredTools.includes(toolName)" :aria-label="`Require ${toolName} as completion evidence`" @checked-change="(checked) => { workflow.requiredTools = checked === true ? [...workflow.requiredTools, toolName] : workflow.requiredTools.filter((name) => name !== toolName) }"><CheckboxIndicator><AppIcon name="check" :size="13" /></CheckboxIndicator></Checkbox>
+                        Required evidence for credit
+                      </label>
+                      <div v-if="workflow.requiredTools.includes(toolName)" class="ml-0 space-y-2 border-t border-[#E4E4E7] pt-2">
+                        <label class="flex min-h-11 items-center gap-2 text-xs text-[#52525B] sm:min-h-9">
+                          <Checkbox :checked="Boolean(workflow.evidencePredicates[toolName])" :aria-label="`Check returned result from ${toolName}`" @checked-change="(checked) => toggleEvidencePredicate(workflow, toolName, checked === true)"><CheckboxIndicator><AppIcon name="check" :size="13" /></CheckboxIndicator></Checkbox>
+                          Also check a result field
+                        </label>
+                        <div v-if="workflow.evidencePredicates[toolName]" class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                          <Input v-model="workflow.evidencePredicates[toolName].path" :aria-label="`Required evidence result field for ${toolName}`" placeholder="/status" class="min-h-11 font-mono-data text-xs" />
+                          <select v-model="workflow.evidencePredicates[toolName].type" :aria-label="`Required evidence result type for ${toolName}`" class="min-h-11 w-full rounded-md border border-[#D4D4D8] bg-white px-3 text-xs text-[#09090B] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">
+                            <option value="non_empty_string">Non-empty text</option>
+                            <option value="string">Text</option>
+                            <option value="boolean">Boolean</option>
+                            <option value="non_empty_object">Non-empty object</option>
+                            <option value="object">Object</option>
+                            <option value="non_empty_array">Non-empty list</option>
+                            <option value="array">List</option>
+                            <option value="number">Number</option>
+                            <option value="integer">Whole number</option>
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="flex gap-2 pl-10 sm:pl-0">
+                    <Button class="min-h-11 px-3 text-xs" :disabled="toolIndex === 0" :aria-label="`Move ${toolName} earlier`" @click="moveWorkflowTool(workflow, toolIndex, -1)">Move up</Button>
+                    <Button class="min-h-11 px-3 text-xs" :disabled="toolIndex === workflow.tools.length - 1" :aria-label="`Move ${toolName} later`" @click="moveWorkflowTool(workflow, toolIndex, 1)">Move down</Button>
+                  </div>
+                </li>
+              </ol>
+              <p v-else class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3 text-xs text-[#71717A]">Add the tools that take part in this business activity.</p>
+            </div>
+
+            <div class="space-y-3 border-t border-[#E4E4E7] pt-4 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0">
+              <div>
+                <h4 class="text-xs font-semibold text-[#09090B]">Confirm the terminal outcome</h4>
+                <p class="mt-1 text-xs leading-5 text-[#52525B]">Choose the tool result that confirms the activity finished. Only a successful matching result completes the workflow.</p>
+              </div>
+              <Field>
+                <FieldLabel>Outcome tool</FieldLabel>
+                <select v-model="workflow.completionTool" :aria-label="`Workflow ${workflowIndex + 1} outcome tool`" class="min-h-11 w-full rounded-md border border-[#D4D4D8] bg-white px-3 text-sm text-[#09090B] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">
+                  <option value="">Choose a tool in this flow</option>
+                  <option v-for="toolName in workflow.tools" :key="toolName" :value="toolName">{{ toolName }}</option>
+                </select>
+              </Field>
+              <Field>
+                <FieldLabel>Result field that confirms success</FieldLabel>
+                <Input v-model="workflow.completionPath" :aria-label="`Workflow ${workflowIndex + 1} completion result field`" placeholder="/status" class="min-h-11 font-mono-data text-xs" />
+                <FieldDescription>Use a field path from the selected tool result, for example /status.</FieldDescription>
+              </Field>
+              <Field>
+                <FieldLabel>Expected result</FieldLabel>
+                <select v-model="workflow.completionType" :aria-label="`Workflow ${workflowIndex + 1} completion result type`" class="min-h-11 w-full rounded-md border border-[#D4D4D8] bg-white px-3 text-sm text-[#09090B] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">
+                  <option value="non_empty_string">Non-empty text</option>
+                  <option value="string">Text</option>
+                  <option value="boolean">True</option>
+                  <option value="non_empty_object">Non-empty object</option>
+                  <option value="object">Object</option>
+                  <option value="non_empty_array">Non-empty list</option>
+                  <option value="array">List</option>
+                  <option value="number">Number</option>
+                  <option value="integer">Whole number</option>
+                </select>
+              </Field>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 gap-3 border-t border-[#E4E4E7] pt-4 sm:grid-cols-2 lg:grid-cols-4">
+            <Field>
+              <FieldLabel>Baseline source</FieldLabel>
+              <select :value="workflow.baselineSource" :aria-label="`Workflow ${workflowIndex + 1} baseline source`" class="min-h-11 w-full rounded-md border border-[#D4D4D8] bg-white px-3 text-sm text-[#09090B] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]" @change="setWorkflowBaselineSource(workflow, ($event.target as HTMLSelectElement).value)">
+                <option value="administrator_estimate">Administrator estimate</option>
+                <option value="sampled_manual_measurement">Sampled manual measurement</option>
+                <option value="validated_external_measurement">Validated external measurement</option>
+              </select>
+            </Field>
+            <Field>
+              <FieldLabel>Confidence</FieldLabel>
+              <div :aria-label="`Workflow ${workflowIndex + 1} baseline confidence`" class="flex min-h-11 items-center rounded-md border border-[#E4E4E7] bg-[#F4F4F5] px-3 text-sm text-[#52525B]">{{ workflow.confidence }}</div>
+            </Field>
+            <Field>
+              <FieldLabel>Effective from</FieldLabel>
+              <Input v-model="workflow.effectiveFrom" :aria-label="`Workflow ${workflowIndex + 1} baseline effective date`" type="date" class="min-h-11 tabular-nums" />
+            </Field>
+            <Field>
+              <FieldLabel>Measurement note</FieldLabel>
+              <Input v-model="workflow.evidenceNote" :aria-label="`Workflow ${workflowIndex + 1} measurement note`" placeholder="How was this estimate established?" class="min-h-11" />
+            </Field>
+          </div>
+          <div class="rounded-md bg-[#F4F4F5] p-3 text-xs leading-5 text-[#52525B]">
+            <strong class="text-[#09090B]">This workflow measures:</strong> {{ workflow.description || "Describe the business activity above." }}
+            <span v-if="workflow.tools.length"> It includes {{ workflow.tools.map((name) => inspectResult.inspection.tools.find((tool) => tool.qualified_name === name)?.name || name).join(", ") }}.</span>
+            <span v-if="workflow.requiredTools.length"> Credit requires successful calls to {{ workflow.requiredTools.join(", ") }}.</span>
+            <span v-if="workflow.completionTool"> Completion requires {{ workflow.completionTool }} to return {{ workflow.completionType }} at {{ workflow.completionPath }}.</span>
+            <span> Manual baseline: {{ workflow.manualMinutes || 0 }} minutes ({{ workflow.baselineSource.replaceAll("_", " ") }}, {{ workflow.confidence }}).</span>
+          </div>
+        </section>
+
+        <div class="flex flex-col gap-3 border-t border-[#E4E4E7] pt-4 sm:flex-row sm:items-center sm:justify-between">
+          <Button class="min-h-11" @click="goToOnboardingStep('policy')">Back to Policy</Button>
+          <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <span v-if="workflowPublishMessage" role="status" class="text-sm text-[#0F766E]">{{ workflowPublishMessage }}</span>
+            <Button data-variant="primary" class="min-h-11" :disabled="workflowSaveBusy || !dynamicPermitted" pending-announcement="Publishing workflows" @click="handleSaveWorkflows">{{ workflowSaveBusy ? "Publishing workflows…" : "Save and publish workflows" }}</Button>
+            <Button class="min-h-11" @click="goToOnboardingStep('publish')">Continue to Test &amp; Save</Button>
+          </div>
+        </div>
+        <p v-if="!dynamicPermitted" class="text-xs leading-5 text-[#71717A]">Workflow publishing requires dynamic registration to be enabled for this gateway. Save the workflow through your GitOps process.</p>
       </div>
     </div>
 
@@ -1361,7 +1783,7 @@ async function copyPromptText() {
       <section class="space-y-5 rounded-lg border border-[#E4E4E7] bg-white p-5 xl:col-span-7">
         <div class="flex items-center gap-2 border-b border-[#E4E4E7] pb-3">
           <AppIcon name="flask" :size="16" class="text-[#0F766E]" />
-          <h2 class="text-[15px] font-semibold text-[#09090B]">Step 3 — Test &amp; Save</h2>
+          <h2 class="text-[15px] font-semibold text-[#09090B]">Step 4 — Test &amp; Save</h2>
         </div>
 
         <div class="space-y-2 rounded border border-[#E4E4E7] bg-[#FAFAFA] p-3 text-xs leading-5 text-[#52525B]">
@@ -1381,7 +1803,7 @@ async function copyPromptText() {
         </div>
 
         <div class="flex flex-wrap items-center justify-between gap-2 border-t border-[#E4E4E7] pt-4">
-          <Button @click="goToOnboardingStep('policy')">← Back: Policy</Button>
+          <Button @click="goToOnboardingStep('workflows')">Back: Workflows</Button>
           <div class="flex flex-wrap items-center gap-2">
             <Button :disabled="abBusy" pending-announcement="Estimating" @click="runAbTest">
               <AppIcon name="flask" :size="15" />

@@ -1,6 +1,6 @@
 # Interactive MCP Experiences and Business Value Design
 
-**Status:** Product and architecture proposal; no runtime behavior changed.  
+**Status:** Product and architecture design; workflow authoring is an onboarding experience, while execution attribution remains explicit in v1.
 **Evidence date:** 22 November 2026.  
 **Scope:** Integration generation, hosted MCP tool execution, optional MCP Apps, workflow attribution, business-value telemetry and administration.
 
@@ -8,9 +8,9 @@
 
 MCPcodeaway can add three related but independent capabilities without becoming an identity portal or workflow engine:
 
-1. **Integration generation:** use the existing onboarding interview, discovery and configuration review to draft one versioned integration definition. It references catalog tools and current gateway policy; it does not copy tool schemas, credentials or authorization rules.
+1. **Integration onboarding:** connect and inspect an upstream, then let an administrator build one or more business workflows from the discovered catalog tools. The builder stores a versioned integration definition that references those tools and current gateway policy; it does not copy tool schemas, credentials or authorization rules.
 2. **Interactive MCP experiences:** optionally publish a constrained declarative UI rendered as an MCP Apps resource. The ordinary MCP tool remains available and is the fallback. UI actions are normal gateway tool calls.
-3. **Business-value measurement:** let an administrator define named workflows and/or standalone tool outcomes. The model may declare a workflow using a gateway tool. MCPcodeaway creates and owns an execution ID, associates later calls explicitly, verifies a configured outcome, and records at most one value event per logical completion.
+3. **Business-value measurement:** let an administrator define named workflows and/or standalone tool outcomes during onboarding. A simple flow builder arranges selected catalog tools in an administrator-chosen display order, identifies required evidence and terminal completion, and records a human-time baseline and its provenance. The visual order describes the business activity; it does not force gateway dispatch order. In v1, the caller explicitly selects a workflow using a gateway tool. MCPcodeaway creates and owns an execution ID, associates later calls explicitly, verifies required evidence and the configured outcome, and records at most one value event per logical completion. Automatic workflow classification or passive sequence matching is a later capability.
 
 The gateway exposes `mcpcodeaway_start_business_execution` for either a published multi-tool workflow or a standalone tool outcome. Both kinds return a gateway-owned execution ID. Only calls carrying that explicit ID can earn business-value credit. Classic and App calls use a gateway-owned attributed-call wrapper; Code Mode carries the ID on `execute_code` and the gateway associates each dispatcher callback with the execution. Hybrid uses both paths; Auto uses whichever route it selects. Missing, invalid, expired or lost context means ordinary tool dispatch may still happen, but it receives no business-value attribution. The ID never authorizes a tool.
 
@@ -18,7 +18,7 @@ Selecting a workflow starts attribution but is not evidence of completion. Compl
 
 Retain Classic-versus-Code token/payload savings as a clearly labelled **technical efficiency** metric. Add business value separately. Keep existing dispatcher security, authentication, authorization, approvals, sensitive-write journaling, tenant isolation and upstream authorization as the authorities.
 
-The first end-to-end slice should be a real multi-tool workflow through `/mcp`: an admin publishes a workflow, the model selects it from the descriptions returned by MCPcodeaway and starts it, two or more calls carry the gateway ID through every execution mode, the gateway verifies one terminal result, and one deduplicated business-value event appears in a basic report. Cross-mode, concurrency and crash-safety acceptance are exit gates before this foundation is declared complete. MCP Apps and polished analytics follow independently.
+The first end-to-end slice should begin in upstream onboarding: an admin builds and publishes a readable multi-tool workflow from the discovered catalog, specifies required evidence and terminal completion, and assigns a sourced manual-time baseline. At runtime, the caller explicitly selects the workflow from descriptions returned by MCPcodeaway and starts it; two or more calls carry the gateway ID through every execution mode. The gateway verifies evidence and the terminal result, then one deduplicated business-value event appears in the report. The builder order is descriptive, not an execution constraint. Cross-mode, concurrency and crash-safety acceptance are exit gates before this foundation is declared complete. MCP Apps and polished analytics follow independently.
 
 ## 2. Findings from the current repository
 
@@ -26,7 +26,7 @@ This is a focused implementation review, not a general capability audit. Status 
 
 | Concern | Current behavior and evidence | Status |
 |---|---|---|
-| Onboarding and AI configuration | `web/app/pages/onboarding.vue` handles connect/inspect, policy/mode configuration, comparison and save. `build_agent_onboarding_prompt` in `src/gateway/upstream_clients.py` asks about transport/spec, auth, operation curation, RBAC/ABAC and execution mode, and offers console/admin-MCP/JSON paths. `build_onboarding_guidance` adds auth setup checklists. The generated object is `UpstreamConfig`. | Implemented. `tests/test_upstream_onboarding.py` and `tests/test_hitl_onboarding_and_abac.py` cover key onboarding flows. No integration manifest, workflow or UI generation exists. |
+| Onboarding and AI configuration | `web/app/pages/onboarding.vue` handles connect/inspect, policy/mode configuration, visual workflow authoring, comparison and save. The onboarding tool catalog includes the per-tool schema digest used to validate a published workflow reference. `build_agent_onboarding_prompt` in `src/gateway/upstream_clients.py` asks about transport/spec, auth, operation curation, RBAC/ABAC and execution mode, and offers the existing configuration paths. | The workflow builder can define multiple flows from enabled catalog tools, their descriptive order, required successful-call evidence, optional bounded result predicates, a terminal result predicate, and a sourced human-time baseline. It lists existing published workflows, adds flows or replaces one by reusing its name, and preserves other definitions. `tests/test_upstream_onboarding.py` verifies schema digests; `web/tests/onboarding-workflow-builder.spec.ts` covers authoring and publication. |
 | OpenAPI and MCP discovery | `_load_openapi_spec`, `_discover_openapi_from_spec`, `_call_openapi`, MCP discovery methods and `DiscoveredTool` normalize tools. `DiscoveredTool` contains qualified name, description, input/output schema, mutability, routing fields, annotations and guidance. `ToolCatalog` owns discovered tools and digests. | Implemented. `tests/test_openapi_generation_golden.py` and onboarding/discovery tests cover generation and invocation. API documentation is not an authorization source. |
 | Tool exposure | `to_mcp_tool_definition` exposes the existing schema; `GatewayRuntime.tools_for_mode` returns mode-specific definitions/stubs. Deferred discovery adds tools through search results. | Implemented. No workflow context argument or Apps UI resource metadata exists. |
 | Execution modes | `tools_for_mode` builds Classic direct tools, Code Mode `execute_code` plus Python stubs, or Hybrid direct mutating tools plus Code Mode reads. Auto resolves execution/discovery through `resolve_dynamic_mode`; the effective route is in `/mcp`. | Implemented. See `src/gateway/server.py`, `src/gateway/catalog.py`, `src/gateway/adaptive_execution.py`; coverage includes `tests/test_gateway_modes_e2e.py` and `tests/test_adaptive_execution.py`. |
@@ -37,7 +37,7 @@ This is a focused implementation review, not a general capability audit. Status 
 | Telemetry and savings | `TelemetryRecorder.record_execution` persists redacted outer runs/subcalls, duration, token estimates and model name when supplied. `/audit/value` and `/audit/analytics` aggregate them. The dashboard has technical efficiency, model cost estimates, mode mix and latency. | Implemented, with estimates and query/retention limits. No workflow execution or business outcome records. |
 | Storage | `audit_runs` stores run JSON; `dynamic_upstreams` stores the current upstream config by name; `gateway_settings` stores keyed JSON; `adaptive_evidence` is tenant scoped. PostgreSQL schema changes use ordered, transactional migrations in `src/gateway/migrations.py`; SQLite bootstraps local tables in `state.py`. | Implemented. Current tables do not provide immutable integration revisions, workflow execution ownership or unique workflow completion events. PostgreSQL is sufficient; no new service is needed. |
 | Hosted MCP Apps | `src/gateway/mcp_protocol.py` defines the current protocol metadata/version and Tasks extension. `/mcp` handles `server/discover`, `tools/list`, `tools/call` and task methods. There is no Apps capability, `resources/list`/`resources/read`, `ui://` retrieval or tool-to-UI metadata path. | Not implemented in gateway. Apps requires protocol changes, not only an onboarding UI. |
-| Console | Relevant pages are `onboarding.vue`, `upstreams.vue`, `approvals.vue`, `audit.vue`, `analytics.vue`, `index.vue` and `settings.vue`. | Implemented for existing operations/metrics; no manifest editor, UI publication or workflow-value dashboard. Preserve `DESIGN.md`, `web/AGENTS.md` and `.agents/rules/ui-craft.md` standards. |
+| Console | Relevant pages are `onboarding.vue`, `upstreams.vue`, `approvals.vue`, `audit.vue`, `analytics.vue`, `index.vue` and `settings.vue`. | Definition authoring is in the catalog-based onboarding workflow builder. The Business Value page is report-only. MCP Apps publication remains out of scope for this view. Preserve `DESIGN.md`, `web/AGENTS.md` and `.agents/rules/ui-craft.md` standards. |
 
 ### Existing token-savings assessment
 
@@ -47,9 +47,19 @@ This is a focused implementation review, not a general capability audit. Status 
 
 **Recommendation:** retain and reposition this feature as Technical Efficiency. Clarify estimate methodology and provider-price assumptions; preserve its history and mode comparisons. Do not turn it into business value or remove it. Report completion, time baseline, review effort and labor assumptions in a separate Business Value view.
 
-## 3. Model-declared intent and workflow execution contract
+## 3. Workflow setup and explicit execution contract
 
-### 3.1 Options and recommendation
+### 3.1 Onboarding workflow builder
+
+Workflow authoring belongs in the upstream onboarding flow after catalog discovery, where the administrator already has the available tools and schemas in view. The first builder is intentionally small and visual: create multiple named workflows for one integration, choose tools from that integration catalog, arrange them in a readable order, set required evidence and a terminal outcome, and record manual baseline minutes with source/confidence. Show a plain-language summary of the measured work before publish. Do not require administrators to author or understand a JSON manifest. The gateway may still store the validated declarative manifest behind this UI.
+
+The selected order is a documentation and organization aid only. It does not impose ordering constraints on calls at runtime, and a workflow may be completed when its unordered required evidence and deterministic terminal predicate are satisfied. In v1, attribution starts only after the caller explicitly selects a published workflow ID; the gateway does not infer workflow type by observing tool sequences. This avoids ambiguous matches when one integration has several workflows with shared tools. A later feature may add sequence-based or other automatic identification with explicit ambiguity handling, but it is not part of this release.
+
+The Business Value page is a report: it explains the measures and displays attributed completions, baselines, provenance and cost coverage. Create and edit workflow definitions in onboarding, not in a raw JSON editor on the report page.
+
+### 3.2 Model-declared intent and workflow execution contract
+
+#### Options and recommendation
 
 | Option | Fit with the actual gateway | Decision |
 |---|---|---|
@@ -107,7 +117,7 @@ The original upstream tool stays exposed for ordinary use. Only its gateway wrap
 
 The model selects only IDs and descriptions provisioned by the administrator. `workflow_id` is required for workflow execution; `tool_value_id` is required for standalone outcome execution. There is no LLM intent-classification step, no free-text intent field and no untracked start call. When no configured definition matches, do not call the start tool; ordinary tools continue as-is without business-value credit.
 
-### 3.2 Execution context propagation by mode
+#### Execution context propagation by mode
 
 | Mode/path | Context carrier | Gateway behavior |
 |---|---|---|
@@ -120,7 +130,7 @@ The model selects only IDs and descriptions provisioned by the administrator. `w
 
 A start call begins attribution but does not reserve or expand tool access. A workflow execution permits wrappers only for its participating tools; a standalone execution permits only its selected tool value. A mismatched wrapper returns an invalid-context error. The caller may call the ordinary original tool separately, subject to normal authorization, but it receives no business-value credit. Each attributed call still checks current tenant, RBAC/scopes, ABAC, server ceiling, effect policy, approvals, rate limits and upstream credentials. Definition membership is an attribution boundary, never an allowlist grant.
 
-### 3.3 Ownership, lifetime and concurrency
+#### Ownership, lifetime and concurrency
 
 Persist owner tenant, caller subject, client ID where stable, workflow ID, immutable definition revision, created/expiry timestamps and state. Validate every supplied execution ID against all owner fields and the authenticated identity. A guessed, cross-tenant, cross-user, expired, revoked, completed or unknown ID returns a generic invalid-context error without disclosing another owner's record. IDs are random and rate-limited, but authorization checks do not depend on secrecy.
 
@@ -394,7 +404,7 @@ Canonical content hash: serialize only the authored integration-definition paylo
 }
 ```
 
-The example output paths are illustrative and must be replaced or confirmed against the discovered upstream output schemas before publication. This is not a general workflow DSL. `participating_tools` bounds which calls can be associated with the execution. `required_evidence` separately lists successful logical tool calls needed to qualify for completion, with optional result predicates; the model/agent still decides call order, and there are no ordering or branching rules. The support example's five-minute baseline explicitly measures successful customer lookup, account review, order-history lookup, and ticket creation. If an administrator intends to value ticket creation alone, they must define a separate ticket-only standalone outcome with a ticket-creation baseline rather than publish this workflow baseline.
+The example output paths are illustrative and must be replaced or confirmed against the discovered upstream output schemas before publication. This is not a general workflow DSL. The order of `participating_tools` preserves the administrator’s visual organization in the onboarding builder, but its runtime meaning is membership only: it bounds which calls can be associated with the execution. `required_evidence` separately lists successful logical tool calls needed to qualify for completion, with optional result predicates; the model/agent may call participating tools in any order, and there are no runtime ordering or branching rules. The support example's five-minute baseline explicitly measures successful customer lookup, account review, order-history lookup, and ticket creation. If an administrator intends to value ticket creation alone, they must define a separate ticket-only standalone outcome with a ticket-creation baseline rather than publish this workflow baseline.
 
 For MVP, each `required_evidence` entry names one participating tool, a bounded minimum count of successful logical calls (initially one), and optionally one deterministic `result_when` predicate. Counts use unique call keys, so retries do not create extra evidence. This is an unordered set of prerequisites, not a sequence.
 
@@ -496,7 +506,7 @@ Business metrics: completed outcomes count deduplicated value events; estimated 
 
 Technical metrics preserve existing `/audit/value` and `/audit/analytics` data, execution mix, token estimates, configured model pricing, tool calls and latency. Clarify the estimate method and avoid a “saved money” headline unless clearly labelled model-cost estimate. Side-by-side experiments remain separately identified.
 
-Console: add manifest/workflow/experience sections to existing onboarding and upstream management; a focused Business Value dashboard; keep `/dashboard/analytics` as Technical Efficiency and `/dashboard/audit` for evidence. No full console redesign. Continue the established component/palette/typography and responsive rules (`375px`, `768px`, `1280px+`) and complete loading/empty/error/permission states.
+Console: put visual workflow authoring, evidence and baseline configuration in upstream onboarding; keep upstream management for lifecycle/review as needed; make Business Value a report-only dashboard; keep `/dashboard/analytics` as Technical Efficiency and `/dashboard/audit` for evidence. No full console redesign. Continue the established component/palette/typography and responsive rules (`375px`, `768px`, `1280px+`) and complete loading/empty/error/permission states.
 
 ## 9. Security, reliability and abuse analysis
 
@@ -525,11 +535,11 @@ The dependency order is: manifest → attributed execution/call identity → out
 
 | Phase | Product outcome and scope | Main code/persistence surface | Complexity |
 |---|---|---|---|
-| 1. Manifest foundation | Strict manifest model, tool refs/digests, draft review/validation/publish/versioning; no workflow DSL. Onboarding proposes optional sections. | `upstream_clients.py`, `config.py`, `catalog.py`, `server.py`, `state.py`, `migrations.py`; onboarding/upstream pages. New version table and admin endpoints. | Medium |
+| 1. Manifest and onboarding builder | Strict manifest model, tool refs/digests, draft review/validation/publish/versioning; onboarding provides a visual catalog-based workflow builder with display ordering, evidence, completion and baseline fields; no workflow DSL or raw JSON authoring in Business Value. | `upstream_clients.py`, `config.py`, `catalog.py`, `server.py`, `state.py`, `migrations.py`; onboarding/upstream pages. New version table and admin endpoints. | Medium |
 | 2. Explicit execution context and dispatch identity | Generalized `mcpcodeaway_start_business_execution`; closed wrapper envelope without upstream schema mutation; owner-bound execution ID; per-dispatch call identity; serialized sequential writes and orthogonal approval state. | `catalog.py`, `server.py` (`tools_for_mode`, `list_tools_for_request`, `mcp_endpoint`, Code callbacks/direct call), `dispatcher.py`, `state.py`, migrations. | Large |
 | 3. Outcome evidence and value ledger | Deterministic terminal predicates; link call/run/journal evidence; complete/failed/incomplete/expired/unknown states; standalone tool outcomes and exclusive attribution; baselines and one deduped value record. | `dispatcher.py`, `server.py`, `telemetry.py`, `state.py`, migrations; additive APIs/admin definitions. | Large |
 | 4. Optional MCP Apps | Negotiate stable Apps extension; resources list/read, resource URI/tool `_meta`, declarative renderer, host-mediated calls, fallback. Apps optional to workflow tracking. | `mcp_protocol.py`, `server.py`, `catalog.py`; renderer/resource module and bundled assets; manifest schema; APIs for preview. | Large |
-| 5. Analytics and console | Separate Business Value and Technical Efficiency, provenance/confidence/cost coverage; onboarding review/editor and focused dashboards. | `telemetry.py`, `server.py`, `web/app/pages/onboarding.vue`, `upstreams.vue`, `analytics.vue`, `index.vue`; `DESIGN.md` patterns. | Medium |
+| 5. Analytics and console | Separate Business Value and Technical Efficiency, provenance/confidence/cost coverage; visual workflow authoring and review in onboarding, with Business Value as a report. | `telemetry.py`, `server.py`, `web/app/pages/onboarding.vue`, `upstreams.vue`, `analytics.vue`, `index.vue`; `DESIGN.md` patterns. | Medium |
 | 6. Compatibility and measurement expansion | Broader client matrix, human validation workflow, sampled baseline evidence and optional external cost imports after core reliability gates. | Existing tests, local/Postgres acceptance scripts, supported client docs; only add integrations if customers provide source contracts. | Medium–large |
 
 Every phase keeps existing mode behavior and security gates unless a narrowly reviewed change is necessary to carry attribution. Do not add another authorization path, identity portal, workflow engine, infrastructure service or credential store.
@@ -538,14 +548,14 @@ Every phase keeps existing mode behavior and security gates unless a narrowly re
 
 Implement this as the first product proof after the manifest skeleton; keep it on the real `/mcp` and dispatcher path:
 
-1. Admin defines/publishes `handle_customer_support_request`, references current `find_customer`, `get_account`, `get_order_history`, and `create_ticket` tools, selects a five-minute unvalidated baseline explicitly covering all four operations, and configures required evidence for the three successful lookups plus `/ticket/id` as terminal evidence and a ticket-ID dedupe identity. Existing tool effects/approval policies are configured separately in upstream settings.
+1. During onboarding, the admin creates `handle_customer_support_request` from the discovered catalog. The builder displays `find_customer`, `get_account`, `get_order_history`, and `create_ticket` in an editable descriptive order, sets required evidence for all three successful lookups, chooses successful ticket creation with `/ticket/id` as terminal evidence and a ticket-ID dedupe identity, and records a five-minute unvalidated baseline that explicitly covers the three lookups plus ticket creation. This is a multi-step support workflow, not a ticket-only baseline. Existing tool effects/approval policies are configured separately in upstream settings.
 2. `tools/list` exposes `mcpcodeaway_start_business_execution` with workflow IDs/descriptions visible to the caller and gateway-owned attributed wrappers for eligible tools. The model selects a published `workflow_id`, calls start, and receives a random `business_execution_id` tied to tenant/caller and manifest revision.
 3. The model performs the three required reads and one protected ticket write. Classic and App wrapper calls carry the ID in their closed envelope. Code Mode carries it in the gateway-owned `execute_code` envelope and callbacks inherit the binding. Hybrid and Auto route the same context through their selected direct/Code paths. Dispatcher auth/policy/approval behavior is unchanged.
 4. Gateway durably records each `workflow_call_id` before dispatch and links outer request ID, Code Mode telemetry run/subcall when available, dispatcher call and sensitive-write journal operation ID. Completion requires successful evidence for all three lookup calls and the final ticket result satisfying the admin predicate after journal status is `succeeded`; atomically transition once to completed and insert one `business_value_event` under execution and optional stable-outcome uniqueness.
 5. Analytics shows one completed workflow, one five-minute estimated manual baseline, source/confidence, human review/rework if captured, and independent gateway duration/tool count. Duplicate request, result replay or a second terminal call cannot add a second value event. Unknown journal/evidence state shows no value credit.
 6. Repeat the same acceptance scenario in all execution routes where available; run a tenant/caller crossing and a policy-change denial case. MCP Apps can be layered on later and must invoke this same start/call contract.
 
-This proves the essential product contract, including cross-call/multi-tool attribution, before building any UI experience. It is not a standalone demo and does not require changing token-savings behavior.
+This proves the essential product contract, including the onboarding workflow builder and cross-call/multi-tool attribution. It is not a standalone demo and does not require changing token-savings behavior.
 
 ## 12. Risks, assumptions, open decisions and non-goals
 
@@ -570,7 +580,7 @@ This proves the essential product contract, including cross-call/multi-tool attr
 
 ### Non-goals
 
-- General agent orchestration, arbitrary workflow DSL, arbitrary generated JavaScript, tool-sequence intent inference, automatic authorization/approval, or automatic write execution during onboarding.
+- General agent orchestration, arbitrary workflow DSL, arbitrary generated JavaScript, automatic workflow classification in v1, automatic authorization/approval, or automatic write execution during onboarding.
 - Making Apps/UI mandatory for tools or business value.
 - Replacing identity providers, upstream authorization, `HostDispatcher`, sensitive-write journal, existing approval path, or current technical analytics.
 - Claiming LLM/provider charges or cash savings without an actual cost source.

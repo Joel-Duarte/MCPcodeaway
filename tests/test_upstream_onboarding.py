@@ -19,7 +19,11 @@ from gateway.config import GatewaySettings, UpstreamConfig, UpstreamRegistry
 from gateway.mcp_protocol import request_headers, request_meta
 from gateway.server import GatewayRuntime, create_gateway_app
 from gateway.state import SQLiteAuditStore
-from gateway.upstream_clients import DiscoveredTool, build_onboarding_guidance
+from gateway.upstream_clients import (
+    DiscoveredTool,
+    build_onboarding_guidance,
+    compute_schema_digest,
+)
 
 
 def test_demo_upstream_tool_details_and_approval_policies_are_complete() -> None:
@@ -293,6 +297,10 @@ async def test_dynamic_onboarding_stdio_http_and_swagger_hot_reload(tmp_path) ->
             ins_body = inspect_resp.json()
             assert ins_body["inspection"]["tool_count"] == 1
             assert "upstreams:" in ins_body["inspection"]["yaml_snippet"]
+            inspected_tool = ins_body["inspection"]["tools"][0]
+            assert inspected_tool["schema_sha256"] == compute_schema_digest(
+                [DiscoveredTool.model_validate(inspected_tool)]
+            )
 
             challenge = await gw.post(
                 "/admin/upstreams/inspect",

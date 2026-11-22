@@ -2,6 +2,12 @@
 
 This plan implements the architecture in [Interactive MCP Experiences and Business Value Design](interactive-experiences-business-value-design.md). It is intentionally scoped to MCPcodeaway's gateway and console; it does not introduce an agent orchestrator, workflow engine, credential service or external event bus.
 
+## Product experience contract
+
+Workflow definitions are created during upstream onboarding from the tools in the discovered catalog. The first release provides a simple visual builder: an administrator can create multiple workflows for one integration, choose tools, arrange them in a readable descriptive order, mark required evidence, choose terminal completion evidence and set a human-time baseline with its source/confidence. The order is for the administrator to explain the work; it is not an enforced runtime sequence. Business Value is a report-only view. The manifest remains a storage/API format behind the builder and is not the administrator-facing authoring experience.
+
+Attribution is explicit in v1: the caller selects a published workflow ID before attributed calls begin. The gateway does not passively infer which workflow a tool sequence represents. Automatic matching/classification may be designed later, after ambiguity and overlap behavior are specified.
+
 ## Implementation invariants
 
 - Tool authorization remains independent from workflow attribution. The ID is never a grant.
@@ -29,7 +35,7 @@ sequenceDiagram
     M->>G: start_business_execution(kind=workflow, workflow_id)
     G->>S: create owner-bound execution pinned to immutable revision
     G-->>M: business_execution_id
-    loop Required calls in model-chosen order
+    loop Participating calls in any order
         M->>G: attributed wrapper(execution ID, original arguments)
         G->>S: bind request ID/body and persist workflow_call intent
         G->>D: invoke original tool (clean arguments)
@@ -93,7 +99,7 @@ P4 and P5 follow the P3 foundation gates. Do not defer cross-mode, concurrency o
 
 ### Product outcome
 
-An administrator can generate, inspect, validate, edit and publish a versioned integration definition that references the existing catalog. Integrations without workflows or UIs remain valid.
+During upstream onboarding, an administrator can visually create, inspect, validate, edit and publish a versioned integration definition that references the current catalog. The builder shows the selected tool flow in an administrator-chosen order, required evidence, terminal outcome, and human baseline/provenance in plain language. One upstream may have multiple workflows. Integrations without workflows or UIs remain valid; the raw manifest is an internal representation, not the workflow authoring UI.
 
 ### Tasks and likely files
 
@@ -126,15 +132,15 @@ An administrator can generate, inspect, validate, edit and publish a versioned i
    - `POST /admin/integration-definitions/{upstream}/publish`
    - `POST /admin/integration-definitions/{upstream}/rollback`
    - Apply `_authorize_control_plane(..., require_admin_role=True)` to writes and viewer-enabled admin authorization for read-only routes. Resolve tenant scope using existing helpers.
-5. **Onboarding generation** in `build_agent_onboarding_prompt` / `build_onboarding_guidance` in `src/gateway/upstream_clients.py`:
-   - Ask for intended tasks, user input/output, candidate workflows, baseline source, UI needs and completion evidence.
-   - Ask the model for manifest JSON with optional empty arrays when not applicable.
-   - Keep existing auth/operation/RBAC/effect/approval questions authoritative and preserve the current UpstreamConfig output path.
-   - AI-generated definition stays draft. Do not execute writes or infer effect/approval.
-6. **Console review** in `web/app/pages/onboarding.vue` and `web/app/pages/upstreams.vue`:
-   - Draft validation errors, tool/schema references, workflow assumptions and preview placeholder.
-   - Explicit publish/rollback and stale-schema warning.
-   - Do not build full Apps runtime preview in this phase.
+5. **Onboarding workflow builder** in `web/app/pages/onboarding.vue`:
+   - Use the just-inspected catalog as the tool source; support multiple named workflows per upstream.
+   - Let administrators select tools and move them in a readable descriptive order. Do not interpret this order as runtime sequencing.
+   - Let administrators mark required successful tool-call evidence and optional bounded result predicates, separately choose terminal completion evidence, and enter baseline minutes/source/confidence.
+   - Present a plain-language preview stating exactly which business activity receives credit. Keep JSON out of the primary authoring flow.
+6. **Definition lifecycle and upstream review** in `web/app/pages/onboarding.vue` and `web/app/pages/upstreams.vue`:
+   - Show validation errors, tool/schema references, evidence/terminal assumptions and stale-schema warnings in ordinary UI language.
+   - Provide explicit save/publish/rollback through the existing definition APIs; keep published revisions immutable.
+   - Preserve existing auth/operation/RBAC/effect/approval configuration as authoritative. Do not execute writes or infer effect/approval during onboarding.
 
 ### Contract decisions
 
@@ -150,7 +156,7 @@ An administrator can generate, inspect, validate, edit and publish a versioned i
 - Store tests: immutable publish, canonical hash reproducibility/exclusion of derived fields, revision sequencing, append-only rollback history, tenant separation, SQLite parity; PostgreSQL migration/schema verification.
 - Admin API tests: unauthorized writes denied, viewer can read only where policy allows, tenant scope cannot be overridden.
 - Onboarding tests prove prompt includes optional manifest and preserves existing UpstreamConfig/security review behavior.
-- **Accept when:** an operator can publish a minimal tools-only integration; manifest revision is immutable and retrievable by tenant/upstream; no upstream config/tool schemas or policy behavior is changed by publication.
+- **Accept when:** an operator can publish a minimal tools-only integration and can author a workflow through the catalog-based builder without editing JSON; the UI makes its selected tools, required evidence, terminal outcome, descriptive order and human baseline clear; the manifest revision is immutable and retrievable by tenant/upstream; no upstream config/tool schemas or policy behavior is changed by publication.
 
 ### Dependencies and risks
 
@@ -160,7 +166,7 @@ An administrator can generate, inspect, validate, edit and publish a versioned i
 
 ### Deliberately excluded
 
-Workflow starts, execution records, MCP Apps resources, generated JavaScript, business-value reporting and writes during onboarding.
+Workflow execution records, MCP Apps resources, generated JavaScript, business-value reporting and writes during onboarding.
 
 ## Phase 2 — Explicit execution context and dispatch identity
 
@@ -320,14 +326,14 @@ Arbitrary generated JavaScript, external iframe URLs, device permissions, app-on
 
 ### Product outcome
 
-Administrators can distinguish business outcomes and assumptions from gateway efficiency and inspect the evidence behind each figure.
+Administrators can distinguish business outcomes and assumptions from gateway efficiency and inspect the evidence behind each figure. Workflow authoring remains in onboarding; this phase makes Business Value a report-only view.
 
 ### Tasks and likely files
 
 1. Add tenant-scoped read/report methods in `AuditStore`; aggregate business-value events at query time initially, with bounded windows and indexes rather than a new analytics store.
 2. Add admin API for business-value summary and workflow/integration breakdown in `src/gateway/server.py`, using current control-plane authorization and `_resolve_audit_tenant_scope`.
 3. Extend `src/gateway/telemetry.py` with output fields for verified vs user-reported completions, estimate/validated minutes, review/rework, costs with provenance/coverage, success/failed/partial/unknown counts and baseline version. Preserve `/audit/value` and `/audit/analytics` contracts or add new namespaced report rather than silently redefining token fields.
-4. Add focused onboarding/upstream management sections in `web/app/pages/onboarding.vue` and `upstreams.vue`: draft status, workflow baselines, predicate review, tool mappings, UI preview/publication status.
+4. Keep workflow creation/editing in the catalog-based onboarding builder; use `upstreams.vue` for published definition status and lifecycle review, not as a competing workflow editor.
 5. Add Business Value page/report, keeping `web/app/pages/analytics.vue` for Technical Efficiency; optional overview card in `index.vue`. Keep `/audit` for per-run inspection.
 6. Label every value with evidence level and source. Display cost coverage (LLM/upstream/gateway/human), assumptions and missing values. Do not label net estimated labor value “cash saved.”
 7. Follow `DESIGN.md`, `web/AGENTS.md` responsive breakpoints and complete page-state requirements.
