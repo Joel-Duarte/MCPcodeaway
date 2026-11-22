@@ -135,7 +135,7 @@ the upstream's configured `auth_type`:
 | `delegated_token` | Exchange the caller token for a downstream token (Entra OBO or RFC 8693); cache is scoped by caller/tenant/audience. |
 | `client_credentials` | Obtain or reuse a gateway service token from the client-credentials provider/cache. |
 | `api_key` / `bearer_secret` | Resolve configured secret reference through `SecretResolver`; attach only to the outbound host request. |
-| `user_oauth` / `user_api_key` | Load the caller's encrypted credential from `CredentialVault`; refresh OAuth when needed. If missing, return an actionable connect link/form. |
+| `user_oauth` / `user_api_key` | Load the caller's OAuth credential from process memory (PostgreSQL backend) or encrypted API key from `CredentialVault`; refresh OAuth when needed. Missing credentials return an actionable connect link/form. PostgreSQL-backed OAuth requires reconnect after restart or when routed to another replica. |
 | `none` | Send no downstream credential; gateway identity and policy still apply. |
 
 Secret and URL validation is performed before outbound use. In particular,
@@ -387,8 +387,9 @@ Prometheus-format metrics when enabled; `/audit/*` exposes caller-scoped audit
 and value views; admin APIs provide broader analytics, traces, archive, and
 retention controls. Optional OpenTelemetry spans/events can be exported to an
 OTLP endpoint. Redis is used for selected cross-request coordination and cache
-state, not MCP sessions. SQLite/Postgres owns durable audit and credential
-records.
+state, not MCP sessions. SQLite/Postgres owns durable audit and encrypted
+non-OAuth user credential records; PostgreSQL also coordinates approvals and
+sensitive writes. OAuth tokens are process-local and never stored in PostgreSQL.
 
 Owners: `gateway.observability`, `gateway.telemetry`, `gateway.state`, and the
 audit/admin routes in `gateway.server`.

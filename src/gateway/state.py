@@ -1766,161 +1766,10 @@ class PostgresAuditStore:
 
     async def init(self) -> None:
         pool = await self._get_pool()
-        await pool.execute(
-            """CREATE TABLE IF NOT EXISTS tool_guidance (
-                tenant_id TEXT NOT NULL, tool_name TEXT NOT NULL, payload_json TEXT NOT NULL,
-                PRIMARY KEY (tenant_id, tool_name))"""
-        )
-        await pool.execute(
-            """CREATE TABLE IF NOT EXISTS adaptive_evidence (
-                tenant_id TEXT NOT NULL, evidence_id TEXT NOT NULL, created_at TEXT NOT NULL,
-                payload_json TEXT NOT NULL, PRIMARY KEY (tenant_id, evidence_id))"""
-        )
-        await pool.execute(
-            """CREATE TABLE IF NOT EXISTS consumed_request_state_nonces (
-                nonce TEXT PRIMARY KEY, expires_at TEXT NOT NULL)"""
-        )
-        await pool.execute(
-            """CREATE TABLE IF NOT EXISTS tool_approvals (
-                approval_id TEXT PRIMARY KEY,
-                tenant_id TEXT NOT NULL,
-                requester_sub TEXT NOT NULL,
-                upstream_name TEXT NOT NULL,
-                tool_name TEXT NOT NULL,
-                argument_digest TEXT NOT NULL,
-                policy_version INTEGER NOT NULL,
-                approver_groups_json TEXT NOT NULL,
-                action_summary TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                decided_by TEXT,
-                decided_at TEXT,
-                execution_started_at TEXT,
-                completed_at TEXT
-            )"""
-        )
-        await pool.execute(
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_approvals_active_action
-            ON tool_approvals (tenant_id, requester_sub, upstream_name, tool_name,
-                               argument_digest, policy_version)
-            WHERE status IN ('pending', 'approved', 'denied')"""
-        )
-        await pool.execute(
-            """CREATE INDEX IF NOT EXISTS idx_tool_approvals_tenant_status_created
-            ON tool_approvals (tenant_id, status, created_at DESC)"""
-        )
-        await pool.execute(
-            """CREATE TABLE IF NOT EXISTS recovery_operations (
-                operation_id TEXT PRIMARY KEY,
-                tenant_id TEXT NOT NULL,
-                requester_sub TEXT NOT NULL,
-                client_id TEXT NOT NULL DEFAULT '',
-                upstream_name TEXT NOT NULL,
-                tool_name TEXT NOT NULL,
-                dedupe_key TEXT NOT NULL UNIQUE,
-                request_digest TEXT NOT NULL,
-                payload_ciphertext TEXT NOT NULL,
-                result_ciphertext TEXT,
-                status TEXT NOT NULL,
-                attempt_count INTEGER NOT NULL,
-                max_attempts INTEGER NOT NULL,
-                next_attempt_at TEXT,
-                recovery_deadline TEXT NOT NULL,
-                lease_token TEXT,
-                lease_expires_at TEXT,
-                cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
-                last_error_type TEXT,
-                last_error TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL
-            )"""
-        )
-        await pool.execute(
-            """CREATE TABLE IF NOT EXISTS sensitive_write_audits (
-                operation_id TEXT PRIMARY KEY,
-                tenant_id TEXT NOT NULL,
-                caller_sub TEXT NOT NULL,
-                upstream_name TEXT NOT NULL,
-                tool_name TEXT NOT NULL,
-                request_digest TEXT NOT NULL,
-                correlation_id TEXT NOT NULL,
-                dedupe_key TEXT NOT NULL UNIQUE,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )"""
-        )
-        await pool.execute(
-            """CREATE INDEX IF NOT EXISTS idx_recovery_operations_claim
-            ON recovery_operations (status, next_attempt_at, lease_expires_at, recovery_deadline)"""
-        )
-        await pool.execute(
-            """CREATE INDEX IF NOT EXISTS idx_recovery_operations_owner
-            ON recovery_operations (tenant_id, requester_sub, client_id, created_at DESC)"""
-        )
-        await pool.execute(
-            """
-            CREATE TABLE IF NOT EXISTS audit_runs (
-                run_id TEXT PRIMARY KEY,
-                tenant_id TEXT,
-                user_sub TEXT,
-                mode TEXT,
-                created_at TEXT NOT NULL,
-                payload_json TEXT NOT NULL
-            )
-            """
-        )
-        await pool.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_audit_runs_tenant_created
-            ON audit_runs(tenant_id, created_at DESC)
-            """
-        )
-        await pool.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dynamic_upstreams (
-                name TEXT PRIMARY KEY,
-                config_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        await pool.execute(
-            """
-            CREATE TABLE IF NOT EXISTS model_pricing (
-                model_name TEXT PRIMARY KEY,
-                input_per_1m_usd DOUBLE PRECISION NOT NULL,
-                output_per_1m_usd DOUBLE PRECISION NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        await pool.execute(
-            """
-            CREATE TABLE IF NOT EXISTS gateway_secrets (
-                name TEXT PRIMARY KEY,
-                ciphertext TEXT NOT NULL,
-                updated_by TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        await pool.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_upstream_credentials (
-                tenant_id TEXT NOT NULL,
-                user_sub TEXT NOT NULL,
-                upstream_name TEXT NOT NULL,
-                auth_kind TEXT NOT NULL,
-                ciphertext TEXT NOT NULL,
-                expires_at BIGINT,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (tenant_id, user_sub, upstream_name)
-            )
-            """
-        )
+        async with pool.acquire() as conn:
+            from gateway.migrations import verify_schema
+
+            await verify_schema(conn)
 
     async def record_run(self, run: dict[str, Any]) -> None:
         pool = await self._get_pool()
@@ -2161,26 +2010,13 @@ class PostgresAuditStore:
                 json.dumps(guidance),
             )
 
-    async def _ensure_settings_table(self, pool: Any) -> None:
-        await pool.execute(
-            """
-            CREATE TABLE IF NOT EXISTS gateway_settings (
-                key TEXT PRIMARY KEY,
-                value_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-
     async def get_setting(self, key: str) -> dict[str, Any] | None:
         pool = await self._get_pool()
-        await self._ensure_settings_table(pool)
         row = await pool.fetchrow("SELECT value_json FROM gateway_settings WHERE key = $1", key)
         return self._decode_json(row["value_json"]) if row is not None else None
 
     async def save_setting(self, key: str, value: dict[str, Any]) -> None:
         pool = await self._get_pool()
-        await self._ensure_settings_table(pool)
         now = datetime.now(UTC).isoformat()
         payload = json.dumps(value, default=str)
         await pool.execute(

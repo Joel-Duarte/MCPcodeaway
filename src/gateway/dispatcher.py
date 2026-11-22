@@ -546,7 +546,9 @@ class HostDispatcher:
     async def _resolve_oauth_client_secret(self, upstream: UpstreamConfig) -> str | None:
         if upstream.oauth and upstream.oauth.client_secret_ref:
             return await self.secret_resolver.resolve(
-                upstream.oauth.client_secret_ref, allow_bare_env=True
+                upstream.oauth.client_secret_ref,
+                allow_bare_env=True,
+                allow_gateway_vault=False,
             )
         return None
 

@@ -268,7 +268,9 @@ def create_user_connect_router(
         }
         if oauth.client_secret_ref:
             form_data["client_secret"] = await secret_resolver.resolve(
-                oauth.client_secret_ref, allow_bare_env=True
+                oauth.client_secret_ref,
+                allow_bare_env=True,
+                allow_gateway_vault=False,
             )
 
         if http_client is not None:
@@ -310,8 +312,9 @@ def create_user_connect_router(
         return _render_html(
             "Connected",
             f"<h1>{html.escape(upstream.name)} Connected</h1>"
-            "<p>Your OAuth authorization succeeded and is encrypted at rest. "
-            "You can close this tab and retry your agent request.</p>",
+            "<p>Your OAuth authorization succeeded. You can close this tab and "
+            "retry your agent request. Reconnect if this gateway process restarts "
+            "or a different replica handles the request.</p>",
         )
 
     @router.get("/me/connections")

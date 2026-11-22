@@ -259,16 +259,40 @@ async def test_postgres_audit_store_crud_and_optional_dep(
 ) -> None:
     class FakePgPool:
         def __init__(self) -> None:
-            self.ddl: list[str] = []
+            self.runtime_sql: list[str] = []
             self.runs: dict[str, dict[str, Any]] = {}
             self.upstreams: dict[str, dict[str, Any]] = {}
             self.closed = False
 
+        class Connection:
+            async def __aenter__(self) -> FakePgPool.Connection:
+                return self
+
+            async def __aexit__(self, *_args: Any) -> None:
+                return None
+
+            async def fetchval(self, sql: str, *_args: Any) -> Any:
+                if "to_regclass" in sql:
+                    return "mcpcodeaway_schema_migrations"
+                if "MAX(version)" in sql:
+                    return 2
+                raise AssertionError(f"Unexpected fetchval SQL: {sql}")
+
+            async def fetch(self, _sql: str, tables: list[str]) -> list[dict[str, str]]:
+                from gateway.migrations import EXPECTED_COLUMNS
+
+                return [
+                    {"table_name": table, "column_name": column}
+                    for table in tables
+                    for column in EXPECTED_COLUMNS[table]
+                ]
+
+        def acquire(self) -> FakePgPool.Connection:
+            return self.Connection()
+
         async def execute(self, sql: str, *args: Any) -> str:
             norm = " ".join(sql.split())
-            if norm.startswith("CREATE"):
-                self.ddl.append(norm)
-                return "CREATE TABLE"
+            self.runtime_sql.append(norm)
             if norm.startswith("INSERT INTO audit_runs"):
                 self.runs[args[0]] = json.loads(args[5])
                 return "INSERT 0 1"
@@ -309,8 +333,7 @@ async def test_postgres_audit_store_crud_and_optional_dep(
     store = PostgresAuditStore("postgresql://user:pass@localhost/db", pool=pool)
     assert store.dsn == "postgresql://user:pass@localhost/db?sslmode=verify-full"
     await store.init()
-    assert len(pool.ddl) >= 7
-    assert any("adaptive_evidence" in ddl for ddl in pool.ddl)
+    assert pool.runtime_sql == []
 
     await store.record_run(
         {"run_id": "r1", "tenant_id": "t1", "created_at": "2026-01-01T00:00:01Z"}

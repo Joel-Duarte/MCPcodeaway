@@ -17,7 +17,7 @@ from gateway.crypto import (
     verify_connect_ticket,
 )
 from gateway.secrets import CredentialVault, SecretResolutionError, SecretResolver
-from gateway.state import SQLiteAuditStore
+from gateway.state import PostgresAuditStore, SQLiteAuditStore
 
 
 def _b64_key(seed: bytes) -> str:
@@ -116,9 +116,32 @@ async def test_secret_resolver_env_file_vault_akv_hcv(
         assert await resolver.resolve("TEST_RESOLVER_ENV", allow_bare_env=True) == "env-secret-456"
         assert await resolver.resolve(f"file://{allowed_file}") == "file-secret-123"
         assert await resolver.resolve("vault://stripe_key") == "sk_live_vault_789"
+        with pytest.raises(SecretResolutionError, match="OAuth client secrets"):
+            await resolver.resolve("vault://stripe_key", allow_gateway_vault=False)
         assert await resolver.resolve("akv://myvault/mysecret") == "akv-secret-111"
         assert await resolver.resolve("hcv://kv/prod/mcp#token") == "hcv-secret-222"
 
         with pytest.raises(SecretResolutionError):
             await resolver.resolve(f"file://{outside_file}")
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_credential_vault_keeps_oauth_tokens_out_of_store() -> None:
+    vault = CredentialVault(
+        store=PostgresAuditStore("postgresql://unused", pool=object()),
+        cipher=EnvelopeCipher(f"k1:{_b64_key(b'0123456789abcdef')}"),
+    )
+    await vault.save_user_credential(
+        tenant_id="tenant-a",
+        user_sub="user-a",
+        upstream_name="upstream-a",
+        auth_kind="user_oauth",
+        payload={"access_token": "access-secret", "refresh_token": "refresh-secret"},
+    )
+    credential = await vault.load_user_credential(
+        tenant_id="tenant-a", user_sub="user-a", upstream_name="upstream-a"
+    )
+    assert credential is not None
+    assert credential["payload"]["access_token"] == "access-secret"
+    assert credential["payload"]["refresh_token"] == "refresh-secret"

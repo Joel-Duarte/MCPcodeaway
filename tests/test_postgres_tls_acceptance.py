@@ -105,7 +105,7 @@ async def test_untrusted_ca_wrong_hostname_and_bad_password_fail_closed(
     assert Path(ca_file).is_file()
 
 
-async def test_gateway_role_is_not_superuser_and_missing_schema_create_fails(
+async def test_gateway_runtime_role_is_not_superuser_or_ddl_capable(
     tls_acceptance_config,
 ) -> None:
     dsn, _ca_file = tls_acceptance_config
@@ -122,8 +122,17 @@ async def test_gateway_role_is_not_superuser_and_missing_schema_create_fails(
     limited = urlunsplit(
         parsed._replace(netloc=parsed.netloc.replace("gateway_test:", "gateway_limited:"))
     )
+    limited_connection = await asyncpg.connect(limited)
+    try:
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await limited_connection.execute(
+                "CREATE TABLE restricted.runtime_must_not_create (id INTEGER)"
+            )
+    finally:
+        await limited_connection.close()
+
     limited_store = PostgresAuditStore(limited)
-    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+    with pytest.raises(RuntimeError, match="gateway requires version 2"):
         await limited_store.init()
     await limited_store.close()
 

@@ -26,15 +26,24 @@ credentials were available, and no cloud infrastructure was provisioned.
 
 ## Schema and database role gate
 
-`PostgresAuditStore.init()` executes `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`
-for application tables at process startup. There is no versioned schema migration command or
-separate migration role in this repository. Therefore the runtime role currently needs schema
-creation privileges during runtime startup. Local TLS acceptance uses a non-superuser role,
-and confirms that a role lacking schema creation rights cannot initialize the store. This is not a
-DML-only least-privilege runtime contract. Before production deployment, the service owner must
-choose a reviewed schema ownership/migration procedure and restrict the runtime grants accordingly;
-the application currently cannot use that restricted role without a separate schema initialization
-step. This is an explicit deployment gate, not a claim of completed least-privilege validation.
+PostgreSQL DDL is applied only by the explicit versioned migration command:
+
+```sh
+MCP_POSTGRES_MIGRATION_DSN='<migration DSN from deployment secret storage>' \
+  uv run python -m gateway.migrations upgrade
+```
+
+Run it as a one-shot deployment step before rolling out gateway replicas. The current schema is
+version 2. The command serializes concurrent migration jobs with a PostgreSQL advisory lock,
+reports the version transition, and exits nonzero if migration fails. The migration DSN and
+runtime DSN must resolve to the same configured `search_path` schema.
+
+`PostgresAuditStore.init()` now verifies connectivity, schema version, and required columns. It
+does not create or alter tables or indexes. The runtime role needs only application DML and
+`SELECT` on the migration version table; the operations role can inspect the restricted
+`sensitive_write_operations` view. Migration ownership and grants for an existing installation
+must be prepared by a DBA. Local TLS acceptance still needs to be rerun with a migrated database
+and the restricted runtime role; its prior findings below predate this separation.
 
 ## Local evidence
 
@@ -55,13 +64,15 @@ failover, backup, or restore behavior.
 
 Run a separate, approved acceptance against a disposable managed database before production:
 
-1. Connect from the production network path using the provider-issued CA and DNS name with
+1. Run the migration job against a disposable managed database using the migration role; then
+   start a gateway using the DML-only runtime role and verify startup succeeds without DDL rights.
+2. Connect from the production network path using the provider-issued CA and DNS name with
    `sslmode=verify-full`.
-2. Verify the chosen runtime and schema-initialization grants against the reviewed schema lifecycle.
-3. Confirm pool sizing against replica count, rollout surge, worker count and provider connection
+3. Verify the chosen runtime and migration grants against the reviewed schema lifecycle.
+4. Confirm pool sizing against replica count, rollout surge, worker count and provider connection
    limits; observe connection and command timeout behavior.
-4. Exercise a safe maintenance/failover event and confirm readiness recovery and journal safety.
-5. Restore a backup into a disposable database and verify required journal and approval records.
+5. Exercise a safe maintenance/failover event and confirm readiness recovery and journal safety.
+6. Restore a backup into a disposable database and verify required journal and approval records.
 
 These provider-specific checks require a real endpoint and approved test environment. They are not
 represented by the local simulation or Kubernetes tests.

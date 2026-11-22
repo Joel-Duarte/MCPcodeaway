@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -13,7 +15,7 @@ import httpx
 
 from gateway.config import GatewaySettings
 from gateway.crypto import CryptoError, EnvelopeCipher
-from gateway.state import AuditStore
+from gateway.state import AuditStore, PostgresAuditStore
 
 
 class SecretResolutionError(Exception):
@@ -54,7 +56,13 @@ class SecretResolver:
         else:
             self._cache.pop(ref, None)
 
-    async def resolve(self, ref: str, *, allow_bare_env: bool = False) -> str:
+    async def resolve(
+        self,
+        ref: str,
+        *,
+        allow_bare_env: bool = False,
+        allow_gateway_vault: bool = True,
+    ) -> str:
         """Resolve a secret reference URI to its plaintext value."""
         raw = (ref or "").strip()
         if not raw:
@@ -82,6 +90,11 @@ class SecretResolver:
             return self._resolve_file(rest)
 
         if scheme == "vault":
+            if not allow_gateway_vault:
+                raise SecretResolutionError(
+                    "OAuth client secrets must use an external secret provider, "
+                    "not gateway vault storage"
+                )
             return await self._resolve_gateway_vault(rest)
 
         now = time.monotonic()
@@ -199,11 +212,13 @@ class SecretResolver:
 
 
 class CredentialVault:
-    """Stores and retrieves envelope-encrypted per-user upstream credentials."""
+    """Stores encrypted user credentials; PostgreSQL-backed OAuth stays process-local."""
 
     def __init__(self, *, store: AuditStore, cipher: EnvelopeCipher) -> None:
         self.store = store
         self.cipher = cipher
+        self._oauth_credentials: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._oauth_lock = asyncio.Lock()
 
     async def save_gateway_secret(self, name: str, plaintext: str, *, updated_by: str = "") -> None:
         ct = self.cipher.encrypt(plaintext, aad=_secret_aad(name))
@@ -219,7 +234,17 @@ class CredentialVault:
         payload: dict[str, Any],
         expires_at: int | None = None,
     ) -> None:
+        """Persist encrypted credentials except OAuth tokens for PostgreSQL stores."""
         raw = json.dumps(payload, separators=(",", ":"))
+        if auth_kind == "user_oauth" and isinstance(self.store, PostgresAuditStore):
+            async with self._oauth_lock:
+                self._oauth_credentials[(tenant_id, user_sub, upstream_name)] = {
+                    "auth_kind": auth_kind,
+                    "expires_at": expires_at,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                    "payload": json.loads(raw),
+                }
+            return
         ct = self.cipher.encrypt(raw, aad=_user_cred_aad(tenant_id, user_sub, upstream_name))
         await self.store.set_user_credential(
             tenant_id,
@@ -237,6 +262,12 @@ class CredentialVault:
         user_sub: str,
         upstream_name: str,
     ) -> dict[str, Any] | None:
+        key = (tenant_id, user_sub, upstream_name)
+        if isinstance(self.store, PostgresAuditStore):
+            async with self._oauth_lock:
+                oauth_record = self._oauth_credentials.get(key)
+                if oauth_record is not None:
+                    return dict(oauth_record)
         record = await self.store.get_user_credential(tenant_id, user_sub, upstream_name)
         if record is None:
             return None
@@ -262,9 +293,28 @@ class CredentialVault:
         }
 
     async def list_user_credentials(self, *, tenant_id: str, user_sub: str) -> list[dict[str, Any]]:
-        return await self.store.list_user_credentials(tenant_id, user_sub)
+        persisted = await self.store.list_user_credentials(tenant_id, user_sub)
+        if not isinstance(self.store, PostgresAuditStore):
+            return persisted
+        async with self._oauth_lock:
+            volatile = [
+                {
+                    "upstream_name": upstream_name,
+                    "auth_kind": "user_oauth",
+                    "expires_at": record.get("expires_at"),
+                    "updated_at": record.get("updated_at", ""),
+                }
+                for (tenant, subject, upstream_name), record in self._oauth_credentials.items()
+                if tenant == tenant_id and subject == user_sub
+            ]
+        return sorted(persisted + volatile, key=lambda item: str(item["upstream_name"]))
 
     async def delete_user_credential(
         self, *, tenant_id: str, user_sub: str, upstream_name: str
     ) -> bool:
-        return await self.store.delete_user_credential(tenant_id, user_sub, upstream_name)
+        async with self._oauth_lock:
+            existed = self._oauth_credentials.pop((tenant_id, user_sub, upstream_name), None)
+        return (
+            await self.store.delete_user_credential(tenant_id, user_sub, upstream_name)
+            or existed is not None
+        )

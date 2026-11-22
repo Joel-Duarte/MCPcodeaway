@@ -237,6 +237,11 @@ def test_user_api_key_user_oauth_client_credentials_and_admin_secrets(
 
         r_cb = client.get(f"/auth/connect/external_github/callback?code=auth-code-1&state={state}")
         assert r_cb.status_code == 200
+        stored_oauth = asyncio.run(
+            runtime.store.get_user_credential(id_a.tenant_id, id_a.sub, "external_github")
+        )
+        assert stored_oauth is not None
+        assert "user-oauth-tok-1" not in stored_oauth["ciphertext"]
 
         h_oauth, _, _ = asyncio.run(runtime.dispatcher.resolve_upstream_headers(id_a, oauth_up))
         assert h_oauth == {"Authorization": "Bearer user-oauth-tok-2"}

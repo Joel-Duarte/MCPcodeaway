@@ -32,7 +32,7 @@ flowchart TD
     Dispatch -->|"api_key / bearer_secret"| SecRes["SecretResolver (env://, file://, vault://, akv://, hcv://)"]
     SecRes -->|"Injected Host Secret Header"| SvcShared["Shared-Secret REST / MCP API"]
 
-    Dispatch -->|"user_oauth / user_api_key"| Vault["CredentialVault (AES-256-GCM in SQLite/Postgres)"]
+    Dispatch -->|"user_oauth / user_api_key"| Vault["CredentialVault: in-memory OAuth, AES-GCM API keys"]
     Vault -->|"Credential Present (Auto-Refreshed if Expiring)"| SvcUser["Per-User Non-Entra OAuth / PAT Service"]
     Vault -->|"Missing or Revoked"| ConnectLink["Actionable Tool Error + Signed /auth/connect/{upstream} URL"]
 
