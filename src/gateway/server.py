@@ -556,6 +556,7 @@ class GatewayRuntime:
         self._recovery_worker_task: asyncio.Task[None] | None = None
         self.recovery = OperationRecovery(self)
         self.lifecycle_state = GatewayLifecycleState.NEW
+        self._postgres_readiness: bool | None = None
         self._lifecycle_lock = asyncio.Lock()
         self.demo_traffic = DemoTrafficRunner(self)
         self.alert_evaluator = AlertEvaluator()
@@ -1080,7 +1081,14 @@ class GatewayRuntime:
                 self.upstream_health.run(self.registry.list_upstreams)
             )
             self._recovery_worker_task = asyncio.create_task(self.recovery.run_worker())
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(self.store, PostgresAuditStore) and isinstance(exc, Exception):
+                log_event(
+                    "database.postgres_startup_failed",
+                    level=logging.ERROR,
+                    dependency="postgres",
+                    error_type=type(exc).__name__,
+                )
             self._transition_lifecycle(GatewayLifecycleState.FAILED)
             raise
         self._transition_lifecycle(GatewayLifecycleState.READY)
@@ -1096,10 +1104,22 @@ class GatewayRuntime:
             except Exception:
                 return False
         if isinstance(self.store, PostgresAuditStore):
+            error_type: str | None = None
             try:
-                if not await asyncio.wait_for(self.store.health_check(), timeout=1.0):
-                    return False
-            except Exception:
+                postgres_ready = await asyncio.wait_for(self.store.health_check(), timeout=1.0)
+            except Exception as exc:
+                postgres_ready = False
+                error_type = type(exc).__name__
+            if self._postgres_readiness is None or self._postgres_readiness != postgres_ready:
+                self._postgres_readiness = postgres_ready
+                log_event(
+                    "database.postgres_readiness_changed",
+                    level=logging.INFO if postgres_ready else logging.ERROR,
+                    dependency="postgres",
+                    status="available" if postgres_ready else "unavailable",
+                    error_type=error_type,
+                )
+            if not postgres_ready:
                 return False
         return True
 

@@ -4,6 +4,11 @@ K2 extends the opt-in K1 kind acceptance workflow. It is a bounded local validat
 not a production-readiness claim. See [K1](kubernetes-k1.md) for the ordinary two-replica
 acceptance commands.
 
+The follow-on acceptance evidence is recorded in [security freshness acceptance](security-freshness-acceptance.md),
+[managed PostgreSQL acceptance](managed-postgres-acceptance.md), and
+[operations acceptance](operations-acceptance.md). Those documents supersede provisional contract
+notes below where they include later code and test results; none claim managed-provider validation.
+
 ## Process-local state classification
 
 | State | Contents and scope | Classification | Replica/restart effect and security boundary |
@@ -118,6 +123,9 @@ The admin-session format has no immediate per-user revocation mechanism. Key rot
 every session signed only by removed keys; otherwise a privilege change waits for cookie expiry.
 This milestone does not introduce a session store.
 
+The current security acceptance extends these tests to two independently constructed
+`GatewayRuntime` instances. It remains a cache simulation and does not claim live pod routing.
+
 Optional local manifests can be schema-checked after `deploy` with
 `./scripts/k8s-local.sh validate-optional`. K2.1 also applies the network policy on Calico and sends
 real permitted and prohibited connections. The ingress suite uses ingress-nginx v1.15.1 and a
@@ -199,6 +207,7 @@ namespace `mcpcodeaway-k1`.
 |---|---|---|
 | PostgreSQL TLS and pool restart | `uv run python scripts/local_acceptance.py --with-postgres-tls` | Docker Compose; generates and removes local CA/server fixtures and disposable TLS PostgreSQL |
 | Process acceptance, crash recovery and TCP/TLS | `uv run python scripts/local_acceptance.py --with-postgres-processes --with-process-crash --with-tcp-tls` | Docker Compose and local test binaries/fixtures |
+| Combined TLS, process interruption, crash and TCP/TLS | `uv run python scripts/local_acceptance.py --with-postgres-tls --with-postgres-processes --with-process-crash --with-tcp-tls` | Docker Compose base plus TLS overlay; child fixtures inherit both Compose files and the TLS DSN |
 | Authorization freshness | `uv run pytest -q tests/test_authorization_freshness.py` | Deterministic local HTTP fixtures; no identity provider |
 | Calico cluster | `MCP_K8S_CLUSTER=mcpcodeaway-k21 ./scripts/k8s-local.sh create-netpol` | kind plus network access to pinned Calico manifest |
 | Build, deploy and K1 acceptance | `MCP_K8S_CLUSTER=mcpcodeaway-k21 ./scripts/k8s-local.sh build`, then `deploy`, then `test` | Existing kind/Calico cluster; local image build |

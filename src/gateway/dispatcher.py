@@ -510,6 +510,12 @@ class HostDispatcher:
         if not await self.audit_store.claim_sensitive_write_audit(
             operation_id, datetime.now(UTC).isoformat()
         ):
+            log_event(
+                "audit.sensitive_write_retry_blocked",
+                level=logging.WARNING,
+                operation_id=operation_id,
+                status=str(row.get("status") or "already_claimed"),
+            )
             raise PermissionError(
                 f"Duplicate sensitive write blocked; audit operation {operation_id} "
                 f"is {row.get('status', 'already claimed')}"
@@ -1087,6 +1093,8 @@ class HostDispatcher:
                     duration_ms=duration_ms,
                     error_type=failure.error_type,
                     retry_attempts=record.retry_attempts,
+                    outcome_unknown=failure.outcome_unknown,
+                    journal_operation_id=(audit_operation_id if audit_claimed else None),
                 )
                 span.set_attribute("upstream.error_type", failure.error_type)
                 span.record_exception(exc)
