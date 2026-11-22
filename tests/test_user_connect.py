@@ -17,12 +17,66 @@ from gateway.auth import (
     UserCredentialRequiredError,
 )
 from gateway.config import GatewaySettings, UpstreamConfig, UpstreamOAuthConfig
+from gateway.dispatcher import HostDispatcher
 from gateway.server import create_gateway_app
 from gateway.state import InMemoryCacheBackend
 
 
 def _b64_key(seed: bytes) -> str:
     return base64.urlsafe_b64encode(seed * 2).decode("ascii")
+
+
+@pytest.mark.parametrize("status_code", [400, 503])
+@pytest.mark.asyncio
+async def test_failed_user_oauth_refresh_fails_closed_without_leaking_tokens(
+    status_code: int,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("TEST_USER_OAUTH_CLIENT_SECRET", "client-secret-private")
+    request_bodies: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(request.content.decode("utf-8"))
+        return httpx.Response(status_code, json={"error": "temporarily_unavailable"})
+
+    settings = GatewaySettings(app_env="sandbox", auth_mode="dev", ssrf_protection_enabled=False)
+    upstream = UpstreamConfig(
+        name="external_oauth",
+        type="openapi",
+        url="https://api.example.test",
+        auth_type="user_oauth",
+        oauth=UpstreamOAuthConfig(
+            token_endpoint="https://auth.example.test/token",
+            client_id="public-client-id",
+            client_secret_ref="env://TEST_USER_OAUTH_CLIENT_SECRET",
+        ),
+    )
+    identity = CallerIdentity(sub="user-a", tenant_id="tenant-a", raw_token="caller-token")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        dispatcher = HostDispatcher(
+            settings=settings,
+            policy=None,
+            exchanger=None,
+            cache=InMemoryCacheBackend(),
+            client_manager=None,
+            catalog=None,
+            registry=None,
+            http_client=http_client,
+        )
+        with pytest.raises(UserCredentialRequiredError) as error:
+            await dispatcher._refresh_user_oauth(
+                identity,
+                upstream,
+                {"access_token": "access-private", "refresh_token": "refresh-private"},
+            )
+
+    assert error.value.reason == "refresh_failed"
+    assert "access-private" not in str(error.value)
+    assert "refresh-private" not in str(error.value)
+    assert "client-secret-private" not in caplog.text
+    assert "refresh-private" in request_bodies[0]
+    assert "client-secret-private" in request_bodies[0]
 
 
 async def test_per_upstream_obo_dialect_override_and_cache_isolation() -> None:
@@ -243,10 +297,19 @@ def test_user_api_key_user_oauth_client_credentials_and_admin_secrets(
         assert stored_oauth is not None
         assert "user-oauth-tok-1" not in stored_oauth["ciphertext"]
 
-        h_oauth, _, _ = asyncio.run(runtime.dispatcher.resolve_upstream_headers(id_a, oauth_up))
-        assert h_oauth == {"Authorization": "Bearer user-oauth-tok-2"}
+        async def resolve_oauth_twice():
+            return await asyncio.gather(
+                runtime.dispatcher.resolve_upstream_headers(id_a, oauth_up),
+                runtime.dispatcher.resolve_upstream_headers(id_a, oauth_up),
+            )
+
+        oauth_results = asyncio.run(resolve_oauth_twice())
+        assert [result[0] for result in oauth_results] == [
+            {"Authorization": "Bearer user-oauth-tok-2"},
+            {"Authorization": "Bearer user-oauth-tok-2"},
+        ]
         assert "authorization_code" in oauth_calls
-        assert "refresh_token" in oauth_calls
+        assert oauth_calls.count("refresh_token") == 1
 
         r_del = client.delete(
             "/me/connections/external_github",

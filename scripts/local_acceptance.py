@@ -16,6 +16,10 @@ ROOT = Path(__file__).resolve().parent.parent
 COMPOSE_FILE = ROOT / "docker-compose.acceptance.yml"
 TLS_COMPOSE_FILE = ROOT / "docker-compose.postgres-tls.yml"
 TESTS = [
+    "tests/test_postgres_migrations.py",
+    "tests/test_crypto_secrets.py",
+    "tests/test_gateway_secrets_audit.py",
+    "tests/test_user_connect.py",
     "tests/test_auth_obo.py",
     "tests/test_mock_oidc_provider.py",
     "tests/test_oidc_golden_flows.py",
@@ -156,8 +160,17 @@ def main() -> int:
             tls_query = urlencode({"sslmode": "verify-full", "sslrootcert": str(ca_file)})
         else:
             tls_query = "sslmode=disable"
+        database_auth = quote(env["MCP_TEST_POSTGRES_PASSWORD"], safe="")
+        env["MCP_TEST_POSTGRES_MIGRATION_DSN"] = (
+            f"postgresql://gateway_test:{database_auth}@"
+            f"127.0.0.1:{port}/mcpcodeaway_acceptance?{tls_query}"
+        )
+        env["MCP_TEST_POSTGRES_BOOTSTRAP_DSN"] = (
+            f"postgresql://acceptance_bootstrap:{database_auth}@"
+            f"127.0.0.1:{port}/mcpcodeaway_acceptance?{tls_query}"
+        )
         env["MCP_TEST_POSTGRES_DSN"] = (
-            f"postgresql://gateway_test:{quote(env['MCP_TEST_POSTGRES_PASSWORD'], safe='')}@"
+            f"postgresql://gateway_limited:{database_auth}@"
             f"127.0.0.1:{port}/mcpcodeaway_acceptance?{tls_query}"
         )
         env["MCP_TEST_POSTGRES_COMPOSE_PROJECT"] = project
@@ -189,6 +202,34 @@ def main() -> int:
                 ]
                 subprocess.run(logs_command, cwd=ROOT, env=env, check=False)
                 raise subprocess.CalledProcessError(result.returncode, compose_command)
+            migration_env = env.copy()
+            migration_env["MCP_POSTGRES_MIGRATION_DSN"] = env["MCP_TEST_POSTGRES_MIGRATION_DSN"]
+            run(
+                [
+                    "uv",
+                    "run",
+                    "--extra",
+                    "postgres",
+                    "python",
+                    "-m",
+                    "gateway.migrations",
+                    "upgrade",
+                ],
+                env=migration_env,
+            )
+            runtime_setup_env = env.copy()
+            runtime_setup_env["MCP_POSTGRES_MIGRATION_DSN"] = env["MCP_TEST_POSTGRES_MIGRATION_DSN"]
+            run(
+                [
+                    "uv",
+                    "run",
+                    "--extra",
+                    "postgres",
+                    "python",
+                    "scripts/grant_postgres_runtime.py",
+                ],
+                env=runtime_setup_env,
+            )
         command = ["uv", "run"]
         if use_postgres:
             command.extend(["--extra", "postgres"])

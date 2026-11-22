@@ -3,8 +3,9 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: mcpcodeaway_acceptance
-      POSTGRES_USER: gateway_test
+      POSTGRES_USER: acceptance_bootstrap
       POSTGRES_PASSWORD: ${MCP_TEST_POSTGRES_PASSWORD:?set MCP_TEST_POSTGRES_PASSWORD for local acceptance}
+      GATEWAY_DB_PASSWORD: ${MCP_TEST_POSTGRES_PASSWORD:?set MCP_TEST_POSTGRES_PASSWORD for local acceptance}
     ports:
       - "${MCP_TEST_POSTGRES_HOST_BIND:-127.0.0.1}:${MCP_TEST_POSTGRES_PORT:-55432}:5432"
     healthcheck:
@@ -14,6 +15,7 @@ services:
       retries: 30
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./tests/fixtures/postgres/init_roles.sh:/docker-entrypoint-initdb.d/20-init-roles.sh:ro
 
 volumes:
   postgres_data:

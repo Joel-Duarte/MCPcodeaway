@@ -255,12 +255,12 @@ async def pg_env():
     if (
         parsed_dsn.scheme not in {"postgres", "postgresql"}
         or parsed_dsn.hostname not in {"127.0.0.1", "localhost", "::1"}
-        or parsed_dsn.username != "gateway_test"
+        or parsed_dsn.username != "gateway_limited"
         or not parsed_dsn.password
         or parsed_dsn.password != os.getenv("MCP_TEST_POSTGRES_PASSWORD")
         or parsed_dsn.path != "/mcpcodeaway_acceptance"
     ):
-        pytest.fail("Phase 2B tests only permit the isolated local acceptance PostgreSQL DSN")
+        pytest.fail("Phase 2B tests only permit the isolated local runtime PostgreSQL DSN")
     probe = PostgresAuditStore(dsn)
     try:
         await probe.init()

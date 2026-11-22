@@ -278,13 +278,23 @@ async def test_postgres_audit_store_crud_and_optional_dep(
                     return 2
                 raise AssertionError(f"Unexpected fetchval SQL: {sql}")
 
-            async def fetch(self, _sql: str, tables: list[str]) -> list[dict[str, str]]:
-                from gateway.migrations import EXPECTED_COLUMNS
+            async def fetch(self, sql: str, names: list[str]) -> list[dict[str, Any]]:
+                from gateway.migrations import EXPECTED_COLUMNS, EXPECTED_INDEXES
 
+                if "information_schema.columns" in sql:
+                    return [
+                        {"table_name": table, "column_name": column}
+                        for table in names
+                        for column in EXPECTED_COLUMNS[table]
+                    ]
                 return [
-                    {"table_name": table, "column_name": column}
-                    for table in tables
-                    for column in EXPECTED_COLUMNS[table]
+                    {
+                        "index_name": name,
+                        "table_name": table,
+                        "is_unique": unique,
+                    }
+                    for name, (table, unique) in EXPECTED_INDEXES.items()
+                    if name in names
                 ]
 
         def acquire(self) -> FakePgPool.Connection:

@@ -8,7 +8,6 @@ CREATE SCHEMA gateway AUTHORIZATION gateway_test;
 ALTER ROLE gateway_test SET search_path TO gateway, public;
 CREATE ROLE gateway_limited LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD :'restricted_password';
 GRANT CONNECT ON DATABASE mcpcodeaway_acceptance TO gateway_limited;
-CREATE SCHEMA restricted AUTHORIZATION acceptance_bootstrap;
-GRANT USAGE ON SCHEMA restricted TO gateway_limited;
-ALTER ROLE gateway_limited SET search_path TO restricted, public;
+GRANT USAGE ON SCHEMA gateway TO gateway_limited;
+ALTER ROLE gateway_limited SET search_path TO gateway, public;
 SQL

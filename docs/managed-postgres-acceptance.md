@@ -34,16 +34,26 @@ MCP_POSTGRES_MIGRATION_DSN='<migration DSN from deployment secret storage>' \
 ```
 
 Run it as a one-shot deployment step before rolling out gateway replicas. The current schema is
-version 2. The command serializes concurrent migration jobs with a PostgreSQL advisory lock,
+version 2. `uv run python scripts/local_acceptance.py --with-postgres` runs the actual migration
+CLI against the isolated disposable PostgreSQL database before live store acceptance. The
+command serializes concurrent migration jobs with a PostgreSQL advisory lock,
 reports the version transition, and exits nonzero if migration fails. The migration DSN and
 runtime DSN must resolve to the same configured `search_path` schema.
 
-`PostgresAuditStore.init()` now verifies connectivity, schema version, and required columns. It
+`PostgresAuditStore.init()` verifies connectivity, schema version, required columns, and required
+indexes, including journal/recovery uniqueness and active-approval constraints. It
 does not create or alter tables or indexes. The runtime role needs only application DML and
 `SELECT` on the migration version table; the operations role can inspect the restricted
 `sensitive_write_operations` view. Migration ownership and grants for an existing installation
-must be prepared by a DBA. Local TLS acceptance still needs to be rerun with a migrated database
-and the restricted runtime role; its prior findings below predate this separation.
+must be prepared by a DBA. The disposable local acceptance uses a schema-owning, non-superuser
+migration role and a separate DML-only runtime role. It applies migrations, grants the runtime
+role table DML and migration-ledger SELECT, verifies runtime startup and DML, and checks that
+runtime DDL fails. The same local role fixture is used by the optional TLS suite.
+
+PostgreSQL-mode per-user OAuth access and refresh tokens are process-local. They do not survive a
+gateway restart or replica change; the OAuth callback and [credential lifecycle guide](credential-lifecycle.md)
+state that users must reconnect. This local PostgreSQL acceptance does not claim persistent OAuth
+connections. Encrypted per-user API keys and durable journals/approvals are shared PostgreSQL state.
 
 ## Local evidence
 

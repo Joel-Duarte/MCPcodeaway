@@ -128,8 +128,22 @@ async def test_secret_resolver_env_file_vault_akv_hcv(
 
 @pytest.mark.asyncio
 async def test_postgres_credential_vault_keeps_oauth_tokens_out_of_store() -> None:
+    store = PostgresAuditStore("postgresql://unused", pool=object())
+
+    async def no_user_credential(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def no_user_credentials(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        return []
+
+    async def no_delete(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    store.get_user_credential = no_user_credential
+    store.list_user_credentials = no_user_credentials
+    store.delete_user_credential = no_delete
     vault = CredentialVault(
-        store=PostgresAuditStore("postgresql://unused", pool=object()),
+        store=store,
         cipher=EnvelopeCipher(f"k1:{_b64_key(b'0123456789abcdef')}"),
     )
     await vault.save_user_credential(
@@ -145,3 +159,35 @@ async def test_postgres_credential_vault_keeps_oauth_tokens_out_of_store() -> No
     assert credential is not None
     assert credential["payload"]["access_token"] == "access-secret"
     assert credential["payload"]["refresh_token"] == "refresh-secret"
+    assert (
+        await vault.load_user_credential(
+            tenant_id="tenant-b", user_sub="user-a", upstream_name="upstream-a"
+        )
+        is None
+    )
+    assert (
+        await vault.load_user_credential(
+            tenant_id="tenant-a", user_sub="user-b", upstream_name="upstream-a"
+        )
+        is None
+    )
+
+    other_runtime_vault = CredentialVault(
+        store=store,
+        cipher=EnvelopeCipher(f"k1:{_b64_key(b'0123456789abcdef')}"),
+    )
+    assert (
+        await other_runtime_vault.load_user_credential(
+            tenant_id="tenant-a", user_sub="user-a", upstream_name="upstream-a"
+        )
+        is None
+    )
+    assert await vault.delete_user_credential(
+        tenant_id="tenant-a", user_sub="user-a", upstream_name="upstream-a"
+    )
+    assert (
+        await vault.load_user_credential(
+            tenant_id="tenant-a", user_sub="user-a", upstream_name="upstream-a"
+        )
+        is None
+    )

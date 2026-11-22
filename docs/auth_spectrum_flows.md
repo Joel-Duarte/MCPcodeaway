@@ -51,13 +51,13 @@ flowchart TD
 
 ## 2. Non-Entra Per-User Credential Linking (`user_oauth` / `user_api_key`)
 
-When a downstream service does **not** use Entra ID and requires each user's own OAuth consent or Personal Access Token (PAT), Entra never holds those credentials. Instead, the gateway uses an encrypted per-user `CredentialVault`:
+When a downstream service does **not** use Entra ID and requires each user's own OAuth consent or Personal Access Token (PAT), Entra never holds those credentials. The `CredentialVault` scopes credentials by tenant, subject, and upstream. API keys/PATs are encrypted at rest. In PostgreSQL mode, delegated OAuth access and refresh tokens are process-local and are not persisted; reconnect is required after restart or when another replica receives the request. SQLite development mode keeps its encrypted local-database behavior.
 
 ```mermaid
 sequenceDiagram
     participant Agent as User / Agent Harness
     participant GW as MCPcodeaway Gateway
-    participant Vault as CredentialVault (AES-GCM)
+    participant Vault as CredentialVault (backend-dependent)
     participant Ext as External OAuth / PAT Service
 
     Agent->>GW: POST /mcp (Bearer Entra JWT) -> tools/call external_oauth
@@ -72,7 +72,8 @@ sequenceDiagram
     Ext-->>GW: GET /auth/connect/external_oauth/callback?code=...&state=...
     GW->>Ext: POST /token (code + code_verifier)
     Ext-->>GW: access_token + refresh_token
-    GW->>Vault: Encrypt (AES-256-GCM + AAD) & store per (tenant_id, user_sub, upstream)
+    GW->>Vault: Store per (tenant_id, user_sub, upstream)
+    Note over Vault: SQLite encrypts OAuth locally; PostgreSQL keeps OAuth in process memory
     Agent->>GW: Retry POST /mcp (same Entra JWT)
     GW->>Vault: Decrypt user token (auto-refresh if near expiry)
     GW->>Ext: Call API with user's external Bearer token
@@ -90,6 +91,6 @@ sequenceDiagram
 | **Downstream uses Keycloak (Entra brokered)** | `delegated_token` (`rfc8693`) | Entra or Keycloak JWT exchanged via RFC 8693 against Keycloak token endpoint | [`test_auth_spectrum_golden.py`](../tests/test_auth_spectrum_golden.py) (`tax_keycloak`) |
 | **Downstream uses OAuth M2M** | `client_credentials` | Gateway enforces caller RBAC, then fetches cached M2M token | [`test_auth_spectrum_golden.py`](../tests/test_auth_spectrum_golden.py) (`metrics_m2m`) |
 | **Downstream uses shared API key / Bearer** | `api_key` / `bearer_secret` | Gateway enforces caller RBAC, resolves `vault://` / `file://` / `env://` / `akv://` / `hcv://` | [`test_auth_spectrum_golden.py`](../tests/test_auth_spectrum_golden.py) (`inventory_apikey`, `tax_bearer`) |
-| **Downstream uses per-user OAuth (non-Entra)** | `user_oauth` | User links once via PKCE `/auth/connect/{upstream}`; gateway auto-refreshes | [`test_auth_spectrum_golden.py`](../tests/test_auth_spectrum_golden.py) (`external_oauth`) |
+| **Downstream uses per-user OAuth (non-Entra)** | `user_oauth` | PKCE `/auth/connect/{upstream}`; auto-refresh while the process has the connection; PostgreSQL mode requires reconnect after restart/replica change | [`test_auth_spectrum_golden.py`](../tests/test_auth_spectrum_golden.py) (`external_oauth`) |
 | **Downstream uses per-user PAT** | `user_api_key` | User saves PAT in `/auth/connect/{upstream}` or `/connections` UI; isolated per `(tenant, sub)` | [`test_auth_spectrum_golden.py`](../tests/test_auth_spectrum_golden.py) (`external_pat`) |
 | **Open internal sandbox** | `none` | No downstream creds; gated strictly by gateway OIDC + RBAC | [`test_auth_spectrum_golden.py`](../tests/test_auth_spectrum_golden.py) (`sandbox_open`) |

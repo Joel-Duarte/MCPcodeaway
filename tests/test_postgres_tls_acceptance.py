@@ -95,7 +95,9 @@ async def test_untrusted_ca_wrong_hostname_and_bad_password_fail_closed(
     bad_ca = _dsn_with(dsn, sslrootcert=untrusted_ca)
     wrong_host = urlunsplit(parsed._replace(netloc=parsed.netloc.replace("127.0.0.1", "localhost")))
     bad_auth = urlunsplit(
-        parsed._replace(netloc=parsed.netloc.replace("gateway_test:", "gateway_test:incorrect-"))
+        parsed._replace(
+            netloc=parsed.netloc.replace("gateway_limited:", "gateway_limited:incorrect-")
+        )
     )
     for attempt in (bad_ca, wrong_host, bad_auth):
         with pytest.raises((OSError, asyncpg.PostgresError)):
@@ -118,23 +120,36 @@ async def test_gateway_runtime_role_is_not_superuser_or_ddl_capable(
     finally:
         await connection.close()
 
-    parsed = urlsplit(dsn)
-    limited = urlunsplit(
-        parsed._replace(netloc=parsed.netloc.replace("gateway_test:", "gateway_limited:"))
-    )
-    limited_connection = await asyncpg.connect(limited)
+    connection = await asyncpg.connect(dsn)
     try:
+        assert await connection.fetchval("SELECT current_user") == "gateway_limited"
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
-            await limited_connection.execute(
-                "CREATE TABLE restricted.runtime_must_not_create (id INTEGER)"
-            )
+            await connection.execute("CREATE TABLE gateway.runtime_must_not_create (id INTEGER)")
     finally:
-        await limited_connection.close()
+        await connection.close()
 
-    limited_store = PostgresAuditStore(limited)
-    with pytest.raises(RuntimeError, match="gateway requires version 2"):
-        await limited_store.init()
-    await limited_store.close()
+    runtime_store = PostgresAuditStore(dsn)
+    run_id = f"limited-runtime-{secrets.token_hex(8)}"
+    await runtime_store.init()
+    await runtime_store.record_run(
+        {"run_id": run_id, "tenant_id": "tls-acceptance", "mode": "classic"}
+    )
+    assert (await runtime_store.list_runs(limit=5, tenant_id="tls-acceptance"))[0][
+        "run_id"
+    ] == run_id
+    await runtime_store._pool.execute("DELETE FROM audit_runs WHERE run_id=$1", run_id)
+    await runtime_store.close()
+
+    migration_dsn = os.getenv("MCP_TEST_POSTGRES_MIGRATION_DSN")
+    assert migration_dsn
+    migration_connection = await asyncpg.connect(migration_dsn)
+    try:
+        await migration_connection.execute(
+            "CREATE TABLE gateway.migration_role_ddl_probe (probe_id INTEGER PRIMARY KEY)"
+        )
+        await migration_connection.execute("DROP TABLE gateway.migration_role_ddl_probe")
+    finally:
+        await migration_connection.close()
 
 
 async def test_pool_recovers_after_postgres_restart_without_replaying_prepared_write(

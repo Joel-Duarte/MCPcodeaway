@@ -38,14 +38,19 @@ For only the TCP/TLS tests:
 MCP_RUN_TCP_TLS_TESTS=1 uv run pytest -q tests/test_tcp_tls_acceptance.py
 ```
 
-The script waits for PostgreSQL health, runs the same local acceptance set plus `tests/test_postgres_acceptance.py`, and tears down only the isolated `mcpcodeaway-local-acceptance` project and its volumes on exit. The database is exposed only on `127.0.0.1:55432`. To select another available port, set `MCP_TEST_POSTGRES_PORT` before running. To connect manually, set `MCP_TEST_POSTGRES_DSN`; when running the script with PostgreSQL, that DSN is set automatically unless supplied by the caller.
+The script waits for PostgreSQL health, applies the actual versioned migration command as the schema-owning `gateway_test` role, grants runtime DML to `gateway_limited`, then runs migration, credential lifecycle, journal, and gateway acceptance tests as the DML-only role. Migration acceptance verifies a fresh 0→2 install, repeatability at v2, a real v1→v2 CLI upgrade, rollback after an injected v2 failure, and retry after correcting the schema conflict. It confirms that migration v2 removes only `user_oauth` credentials while API keys, generic secrets, journal records, and approval records survive. Startup also checks required columns and indexes. The script tears down only its generated Compose project and volumes on exit. The database is exposed only on `127.0.0.1:55432`. To select another available port, set `MCP_TEST_POSTGRES_PORT` before running. To connect manually, set `MCP_TEST_POSTGRES_DSN`; when running the script with PostgreSQL, that DSN is set automatically unless supplied by the caller.
 
-Direct PostgreSQL invocation is also available after starting the service:
+Direct PostgreSQL invocation is also available after starting the service. Migrations run as
+`gateway_test`; runtime acceptance uses `gateway_limited`, which has table DML and schema-version
+SELECT only:
 
 ```sh
 export MCP_TEST_POSTGRES_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 docker compose -f docker-compose.acceptance.yml -p mcpcodeaway-local-acceptance up -d --wait postgres
-MCP_TEST_POSTGRES_DSN="postgresql://gateway_test:${MCP_TEST_POSTGRES_PASSWORD}@127.0.0.1:55432/mcpcodeaway_acceptance?sslmode=disable" uv run --extra postgres pytest -m postgres -q
+export MCP_POSTGRES_MIGRATION_DSN="postgresql://gateway_test:${MCP_TEST_POSTGRES_PASSWORD}@127.0.0.1:55432/mcpcodeaway_acceptance?sslmode=disable"
+uv run --extra postgres python -m gateway.migrations upgrade
+uv run --extra postgres python scripts/grant_postgres_runtime.py
+MCP_TEST_POSTGRES_DSN="postgresql://gateway_limited:${MCP_TEST_POSTGRES_PASSWORD}@127.0.0.1:55432/mcpcodeaway_acceptance?sslmode=disable" MCP_TEST_POSTGRES_MIGRATION_DSN="$MCP_POSTGRES_MIGRATION_DSN" uv run --extra postgres pytest -m postgres -q
 docker compose -f docker-compose.acceptance.yml -p mcpcodeaway-local-acceptance down --volumes --remove-orphans
 ```
 
@@ -60,7 +65,8 @@ If Docker or `asyncpg` is unavailable, PostgreSQL tests are skipped with a reaso
 | Graph group overage and cache scope | `test_auth_obo.py`; actual `EntraGroupMembershipResolver` and cache backend | Stateful in-process Graph-shaped responses | No / No | Passed | Not a live Microsoft Graph permission or API contract test |
 | Gateway modes and adaptive Auto | `test_gateway_modes_e2e.py`, `test_phase11_scaling_analytics_ab.py`, `test_adaptive_execution.py`; actual gateway `/mcp` dispatch and policy | In-process gateway/upstreams | No / No | Passed | Existing gateway tests cover all modes across cases, but don't run a standalone MCP SDK server over a local TCP/TLS connection |
 | Write journal and recovery | `test_sensitive_write_audit.py`, `test_upstream_recovery_golden.py`, `test_mcp_task_recovery.py`; actual dispatcher and SQLite store | SQLite plus failure-injected dispatch calls | No / No | Passed | SQLite does not prove Postgres transaction/concurrency behavior |
-| Postgres claims and durable state | New `test_postgres_acceptance.py`; actual `PostgresAuditStore`, two independent pools | Disposable PostgreSQL 16 | Yes / No | Passed: 2 tests; skipped in default full-suite run | Separate pools model replicas but do not exercise process scheduling or production HA/failover |
+| Postgres migration lifecycle and roles | Actual `gateway.migrations upgrade`, `test_postgres_migrations.py`, and restricted-role DML/DDL checks | Disposable PostgreSQL 16, schema owner plus DML-only runtime role | Yes / No | Passed in `--with-postgres` and `--with-postgres-tls` runs | Local single-node database; no managed-provider failover/restore |
+| Postgres claims and durable state | `test_postgres_acceptance.py`; actual `PostgresAuditStore`, two independent pools; `test_postgres_process_acceptance.py`, separate OS processes | Disposable PostgreSQL 16 | Yes / No | Passed: 2 pool tests and 6 process tests; opt-in in default full-suite run | Local process barriers model replicas but do not prove production HA/failover |
 | DNS pinning / SSRF | `test_security_hardening.py`; actual URL validation and `_PinnedNetworkBackend` with controlled resolver/peer | Simulated DNS and backend peer stream | No / No | Passed | Resolver/peer tests are simulated; no live local TLS certificate/connection test, corporate DNS, or production egress path |
 | Failure injection and audit | Recovery, journal, and auth tests above; local timeouts/errors, invalid responses, and persistence states | In-process and mocked failure controls | No / No | Passed | Diagnostics are asserted only where each test explicitly checks them |
 
@@ -96,7 +102,7 @@ Database outages are injected by stopping and restarting only the named Compose 
 - After preparation and before claim: the test waits for the durable insert and claim-ready signal, stops PostgreSQL, and releases the claim. The claim fails, the upstream is not called, and the row remains prepared after restart.
 - After upstream dispatch: the local service records the write and holds its response. PostgreSQL is stopped after receipt; then the upstream response is released. After restart, the operation remains executing, the same correlation cannot dispatch again, and a fresh correlation can complete a write. Raw arguments and credentials are not stored in the journal row.
 
-The focused process suite passed all 6 tests in this run. The post-dispatch PostgreSQL failure now returns an error with outcome_unknown=true, while the durable row remains executing and same-correlation retry remains blocked. The service log records the attempted outcome_unknown terminal update and its persistence failure. A fresh correlation can still proceed after PostgreSQL recovers.
+The focused process suite passed all 6 tests in this run using the DML-only runtime role. The post-dispatch PostgreSQL failure now returns an error with outcome_unknown=true, while the durable row remains executing and same-correlation retry remains blocked. The service log records the attempted outcome_unknown terminal update and its persistence failure. A fresh correlation can still proceed after PostgreSQL recovers.
 
 Definitive upstream failures remain outcome_unknown=false. If saving their terminal journal state also fails, the error preserves the upstream failure and states that the journal status could not be saved.
 
@@ -110,7 +116,7 @@ Run the hard process-termination acceptance suite with:
 uv run python scripts/local_acceptance.py --with-process-crash
 ```
 
-This opt-in option starts the same disposable, project-scoped PostgreSQL Compose service and persistent volume as the Phase 2B runner, executes the local acceptance tests and both PostgreSQL process suites, then removes only the `mcpcodeaway-local-acceptance` project and its volume. It requires Docker and the optional `asyncpg` dependency. The suite uses no production credentials or external services.
+This opt-in option starts the same disposable, project-scoped PostgreSQL Compose service and persistent volume as the Phase 2B runner, executes the local acceptance tests and both PostgreSQL process suites, then removes only its generated project and volume. It requires Docker and the optional `asyncpg` dependency. The suite uses no production credentials or external services.
 
 `tests/test_process_crash_acceptance.py` starts each gateway worker with Python multiprocessing `spawn`, so the controller and gateway have independent OS processes. Every worker creates a real `GatewayRuntime`, initializes `PostgresAuditStore`, and invokes `HostDispatcher.invoke_tool`. The controller and restarted worker use the same DSN. A parent-owned loopback HTTP upstream records each received write and completion in multiprocessing queues, so observations survive gateway death. `Process.kill()` is used; on POSIX the test asserts the exit status is `SIGKILL` (`-9`).
 

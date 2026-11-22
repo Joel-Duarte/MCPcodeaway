@@ -189,6 +189,30 @@ EXPECTED_COLUMNS: dict[str, set[str]] = {
     },
 }
 
+EXPECTED_INDEXES: dict[str, tuple[str, bool]] = {
+    "audit_runs_pkey": ("audit_runs", True),
+    "idx_audit_runs_created": ("audit_runs", False),
+    "idx_audit_runs_tenant_created": ("audit_runs", False),
+    "dynamic_upstreams_pkey": ("dynamic_upstreams", True),
+    "model_pricing_pkey": ("model_pricing", True),
+    "gateway_settings_pkey": ("gateway_settings", True),
+    "adaptive_evidence_pkey": ("adaptive_evidence", True),
+    "idx_adaptive_evidence_tenant_created": ("adaptive_evidence", False),
+    "consumed_request_state_nonces_pkey": ("consumed_request_state_nonces", True),
+    "tool_approvals_pkey": ("tool_approvals", True),
+    "idx_tool_approvals_active_action": ("tool_approvals", True),
+    "idx_tool_approvals_tenant_status_created": ("tool_approvals", False),
+    "tool_guidance_pkey": ("tool_guidance", True),
+    "gateway_secrets_pkey": ("gateway_secrets", True),
+    "recovery_operations_pkey": ("recovery_operations", True),
+    "recovery_operations_dedupe_key_key": ("recovery_operations", True),
+    "idx_recovery_operations_claim": ("recovery_operations", False),
+    "idx_recovery_operations_owner": ("recovery_operations", False),
+    "sensitive_write_audits_pkey": ("sensitive_write_audits", True),
+    "sensitive_write_audits_dedupe_key_key": ("sensitive_write_audits", True),
+    "user_upstream_credentials_pkey": ("user_upstream_credentials", True),
+}
+
 
 async def current_version(conn: Any) -> int:
     exists = await conn.fetchval("SELECT to_regclass($1)", MIGRATION_TABLE)
@@ -270,6 +294,36 @@ async def verify_schema(conn: Any, *, expected_version: int | None = None) -> in
         summary = "; ".join(f"{table}: {', '.join(columns)}" for table, columns in missing.items())
         raise RuntimeError(
             f"PostgreSQL schema version {version} is incomplete ({summary}). Apply migrations."
+        )
+    index_rows = await conn.fetch(
+        """SELECT index_class.relname AS index_name,
+                  table_class.relname AS table_name,
+                  index_info.indisunique AS is_unique
+           FROM pg_class AS index_class
+           JOIN pg_index AS index_info ON index_info.indexrelid = index_class.oid
+           JOIN pg_class AS table_class ON table_class.oid = index_info.indrelid
+           JOIN pg_namespace AS schema_info ON schema_info.oid = index_class.relnamespace
+           WHERE schema_info.nspname = current_schema()
+             AND index_class.relname = ANY($1::text[])""",
+        list(EXPECTED_INDEXES),
+    )
+    actual_indexes = {
+        str(row["index_name"]): (str(row["table_name"]), bool(row["is_unique"]))
+        for row in index_rows
+    }
+    invalid_indexes = {
+        name: expected
+        for name, expected in EXPECTED_INDEXES.items()
+        if actual_indexes.get(name) != expected
+    }
+    if invalid_indexes:
+        summary = "; ".join(
+            f"{name} on {table} (unique={unique})"
+            for name, (table, unique) in invalid_indexes.items()
+        )
+        raise RuntimeError(
+            f"PostgreSQL schema version {version} is incomplete or incompatible "
+            f"(indexes: {summary}). Apply migrations."
         )
     return version
 
