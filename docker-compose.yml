@@ -26,6 +26,8 @@ services:
       GATEWAY_SANDBOX_BACKEND: local
     ports:
       - "8000:8000"
+    volumes:
+      - gateway_data:/app/data
     networks:
       - control_plane
     profiles: ["", "default", "demo"]
@@ -243,3 +245,6 @@ networks:
   sandbox_isolated:
     driver: bridge
     internal: true
+
+volumes:
+  gateway_data:

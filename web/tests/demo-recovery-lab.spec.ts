@@ -47,6 +47,20 @@ test("Demo Control runs the Recovery Lab and presents the gateway proof", async 
   const apiFetch = vi.fn(async (path: string) => {
     if (path === "/admin/demo/models") return { models: [] };
     if (path === "/admin/demo/recovery/run") return recoveryResult;
+    if (path === "/admin/demo/golden-run") {
+      return {
+        evidence_rows: 200,
+        models: 4,
+        workloads_per_model: 5,
+        traffic_requests: 24,
+        traffic_errors: 5,
+        discovery_requests: 2,
+        task_polls: 1,
+        recovery_operations_created: 4,
+        recovery_operations_pending: 1,
+        recovery_operations_needs_attention: 0,
+      };
+    }
     throw new Error(`Unexpected API request: ${path}`);
   });
   const demoStatus = {
@@ -56,6 +70,12 @@ test("Demo Control runs the Recovery Lab and presents the gateway proof", async 
       tier: "enterprise",
       requests_sent: 0,
       errors_count: 0,
+      rpc_errors_count: 0,
+      http_errors_count: 0,
+      write_calls_count: 0,
+      discovery_requests_count: 0,
+      task_polls_count: 0,
+      golden_runs_count: 0,
       last_target: "",
       last_error: "",
     },
@@ -118,6 +138,19 @@ test("Demo Control runs the Recovery Lab and presents the gateway proof", async 
     }
     expect(wrapper.text()).toContain("Side effects");
     expect(wrapper.text()).toContain("Task operation-1");
+    const evidenceButton = agent.snapshot().find(
+      (entry) => entry.component === "button" && entry.label === "Run Golden Demo Traffic"
+    );
+    expect(evidenceButton).toBeDefined();
+    const generated = await agent.act({ steps: [{ ref: evidenceButton!.ref, action: "press" }] });
+    expect(generated.ok, generated.error?.message).toBe(true);
+    await vi.waitFor(() => expect(wrapper.text()).toContain("Golden run sent 24 mock MCP calls"));
+    expect(apiFetch).toHaveBeenCalledWith(
+      "/admin/demo/golden-run",
+      { method: "POST", timeout: 60000 }
+    );
+    expect(wrapper.text()).toContain("Write Calls");
+    expect(wrapper.text()).toContain("MCP Errors");
   } finally {
     wrapper.unmount();
     vi.unstubAllGlobals();

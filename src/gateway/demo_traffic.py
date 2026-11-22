@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import random
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlsplit
+from uuid import uuid4
 
 import httpx
 
@@ -32,6 +35,7 @@ _BUILTIN_SERVERS = frozenset(
         "crm_accounts",
         "hr_directory",
         "devops_ci",
+        "recovery_workbench",
     }
 )
 
@@ -47,6 +51,12 @@ class DemoTrafficRunner:
         self.tier: DemoTier = "enterprise"
         self.requests_sent = 0
         self.errors_count = 0
+        self.rpc_errors_count = 0
+        self.http_errors_count = 0
+        self.write_calls_count = 0
+        self.discovery_requests_count = 0
+        self.task_polls_count = 0
+        self.golden_runs_count = 0
         self.last_target = ""
         self.last_error = ""
         self.model_profiles: list[dict[str, Any]] = [
@@ -91,12 +101,186 @@ class DemoTrafficRunner:
             "tier": self.tier,
             "requests_sent": self.requests_sent,
             "errors_count": self.errors_count,
+            "rpc_errors_count": self.rpc_errors_count,
+            "http_errors_count": self.http_errors_count,
+            "write_calls_count": self.write_calls_count,
+            "discovery_requests_count": self.discovery_requests_count,
+            "task_polls_count": self.task_polls_count,
+            "golden_runs_count": self.golden_runs_count,
             "last_target": self.last_target,
             "last_error": self.last_error,
         }
 
+    def simulated_workflow_evidence(self) -> list[dict[str, Any]]:
+        """Create labeled, deterministic paired fixtures for the demo report only."""
+        workloads = (
+            "single_read",
+            "small_fanout",
+            "data_reconciliation",
+            "large_data_reconciliation",
+            "sequential_workflow",
+        )
+        thresholds = (0.1, 0.3, 0.5, 0.7, 0.9)
+        created_at = datetime.now(UTC).isoformat()
+        rows: list[dict[str, Any]] = []
+        for profile in self.model_profiles:
+            model = str(profile.get("model") or "demo-model").strip().lower()
+            for workload in workloads:
+                for repeat, threshold in enumerate(thresholds):
+                    for mode in ("traditional", "codemode"):
+                        key = f"{model}:{workload}:{repeat}:{mode}"
+                        rate_key = (
+                            "traditional_success_rate"
+                            if mode == "traditional"
+                            else "codemode_success_rate"
+                        )
+                        correct = threshold <= float(profile.get(rate_key, 0.9))
+                        rows.append(
+                            {
+                                "version": 1,
+                                "evidence_id": f"demo:{key}",
+                                "created_at": created_at,
+                                "model": model,
+                                "workload": workload,
+                                "scenario_id": workload,
+                                "repeat_id": f"demo-repeat-{repeat}",
+                                "fixture_id": "demo-simulator-v1",
+                                "discovery_config": {
+                                    "runner_version": "demo-traffic-v1",
+                                    "model_source": "demo-simulator",
+                                },
+                                "mode": mode,
+                                "correct": correct,
+                                "grounded": correct,
+                                "input_tokens": 480 if mode == "traditional" else 290,
+                                "output_tokens": 90 if mode == "traditional" else 70,
+                                "wall_ms": 280 if mode == "traditional" else 190,
+                                "upstream_calls": 3 if mode == "traditional" else 2,
+                                "turns": int(profile.get("traditional_turns", 3))
+                                if mode == "traditional"
+                                else 1,
+                                "recovery_count": 0,
+                                "runtime_failure": not correct,
+                            }
+                        )
+        return rows
+
     def _next_workloads(self) -> list[tuple[str, str, str, dict[str, Any], dict[str, str] | None]]:
+        batch_key = f"demo-{uuid4().hex}"
         workloads: list[tuple[str, str, str, dict[str, Any], dict[str, str] | None]] = [
+            (
+                "gateway_admin",
+                "mode=traditional",
+                "recovery:delayed_write",
+                {
+                    "name": "recovery_workbench__submit_change",
+                    "arguments": {
+                        "idempotency_key": batch_key,
+                        "resource_id": "DEMO-RESOURCE-01",
+                        "change": "set processing state",
+                        "delay_ms": 650,
+                    },
+                },
+                {"X-Model-Name": "claude-sonnet-4-5"},
+            ),
+            (
+                "gateway_admin",
+                "mode=traditional",
+                "recovery:idempotent_replay",
+                {
+                    "name": "recovery_workbench__submit_change",
+                    "arguments": {
+                        "idempotency_key": batch_key,
+                        "resource_id": "DEMO-RESOURCE-01",
+                        "change": "set processing state",
+                        "delay_ms": 650,
+                    },
+                },
+                {"X-Model-Name": "claude-sonnet-4-5"},
+            ),
+            (
+                "gateway_admin",
+                "mode=traditional",
+                "recovery:idempotency_conflict",
+                {
+                    "name": "recovery_workbench__submit_change",
+                    "arguments": {
+                        "idempotency_key": batch_key,
+                        "resource_id": "DEMO-RESOURCE-02",
+                        "change": "different payload",
+                    },
+                },
+                {"X-Model-Name": "claude-sonnet-4-5"},
+            ),
+            (
+                "gateway_admin",
+                "mode=traditional",
+                "recovery:upstream_rejection",
+                {
+                    "name": "recovery_workbench__submit_change",
+                    "arguments": {
+                        "idempotency_key": f"{batch_key}-reject",
+                        "resource_id": "DEMO-RESOURCE-03",
+                        "change": "rejected update",
+                        "simulate_failure": True,
+                    },
+                },
+                {"X-Model-Name": "claude-sonnet-4-5"},
+            ),
+            (
+                "gateway_admin",
+                "mode=traditional",
+                "recovery:lost_response_then_status_read",
+                {
+                    "name": "recovery_workbench__submit_change",
+                    "arguments": {
+                        "idempotency_key": f"{batch_key}-lost",
+                        "resource_id": "DEMO-RESOURCE-04",
+                        "change": "commit before simulated response loss",
+                        "simulate_lost_response": True,
+                    },
+                },
+                {"X-Model-Name": "claude-sonnet-4-5"},
+            ),
+            (
+                "gateway_admin",
+                "mode=traditional",
+                "recovery:status_after_lost_response",
+                {
+                    "name": "recovery_workbench__get_change_status",
+                    "arguments": {"idempotency_key": f"{batch_key}-lost"},
+                },
+                {"X-Model-Name": "claude-sonnet-4-5"},
+            ),
+            (
+                "gateway_admin",
+                "mode=traditional",
+                "recovery:upstream_stays_pending",
+                {
+                    "name": "recovery_workbench__submit_change",
+                    "arguments": {
+                        "idempotency_key": f"{batch_key}-pending",
+                        "resource_id": "DEMO-RESOURCE-06",
+                        "change": "simulate an upstream operation that remains processing",
+                        "simulate_pending": True,
+                    },
+                },
+                {"X-Model-Name": "claude-sonnet-4-5"},
+            ),
+            (
+                "readonly_auditor",
+                "mode=traditional",
+                "recovery:rbac_write_denied",
+                {
+                    "name": "recovery_workbench__submit_change",
+                    "arguments": {
+                        "idempotency_key": f"{batch_key}-denied",
+                        "resource_id": "DEMO-RESOURCE-05",
+                        "change": "must be denied",
+                    },
+                },
+                {"X-Model-Name": "gpt-4o"},
+            ),
             (
                 "finance_analyst",
                 "mode=codemode",
@@ -301,6 +485,11 @@ class DemoTrafficRunner:
         for upstream in self.runtime.registry.list_upstreams():
             if not upstream.enabled:
                 continue
+            if upstream.name not in _BUILTIN_SERVERS:
+                continue
+            endpoint = upstream.url or upstream.openapi_spec_url or ""
+            if urlsplit(endpoint).hostname not in {"127.0.0.1", "localhost", "mock-backends"}:
+                continue
             for safe_tool in self.runtime.catalog.get_server_tools(upstream.name):
                 if safe_tool.mutating:
                     continue
@@ -346,7 +535,12 @@ class DemoTrafficRunner:
                         {"X-Model-Name": model_name, "X-Admin-Force-Mode": arm},
                     )
                 )
-        return dynamic_workloads + workloads
+        registry = getattr(self.runtime, "registry", None)
+        if registry is not None and not any(
+            upstream.name == "recovery_workbench" for upstream in registry.list_upstreams()
+        ):
+            workloads = [item for item in workloads if not item[2].startswith("recovery:")]
+        return workloads + dynamic_workloads
 
     async def _dispatch_one(
         self,
@@ -360,14 +554,25 @@ class DemoTrafficRunner:
         dev_keys = self.runtime.dev_keys
         if dev_keys is None:
             return False
-        token = dev_keys.issue_user_token(persona=persona)
+        token_overrides = (
+            {
+                "roles": ["gateway_admin", "admin"],
+                "groups": ["platform-admins"],
+                "scopes": ["mcp.tools", "mcp.write"],
+            }
+            if persona == "gateway_admin"
+            else None
+        )
+        token = dev_keys.issue_user_token(persona=persona, overrides=token_overrides)
         headers = {
             **request_headers("tools/call", tool_name=str(params.get("name") or "") or None),
             "Authorization": f"Bearer {token}",
             **(extra_headers or {}),
         }
-        payload_params = {"_meta": request_meta(), **params}
+        payload_params = {"_meta": request_meta(supports_tasks=True), **params}
         try:
+            if str(params.get("name") or "").endswith("__submit_change"):
+                self.write_calls_count += 1
             resp = await client.post(
                 f"/mcp?{query}",
                 headers=headers,
@@ -382,16 +587,153 @@ class DemoTrafficRunner:
             self.last_target = label
             if resp.status_code >= 400:
                 self.errors_count += 1
+                self.http_errors_count += 1
                 self.last_error = f"HTTP {resp.status_code} on {label}"
+                return False
+            body = resp.json()
+            rpc_error = body.get("error") if isinstance(body, dict) else None
+            result = body.get("result") if isinstance(body, dict) else None
+            if isinstance(result, dict) and result.get("resultType") == "task":
+                task_id = str(result.get("taskId") or "")
+                if task_id:
+                    poll = await client.post(
+                        "/mcp",
+                        headers={
+                            **request_headers("tasks/get", task_id=task_id),
+                            "Authorization": f"Bearer {token}",
+                        },
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": f"demo-task-{self._step + 1}",
+                            "method": "tasks/get",
+                            "params": {
+                                "taskId": task_id,
+                                "_meta": request_meta(supports_tasks=True),
+                            },
+                        },
+                    )
+                    self.task_polls_count += 1
+                    if poll.status_code >= 400:
+                        self.errors_count += 1
+                        self.http_errors_count += 1
+                        self.last_error = f"HTTP {poll.status_code} polling task {task_id}"
+                        return False
+                    task_body = poll.json()
+                    if task_body.get("error"):
+                        self.errors_count += 1
+                        self.rpc_errors_count += 1
+                        self.last_error = f"MCP task poll failed for {task_id}"
+                        return False
+            if rpc_error or (isinstance(result, dict) and result.get("isError")):
+                self.errors_count += 1
+                self.rpc_errors_count += 1
+                error = rpc_error or result
+                detail = (
+                    error.get("message", "MCP tool returned an error")
+                    if isinstance(error, dict)
+                    else str(error)
+                )
+                self.last_error = f"MCP error on {label}: {detail}"
                 return False
             self.last_error = ""
             return True
         except Exception as exc:
             self.requests_sent += 1
             self.errors_count += 1
+            self.http_errors_count += 1
             self.last_target = label
             self.last_error = str(exc)
             return False
+
+    async def _dispatch_discovery(
+        self, client: httpx.AsyncClient, *, method: str, query: str
+    ) -> bool:
+        """Record a real listing or search against the gateway for demo discovery telemetry."""
+        if self.runtime.dev_keys is None:
+            return False
+        token = self.runtime.dev_keys.issue_user_token(
+            persona="gateway_admin",
+            overrides={
+                "roles": ["gateway_admin", "admin"],
+                "groups": ["platform-admins"],
+                "scopes": ["mcp.tools", "mcp.write"],
+            },
+        )
+        headers = {
+            **request_headers(method, tool_name="search_tools" if method == "tools/call" else None),
+            "Authorization": f"Bearer {token}",
+            "X-Model-Name": "claude-sonnet-4-5",
+        }
+        params: dict[str, Any] = {"_meta": request_meta()}
+        if method == "tools/list":
+            params["limit"] = 50
+            endpoint = "/mcp?execution=classic&discovery_mode=upfront"
+        else:
+            params.update(
+                {
+                    "name": "search_tools",
+                    "arguments": {"query": query, "limit": 10},
+                }
+            )
+            endpoint = "/mcp?execution=classic&discovery_mode=deferred"
+        try:
+            response = await client.post(
+                endpoint,
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": f"demo-discovery-{self.discovery_requests_count + 1}",
+                    "method": method,
+                    "params": params,
+                },
+            )
+            self.discovery_requests_count += 1
+            if response.status_code >= 400:
+                self.errors_count += 1
+                self.http_errors_count += 1
+                self.last_error = f"HTTP {response.status_code} during demo {method}"
+                return False
+            body = response.json()
+            if body.get("error"):
+                self.errors_count += 1
+                self.rpc_errors_count += 1
+                self.last_error = f"MCP {method} discovery failed"
+                return False
+            return True
+        except Exception as exc:
+            self.errors_count += 1
+            self.http_errors_count += 1
+            self.last_error = str(exc)
+            return False
+
+    async def _run_discovery(self) -> dict[str, int]:
+        if self._app is None:
+            raise RuntimeError("DemoTrafficRunner app is not bound")
+        start = self.discovery_requests_count
+        ok = 0
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self._app), base_url="http://demo.local"
+        ) as client:
+            for method, query in (
+                ("tools/list", ""),
+                ("tools/call", "reconcile overdue invoices"),
+            ):
+                if await self._dispatch_discovery(client, method=method, query=query):
+                    ok += 1
+        return {"sent": self.discovery_requests_count - start, "ok": ok}
+
+    async def golden_run(self) -> dict[str, Any]:
+        """Exercise discovery plus every bounded local golden traffic flow once."""
+        workloads = self._next_workloads()
+        discovery = await self._run_discovery()
+        burst = await self.burst(count=min(max(1, len(workloads)), 100))
+        self.golden_runs_count += 1
+        return {
+            "discovery": discovery,
+            "traffic": burst,
+            "workload_cases": min(len(workloads), 100),
+            "status": self.status(),
+        }
 
     async def burst(self, count: int = 8) -> dict[str, Any]:
         if self._app is None:
@@ -405,7 +747,9 @@ class DemoTrafficRunner:
             transport=httpx.ASGITransport(app=self._app), base_url="http://demo.local"
         ) as client:
             for _ in range(max(1, min(count, 100))):
-                item = random.choice(workloads)
+                if self._step % len(workloads) == 0:
+                    workloads = self._next_workloads()
+                item = workloads[self._step % len(workloads)]
                 self._step += 1
                 sent += 1
                 if await self._dispatch_one(client, *item):
@@ -415,13 +759,17 @@ class DemoTrafficRunner:
     async def _loop(self) -> None:
         if self._app is None:
             return
+        workloads = self._next_workloads()
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=self._app), base_url="http://demo.local"
         ) as client:
+            for method, query in (("tools/list", ""), ("tools/call", "invoice status")):
+                await self._dispatch_discovery(client, method=method, query=query)
             while True:
-                workloads = self._next_workloads()
+                if self._step % len(workloads) == 0:
+                    workloads = self._next_workloads()
                 if workloads:
-                    item = random.choice(workloads)
+                    item = workloads[self._step % len(workloads)]
                     self._step += 1
                     await self._dispatch_one(client, *item)
                 base_delay, jitter = _TIER_TIMING.get(self.tier, (0.5, 0.2))

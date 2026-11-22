@@ -194,5 +194,42 @@
       "kind": "legacy_status_fallback",
       "expected_side_effect_count": 2
     }
+  ],
+  "demo_traffic_flows": [
+    {
+      "id": "delayed_write_commits",
+      "kind": "mock_delayed_write",
+      "expected_status": "committed"
+    },
+    {
+      "id": "idempotent_replay_has_one_effect",
+      "kind": "mock_idempotent_replay",
+      "expected_replayed": true
+    },
+    {
+      "id": "changed_payload_key_conflicts",
+      "kind": "mock_idempotency_conflict",
+      "expected_rpc_error_code": -32602
+    },
+    {
+      "id": "upstream_rejection_is_reported",
+      "kind": "mock_upstream_rejection",
+      "expected_rpc_error_code": -32602
+    },
+    {
+      "id": "lost_response_can_be_checked",
+      "kind": "mock_lost_response_status_readback",
+      "expected_status": "committed"
+    },
+    {
+      "id": "pending_upstream_stays_visible_for_reconciliation",
+      "kind": "mock_upstream_pending_reconciliation",
+      "expected_status": "processing"
+    },
+    {
+      "id": "readonly_write_is_denied",
+      "kind": "gateway_rbac_denial",
+      "expected_ok": false
+    }
   ]
 }

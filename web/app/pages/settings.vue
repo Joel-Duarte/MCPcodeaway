@@ -855,22 +855,22 @@ async function pruneAuditRuns() {
       <section v-else-if="activeSettingsTab === 'routing'" id="settings-panel-routing" role="tabpanel" class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
         <div>
           <h2 class="text-sm font-semibold text-[#09090B]">
-            Adaptive execution routing
+            Global adaptive routing for Auto upstreams
           </h2>
           <p class="mt-1 text-xs text-[#71717A]">
-            Observe records the mode applied and the evidence recommendation. Active applies qualified workflow evidence to Auto requests for read-only workloads. Explicit Hybrid, manual overrides, configured A/B splits, and dispatcher safety checks keep their existing behavior.
+            This is a gateway-wide evidence-based selector for requests resolved to Auto, such as `execution=auto` or a gateway default of Auto. It needs a model name, a known workload, and accessible read-only tools. Observe records the recommendation while leaving the normal Auto decision unchanged. Active can apply qualified paired evidence to eligible requests. Per-upstream preferred mode is configured separately; this setting does not change it. Explicit Classic or Code Mode, Hybrid, per-tool overrides, A/B experiments, and safety checks remain in control.
           </p>
         </div>
         <DiscoveryReport policy-only />
         <div class="max-w-sm">
           <label class="block text-xs font-medium text-[#52525B]" for="adaptive-routing-mode">Routing mode</label>
           <select id="adaptive-routing-mode" v-model="adaptiveMode" class="mt-1 min-h-11 w-full rounded-md border border-[#D4D4D8] bg-white px-3 text-sm text-[#09090B] focus-visible:outline-2 focus-visible:outline-[#0F766E]">
-            <option value="observe">Observe</option>
-            <option value="active">Active</option>
+            <option value="observe">Observe recommendations only</option>
+            <option value="active">Apply to eligible Auto reads</option>
           </select>
         </div>
         <div class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3 text-xs leading-5 text-[#52525B]">
-          Eligible traffic uses Auto mode, a known workload profile, and accessible tools that are all read-only. Evidence needs at least five matched pairs within 30 days; the recommended arm must be at least 90% jointly correct and grounded. Higher verified quality wins. Equal quality requires at least 5% lower cost with bounded latency, call, and recovery regressions. Unknown, uncertain, mutating, stale, sparse, or conflicting evidence falls back to deterministic heuristics.
+          Eligible requests resolve to Auto and include a model name, known workload, and accessible read-only tools. Real evidence needs at least five matched pairs within 30 days; the recommended arm must be at least 90% jointly correct and grounded. Simulated demo evidence is never eligible. Unknown, uncertain, mutating, stale, sparse, or conflicting evidence falls back to the normal Auto selector.
         </div>
         <div class="flex items-center gap-3">
           <Button data-variant="primary" :disabled="savingAdaptiveMode" @click="saveAdaptiveMode">

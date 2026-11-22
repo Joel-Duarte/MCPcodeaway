@@ -10,7 +10,9 @@ import hmac
 import json
 import logging
 import math
+import os
 import re
+import secrets
 import time
 import uuid
 from collections import deque
@@ -183,6 +185,59 @@ _GATEWAY_LIFECYCLE_TRANSITIONS: dict[GatewayLifecycleState, frozenset[GatewayLif
     GatewayLifecycleState.FAILED: frozenset({GatewayLifecycleState.STOPPING}),
     GatewayLifecycleState.STOPPED: frozenset(),
 }
+
+
+def _ensure_local_demo_recovery_secrets(
+    settings: GatewaySettings, registry: UpstreamRegistry
+) -> None:
+    """Persist local keys for demo-only recovery without weakening customer upstreams."""
+    if settings.app_env != "sandbox" or settings.effective_profile_name != "demo":
+        return
+    recovery_upstreams = [
+        upstream
+        for upstream in registry.list_upstreams(include_disabled=True)
+        if any(policy.enabled for policy in upstream.tool_recovery_policies.values())
+    ]
+    if not recovery_upstreams or any(not upstream.demo_only for upstream in recovery_upstreams):
+        return
+    if (
+        settings.credential_encryption_key
+        and len(settings.task_dedupe_secret.get_secret_value()) >= 32
+    ):
+        return
+
+    database_path = Path(settings.sqlite_path)
+    if str(database_path) == ":memory:":
+        raise ValueError("Demo write recovery needs a persistent SQLite path for its local keys")
+    key_path = database_path.parent / ".mcpcodeaway-demo-recovery-keys.json"
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        key_data = json.loads(key_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        key_data = {
+            "credential_encryption_key": secrets.token_urlsafe(32),
+            "task_dedupe_secret": secrets.token_urlsafe(48),
+        }
+        try:
+            descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            key_data = json.loads(key_path.read_text(encoding="utf-8"))
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as secret_file:
+                json.dump(key_data, secret_file)
+                secret_file.flush()
+                os.fsync(secret_file.fileno())
+    if not isinstance(key_data, dict):
+        raise ValueError("Local demo recovery key file is malformed")
+    if key_path.stat().st_mode & 0o077:
+        raise ValueError("Local demo recovery key file must be accessible only to its owner")
+    if not settings.credential_encryption_key:
+        settings.credential_encryption_key = str(key_data.get("credential_encryption_key") or "")
+    if len(settings.task_dedupe_secret.get_secret_value()) < 32:
+        from pydantic import SecretStr
+
+        settings.task_dedupe_secret = SecretStr(str(key_data.get("task_dedupe_secret") or ""))
+
 
 _MODE_TO_AXES: dict[GatewayMode, tuple[ExecutionMode, DiscoveryMode]] = {
     "traditional": ("classic", "upfront"),
@@ -409,6 +464,7 @@ class GatewayRuntime:
             http_client=http_client,
         )
         self.registry = UpstreamRegistry(self.settings, store=self.store)
+        _ensure_local_demo_recovery_secrets(self.settings, self.registry)
         self.client_manager = UpstreamClientManager(
             http_client=http_client,
             app_env=self.settings.app_env,
@@ -4544,6 +4600,64 @@ def create_gateway_app(
 
                 return await run_recovery_lab()
 
+            @app.post("/admin/demo/workflow-evidence")
+            @app.post("/admin/demo/golden-run")
+            async def admin_demo_workflow_evidence(
+                authorization: str | None = Header(default=None),
+                mcpcodeaway_admin_session: str | None = Cookie(default=None),
+            ) -> dict[str, Any]:
+                identity = await _authorize_control_plane(
+                    authorization,
+                    mcpcodeaway_admin_session,
+                    require_admin_role=True,
+                )
+                if identity is None:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="An authenticated demo administrator is required.",
+                    )
+                _ensure_demo_traffic_allowed()
+                tenant = _resolve_audit_tenant_scope(identity, None) or identity.tenant_id
+                if not tenant:
+                    raise HTTPException(status_code=401, detail="Tenant identity is required.")
+                task_polls_before = runtime.demo_traffic.task_polls_count
+                operations_before = await runtime.store.list_operations(
+                    tenant, statuses=None, limit=200
+                )
+                golden_run = await runtime.demo_traffic.golden_run()
+                evidence = runtime.demo_traffic.simulated_workflow_evidence()
+                await runtime.store.save_setting(
+                    f"demo_adaptive_evidence:{tenant}",
+                    {"evidence": evidence, "created_at": datetime.now(UTC).isoformat()},
+                )
+                operations_after = await runtime.store.list_operations(
+                    tenant, statuses=None, limit=200
+                )
+                before_ids = {str(row["operation_id"]) for row in operations_before}
+                created = [
+                    row for row in operations_after if str(row["operation_id"]) not in before_ids
+                ]
+                return {
+                    "evidence_rows": len(evidence),
+                    "models": len(runtime.demo_traffic.model_profiles),
+                    "workloads_per_model": 5,
+                    "pairs_per_workload": 5,
+                    "source": "demo simulator; excluded from routing recommendations",
+                    "traffic_requests": golden_run["traffic"]["sent"],
+                    "traffic_workload_cases": golden_run["workload_cases"],
+                    "traffic_ok": golden_run["traffic"]["ok"],
+                    "traffic_errors": golden_run["traffic"]["errors"],
+                    "discovery_requests": golden_run["discovery"]["sent"],
+                    "task_polls": runtime.demo_traffic.task_polls_count - task_polls_before,
+                    "recovery_operations_created": len(created),
+                    "recovery_operations_pending": sum(
+                        row["status"] in {"pending", "working"} for row in created
+                    ),
+                    "recovery_operations_needs_attention": sum(
+                        row["status"] == "needs_attention" for row in created
+                    ),
+                }
+
         @app.get("/admin/demo/traffic/status")
         async def admin_demo_traffic_status(
             authorization: str | None = Header(default=None),
@@ -5026,9 +5140,24 @@ def create_gateway_app(
             evidence = await runtime.store.list_adaptive_evidence(tenant or "")
             days = {"1h": 1 / 24, "24h": 1, "7d": 7, "30d": 30, "all": None}.get(window, 30)
             pricing = await runtime.merged_model_pricing()
+            rows = summarize_pairs(evidence, days=days, pricing=pricing)
+            if runtime.settings.effective_profile_name == "demo":
+                demo_record = await runtime.store.get_setting(
+                    f"demo_adaptive_evidence:{tenant or ''}"
+                )
+                demo_evidence = demo_record.get("evidence", []) if demo_record else []
+                simulated = summarize_pairs(demo_evidence, days=days, pricing=pricing)
+                for row in simulated:
+                    row.update(
+                        evidence_tier="demo_simulated",
+                        qualification="simulated",
+                        recommended_mode=None,
+                        reason="Simulated demo fixture; excluded from adaptive routing.",
+                    )
+                rows.extend(simulated)
             return {
                 "window": window if window in {"1h", "24h", "7d", "30d", "all"} else "30d",
-                "rows": summarize_pairs(evidence, days=days, pricing=pricing),
+                "rows": rows,
                 "adaptive_mode": (
                     await runtime.store.get_setting(f"adaptive_execution:{tenant or ''}") or {}
                 ).get("mode", "observe"),

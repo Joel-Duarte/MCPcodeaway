@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
+import inspect
 import json
 import os
 import secrets
@@ -517,6 +519,8 @@ async def _handle_mcp_rpc(
         args = params.get("arguments") or {}
         try:
             data = call_fn(name, args)
+            if inspect.isawaitable(data):
+                data = await data
         except KeyError as exc:
             return _jsonrpc_error(req_id, -32601, str(exc))
         except ValueError as exc:
@@ -551,6 +555,8 @@ def create_mock_backends_app(
         _seed_enterprise_data()
     )
     readiness_approval_cases: list[dict[str, Any]] = []
+    demo_changes: dict[str, dict[str, Any]] = {}
+    demo_change_metrics = {"calls": 0, "commits": 0, "replays": 0, "failures": 0}
     readiness_crm_health = {"available": True}
     idempotency_operations: dict[str, dict[str, Any]] = {}
     idempotency_side_effects = {"count": 0}
@@ -1108,6 +1114,121 @@ def create_mock_backends_app(
             server_name="readiness_approvals",
             tools=tools,
             call_fn=create_readiness_case,
+        )
+
+    @app.post("/recovery/mcp")
+    async def recovery_workbench_mcp(request: Request) -> JSONResponse:
+        """Local MCP fixture for delayed, idempotent writes and deterministic errors."""
+        tools = [
+            {
+                "name": "submit_change",
+                "description": (
+                    "Submit an idempotent change with bounded delay and gateway fault simulations."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "idempotency_key": {"type": "string", "minLength": 1},
+                        "resource_id": {"type": "string", "minLength": 1},
+                        "change": {"type": "string", "minLength": 1},
+                        "delay_ms": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 2000,
+                            "default": 0,
+                        },
+                        "simulate_failure": {"type": "boolean", "default": False},
+                        "simulate_lost_response": {"type": "boolean", "default": False},
+                        "simulate_pending": {"type": "boolean", "default": False},
+                    },
+                    "required": ["idempotency_key", "resource_id", "change"],
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "operation_id": {"type": "string"},
+                        "idempotency_key": {"type": "string"},
+                        "resource_id": {"type": "string"},
+                        "status": {"type": "string"},
+                        "replayed": {"type": "boolean"},
+                    },
+                },
+                "annotations": {"readOnlyHint": False, "destructiveHint": False},
+            },
+            {
+                "name": "get_change_status",
+                "description": "Look up an idempotent change by its upstream idempotency key.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"idempotency_key": {"type": "string", "minLength": 1}},
+                    "required": ["idempotency_key"],
+                },
+                "annotations": {"readOnlyHint": True, "destructiveHint": False},
+            },
+        ]
+
+        async def call_recovery_workbench(name: str, args: dict[str, Any]) -> Any:
+            demo_change_metrics["calls"] += 1
+            if name == "get_change_status":
+                operation = demo_changes.get(str(args.get("idempotency_key") or ""))
+                return operation["result"] if operation else {"status": "not_found"}
+            if name != "submit_change":
+                raise KeyError(name)
+            key = str(args.get("idempotency_key") or "").strip()
+            resource_id = str(args.get("resource_id") or "").strip()
+            change = str(args.get("change") or "").strip()
+            if not key or not resource_id or not change:
+                raise ValueError("idempotency_key, resource_id, and change are required")
+            if args.get("simulate_failure"):
+                demo_change_metrics["failures"] += 1
+                raise ValueError("Simulated upstream rejection before commit")
+            fingerprint = hashlib.sha256(
+                json.dumps({"resource_id": resource_id, "change": change}, sort_keys=True).encode()
+            ).hexdigest()
+            existing = demo_changes.get(key)
+            if existing is not None:
+                if existing["fingerprint"] != fingerprint:
+                    demo_change_metrics["failures"] += 1
+                    raise ValueError("Idempotency key was reused with a different change")
+                demo_change_metrics["replays"] += 1
+                return {**existing["result"], "replayed": True}
+            delay_ms = max(0, min(int(args.get("delay_ms", 0)), 2000))
+            if args.get("simulate_pending"):
+                demo_changes[key] = {
+                    "fingerprint": fingerprint,
+                    "result": {
+                        "operation_id": f"CHANGE-{demo_change_metrics['commits'] + 1:06d}",
+                        "idempotency_key": key,
+                        "resource_id": resource_id,
+                        "status": "processing",
+                        "replayed": False,
+                    },
+                }
+                demo_change_metrics["failures"] += 1
+                raise HTTPException(
+                    status_code=504,
+                    detail="Simulated upstream accepted the write but remains processing.",
+                )
+            if delay_ms:
+                await asyncio.sleep(delay_ms / 1000)
+            result = {
+                "operation_id": f"CHANGE-{demo_change_metrics['commits'] + 1:06d}",
+                "idempotency_key": key,
+                "resource_id": resource_id,
+                "status": "committed",
+                "replayed": False,
+            }
+            demo_changes[key] = {"fingerprint": fingerprint, "result": result}
+            demo_change_metrics["commits"] += 1
+            if args.get("simulate_lost_response"):
+                raise HTTPException(status_code=504, detail="Simulated response loss after commit")
+            return result
+
+        return await _handle_mcp_rpc(
+            request,
+            server_name="recovery_workbench",
+            tools=tools,
+            call_fn=call_recovery_workbench,
         )
 
     app.mount(

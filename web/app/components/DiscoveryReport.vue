@@ -88,7 +88,7 @@ const cohorts = computed(() => {
       <p class="text-sm text-zinc-600"><strong class="text-zinc-950">{{ report.policy === "active" ? "Active" : "Observe" }}</strong> · Upfront budget <span class="tabular-nums">{{ report.token_budget.toLocaleString() }}</span> estimated tokens</p>
       <template v-if="!policyOnly">
         <p class="text-sm text-zinc-600">Recent requests on this replica. Token estimates cover gateway discovery payloads. Verified workflow outcomes appear under Routing and Efficiency.</p>
-        <p v-if="!snapshot.length" class="text-sm text-zinc-600">No discovery requests recorded yet.</p>
+        <p v-if="!snapshot.length" class="text-sm text-zinc-600">No discovery requests recorded on this gateway process yet. Run the golden demo traffic to send listing and search requests through MCP and populate this report. <NuxtLink to="/demo" class="font-medium text-teal-700 underline underline-offset-2">Open Demo Control</NuxtLink>.</p>
         <template v-else>
           <p class="text-sm tabular-nums text-zinc-600">{{ searches }} searches across {{ snapshot.length }} discovery requests</p>
           <div class="overflow-x-auto rounded-md border border-zinc-200">

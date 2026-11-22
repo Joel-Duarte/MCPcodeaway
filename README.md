@@ -64,7 +64,7 @@ uv run uvicorn examples.mock_backends:app --port 8001
 uv run uvicorn gateway.server:app --port 8000
 ```
 
-Open `http://127.0.0.1:8000/dashboard` for the interactive playground, HITL onboarding wizard, and agent prompt exporter. In the demo profile, **Demo Control → MCP Write Recovery Lab** runs isolated golden recovery journeys against an in-process mock; it does not call registered upstreams.
+Open `http://127.0.0.1:8000/dashboard` for the interactive playground, HITL onboarding wizard, and agent prompt exporter. In the demo profile, **Run Golden Demo Traffic** sends discovery and MCP calls through the gateway to the local mock upstreams, including reads, delayed writes, idempotent replay, payload conflict, upstream rejection, a lost response, a write that remains processing, status reconciliation, task polling, and RBAC denial. Customer-configured upstreams are excluded. Mock writes use the demo-only `recovery_workbench` upstream and create visible records on **Operations Recovery**; that view refreshes automatically while open. The dashboard also seeds clearly labeled simulated paired model evidence for report exploration; it is not used for routing recommendations. The local sandbox creates an owner-only recovery key file beside its SQLite database; production recovery continues to require explicitly managed persistent keys. **MCP Write Recovery Lab** remains isolated and does not call registered upstreams.
 
 ### CLI Onboarding & Comparison
 

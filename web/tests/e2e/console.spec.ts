@@ -64,7 +64,7 @@ test.describe("MCPcodeaway Admin Console E2E", () => {
 
     await page.getByRole("link", { name: /Demo Control/i }).click();
     await expect(page.getByRole("heading", { name: "Continuous Demo Traffic Runner", exact: true })).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Simulated Model Performance Profiles", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Synthetic Evidence Profiles", exact: true })).toBeVisible();
 
     await page.getByRole("link", { name: /Onboarding/i }).click();
     await expect(page.getByText("Stateful MCP Session", { exact: true })).toHaveCount(0);

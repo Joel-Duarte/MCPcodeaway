@@ -42,6 +42,7 @@ const errorMsg = ref("");
 const recoveryRunning = ref(false);
 const recoveryError = ref("");
 const recoveryResult = ref<RecoveryLabResult | null>(null);
+const evidenceGenerating = ref(false);
 
 const newModelName = ref("");
 const newCodeSuccessRate = ref(0.95);
@@ -99,13 +100,13 @@ async function saveModels() {
   }
 }
 
-async function runCalibrationBurst(count = 100) {
+async function runDemoBurst(count = 100) {
   notice.value = "";
   errorMsg.value = "";
   try {
     await runBurst(count);
     await refreshStatus();
-    notice.value = `Dispatched ${count}-request A/B demo burst.`;
+    notice.value = `Dispatched ${count}-request mixed MCP demo burst.`;
   } catch (err) {
     errorMsg.value = extractErrorMessage(err);
   }
@@ -123,6 +124,35 @@ async function runRecoveryLab() {
     recoveryError.value = `${extractErrorMessage(err)} Check that the gateway is using the demo profile and retry.`;
   } finally {
     recoveryRunning.value = false;
+  }
+}
+
+async function generateWorkflowEvidence() {
+  evidenceGenerating.value = true;
+  notice.value = "";
+  errorMsg.value = "";
+  try {
+    const result = await apiFetch<{
+      evidence_rows: number;
+      models: number;
+      workloads_per_model: number;
+      traffic_requests: number;
+      traffic_errors: number;
+      discovery_requests: number;
+      task_polls: number;
+      recovery_operations_created: number;
+      recovery_operations_pending: number;
+      recovery_operations_needs_attention: number;
+    }>(
+      "/admin/demo/golden-run",
+      { method: "POST", timeout: 60000 },
+    );
+    notice.value = `Golden run sent ${result.traffic_requests} mock MCP calls, including ${result.traffic_errors} expected errors, ${result.discovery_requests} discovery requests, and ${result.task_polls} task polls. It created ${result.recovery_operations_created} recovery operations (${result.recovery_operations_pending} pending, ${result.recovery_operations_needs_attention} need attention) and ${result.evidence_rows} clearly labeled simulated report rows.`;
+    await refreshStatus();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err);
+  } finally {
+    evidenceGenerating.value = false;
   }
 }
 
@@ -170,16 +200,19 @@ onMounted(() => {
       <div>
         <h1 class="text-xl font-semibold tracking-tight text-[#09090B]">Demo Control</h1>
         <p class="text-sm text-[#71717A]">
-          Configure simulated model performance on Code Mode vs. Classic MCP and trigger 100-request A/B calibration bursts.
+          Run the golden workload through the gateway and local mock APIs. It records discovery, writes, failures, and recovery operations.
         </p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
-        <Button :disabled="saving" @click="saveModels">Save Model Profiles</Button>
-        <Button :disabled="demoBusy || !demoStatus.enabled" @click="runCalibrationBurst(8)">
-          Burst +8
+        <Button :disabled="evidenceGenerating" @click="generateWorkflowEvidence">
+          {{ evidenceGenerating ? "Running golden demo…" : "Run Golden Demo Traffic" }}
         </Button>
-        <Button :disabled="demoBusy || !demoStatus.enabled" @click="runCalibrationBurst(100)">
-          Run 100-Req Calibration Burst
+        <Button :disabled="saving" @click="saveModels">Save Model Profiles</Button>
+        <Button :disabled="demoBusy || !demoStatus.enabled" @click="runDemoBurst(8)">
+          Run 8-Request Demo Burst
+        </Button>
+        <Button :disabled="demoBusy || !demoStatus.enabled" @click="runDemoBurst(100)">
+          Run 100-Request Demo Burst
         </Button>
       </div>
     </div>
@@ -200,7 +233,7 @@ onMounted(() => {
         <div>
           <h2 class="text-sm font-semibold text-[#09090B]">Continuous Demo Traffic Runner</h2>
           <p class="text-xs text-[#71717A]">
-            Stream realistic multi-persona Code Mode vs. Classic MCP requests through the gateway.
+            Cycle reads and recoverable writes through the gateway into local mocks only. Scenarios include replay, rejection, lost responses, a write that stays processing, status reconciliation, and RBAC denial. Customer-configured upstreams are skipped.
           </p>
         </div>
         <span
@@ -348,9 +381,9 @@ onMounted(() => {
     </section>
 
     <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-      <h2 class="text-sm font-semibold text-[#09090B]">Simulated Model Performance Profiles</h2>
+      <h2 class="text-sm font-semibold text-[#09090B]">Synthetic Evidence Profiles</h2>
       <p class="mb-4 text-xs text-[#71717A]">
-        Adjust success rates and average Classic MCP turns per model to observe automatic mode switching.
+        These profiles feed generated paired report data and label mock traffic. They are not LLM measurements and never affect routing recommendations.
       </p>
       <div class="overflow-x-auto">
         <table class="w-full text-left text-xs tabular-nums">
@@ -393,7 +426,7 @@ onMounted(() => {
 
     <div v-if="demoStatus" class="rounded-lg border border-[#E4E4E7] bg-white p-4">
       <h2 class="mb-3 text-sm font-semibold text-[#09090B]">Live Demo Traffic Status</h2>
-      <div class="grid grid-cols-2 gap-4 text-xs tabular-nums sm:grid-cols-4">
+      <div class="grid grid-cols-2 gap-4 text-xs tabular-nums sm:grid-cols-3 xl:grid-cols-4">
         <div>
           <div class="text-[#71717A]">Requests Sent</div>
           <div class="font-mono-data text-base font-semibold text-[#09090B]">{{ demoStatus.requests_sent }}</div>
@@ -401,6 +434,30 @@ onMounted(() => {
         <div>
           <div class="text-[#71717A]">Errors</div>
           <div class="font-mono-data text-base font-semibold text-[#09090B]">{{ demoStatus.errors_count }}</div>
+        </div>
+        <div>
+          <div class="text-[#71717A]">Write Calls</div>
+          <div class="font-mono-data text-base font-semibold text-[#09090B]">{{ demoStatus.write_calls_count }}</div>
+        </div>
+        <div>
+          <div class="text-[#71717A]">Discovery Requests</div>
+          <div class="font-mono-data text-base font-semibold text-[#09090B]">{{ demoStatus.discovery_requests_count }}</div>
+        </div>
+        <div>
+          <div class="text-[#71717A]">Task Polls</div>
+          <div class="font-mono-data text-base font-semibold text-[#09090B]">{{ demoStatus.task_polls_count }}</div>
+        </div>
+        <div>
+          <div class="text-[#71717A]">Golden Runs</div>
+          <div class="font-mono-data text-base font-semibold text-[#09090B]">{{ demoStatus.golden_runs_count }}</div>
+        </div>
+        <div>
+          <div class="text-[#71717A]">MCP Errors</div>
+          <div class="font-mono-data text-base font-semibold text-[#09090B]">{{ demoStatus.rpc_errors_count }}</div>
+        </div>
+        <div>
+          <div class="text-[#71717A]">Gateway HTTP Errors</div>
+          <div class="font-mono-data text-base font-semibold text-[#09090B]">{{ demoStatus.http_errors_count }}</div>
         </div>
         <div>
           <div class="text-[#71717A]">Tier</div>

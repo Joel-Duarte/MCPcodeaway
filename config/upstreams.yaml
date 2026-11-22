@@ -112,3 +112,29 @@ upstreams:
         confirmation_message: Approve creation of this outbound collections case.
         approver_groups: [operations-approvers]
     enabled: true
+
+  - name: recovery_workbench
+    demo_only: true
+    type: mcp_http
+    url: http://127.0.0.1:8001/recovery/mcp
+    auth_type: none
+    allowed_roles: [gateway_admin]
+    allowed_groups: [platform-admins]
+    allowed_scopes: [mcp.tools, mcp.write]
+    allowed_operations: [submit_change, get_change_status]
+    tool_effects:
+      submit_change: write
+      get_change_status: read
+    mutating_tools: [submit_change]
+    tool_recovery_policies:
+      submit_change:
+        enabled: true
+        idempotency_key_argument: idempotency_key
+        synchronous_budget_seconds: 0.4
+        max_attempts: 3
+        max_recovery_age_seconds: 30
+        upstream_key_retention_seconds: 60
+        status_tool: get_change_status
+        status_key_argument: idempotency_key
+    request_timeout_seconds: 5
+    enabled: true

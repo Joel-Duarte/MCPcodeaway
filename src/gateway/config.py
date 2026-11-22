@@ -230,6 +230,7 @@ class UpstreamConfig(BaseModel):
     max_requests_per_minute: int | None = Field(default=120, ge=1, le=100_000)
     max_concurrent_calls: int | None = Field(default=10, ge=1, le=10_000)
     enabled: bool = True
+    demo_only: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -600,7 +601,7 @@ class UpstreamRegistry:
         items = raw.get("upstreams", []) if isinstance(raw, dict) else raw
         for item in items:
             cfg = UpstreamConfig.model_validate(item)
-            if self.settings.app_env == "prod" and cfg.enabled:
+            if self.settings.app_env == "prod" and cfg.enabled and not cfg.demo_only:
                 if not cfg.allowed_roles and not cfg.allowed_groups and not cfg.allow_all_callers:
                     raise ValueError(
                         f"Production upstream '{cfg.name}' must set allowed_roles or "
@@ -659,6 +660,10 @@ class UpstreamRegistry:
         result: list[UpstreamConfig] = []
         for cfg in merged.values():
             if not include_disabled and not cfg.enabled:
+                continue
+            if cfg.demo_only and (
+                self.settings.app_env == "prod" or self.settings.effective_profile_name != "demo"
+            ):
                 continue
             if self.settings.app_env == "prod" and cfg.type == "mcp_stdio":
                 continue

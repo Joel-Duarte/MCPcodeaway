@@ -13,6 +13,12 @@ export interface DemoTrafficStatus {
   tier: DemoTier;
   requests_sent: number;
   errors_count: number;
+  rpc_errors_count: number;
+  http_errors_count: number;
+  write_calls_count: number;
+  discovery_requests_count: number;
+  task_polls_count: number;
+  golden_runs_count: number;
   last_target: string;
   last_error: string;
 }
@@ -106,6 +112,12 @@ export function useDemoTraffic() {
     tier: "enterprise",
     requests_sent: 0,
     errors_count: 0,
+    rpc_errors_count: 0,
+    http_errors_count: 0,
+    write_calls_count: 0,
+    discovery_requests_count: 0,
+    task_polls_count: 0,
+    golden_runs_count: 0,
     last_target: "",
     last_error: "",
   }));

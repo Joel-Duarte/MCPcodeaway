@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from "vue";
+import { onMounted, onUnmounted, ref, watch } from "vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
 
 interface RecoveryOperation {
@@ -38,8 +38,8 @@ function formatTime(value: string): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
-async function loadOperations() {
-  loading.value = true;
+async function loadOperations(silent = false) {
+  if (!silent) loading.value = true;
   errorMessage.value = "";
   try {
     const response = await apiFetch<{ operations: RecoveryOperation[] }>(
@@ -54,7 +54,16 @@ async function loadOperations() {
 }
 
 watch(statusFilter, () => { void loadOperations(); });
-onMounted(() => { void loadOperations(); });
+let refreshTimer: ReturnType<typeof setInterval> | undefined;
+onMounted(() => {
+  void loadOperations();
+  refreshTimer = setInterval(() => {
+    if (document.visibilityState === "visible") void loadOperations(true);
+  }, 4000);
+});
+onUnmounted(() => {
+  if (refreshTimer) clearInterval(refreshTimer);
+});
 </script>
 
 <template>
@@ -63,8 +72,7 @@ onMounted(() => { void loadOperations(); });
       <div>
         <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">Operations recovery</h1>
         <p class="mt-1 max-w-3xl text-[13px] leading-5 text-[#52525B]">
-          Inspect write operations whose outcome the gateway is confirming. This view is read only;
-          callers receive the final result through their MCP task or can check its operation status.
+          Inspect idempotent writes the gateway is confirming with an upstream. The list refreshes every four seconds while this page is open. Demo runs create visible records here; the gateway keeps the final caller result on its MCP task or operation status.
         </p>
       </div>
       <div class="flex items-center gap-2">
@@ -97,7 +105,7 @@ onMounted(() => { void loadOperations(); });
       <div v-if="operations.length === 0" class="px-5 py-12 text-center">
         <h2 class="text-[15px] font-semibold text-[#09090B]">No operations for this state</h2>
         <p class="mx-auto mt-2 max-w-md text-[13px] leading-5 text-[#52525B]">
-          Operations appear when an enabled, idempotent write needs confirmation or recovery.
+          Operations appear when a configured idempotent write is sent through the gateway. Start continuous demo traffic or run the golden workload to create local mock operations. <NuxtLink to="/demo" class="font-medium text-[#0F766E] underline underline-offset-2">Open Demo Control</NuxtLink>.
         </p>
       </div>
       <div v-else class="overflow-x-auto">

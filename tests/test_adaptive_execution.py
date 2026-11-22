@@ -223,6 +223,35 @@ def test_exact_qualified_recommendation_is_not_discarded() -> None:
 
 
 @pytest.mark.asyncio
+async def test_demo_workflow_evidence_is_reported_but_never_recommended(tmp_path) -> None:
+    keys = LocalDevKeyManager()
+    settings = GatewaySettings(
+        auth_mode="dev",
+        profile="demo",
+        sqlite_path=str(tmp_path / "demo-evidence.db"),
+        upstreams_config_path=str(tmp_path / "no-upstreams.yaml"),
+        allowed_tenants=["tenant-acme-dev"],
+    )
+    app = create_gateway_app(settings=settings, dev_keys=keys, preloaded_tools={})
+    admin = keys.issue_user_token(persona="gateway_admin", audience=settings.oidc_audience)
+    headers = {"Authorization": f"Bearer {admin}"}
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            seeded = await client.post("/admin/demo/workflow-evidence", headers=headers)
+            assert seeded.status_code == 200, seeded.text
+            assert seeded.json()["evidence_rows"] == 200
+            report = await client.get("/admin/adaptive-execution/report", headers=headers)
+            rows = report.json()["rows"]
+            assert len(rows) == 20
+            assert all(row["evidence_tier"] == "demo_simulated" for row in rows)
+            assert all(row["recommended_mode"] is None for row in rows)
+            stored = await app.state.runtime.store.list_adaptive_evidence("tenant-acme-dev")
+            assert stored == []
+
+
+@pytest.mark.asyncio
 async def test_adaptive_route_context_survives_discovery_execution_and_rollback(tmp_path) -> None:
     from gateway.auth import CallerIdentity
     from gateway.server import GatewayRuntime
