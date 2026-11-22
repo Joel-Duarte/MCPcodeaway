@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CLUSTER="mcpcodeaway-k1"
+CLUSTER="${MCP_K8S_CLUSTER:-mcpcodeaway-k1}"
 NAMESPACE="mcpcodeaway-k1"
 CONTEXT="kind-${CLUSTER}"
 LOCAL_STATE="${ROOT}/.k8s-local/${CLUSTER}"
@@ -51,6 +51,21 @@ create_cluster() {
   kubectl config use-context "$CONTEXT" >/dev/null
 }
 
+create_netpol_cluster() {
+  require docker
+  require kind
+  if cluster_exists; then
+    echo "kind cluster '${CLUSTER}' already exists"
+    return
+  fi
+  kind create cluster --name "$CLUSTER" --config "${MANIFESTS}/cluster-netpol.yaml" --wait 0s
+  kubectl config use-context "$CONTEXT" >/dev/null
+  python3 -c 'from urllib.request import urlopen; p="https://raw.githubusercontent.com/projectcalico/calico/v3.33.0/manifests/calico.yaml"; s=urlopen(p, timeout=30).read().decode(); old="            # - name: CALICO_IPV4POOL_CIDR\n            #   value: \"192.168.0.0/16\""; new="            - name: CALICO_IPV4POOL_CIDR\n              value: \"10.244.0.0/16\""; assert old in s; print(s.replace(old, new))' \
+    | kubectl --context "$CONTEXT" apply -f -
+  kubectl --context "$CONTEXT" -n kube-system rollout status daemonset/calico-node --timeout=240s
+  kubectl --context "$CONTEXT" wait --for=condition=Ready nodes --all --timeout=240s
+}
+
 build_images() {
   require docker
   require kind
@@ -72,7 +87,7 @@ deploy_local() {
   password="$(cat "${LOCAL_STATE}/postgres-password")"
   kubectl --context "$CONTEXT" -n "$NAMESPACE" create secret generic gateway-secrets \
     --from-literal="postgres-password=${password}" \
-    --from-literal="postgres-dsn=postgresql://gateway:${password}@postgres:5432/mcpcodeaway" \
+    --from-literal="postgres-dsn=postgresql://gateway:${password}@postgres:5432/mcpcodeaway?sslmode=disable" \
     --from-literal="admin-session-secret=$(cat "${LOCAL_STATE}/admin-session-secret")" \
     --from-literal="provenance-signing-secret=$(cat "${LOCAL_STATE}/provenance-signing-secret")" \
     --from-literal="task-dedupe-secret=$(cat "${LOCAL_STATE}/task-dedupe-secret")" \
@@ -93,6 +108,19 @@ show_status() {
   kubectl --context "$CONTEXT" -n "$NAMESPACE" get all -o wide
 }
 
+validate_optional() {
+  require kubectl
+  kubectl --context "$CONTEXT" apply --dry-run=server \
+    -f "${MANIFESTS}/network-policy.yaml" \
+    -f "${MANIFESTS}/pdb.yaml" \
+    -f "${MANIFESTS}/ingress-tls.example.yaml"
+}
+
+resource_snapshot() {
+  require kubectl
+  python3 "${ROOT}/scripts/k8s_resource_snapshot.py" --context "$CONTEXT" --namespace "$NAMESPACE"
+}
+
 destroy_local() {
   require kind
   if cluster_exists; then
@@ -110,16 +138,19 @@ destroy_local() {
 
 case "${1:-}" in
   create) create_cluster ;;
+  create-netpol) create_netpol_cluster ;;
   build) build_images ;;
   deploy) deploy_local ;;
   status) show_status ;;
+  validate-optional) validate_optional ;;
+  resource-snapshot) resource_snapshot ;;
   test)
     require kubectl
     python3 "${ROOT}/scripts/k8s_acceptance.py" --context "$CONTEXT" --namespace "$NAMESPACE"
     ;;
   destroy) destroy_local ;;
   *)
-    echo "Usage: $0 {create|build|deploy|status|test|destroy}" >&2
+    echo "Usage: $0 {create|create-netpol|build|deploy|status|test|validate-optional|resource-snapshot|destroy}" >&2
     exit 2
     ;;
 esac

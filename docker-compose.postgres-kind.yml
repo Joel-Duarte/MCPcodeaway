@@ -1,0 +1,10 @@
+services:
+  postgres:
+    networks:
+      - default
+      - kind
+
+networks:
+  kind:
+    name: kind
+    external: true

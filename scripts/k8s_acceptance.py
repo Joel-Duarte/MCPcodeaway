@@ -1037,6 +1037,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--context", required=True)
     parser.add_argument("--namespace", required=True)
+    parser.add_argument("--client-only", action="store_true")
     args = parser.parse_args()
     created_client = False
     try:
@@ -1047,6 +1048,9 @@ def main() -> int:
         output = run_client(args.context, args.namespace)
         run_tag_line = next(line for line in output.splitlines() if line.startswith("run_tag="))
         run_tag = run_tag_line.split("=", 1)[1]
+        if args.client_only:
+            print("external_postgres_client_checks=passed")
+            return 0
         write_pod_line = next(
             line for line in output.splitlines() if line.startswith("approval_prompt_pod=")
         )
