@@ -6386,6 +6386,7 @@ def create_gateway_app(
                     "traffic_workload_cases": golden_run["workload_cases"],
                     "traffic_ok": golden_run["traffic"]["ok"],
                     "traffic_errors": golden_run["traffic"]["errors"],
+                    "business_value_workflow": golden_run["business_value_workflow"],
                     "discovery_requests": golden_run["discovery"]["sent"],
                     "task_polls": runtime.demo_traffic.task_polls_count - task_polls_before,
                     "recovery_operations_created": len(created),

@@ -22,6 +22,9 @@ from gateway.state import SQLiteAuditStore
 _GOLDEN_DEMO_FLOWS = json.loads(
     (Path(__file__).parent / "golden" / "flows.json").read_text(encoding="utf-8")
 )["demo_traffic_flows"]
+_GOLDEN_BUSINESS_VALUE_WORKFLOW = next(
+    flow for flow in _GOLDEN_DEMO_FLOWS if flow["kind"] == "business_value_attributed_workflow"
+)
 
 
 def _call_payload(tool: str, arguments: dict[str, object]) -> dict[str, object]:
@@ -193,6 +196,7 @@ def test_demo_traffic_cases_match_additive_golden_catalog() -> None:
         "mock_lost_response_status_readback",
         "mock_upstream_pending_reconciliation",
         "gateway_rbac_denial",
+        "business_value_attributed_workflow",
     }
 
 
@@ -226,7 +230,36 @@ async def test_gateway_demo_burst_exercises_write_and_failure_spectrum(tmp_path:
                     }
                 },
                 "request_timeout_seconds": 5,
-            }
+            },
+            {
+                "name": "hr_directory",
+                "type": "openapi",
+                "url": "http://mock-backends/hr",
+                "openapi_spec_url": "http://mock-backends/hr/openapi.json",
+                "auth_type": "none",
+                "allowed_roles": ["hr_ops", "hr_writer", "gateway_admin", "admin"],
+                "allowed_groups": ["hr", "platform-admins"],
+                "allowed_operations": [
+                    "list_hr_employees",
+                    "get_hr_employee",
+                    "update_hr_employee",
+                ],
+                "tool_effects": {
+                    "list_hr_employees": "read",
+                    "get_hr_employee": "read",
+                    "update_hr_employee": "write",
+                },
+                "tool_approval_policies": {
+                    "list_hr_employees": {"mode": "none", "version": 1},
+                    "get_hr_employee": {"mode": "none", "version": 1},
+                    "update_hr_employee": {
+                        "mode": "requester_confirmation",
+                        "version": 1,
+                        "confirmation_message": "Confirm the demo profile update.",
+                    },
+                },
+                "mutating_tools": ["update_hr_employee"],
+            },
         ]
     }
     config_path = tmp_path / "upstreams.json"
@@ -260,8 +293,25 @@ async def test_gateway_demo_burst_exercises_write_and_failure_spectrum(tmp_path:
         assert response.status_code == 200
         golden = response.json()
         status = app.state.runtime.demo_traffic.status()
-        assert golden["traffic_requests"] == status["requests_sent"]
         assert golden["traffic_requests"] == golden["traffic_workload_cases"]
+        assert golden["business_value_workflow"]["status"] == "completed"
+        assert (
+            golden["business_value_workflow"]["workflow_id"]
+            == _GOLDEN_BUSINESS_VALUE_WORKFLOW["workflow_id"]
+        )
+        assert (
+            golden["business_value_workflow"]["completion_count"]
+            == _GOLDEN_BUSINESS_VALUE_WORKFLOW["expected_completions"]
+        )
+        assert (
+            golden["business_value_workflow"]["manual_baseline_minutes"]
+            == _GOLDEN_BUSINESS_VALUE_WORKFLOW["expected_manual_baseline_minutes"]
+        )
+        assert golden["business_value_workflow"]["requests"] == 6
+        assert (
+            golden["traffic_requests"] + golden["business_value_workflow"]["requests"]
+            == status["requests_sent"]
+        )
         assert golden["traffic_ok"] >= 3
         assert golden["discovery_requests"] == 2
         assert golden["recovery_operations_created"] >= 4
@@ -289,6 +339,19 @@ async def test_gateway_demo_burst_exercises_write_and_failure_spectrum(tmp_path:
             row["upstream_name"] == "recovery_workbench"
             for row in metrics.json()["by_upstream_24h"]
         )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+        ) as report_client:
+            report = await report_client.get(
+                "/admin/business-value/report", headers={"Authorization": f"Bearer {token}"}
+            )
+        assert report.status_code == 200
+        report_workflows = {
+            row["selected_id"]: row for row in report.json()["by_integration_workflow_day"]
+        }
+        report_key = _GOLDEN_BUSINESS_VALUE_WORKFLOW["workflow_id"]
+        assert report_workflows[report_key]["completed_count"] == 1
+        assert report_workflows[report_key]["estimated_manual_baseline_minutes"] == 8
         key_file = tmp_path / ".mcpcodeaway-demo-recovery-keys.json"
         assert key_file.exists()
         assert key_file.stat().st_mode & 0o077 == 0

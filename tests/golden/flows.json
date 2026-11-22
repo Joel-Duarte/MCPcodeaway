@@ -276,6 +276,15 @@
       "id": "readonly_write_is_denied",
       "kind": "gateway_rbac_denial",
       "expected_ok": false
+    },
+    {
+      "id": "demo_hr_profile_update_appears_in_business_value",
+      "kind": "business_value_attributed_workflow",
+      "workflow_id": "hr_directory/demo_fictional_employee_profile_update",
+      "employee_id": "EMP-01",
+      "expected_role": "senior_controller",
+      "expected_manual_baseline_minutes": 8,
+      "expected_completions": 1
     }
   ]
 }

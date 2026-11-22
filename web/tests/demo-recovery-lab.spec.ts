@@ -59,6 +59,11 @@ test("Demo Control runs the Recovery Lab and presents the gateway proof", async 
         recovery_operations_created: 4,
         recovery_operations_pending: 1,
         recovery_operations_needs_attention: 0,
+        business_value_workflow: {
+          status: "completed",
+          completion_count: 1,
+          manual_baseline_minutes: 8,
+        },
       };
     }
     throw new Error(`Unexpected API request: ${path}`);
@@ -145,6 +150,8 @@ test("Demo Control runs the Recovery Lab and presents the gateway proof", async 
     const generated = await agent.act({ steps: [{ ref: evidenceButton!.ref, action: "press" }] });
     expect(generated.ok, generated.error?.message).toBe(true);
     await vi.waitFor(() => expect(wrapper.text()).toContain("Golden run sent 24 mock MCP calls"));
+    expect(wrapper.text()).toContain("1 HR workflow completion");
+    expect(wrapper.text()).toContain("8-minute estimated manual baseline in Business Value");
     expect(wrapper.text()).toContain("360 clearly labeled simulated report rows");
     expect(apiFetch).toHaveBeenCalledWith(
       "/admin/demo/golden-run",

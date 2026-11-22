@@ -151,11 +151,20 @@ async function generateWorkflowEvidence() {
       recovery_operations_created: number;
       recovery_operations_pending: number;
       recovery_operations_needs_attention: number;
+      business_value_workflow: {
+        status: string;
+        completion_count: number;
+        manual_baseline_minutes: number;
+      };
     }>(
       "/admin/demo/golden-run",
       { method: "POST", timeout: 60000 },
     );
-    notice.value = `Golden run sent ${result.traffic_requests} mock MCP calls, including ${result.traffic_errors} expected errors, ${result.discovery_requests} discovery requests, and ${result.task_polls} task polls. It created ${result.recovery_operations_created} recovery operations (${result.recovery_operations_pending} pending, ${result.recovery_operations_needs_attention} need attention) and ${result.evidence_rows} clearly labeled simulated report rows.`;
+    const workflow = result.business_value_workflow;
+    const valueNotice = workflow.status === "completed"
+      ? ` It recorded ${workflow.completion_count} HR workflow completion with an ${workflow.manual_baseline_minutes}-minute estimated manual baseline in Business Value.`
+      : " No attributed HR business workflow was recorded.";
+    notice.value = `Golden run sent ${result.traffic_requests} mock MCP calls, including ${result.traffic_errors} expected errors, ${result.discovery_requests} discovery requests, and ${result.task_polls} task polls. It created ${result.recovery_operations_created} recovery operations (${result.recovery_operations_pending} pending, ${result.recovery_operations_needs_attention} need attention) and ${result.evidence_rows} clearly labeled simulated report rows.${valueNotice}`;
     await refreshStatus();
   } catch (err) {
     errorMsg.value = extractErrorMessage(err);

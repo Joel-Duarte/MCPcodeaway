@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import random
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
@@ -12,7 +13,13 @@ from uuid import uuid4
 import httpx
 from pydantic import BaseModel, Field, model_validator
 
-from gateway.mcp_protocol import request_headers, request_meta
+from gateway.integration_validation import ATTRIBUTED_TOOL_PREFIX, START_BUSINESS_EXECUTION_TOOL
+from gateway.mcp_protocol import (
+    MCP_CLIENT_CAPABILITIES_META,
+    request_headers,
+    request_meta,
+)
+from gateway.upstream_clients import compute_schema_digest
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -72,6 +79,7 @@ class DemoTrafficRunner:
         self._app = app
         self._task: asyncio.Task[None] | None = None
         self._step = 0
+        self._business_value_workflow_lock = asyncio.Lock()
         self.tier: DemoTier = "enterprise"
         self.requests_sent = 0
         self.errors_count = 0
@@ -802,13 +810,320 @@ class DemoTrafficRunner:
         workloads = self._next_workloads()
         discovery = await self._run_discovery()
         burst = await self.burst(count=min(max(1, len(workloads)), 100))
+        business_value_workflow = await self._run_hr_business_value_workflow()
         self.golden_runs_count += 1
         return {
             "discovery": discovery,
             "traffic": burst,
             "workload_cases": min(len(workloads), 100),
+            "business_value_workflow": business_value_workflow,
             "status": self.status(),
         }
+
+    async def _ensure_hr_demo_workflow(self, client: httpx.AsyncClient) -> str | None:
+        upstream = self.runtime.registry.get("hr_directory")
+        if upstream is None or not upstream.enabled:
+            return None
+        endpoint = upstream.url or upstream.openapi_spec_url or ""
+        if urlsplit(endpoint).hostname not in {"127.0.0.1", "localhost", "mock-backends"}:
+            return None
+
+        tenant_id = next(iter(self.runtime.settings.allowed_tenants), None)
+        if not tenant_id or self.runtime.dev_keys is None:
+            return None
+        workflow_slug = "demo_fictional_employee_profile_update"
+        workflow_id = f"hr_directory/{workflow_slug}"
+        async with self._business_value_workflow_lock:
+            current = await self.runtime.store.get_current_published_integration_definition(
+                tenant_id, "hr_directory"
+            )
+            if current and any(
+                item.get("id") == workflow_slug
+                for item in (current.get("definition") or {}).get("workflows", [])
+            ):
+                return workflow_id
+
+            discovery_identity = self.runtime._dev_discovery_identity()
+            await self.runtime.ensure_catalog_for_identity(discovery_identity)
+            selected = {
+                name: self.runtime.catalog.get_tool(f"hr_directory__{name}")
+                for name in ("list_hr_employees", "get_hr_employee", "update_hr_employee")
+            }
+            if any(tool is None for tool in selected.values()):
+                return None
+            tools = {name: tool for name, tool in selected.items() if tool is not None}
+
+            if current:
+                definition = copy.deepcopy(current["definition"])
+                integration = definition["integration"]
+                integration["status"] = "draft"
+                integration["revision"] = 1
+                definition["publication"] = None
+            else:
+                definition = {
+                    "manifest_version": "1.0",
+                    "integration": {
+                        "id": "hr_directory_demo",
+                        "display_name": "HR Directory demo workflows",
+                        "upstream_name": "hr_directory",
+                        "status": "draft",
+                        "revision": 1,
+                    },
+                    "tool_refs": [],
+                    "experiences": [],
+                    "workflows": [],
+                    "standalone_tool_values": [],
+                    "publication": None,
+                }
+            refs = definition.setdefault("tool_refs", [])
+            existing_refs = {reference.get("name") for reference in refs}
+            for tool in tools.values():
+                if tool.qualified_name not in existing_refs:
+                    refs.append(
+                        {
+                            "name": tool.qualified_name,
+                            "schema_sha256": compute_schema_digest([tool]),
+                        }
+                    )
+
+            definition.setdefault("workflows", []).append(
+                {
+                    "id": workflow_slug,
+                    "name": "Update and verify a fictional employee profile",
+                    "description": (
+                        "List the fictional HR directory, read an employee profile, update the "
+                        "employee role, and verify the saved profile with a terminal readback."
+                    ),
+                    "participating_tools": [
+                        tools["list_hr_employees"].qualified_name,
+                        tools["get_hr_employee"].qualified_name,
+                        tools["update_hr_employee"].qualified_name,
+                    ],
+                    "required_evidence": [
+                        {
+                            "tool": tools["list_hr_employees"].qualified_name,
+                            "result_when": {"path": "/items", "type": "non_empty_array"},
+                        },
+                        {
+                            "tool": tools["get_hr_employee"].qualified_name,
+                            "min_successful_calls": 2,
+                            "result_when": {
+                                "path": "/employee_id",
+                                "type": "non_empty_string",
+                            },
+                        },
+                        {
+                            "tool": tools["update_hr_employee"].qualified_name,
+                            "result_when": {
+                                "path": "/role",
+                                "type": "string",
+                                "equals": "senior_controller",
+                            },
+                        },
+                    ],
+                    "completion": {
+                        "kind": "terminal_tool_result",
+                        "tool": tools["get_hr_employee"].qualified_name,
+                        "success_when": {
+                            "path": "/role",
+                            "type": "string",
+                            "equals": "senior_controller",
+                        },
+                    },
+                    "business_value": {
+                        "manual_baseline_minutes": 8,
+                        "baseline_source": "administrator_estimate",
+                        "confidence": "unvalidated",
+                        "effective_from": datetime.now(UTC).date().isoformat(),
+                        "evidence_note": (
+                            "Demo-only estimate for the fictional HR profile update workflow."
+                        ),
+                    },
+                }
+            )
+            admin_token = self.runtime.dev_keys.issue_user_token(
+                persona="gateway_admin",
+                overrides={"tenant_id": tenant_id},
+            )
+            headers = {"Authorization": f"Bearer {admin_token}"}
+            draft = await client.post(
+                "/admin/integration-definitions/drafts",
+                headers=headers,
+                json={"definition": definition},
+            )
+            if draft.status_code != 200:
+                raise RuntimeError(f"Could not prepare the demo HR workflow: {draft.text}")
+            revision = str(draft.json()["revision"])
+            published = await client.post(
+                "/admin/integration-definitions/hr_directory/publish",
+                headers=headers,
+                json={"revision": revision},
+            )
+            if published.status_code != 200:
+                raise RuntimeError(f"Could not publish the demo HR workflow: {published.text}")
+            return workflow_id
+
+    async def _run_hr_business_value_workflow(self) -> dict[str, Any]:
+        if self._app is None or self.runtime.dev_keys is None:
+            return {"status": "skipped", "reason": "gateway demo runtime is unavailable"}
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self._app), base_url="http://demo.local"
+        ) as client:
+            workflow_id = await self._ensure_hr_demo_workflow(client)
+            if workflow_id is None:
+                return {"status": "skipped", "reason": "local hr_directory is unavailable"}
+
+            tenant_id = next(iter(self.runtime.settings.allowed_tenants), None)
+            if not tenant_id:
+                return {"status": "skipped", "reason": "demo tenant is unavailable"}
+            caller_token = self.runtime.dev_keys.issue_user_token(
+                persona="gateway_admin",
+                overrides={
+                    "tenant_id": tenant_id,
+                    "sub": "demo-hr-operator",
+                    "roles": ["hr_ops", "hr_writer", "gateway_admin", "admin"],
+                    "groups": ["hr", "platform-admins"],
+                    "scopes": ["mcp.tools", "mcp.write"],
+                },
+            )
+            meta = request_meta(client_name="mcpcodeaway-demo-traffic")
+            capabilities = meta[MCP_CLIENT_CAPABILITIES_META]
+            capabilities["elicitation"] = {"form": {}}
+            calls_before = self.requests_sent
+            write_count_before = self.write_calls_count
+
+            async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                return await self._business_value_rpc(
+                    client,
+                    caller_token,
+                    meta,
+                    name,
+                    arguments,
+                )
+
+            start = await call_tool(
+                START_BUSINESS_EXECUTION_TOOL,
+                {"kind": "workflow", "workflow_id": workflow_id},
+            )
+            execution_id = str(start.get("business_execution_id") or "")
+            if not execution_id:
+                return {
+                    "status": "failed",
+                    "workflow_id": workflow_id,
+                    "reason": "gateway did not start the attributed workflow",
+                    "requests": self.requests_sent - calls_before,
+                }
+
+            async def attributed(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                response = await call_tool(
+                    f"{ATTRIBUTED_TOOL_PREFIX}hr_directory__{tool_name}",
+                    {"business_execution_id": execution_id, "arguments": arguments},
+                )
+                return response.get("result", response)
+
+            listing = await attributed("list_hr_employees", {"limit": 10})
+            before = await attributed("get_hr_employee", {"employee_id": "EMP-01"})
+            update_arguments = {"employee_id": "EMP-01", "role": "senior_controller"}
+            self.write_calls_count += 1
+            update_name = f"{ATTRIBUTED_TOOL_PREFIX}hr_directory__update_hr_employee"
+            requested = await call_tool(
+                update_name,
+                {"business_execution_id": execution_id, "arguments": update_arguments},
+            )
+            state = requested.get("requestState")
+            if requested.get("resultType") != "input_required" or not isinstance(state, str):
+                return {
+                    "status": "failed",
+                    "workflow_id": workflow_id,
+                    "reason": "demo client did not receive the expected write confirmation",
+                    "requests": self.requests_sent - calls_before,
+                }
+            update = await self._business_value_rpc(
+                client,
+                caller_token,
+                meta,
+                update_name,
+                {"business_execution_id": execution_id, "arguments": update_arguments},
+                request_state=state,
+                input_responses={"confirm": {"action": "accept", "content": {"confirm": True}}},
+            )
+            update = update.get("result", update)
+            verified = await attributed("get_hr_employee", {"employee_id": "EMP-01"})
+            successful = (
+                listing.get("count", 0) >= 1
+                and before.get("employee_id") == "EMP-01"
+                and update.get("role") == "senior_controller"
+                and verified.get("role") == "senior_controller"
+            )
+            events = await self.runtime.store.list_business_value_events(tenant_id)
+            credited = [
+                event
+                for event in events
+                if event.get("business_execution_id") == execution_id and event.get("credited")
+            ]
+            return {
+                "status": "completed" if successful and credited else "failed",
+                "workflow_id": workflow_id,
+                "business_execution_id": execution_id,
+                "completion_count": len(credited),
+                "manual_baseline_minutes": 8,
+                "requests": self.requests_sent - calls_before,
+                "write_calls": self.write_calls_count - write_count_before,
+                "confirmation": "accepted by the demo caller through MCP form elicitation",
+            }
+
+    async def _business_value_rpc(
+        self,
+        client: httpx.AsyncClient,
+        token: str,
+        meta: dict[str, Any],
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        request_state: str | None = None,
+        input_responses: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"_meta": meta, "name": name, "arguments": arguments}
+        if request_state is not None:
+            params["requestState"] = request_state
+        if input_responses is not None:
+            params["inputResponses"] = input_responses
+        response = await client.post(
+            "/mcp?mode=traditional",
+            headers={
+                "Authorization": f"Bearer {token}",
+                **request_headers("tools/call", tool_name=name),
+            },
+            json={
+                "jsonrpc": "2.0",
+                "id": f"demo-business-{uuid4().hex}",
+                "method": "tools/call",
+                "params": params,
+            },
+        )
+        self.requests_sent += 1
+        self.last_target = f"business_value:{name}"
+        if response.status_code >= 400:
+            self.errors_count += 1
+            self.http_errors_count += 1
+            self.last_error = f"HTTP {response.status_code} on business-value demo workflow"
+            raise RuntimeError(self.last_error)
+        body = response.json()
+        rpc_error = body.get("error") if isinstance(body, dict) else None
+        if rpc_error:
+            self.errors_count += 1
+            self.rpc_errors_count += 1
+            self.last_error = str(rpc_error.get("message") or "MCP workflow call failed")
+            raise RuntimeError(self.last_error)
+        result = body.get("result") if isinstance(body, dict) else None
+        if not isinstance(result, dict) or result.get("isError"):
+            self.errors_count += 1
+            self.rpc_errors_count += 1
+            self.last_error = "MCP business-value workflow call returned an error"
+            raise RuntimeError(self.last_error)
+        self.last_error = ""
+        structured = result.get("structuredContent")
+        return structured if isinstance(structured, dict) else result
 
     async def burst(self, count: int = 8) -> dict[str, Any]:
         if self._app is None:
