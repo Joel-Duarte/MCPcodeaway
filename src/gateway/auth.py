@@ -400,13 +400,24 @@ class OidcTokenValidator:
                 block_private_ips_in_prod=self.settings.block_private_ips_in_prod,
                 allowed_hosts=self.settings.allowed_upstream_hosts,
             )
-        if self._http_client is not None:
-            resp = await self._http_client.get(target_uri, follow_redirects=False)
-        else:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(target_uri, follow_redirects=False)
-        resp.raise_for_status()
-        jwks = resp.json()
+        status_code: int | None = None
+        try:
+            if self._http_client is not None:
+                resp = await self._http_client.get(target_uri, follow_redirects=False)
+            else:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(target_uri, follow_redirects=False)
+            status_code = resp.status_code
+            resp.raise_for_status()
+            jwks = resp.json()
+        except Exception as exc:
+            log_event(
+                "auth.jwks_refresh_failed",
+                level=logging.WARNING,
+                error_type=type(exc).__name__,
+                status_code=status_code,
+            )
+            raise
         if not jwks_uri_override:
             self._jwks_cache = jwks
             self._jwks_expires_at = time.monotonic() + 300
