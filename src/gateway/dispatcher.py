@@ -856,6 +856,7 @@ class HostDispatcher:
             audit_operation_id: str | None = None
             audit_claimed = False
             audit_completed = False
+            audit_terminal_persisted = False
             upstream_execution_succeeded = False
             try:
                 if (
@@ -949,6 +950,7 @@ class HostDispatcher:
                                 "Sensitive write completed but its audit status could not be saved"
                             )
                         audit_completed = True
+                        audit_terminal_persisted = True
                 except Exception as first_error:
                     first_failure = classify_upstream_error(
                         first_error, operation_is_read=operation_is_read
@@ -1009,7 +1011,17 @@ class HostDispatcher:
                         else "failed"
                     )
                     try:
-                        await self._finish_sensitive_write_audit(audit_operation_id, final_status)
+                        audit_terminal_persisted = await self._finish_sensitive_write_audit(
+                            audit_operation_id, final_status
+                        )
+                        if not audit_terminal_persisted:
+                            log_event(
+                                "audit.sensitive_write_status_failed",
+                                level=logging.ERROR,
+                                operation_id=audit_operation_id,
+                                status=final_status,
+                                error_type="journal_status_not_updated",
+                            )
                     except Exception as audit_error:
                         log_event(
                             "audit.sensitive_write_status_failed",
@@ -1018,6 +1030,26 @@ class HostDispatcher:
                             status=final_status,
                             error_type=type(audit_error).__name__,
                         )
+                if audit_claimed and upstream_execution_succeeded:
+                    failure = UpstreamFailure(
+                        error_type="sensitive_write_outcome_unknown",
+                        message=(
+                            "The upstream write may have completed, but the gateway could not "
+                            "durably record its outcome."
+                        ),
+                        outcome_unknown=True,
+                    )
+                elif audit_claimed and not audit_terminal_persisted and not failure.outcome_unknown:
+                    failure = UpstreamFailure(
+                        error_type=failure.error_type,
+                        message=(
+                            f"{failure.message} The gateway could not durably record the "
+                            "journal status."
+                        ),
+                        retryable=False,
+                        outcome_unknown=False,
+                        status_code=failure.status_code,
+                    )
                 safe_error = OutputRedactor.redact_text(failure.message)
                 record = SubcallRecord(
                     tool=tool.qualified_name,

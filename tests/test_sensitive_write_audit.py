@@ -135,7 +135,79 @@ async def test_sensitive_write_audit_failure_blocks_upstream_call(tmp_path) -> N
         clear_request_context()
     assert calls == 0
     assert record.status == "error"
+    assert record.outcome_unknown is False
     assert "_dispatch_error" in result
+    assert result["outcome_unknown"] is False
+
+
+@pytest.mark.asyncio
+async def test_sensitive_write_claim_failure_is_known_and_blocks_dispatch(tmp_path) -> None:
+    runtime = GatewayRuntime(
+        settings=GatewaySettings(
+            auth_mode="dev",
+            sqlite_path=str(tmp_path / "claim-failure.db"),
+            upstreams_config_path=str(tmp_path / "missing.yaml"),
+        ),
+        preloaded_tools={},
+    )
+    await runtime.store.init()
+    upstream = UpstreamConfig(
+        name="write_api",
+        type="mcp_http",
+        url="https://api.example.test/mcp",
+        auth_type="none",
+        allow_all_callers=True,
+        allowed_operations=["write_item"],
+        tool_effects={"write_item": "write"},
+        mutating_tools=["write_item"],
+    )
+    identity = CallerIdentity(
+        sub="caller-a", tenant_id="tenant-a", roles=["admin"], scopes=["mcp.write"]
+    )
+    tool = DiscoveredTool(
+        server=upstream.name,
+        name="write_item",
+        qualified_name="write_api__write_item",
+        input_schema={"type": "object", "properties": {}},
+        mutating=True,
+    )
+    calls = 0
+    backing_store = runtime.store
+
+    class FailedClaim:
+        async def prepare_sensitive_write_audit(self, operation):
+            return await backing_store.prepare_sensitive_write_audit(operation)
+
+        async def claim_sensitive_write_audit(self, operation_id, started_at):
+            assert await backing_store.claim_sensitive_write_audit(operation_id, started_at)
+            return False
+
+    async def upstream_call(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    runtime.dispatcher.audit_store = FailedClaim()
+    runtime.client_manager.call_tool = upstream_call
+    set_request_context(request_id="audit-claim-failure")
+    try:
+        result, record = await runtime.dispatcher.invoke_tool(identity, tool, upstream, {})
+    finally:
+        clear_request_context()
+
+    assert calls == 0
+    assert record.status == "error"
+    assert record.outcome_unknown is False
+    assert result["outcome_unknown"] is False
+    row = (
+        runtime.store._ensure_conn()
+        .execute(
+            "SELECT status FROM sensitive_write_audits WHERE correlation_id=?",
+            ("audit-claim-failure",),
+        )
+        .fetchone()
+    )
+    assert row["status"] == "executing"
 
 
 @pytest.mark.asyncio
@@ -209,8 +281,13 @@ async def test_sensitive_write_outcome_and_audit_failure_block_replay(tmp_path) 
     assert calls == 1
     assert record.status == "error"
     assert "_dispatch_error" in result
+    assert record.outcome_unknown is True
+    assert result["outcome_unknown"] is True
+    assert "may have completed" in result["_dispatch_error"]
     assert retry_record.status == "error"
     assert "_dispatch_error" in retry_result
+    assert retry_record.outcome_unknown is False
+    assert retry_result["outcome_unknown"] is False
     rows = (
         runtime.store._ensure_conn()
         .execute(
@@ -277,4 +354,198 @@ async def test_ambiguous_write_failure_is_recorded_as_outcome_unknown(tmp_path) 
     )
     assert record.outcome_unknown
     assert "_dispatch_error" in result
+    assert result["outcome_unknown"] is True
     assert row["status"] == "outcome_unknown"
+
+
+@pytest.mark.asyncio
+async def test_definitive_upstream_failure_persists_failed_and_is_not_uncertain(tmp_path) -> None:
+    runtime = GatewayRuntime(
+        settings=GatewaySettings(
+            auth_mode="dev",
+            sqlite_path=str(tmp_path / "definitive-failure.db"),
+            upstreams_config_path=str(tmp_path / "missing.yaml"),
+        ),
+        preloaded_tools={},
+    )
+    await runtime.store.init()
+    upstream = UpstreamConfig(
+        name="write_api",
+        type="mcp_http",
+        url="https://api.example.test/mcp",
+        auth_type="none",
+        allow_all_callers=True,
+        allowed_operations=["write_item"],
+        tool_effects={"write_item": "write"},
+        mutating_tools=["write_item"],
+    )
+    identity = CallerIdentity(
+        sub="caller-a", tenant_id="tenant-a", roles=["admin"], scopes=["mcp.write"]
+    )
+    tool = DiscoveredTool(
+        server=upstream.name,
+        name="write_item",
+        qualified_name="write_api__write_item",
+        input_schema={"type": "object", "properties": {}},
+        mutating=True,
+    )
+
+    async def rejected(*_args, **_kwargs):
+        request = httpx.Request("POST", upstream.url)
+        response = httpx.Response(400, request=request)
+        raise httpx.HTTPStatusError("definitive rejection", request=request, response=response)
+
+    runtime.client_manager.call_tool = rejected
+    set_request_context(request_id="audit-definitive-failure")
+    try:
+        result, record = await runtime.dispatcher.invoke_tool(identity, tool, upstream, {})
+    finally:
+        clear_request_context()
+
+    row = (
+        runtime.store._ensure_conn()
+        .execute(
+            "SELECT status FROM sensitive_write_audits WHERE correlation_id=?",
+            ("audit-definitive-failure",),
+        )
+        .fetchone()
+    )
+    assert record.status == "error"
+    assert record.outcome_unknown is False
+    assert result["outcome_unknown"] is False
+    assert row["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_definitive_failure_with_journal_error_reports_both_facts(tmp_path) -> None:
+    runtime = GatewayRuntime(
+        settings=GatewaySettings(
+            auth_mode="dev",
+            sqlite_path=str(tmp_path / "definitive-journal-failure.db"),
+            upstreams_config_path=str(tmp_path / "missing.yaml"),
+        ),
+        preloaded_tools={},
+    )
+    await runtime.store.init()
+    upstream = UpstreamConfig(
+        name="write_api",
+        type="mcp_http",
+        url="https://api.example.test/mcp",
+        auth_type="none",
+        allow_all_callers=True,
+        allowed_operations=["write_item"],
+        tool_effects={"write_item": "write"},
+        mutating_tools=["write_item"],
+    )
+    identity = CallerIdentity(
+        sub="caller-a", tenant_id="tenant-a", roles=["admin"], scopes=["mcp.write"]
+    )
+    tool = DiscoveredTool(
+        server=upstream.name,
+        name="write_item",
+        qualified_name="write_api__write_item",
+        input_schema={"type": "object", "properties": {}},
+        mutating=True,
+    )
+
+    async def rejected(*_args, **_kwargs):
+        request = httpx.Request("POST", upstream.url)
+        response = httpx.Response(400, request=request)
+        raise httpx.HTTPStatusError("definitive rejection", request=request, response=response)
+
+    class UnavailableTerminalJournal:
+        async def prepare_sensitive_write_audit(self, operation):
+            return await runtime.store.prepare_sensitive_write_audit(operation)
+
+        async def claim_sensitive_write_audit(self, operation_id, started_at):
+            return await runtime.store.claim_sensitive_write_audit(operation_id, started_at)
+
+        async def finish_sensitive_write_audit(self, *_args):
+            raise OSError("journal unavailable")
+
+    runtime.dispatcher.audit_store = UnavailableTerminalJournal()
+    runtime.client_manager.call_tool = rejected
+    set_request_context(request_id="audit-definitive-journal-failure")
+    try:
+        result, record = await runtime.dispatcher.invoke_tool(identity, tool, upstream, {})
+    finally:
+        clear_request_context()
+
+    row = (
+        runtime.store._ensure_conn()
+        .execute(
+            "SELECT status FROM sensitive_write_audits WHERE correlation_id=?",
+            ("audit-definitive-journal-failure",),
+        )
+        .fetchone()
+    )
+    assert record.error_type == "upstream_http_error"
+    assert record.outcome_unknown is False
+    assert result["outcome_unknown"] is False
+    assert "HTTP 400" in result["_dispatch_error"]
+    assert "could not durably record the journal status" in result["_dispatch_error"]
+    assert row["status"] == "executing"
+
+
+@pytest.mark.asyncio
+async def test_different_correlation_ids_remain_independent(tmp_path) -> None:
+    runtime = GatewayRuntime(
+        settings=GatewaySettings(
+            auth_mode="dev",
+            sqlite_path=str(tmp_path / "different-correlations.db"),
+            upstreams_config_path=str(tmp_path / "missing.yaml"),
+        ),
+        preloaded_tools={},
+    )
+    await runtime.store.init()
+    upstream = UpstreamConfig(
+        name="write_api",
+        type="mcp_http",
+        url="https://api.example.test/mcp",
+        auth_type="none",
+        allow_all_callers=True,
+        allowed_operations=["write_item"],
+        tool_effects={"write_item": "write"},
+        mutating_tools=["write_item"],
+    )
+    identity = CallerIdentity(
+        sub="caller-a", tenant_id="tenant-a", roles=["admin"], scopes=["mcp.write"]
+    )
+    tool = DiscoveredTool(
+        server=upstream.name,
+        name="write_item",
+        qualified_name="write_api__write_item",
+        input_schema={"type": "object", "properties": {}},
+        mutating=True,
+    )
+    calls = 0
+
+    async def upstream_call(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    runtime.client_manager.call_tool = upstream_call
+    records = []
+    for request_id in ("correlation-a", "correlation-b"):
+        set_request_context(request_id=request_id)
+        try:
+            result, record = await runtime.dispatcher.invoke_tool(identity, tool, upstream, {})
+        finally:
+            clear_request_context()
+        assert result == {"ok": True}
+        records.append(record)
+
+    rows = (
+        runtime.store._ensure_conn()
+        .execute(
+            "SELECT correlation_id, status FROM sensitive_write_audits "
+            "WHERE correlation_id IN (?, ?)",
+            ("correlation-a", "correlation-b"),
+        )
+        .fetchall()
+    )
+    assert calls == 2
+    assert all(record.status == "ok" for record in records)
+    assert {row["correlation_id"] for row in rows} == {"correlation-a", "correlation-b"}
+    assert {row["status"] for row in rows} == {"succeeded"}

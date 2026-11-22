@@ -45,6 +45,11 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "integration: local integration tests using in-process services or local infrastructure",
+    "postgres: requires an isolated PostgreSQL instance and mcpcodeaway[postgres]",
+    "tcp_tls: opt-in local TCP/TLS integration tests",
+]
 
 [tool.ruff]
 line-length = 100

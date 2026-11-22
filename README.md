@@ -248,3 +248,5 @@ Review **Model Performance → Adaptive routing** in Observe mode first. Live ro
 ./scripts/pre-ci.sh --fast   # agent preflight, ruff, golden flows & regression tests
 ./scripts/pre-ci.sh --full   # full pytest, Nuxt generate & --verify-thresholds (add --docker for images)
 ```
+
+For the focused local security/integration suite and optional disposable PostgreSQL checks, see [Local Integration Testing](docs/local-integration-testing.md).
