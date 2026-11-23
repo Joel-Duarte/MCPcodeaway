@@ -72,9 +72,11 @@ from gateway.auth import (
     UserCredentialRequiredError,
 )
 from gateway.business_value_runtime import (
+    apply_regional_baseline,
     build_workflow_call_key,
     canonical_json_digest,
     encode_jsonrpc_request_id,
+    extract_caller_regions,
     required_evidence_satisfied,
     resolve_json_pointer,
     result_matches_predicate,
@@ -1173,6 +1175,17 @@ class GatewayRuntime:
             raise
         self._transition_lifecycle(GatewayLifecycleState.READY)
 
+    async def get_reporting_currency(self) -> str:
+        """Return gateway-wide ISO currency code, preferring persisted control-plane setting."""
+        fallback = str(self.settings.default_currency or "USD").strip().upper()
+        if hasattr(self.store, "get_setting"):
+            saved = await self.store.get_setting("business_value_settings")
+            if isinstance(saved, dict):
+                raw = str(saved.get("reporting_currency") or "").strip().upper()
+                if re.match(r"^[A-Z]{3}$", raw):
+                    return raw
+        return fallback
+
     async def _run_demo_auto_golden(self) -> None:
         try:
             await self.demo_traffic.golden_run()
@@ -1497,7 +1510,12 @@ class GatewayRuntime:
         now = datetime.now(UTC)
         expires_at = now + timedelta(minutes=int(ttl_minutes))
         execution_id = uuid.uuid4().hex
-        baseline_snapshot = copy.deepcopy(selected_definition["business_value"])
+        caller_regions = extract_caller_regions(
+            claims=identity.claims, client_groups=identity.client_groups
+        )
+        baseline_snapshot = apply_regional_baseline(
+            selected_definition["business_value"], caller_regions
+        )
         metadata = {
             "pinned_definition": row["definition"],
             "selected_id": selected_id,
@@ -2571,6 +2589,9 @@ class GatewayRuntime:
                 run_id=run["run_id"],
                 calls=detector_calls,
                 is_single_turn_batch=True,
+                caller_regions=extract_caller_regions(
+                    claims=identity.claims, client_groups=identity.client_groups
+                ),
             )
         business_value_event: dict[str, Any] | None = None
         for attributed_call in attributed_pending_calls:
@@ -2751,6 +2772,9 @@ class GatewayRuntime:
                         }
                     ],
                     is_single_turn_batch=False,
+                    caller_regions=extract_caller_regions(
+                        claims=identity.claims, client_groups=identity.client_groups
+                    ),
                 )
             self._record_execution_metrics(
                 identity=identity,
@@ -3163,6 +3187,137 @@ def _is_dependency_connection_error(exc: BaseException) -> bool:
         if current.__context__ is not None:
             pending.append(current.__context__)
     return False
+
+
+def _parse_minute_assumption(value: Any, field_name: str) -> dict[str, Any] | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, dict):
+        if value.get("kind") == "capture_actual_when_available":
+            return {"kind": "capture_actual_when_available"}
+        raw = value.get("minutes")
+    else:
+        raw = value
+    try:
+        mins = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"{field_name} must be numeric.") from exc
+    if mins < 0 or mins > 1440:
+        raise HTTPException(
+            status_code=422, detail=f"{field_name} must be between 0 and 1440 minutes."
+        )
+    return {"kind": "expected_average", "minutes": mins}
+
+
+def _apply_baseline_updates(
+    bv: dict[str, Any], body: dict[str, Any], reporting_currency: str
+) -> dict[str, Any]:
+    updated = dict(bv)
+    if "manual_baseline_minutes" in body:
+        try:
+            mins = float(body["manual_baseline_minutes"])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422, detail="manual_baseline_minutes must be numeric."
+            ) from exc
+        if mins <= 0:
+            raise HTTPException(status_code=422, detail="manual_baseline_minutes must exceed zero.")
+        updated["manual_baseline_minutes"] = mins
+    if "baseline_source" in body:
+        updated["baseline_source"] = str(body["baseline_source"])
+    if "confidence" in body:
+        updated["confidence"] = str(body["confidence"])
+    if "effective_from" in body and body["effective_from"]:
+        updated["effective_from"] = str(body["effective_from"])
+    if "evidence_note" in body:
+        updated["evidence_note"] = (
+            str(body["evidence_note"]) if body["evidence_note"] is not None else None
+        )
+    if "review_minutes" in body:
+        parsed_review = _parse_minute_assumption(body["review_minutes"], "review_minutes")
+        if parsed_review is None:
+            updated.pop("review_minutes", None)
+        else:
+            updated["review_minutes"] = parsed_review
+    if "correction_minutes" in body:
+        parsed_corr = _parse_minute_assumption(body["correction_minutes"], "correction_minutes")
+        if parsed_corr is None:
+            updated.pop("correction_minutes", None)
+        else:
+            updated["correction_minutes"] = parsed_corr
+    if "regional_labor_rates" in body:
+        raw_regional = body["regional_labor_rates"]
+        if not isinstance(raw_regional, dict):
+            raise HTTPException(
+                status_code=422,
+                detail="regional_labor_rates must be an object mapping region to rate.",
+            )
+        normalized_reg: dict[str, float] = {}
+        for region_key, region_rate in raw_regional.items():
+            clean_key = str(region_key).strip().upper()
+            if not re.match(r"^[A-Z0-9_-]{2,24}$", clean_key):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Regional rate key '{region_key}' must be 2-24 characters "
+                        "(A-Z, 0-9, _, -)."
+                    ),
+                )
+            try:
+                num_rate = float(region_rate)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Regional labor rate for '{clean_key}' must be numeric.",
+                ) from exc
+            if num_rate < 0 or num_rate > 1_000_000:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Regional labor rate for '{clean_key}' must be between 0 and 1,000,000."
+                    ),
+                )
+            normalized_reg[clean_key] = num_rate
+        if normalized_reg:
+            updated["regional_labor_rates"] = normalized_reg
+        else:
+            updated.pop("regional_labor_rates", None)
+    if "loaded_labor_cost_per_hour" in body:
+        raw_hourly = body["loaded_labor_cost_per_hour"]
+        if raw_hourly is None or raw_hourly == "":
+            updated.pop("loaded_labor_cost_per_hour", None)
+        else:
+            try:
+                hourly = float(raw_hourly)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422, detail="loaded_labor_cost_per_hour must be numeric."
+                ) from exc
+            if hourly < 0 or hourly > 1_000_000:
+                raise HTTPException(
+                    status_code=422,
+                    detail="loaded_labor_cost_per_hour must be between 0 and 1,000,000.",
+                )
+            updated["loaded_labor_cost_per_hour"] = hourly
+    if "currency" in body:
+        raw_cur = body["currency"]
+        if raw_cur is None or str(raw_cur).strip() == "":
+            updated.pop("currency", None)
+        else:
+            clean_cur = str(raw_cur).strip().upper()
+            if not re.match(r"^[A-Z]{3}$", clean_cur):
+                raise HTTPException(
+                    status_code=422, detail="currency must be a 3-letter ISO currency code."
+                )
+            updated["currency"] = clean_cur
+    has_rate = updated.get("loaded_labor_cost_per_hour") is not None or bool(
+        updated.get("regional_labor_rates")
+    )
+    if has_rate and not updated.get("currency"):
+        updated["currency"] = reporting_currency
+    elif not has_rate:
+        updated.pop("currency", None)
+    return updated
 
 
 def create_gateway_app(
@@ -5221,7 +5376,25 @@ def create_gateway_app(
                 tenant_id=effective_tenant,
                 since=since,
                 limit=limit,
+                reporting_currency=await runtime.get_reporting_currency(),
             )
+
+        @app.get("/admin/business-value/settings")
+        async def admin_business_value_settings(
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            return {
+                "reporting_currency": await runtime.get_reporting_currency(),
+                "env_default_currency": runtime.settings.default_currency,
+                "supported_presets": ["USD", "EUR", "GBP", "BRL", "CAD", "AUD", "JPY", "CHF"],
+            }
 
         @app.get("/admin/onboarding/prompt-pack")
         async def admin_onboarding_prompt_pack(
@@ -6408,19 +6581,18 @@ def create_gateway_app(
             ):
                 completion_cfg["require_sensitive_write_journal_status"] = "succeeded"
             wf_draft["completion"] = completion_cfg
-            wf_draft["business_value"] = {
-                "manual_baseline_minutes": minutes,
-                "baseline_source": str(body.get("baseline_source") or "administrator_estimate"),
-                "confidence": str(body.get("confidence") or "unvalidated"),
-                "effective_from": str(
-                    body.get("effective_from") or datetime.now(UTC).date().isoformat()
-                ),
-                **(
-                    {"evidence_note": str(body["evidence_note"])}
-                    if body.get("evidence_note")
-                    else {}
-                ),
-            }
+            wf_draft["business_value"] = _apply_baseline_updates(
+                {
+                    "manual_baseline_minutes": minutes,
+                    "baseline_source": str(body.get("baseline_source") or "administrator_estimate"),
+                    "confidence": str(body.get("confidence") or "unvalidated"),
+                    "effective_from": str(
+                        body.get("effective_from") or datetime.now(UTC).date().isoformat()
+                    ),
+                },
+                body,
+                await runtime.get_reporting_currency(),
+            )
             existing_wfs = [
                 w for w in base_def.get("workflows", []) if w.get("id") != wf_draft["id"]
             ]
@@ -6781,6 +6953,7 @@ def create_gateway_app(
                 "workflows": workflows,
                 "candidates": candidates,
                 "episodes": episodes,
+                "reporting_currency": await runtime.get_reporting_currency(),
             }
 
         @app.patch("/admin/integration-definitions/{upstream_name}/workflows/{workflow_id}")
@@ -6828,30 +7001,18 @@ def create_gateway_app(
                     "baseline_source",
                     "confidence",
                     "evidence_note",
+                    "effective_from",
+                    "review_minutes",
+                    "correction_minutes",
+                    "loaded_labor_cost_per_hour",
+                    "currency",
+                    "regional_labor_rates",
                 )
             ):
                 bv = dict(target.get("business_value") or {})
-                if "manual_baseline_minutes" in body:
-                    try:
-                        mins = float(body["manual_baseline_minutes"])
-                    except (TypeError, ValueError) as exc:
-                        raise HTTPException(
-                            status_code=422, detail="manual_baseline_minutes must be numeric."
-                        ) from exc
-                    if mins <= 0:
-                        raise HTTPException(
-                            status_code=422, detail="manual_baseline_minutes must exceed zero."
-                        )
-                    bv["manual_baseline_minutes"] = mins
-                if "baseline_source" in body:
-                    bv["baseline_source"] = str(body["baseline_source"])
-                if "confidence" in body:
-                    bv["confidence"] = str(body["confidence"])
-                if "evidence_note" in body:
-                    bv["evidence_note"] = (
-                        str(body["evidence_note"]) if body["evidence_note"] is not None else None
-                    )
-                target["business_value"] = bv
+                target["business_value"] = _apply_baseline_updates(
+                    bv, body, await runtime.get_reporting_currency()
+                )
             result = await _save_and_publish_definition_mutation(
                 tenant_id=tenant_id,
                 upstream_name=upstream_name,
@@ -7477,6 +7638,37 @@ def create_gateway_app(
                 "auto_interval": str(saved.get("auto_interval", "off")),
                 "s3_bucket": str(saved.get("s3_bucket", runtime.settings.audit_archive_s3_bucket)),
                 "prune_after_archive": bool(saved.get("prune_after_archive", True)),
+            }
+
+        @app.put("/admin/business-value/settings")
+        async def admin_save_business_value_settings(
+            body: dict[str, Any],
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            raw_currency = str(body.get("reporting_currency") or "").strip().upper()
+            if not re.match(r"^[A-Z]{3}$", raw_currency):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "reporting_currency must be a 3-letter ISO currency code "
+                        "(e.g. USD, EUR, GBP)."
+                    ),
+                )
+            payload = {
+                "reporting_currency": raw_currency,
+                "updated_by": identity.sub if identity is not None else "dev-admin",
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+            if hasattr(runtime.store, "save_setting"):
+                await runtime.store.save_setting("business_value_settings", payload)
+            return {
+                "saved": True,
+                "reporting_currency": raw_currency,
+                "env_default_currency": runtime.settings.default_currency,
             }
 
         @app.post("/admin/audit/retention-policy")

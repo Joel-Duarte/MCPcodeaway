@@ -14,6 +14,7 @@ export interface BusinessValueRow {
   baseline_source: string;
   baseline_confidence: string;
   currency: string | null;
+  region?: string | null;
   completed_count: number;
   estimated_manual_baseline_minutes: number | null;
   validated_manual_baseline_minutes: number | null;
@@ -291,7 +292,15 @@ onMounted(() => {
                 class="border-t border-[#E4E4E7] align-top"
               >
                 <td class="px-3 py-3">
-                  <div class="font-medium text-[#09090B]">{{ row.integration_display_name }}</div>
+                  <div class="flex flex-wrap items-center gap-1.5 font-medium text-[#09090B]">
+                    <span>{{ row.integration_display_name }}</span>
+                    <span
+                      v-if="row.region"
+                      class="rounded border border-[#E4E4E7] bg-[#F4F4F5] px-1.5 py-0.5 font-mono-data text-[10px] font-medium text-[#52525B]"
+                    >
+                      {{ row.region }}
+                    </span>
+                  </div>
                   <div class="mt-0.5 text-[#52525B]">
                     {{ row.selected_id }} · {{ statusLabel(row.selected_kind) }}
                   </div>
@@ -393,8 +402,14 @@ onMounted(() => {
             :key="`${row.integration_id}:${row.selected_id}:${row.period_utc}:${row.baseline_source}:${row.baseline_confidence}`"
             class="py-4"
           >
-            <h3 class="text-sm font-semibold text-[#09090B]">
-              {{ row.integration_display_name }}
+            <h3 class="flex flex-wrap items-center gap-1.5 text-sm font-semibold text-[#09090B]">
+              <span>{{ row.integration_display_name }}</span>
+              <span
+                v-if="row.region"
+                class="rounded border border-[#E4E4E7] bg-[#F4F4F5] px-1.5 py-0.5 font-mono-data text-[10px] font-medium text-[#52525B]"
+              >
+                {{ row.region }}
+              </span>
             </h3>
             <p class="mt-1 break-words text-xs text-[#52525B]">
               {{ row.selected_id }} · {{ statusLabel(row.selected_kind) }}

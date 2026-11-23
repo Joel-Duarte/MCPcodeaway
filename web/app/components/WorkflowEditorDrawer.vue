@@ -38,6 +38,7 @@ const props = withDefaults(
     editingWorkflow?: Workflow | null;
     promotingCandidate?: Record<string, any> | null;
     lockUpstream?: boolean;
+    gatewayCurrency?: string;
   }>(),
   {
     upstream: "",
@@ -48,6 +49,7 @@ const props = withDefaults(
     editingWorkflow: null,
     promotingCandidate: null,
     lockUpstream: false,
+    gatewayCurrency: "",
   },
 );
 
@@ -75,6 +77,10 @@ const submissionStep = ref<"validate" | "save-draft" | "publish">("validate");
 const loadingContext = ref(false);
 const fetchedToolsByUpstream = ref<Record<string, string[]>>({});
 const fetchedDefinitions = ref<Record<string, Definition | null>>({});
+const fetchedGatewayCurrency = ref("USD");
+const activeCurrency = computed(
+  () => (props.gatewayCurrency || fetchedGatewayCurrency.value || "USD").trim().toUpperCase(),
+);
 
 const form = ref({
   id: "",
@@ -88,6 +94,10 @@ const form = ref({
   completionPath: "/status",
   completionType: "non_empty_string",
   minutes: "",
+  reviewMinutes: "",
+  correctionMinutes: "",
+  loadedHourlyCost: "",
+  regionalRates: [] as { region: string; rate: string }[],
   source: "administrator_estimate",
   effectiveFrom: new Date().toISOString().slice(0, 10),
   evidenceNote: "",
@@ -144,6 +154,15 @@ async function ensureUpstreamContext(targetUpstream: string) {
     !(props.definition !== undefined && targetUpstream === props.upstream) &&
     !(targetUpstream in fetchedDefinitions.value);
 
+  if (!needsTools && !needsDefinition && !props.gatewayCurrency) {
+    try {
+      const curRes = await apiFetch<{ reporting_currency?: string }>("/admin/business-value/settings");
+      if (curRes?.reporting_currency) {
+        fetchedGatewayCurrency.value = curRes.reporting_currency;
+      }
+    } catch {
+    }
+  }
   if (!needsTools && !needsDefinition) return;
   loadingContext.value = true;
   try {
@@ -187,6 +206,11 @@ function initFormFromProps() {
     const workflow = props.editingWorkflow;
     editingId.value = workflow.id;
     promotingCandidateId.value = null;
+    const existingBv = workflow.business_value ?? {};
+    const regEntries = Object.entries(existingBv.regional_labor_rates ?? {}).map(([reg, rate]) => ({
+      region: String(reg),
+      rate: String(rate),
+    }));
     form.value = {
       id: workflow.id,
       name: workflow.name,
@@ -210,11 +234,21 @@ function initFormFromProps() {
       completionTool: workflow.completion?.tool ?? "",
       completionPath: workflow.completion?.success_when?.path ?? "/status",
       completionType: workflow.completion?.success_when?.type ?? "non_empty_string",
-      minutes: String(workflow.business_value?.manual_baseline_minutes ?? ""),
-      source: workflow.business_value?.baseline_source ?? "administrator_estimate",
-      effectiveFrom:
-        workflow.business_value?.effective_from ?? new Date().toISOString().slice(0, 10),
-      evidenceNote: workflow.business_value?.evidence_note ?? "",
+      minutes: String(existingBv.manual_baseline_minutes ?? ""),
+      reviewMinutes:
+        existingBv.review_minutes?.minutes != null ? String(existingBv.review_minutes.minutes) : "",
+      correctionMinutes:
+        existingBv.correction_minutes?.minutes != null
+          ? String(existingBv.correction_minutes.minutes)
+          : "",
+      loadedHourlyCost:
+        existingBv.loaded_labor_cost_per_hour != null
+          ? String(existingBv.loaded_labor_cost_per_hour)
+          : "",
+      regionalRates: regEntries,
+      source: existingBv.baseline_source ?? "administrator_estimate",
+      effectiveFrom: existingBv.effective_from ?? new Date().toISOString().slice(0, 10),
+      evidenceNote: existingBv.evidence_note ?? "",
     };
     return;
   }
@@ -246,6 +280,10 @@ function initFormFromProps() {
       completionPath: String(draft.completion?.success_when?.path ?? "/status"),
       completionType: String(draft.completion?.success_when?.type ?? "non_empty_string"),
       minutes: "5",
+      reviewMinutes: "",
+      correctionMinutes: "",
+      loadedHourlyCost: "",
+      regionalRates: [],
       source: "administrator_estimate",
       effectiveFrom: new Date().toISOString().slice(0, 10),
       evidenceNote: "Confirmed from auto-discovered workflow candidate.",
@@ -267,6 +305,10 @@ function initFormFromProps() {
     completionPath: "/status",
     completionType: "non_empty_string",
     minutes: "",
+    reviewMinutes: "",
+    correctionMinutes: "",
+    loadedHourlyCost: "",
+    regionalRates: [],
     source: "administrator_estimate",
     effectiveFrom: new Date().toISOString().slice(0, 10),
     evidenceNote: "",
@@ -480,6 +522,53 @@ async function save() {
       (existingWorkflow?.required_evidence ?? []).map((item: any) => [item.tool, item]),
     );
     const confidence = sourceToConfidence(form.value.source);
+    const regionalMap: Record<string, number> = {};
+    for (const row of form.value.regionalRates) {
+      const key = row.region.trim().toUpperCase();
+      const val = Number(row.rate);
+      if (key && Number.isFinite(val) && val >= 0) {
+        regionalMap[key] = val;
+      }
+    }
+    const hourlyRate =
+      form.value.loadedHourlyCost.trim() !== "" ? Number(form.value.loadedHourlyCost) : null;
+    const hasPricing = hourlyRate !== null || Object.keys(regionalMap).length > 0;
+    const bvPayload: Record<string, any> = {
+      ...(existingWorkflow?.business_value ?? {}),
+      manual_baseline_minutes: Number(form.value.minutes),
+      baseline_source: form.value.source,
+      confidence,
+      effective_from: form.value.effectiveFrom,
+      evidence_note: form.value.evidenceNote.trim() || undefined,
+    };
+    if (form.value.reviewMinutes.trim() !== "") {
+      bvPayload.review_minutes = { kind: "expected_average", minutes: Number(form.value.reviewMinutes) };
+    } else {
+      delete bvPayload.review_minutes;
+    }
+    if (form.value.correctionMinutes.trim() !== "") {
+      bvPayload.correction_minutes = {
+        kind: "expected_average",
+        minutes: Number(form.value.correctionMinutes),
+      };
+    } else {
+      delete bvPayload.correction_minutes;
+    }
+    if (hourlyRate !== null) {
+      bvPayload.loaded_labor_cost_per_hour = hourlyRate;
+    } else {
+      delete bvPayload.loaded_labor_cost_per_hour;
+    }
+    if (Object.keys(regionalMap).length > 0) {
+      bvPayload.regional_labor_rates = regionalMap;
+    } else {
+      delete bvPayload.regional_labor_rates;
+    }
+    if (hasPricing) {
+      bvPayload.currency = bvPayload.currency || activeCurrency.value;
+    } else {
+      delete bvPayload.currency;
+    }
     const workflow = {
       ...(existingWorkflow ?? {}),
       id,
@@ -514,14 +603,7 @@ async function save() {
         tool: form.value.completionTool,
         success_when: completionPredicate,
       },
-      business_value: {
-        ...(existingWorkflow?.business_value ?? {}),
-        manual_baseline_minutes: Number(form.value.minutes),
-        baseline_source: form.value.source,
-        confidence,
-        effective_from: form.value.effectiveFrom,
-        evidence_note: form.value.evidenceNote.trim() || undefined,
-      },
+      business_value: bvPayload,
     };
     const index = next.workflows.findIndex((item: Workflow) => item.id === id);
     if (index >= 0) next.workflows[index] = workflow;
@@ -921,6 +1003,90 @@ async function save() {
                 <FieldLabel for="baseline-effective">Effective date</FieldLabel>
                 <Input id="baseline-effective" v-model="form.effectiveFrom" type="date" required />
               </Field>
+              <Field class="min-w-0">
+                <FieldLabel for="baseline-hourly">
+                  Loaded labor rate ({{ activeCurrency }} / hr, optional)
+                </FieldLabel>
+                <Input
+                  id="baseline-hourly"
+                  v-model="form.loadedHourlyCost"
+                  type="number"
+                  min="0"
+                  step="0.5"
+                  placeholder="e.g. 95"
+                />
+              </Field>
+              <Field class="min-w-0">
+                <FieldLabel for="baseline-review">Expected review minutes (optional)</FieldLabel>
+                <Input
+                  id="baseline-review"
+                  v-model="form.reviewMinutes"
+                  type="number"
+                  min="0"
+                  max="1440"
+                  step="0.1"
+                  placeholder="e.g. 1.0"
+                />
+              </Field>
+              <Field class="min-w-0">
+                <FieldLabel for="baseline-correction">
+                  Expected correction minutes (optional)
+                </FieldLabel>
+                <Input
+                  id="baseline-correction"
+                  v-model="form.correctionMinutes"
+                  type="number"
+                  min="0"
+                  max="1440"
+                  step="0.1"
+                  placeholder="e.g. 0.5"
+                />
+              </Field>
+              <div class="space-y-2 rounded border border-[#E4E4E7] bg-[#FAFAFA] p-2.5 sm:col-span-2">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <span class="text-xs font-medium text-[#09090B]">
+                    Regional rate overrides ({{ activeCurrency }} / hr, optional)
+                  </span>
+                  <Button
+                    type="button"
+                    class="min-h-8 text-xs"
+                    @click="form.regionalRates.push({ region: '', rate: '' })"
+                  >
+                    + Add region rate
+                  </Button>
+                </div>
+                <p class="text-[11px] text-[#71717A]">
+                  Match caller country/region JWT claims (e.g. US, EU, LATAM, BR) while reporting in {{ activeCurrency }}.
+                </p>
+                <div
+                  v-for="(row, rIdx) in form.regionalRates"
+                  :key="rIdx"
+                  class="flex flex-wrap items-center gap-2"
+                >
+                  <Input
+                    v-model="row.region"
+                    placeholder="Region (e.g. BR, US)"
+                    aria-label="Region code"
+                    class="w-36 font-mono-data uppercase"
+                  />
+                  <Input
+                    v-model="row.rate"
+                    type="number"
+                    min="0"
+                    step="0.5"
+                    :placeholder="`Rate (${activeCurrency}/hr)`"
+                    aria-label="Regional hourly rate"
+                    class="w-36"
+                  />
+                  <Button
+                    type="button"
+                    class="min-h-9 text-xs"
+                    @click="form.regionalRates.splice(rIdx, 1)"
+                  >
+                    Remove
+                  </Button>
+                </div>
+              </div>
               <Field class="min-w-0 sm:col-span-2">
                 <FieldLabel for="baseline-note">Evidence note (optional)</FieldLabel>
                 <Textarea

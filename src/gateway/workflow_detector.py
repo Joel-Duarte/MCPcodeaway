@@ -17,6 +17,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from gateway.business_value_runtime import (
+    apply_regional_baseline,
     canonical_json_digest,
     required_evidence_satisfied,
     resolve_json_pointer,
@@ -860,6 +861,7 @@ class WorkflowEpisodeTracker:
         run_id: str,
         calls: list[dict[str, Any]],
         is_single_turn_batch: bool = False,
+        caller_regions: tuple[str, ...] = (),
     ) -> dict[str, Any] | None:
         """Record one or more tool calls into a passive episode and evaluate completion."""
 
@@ -944,6 +946,7 @@ class WorkflowEpisodeTracker:
                 "payload": {
                     "field_state": {},
                     "ordinal_counter": 0,
+                    "caller_regions": list(caller_regions),
                     "arg_entities": all_arg_entities,
                 },
             }
@@ -958,6 +961,10 @@ class WorkflowEpisodeTracker:
                 dict.fromkeys([*(ep_payload.get("arg_entities") or []), *all_arg_entities])
             )[:50]
             episode["payload"] = ep_payload
+            if caller_regions and not (episode.get("payload") or {}).get("caller_regions"):
+                ep_payload = dict(episode.get("payload") or {})
+                ep_payload["caller_regions"] = list(caller_regions)
+                episode["payload"] = ep_payload
             if redacted_intent and not episode.get("redacted_intent"):
                 episode["redacted_intent"] = redacted_intent
             episode["updated_at"] = now_iso
@@ -1579,7 +1586,11 @@ class WorkflowEpisodeTracker:
             outcome_digest = terminal_diff.get("outcome_digest") or wf_pred.get("outcome_digest")
             if wf.dedupe is not None and not outcome_digest:
                 return
-            baseline = wf.business_value.model_dump(mode="json")
+            ep_regions = (episode.get("payload") or {}).get("caller_regions") or []
+            baseline = apply_regional_baseline(
+                wf.business_value.model_dump(mode="json"),
+                ep_regions,
+            )
             event = {
                 "event_id": uuid.uuid4().hex,
                 "tenant_id": tenant_id,

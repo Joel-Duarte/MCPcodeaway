@@ -1085,11 +1085,17 @@ class DemoTrafficRunner:
                             "confidence": "sampled",
                             "loaded_labor_cost_per_hour": 85.0,
                             "currency": "USD",
+                            "regional_labor_rates": {
+                                "US": 115.0,
+                                "EU": 85.0,
+                                "APAC": 70.0,
+                                "LATAM": 55.0,
+                            },
                             "review_minutes": {"kind": "expected_average", "minutes": 2.0},
                             "correction_minutes": {"kind": "expected_average", "minutes": 0.5},
                             "effective_from": today,
                             "evidence_note": (
-                                "Sampled SRE queue benchmark across 15 EU ticket resolutions."
+                                "Sampled SRE queue benchmark across regional support pods."
                             ),
                         },
                     },
@@ -1237,6 +1243,7 @@ class DemoTrafficRunner:
                     "sub": "demo-sre-operator",
                     "roles": ["ops_engineer", "ticketing_reader", "ticketing_writer", "admin"],
                     "groups": ["operations", "platform-admins"],
+                    "client_groups": ["EU"],
                     "scopes": ["mcp.tools", "ops.write"],
                 },
             )
@@ -1990,6 +1997,7 @@ class DemoTrafficRunner:
                     "sales",
                     "finance",
                 ],
+                "client_groups": ["US"],
                 "scopes": ["mcp.tools", "ops.write", "mcp.write"],
             },
         )

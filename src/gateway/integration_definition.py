@@ -138,6 +138,7 @@ class BusinessValueBaseline(DefinitionModel):
     confidence: Literal["unvalidated", "sampled", "validated"]
     loaded_labor_cost_per_hour: float | None = Field(default=None, ge=0, le=1_000_000)
     currency: str | None = Field(default=None, pattern=_CURRENCY_PATTERN)
+    regional_labor_rates: dict[str, float] = Field(default_factory=dict, max_length=50)
     effective_from: date
     evidence_note: str | None = Field(default=None, max_length=1000)
     review_minutes: MinuteAssumption | None = None
@@ -147,6 +148,24 @@ class BusinessValueBaseline(DefinitionModel):
     def _validate_rate_currency(self) -> BusinessValueBaseline:
         if (self.loaded_labor_cost_per_hour is None) != (self.currency is None):
             raise ValueError("loaded labor cost and currency must be supplied together")
+        if self.regional_labor_rates:
+            normalized_rates: dict[str, float] = {}
+            for raw_region, rate in self.regional_labor_rates.items():
+                region_key = str(raw_region).strip().upper()
+                if not re.match(r"^[A-Z0-9_-]{2,24}$", region_key):
+                    raise ValueError(
+                        f"Regional rate key '{raw_region}' must be 2-24 characters (A-Z, 0-9, _, -)"
+                    )
+                if isinstance(rate, bool) or float(rate) < 0 or float(rate) > 1_000_000:
+                    raise ValueError(
+                        f"Regional labor rate for '{region_key}' must be between 0 and 1,000,000"
+                    )
+                normalized_rates[region_key] = float(rate)
+            object.__setattr__(self, "regional_labor_rates", normalized_rates)
+            if self.currency is None:
+                raise ValueError(
+                    "currency must be supplied when regional_labor_rates are configured"
+                )
         if self.confidence == "validated" and self.baseline_source == "administrator_estimate":
             raise ValueError("an administrator estimate cannot be marked validated")
         if self.confidence == "unvalidated" and self.baseline_source != "administrator_estimate":

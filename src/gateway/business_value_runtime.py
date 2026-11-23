@@ -6,12 +6,53 @@ continue to use the normal catalog, policy and ``HostDispatcher`` path.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
 from typing import Any
 
 from gateway.integration_definition import ResultPredicate, WorkflowDefinition
+
+
+def extract_caller_regions(
+    *,
+    claims: dict[str, Any] | None = None,
+    client_groups: list[str] | tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """Return ordered uppercase region/country identifiers from verified caller identity."""
+    candidates: list[str] = []
+    if isinstance(claims, dict):
+        for key in ("country", "c", "region", "geo"):
+            raw = claims.get(key)
+            if isinstance(raw, str) and raw.strip():
+                candidates.append(raw.strip().upper())
+            elif isinstance(raw, (list, tuple)):
+                for item in raw:
+                    if isinstance(item, str) and item.strip():
+                        candidates.append(item.strip().upper())
+    for grp in client_groups:
+        if isinstance(grp, str) and grp.strip() and grp.strip().upper() != "ALL":
+            candidates.append(grp.strip().upper())
+    return tuple(dict.fromkeys(candidates))
+
+
+def apply_regional_baseline(
+    baseline: dict[str, Any], caller_regions: tuple[str, ...] | list[str] = ()
+) -> dict[str, Any]:
+    """Snapshot baseline with any caller-region rate override in the same gateway currency."""
+    snapshot = copy.deepcopy(baseline)
+    regional = snapshot.get("regional_labor_rates")
+    if isinstance(regional, dict) and caller_regions:
+        normalized_map = {str(k).strip().upper(): v for k, v in regional.items() if str(k).strip()}
+        for region in caller_regions:
+            key = str(region).strip().upper()
+            if key in normalized_map:
+                snapshot["loaded_labor_cost_per_hour"] = float(normalized_map[key])
+                snapshot["resolved_region"] = key
+                return snapshot
+    snapshot.setdefault("resolved_region", None)
+    return snapshot
 
 
 def canonical_json_digest(value: Any) -> str:

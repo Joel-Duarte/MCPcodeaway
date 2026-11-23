@@ -413,6 +413,18 @@ class GatewaySettings(BaseSettings):
     log_level: str = "INFO"
     cost_per_1m_input_tokens_usd: float = 3.0
     cost_per_1m_output_tokens_usd: float = 15.0
+    default_currency: str = Field(
+        default="USD", min_length=3, max_length=3, pattern=r"^[A-Za-z]{3}$"
+    )
+
+    @field_validator("default_currency")
+    @classmethod
+    def _normalize_default_currency(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if not re.match(r"^[A-Z]{3}$", normalized):
+            raise ValueError("default_currency must be a 3-letter ISO currency code")
+        return normalized
+
     context_overflow_threshold_tokens: int = 32768
     metrics_require_auth: bool = False
 

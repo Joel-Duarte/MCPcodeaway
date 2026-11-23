@@ -338,7 +338,12 @@ class TelemetryRecorder:
         return {"total_runs": len(runs), "by_mode": by_mode}
 
     async def business_value_report(
-        self, *, tenant_id: str, since: str | None = None, limit: int = 1000
+        self,
+        *,
+        tenant_id: str,
+        since: str | None = None,
+        limit: int = 1000,
+        reporting_currency: str = "USD",
     ) -> dict[str, Any]:
         """Aggregate durable outcomes by integration, definition, revision, and UTC day.
 
@@ -399,6 +404,12 @@ class TelemetryRecorder:
             confidence = str(baseline.get("confidence") or "unknown")
             currency = baseline.get("currency")
             currency = str(currency) if isinstance(currency, str) else None
+            resolved_region = baseline.get("resolved_region")
+            region = (
+                str(resolved_region).strip().upper()
+                if isinstance(resolved_region, str) and resolved_region.strip()
+                else None
+            )
             key = (
                 integration_id,
                 upstream,
@@ -408,6 +419,7 @@ class TelemetryRecorder:
                 source,
                 confidence,
                 currency or "",
+                region or "",
                 utc_day,
             )
             bucket = grouped.setdefault(
@@ -424,6 +436,7 @@ class TelemetryRecorder:
                     "baseline_source": source,
                     "baseline_confidence": confidence,
                     "currency": currency,
+                    "region": region,
                     "completed_count": 0,
                     "estimated_manual_baseline_minutes": 0.0,
                     "validated_manual_baseline_minutes": 0.0,
@@ -549,6 +562,7 @@ class TelemetryRecorder:
 
         return {
             "tenant_scope": tenant_id,
+            "reporting_currency": reporting_currency,
             "since": since,
             "events_returned": len(events),
             "truncated": len(events) >= limit,

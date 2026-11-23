@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed, onMounted, ref, watch } from "vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
 import {
   AlertDialog,
@@ -61,6 +62,10 @@ const statusMsg = ref("");
 const errorMsg = ref("");
 
 const pricing = ref<ModelPricingMap | null>(null);
+const reportingCurrency = ref("USD");
+const envDefaultCurrency = ref("USD");
+const currencyPresets = ref<string[]>(["USD", "EUR", "GBP", "BRL", "CAD", "AUD", "JPY", "CHF"]);
+const savingCurrency = ref(false);
 const modelSearch = ref("");
 const modelPage = ref(1);
 const modelPageSize = 8;
@@ -143,6 +148,23 @@ async function loadSettings() {
       }
     } catch {
     }
+    try {
+      const bvSettings = await apiFetch<{
+        reporting_currency?: string;
+        env_default_currency?: string;
+        supported_presets?: string[];
+      }>("/admin/business-value/settings");
+      if (bvSettings.reporting_currency) {
+        reportingCurrency.value = bvSettings.reporting_currency;
+      }
+      if (bvSettings.env_default_currency) {
+        envDefaultCurrency.value = bvSettings.env_default_currency;
+      }
+      if (Array.isArray(bvSettings.supported_presets) && bvSettings.supported_presets.length) {
+        currencyPresets.value = bvSettings.supported_presets;
+      }
+    } catch {
+    }
     pricing.value = p;
     errorRateMax.value = String(r.error_rate_pct_max);
     p95LatencyMax.value = String(r.p95_latency_ms_max);
@@ -210,6 +232,30 @@ async function saveAdaptiveMode() {
       : "Adaptive recommendations will be recorded; Auto will keep choosing the mode.";
   } catch (err) { errorMsg.value = extractErrorMessage(err); }
   finally { savingAdaptiveMode.value = false; }
+}
+
+
+async function saveReportingCurrency() {
+  const clean = reportingCurrency.value.trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(clean)) {
+    errorMsg.value = "Reporting currency must be a 3-letter ISO code (e.g. USD, EUR, GBP).";
+    return;
+  }
+  savingCurrency.value = true;
+  statusMsg.value = "";
+  errorMsg.value = "";
+  try {
+    const res = await apiFetch<{ reporting_currency: string }>("/admin/business-value/settings", {
+      method: "PUT",
+      body: { reporting_currency: clean },
+    });
+    reportingCurrency.value = res.reporting_currency;
+    statusMsg.value = `Saved gateway reporting currency (${res.reporting_currency}).`;
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err);
+  } finally {
+    savingCurrency.value = false;
+  }
 }
 
 
@@ -554,6 +600,52 @@ async function pruneAuditRuns() {
           <div class="mt-4 grid grid-cols-1 gap-4 border-t border-[#E4E4E7] pt-4 sm:grid-cols-2">
             <div><h3 class="text-xs font-semibold text-[#52525B]">Groups</h3><p class="mt-1 text-xs text-[#71717A]">{{ (session?.user?.groups || []).join(", ") || "No group claims returned" }}</p></div>
             <div><h3 class="text-xs font-semibold text-[#52525B]">Client groups</h3><p class="mt-1 text-xs text-[#71717A]">{{ (session?.user?.client_groups || []).join(", ") || "No client-group claims returned" }}</p></div>
+          </div>
+        </div>
+        <div class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
+          <div class="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h2 class="text-sm font-semibold text-[#09090B]">Gateway Reporting Currency</h2>
+              <p class="mt-1 text-xs leading-5 text-[#52525B]">
+                Set the gateway-wide ISO currency used for workflow hourly rates, regional rate overrides, and ROI rollups (env default:
+                <code class="font-mono-data">{{ envDefaultCurrency }}</code>).
+              </p>
+            </div>
+            <span class="rounded border border-[#99F6E4] bg-[#F0FDFA] px-2 py-0.5 font-mono-data text-xs font-medium text-[#0F766E]">
+              Active: {{ reportingCurrency }}
+            </span>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <button
+              v-for="preset in currencyPresets"
+              :key="preset"
+              type="button"
+              class="min-h-8 rounded border px-2.5 py-1 font-mono-data text-xs font-medium transition-colors"
+              :class="
+                reportingCurrency.toUpperCase() === preset
+                  ? 'border-[#0F766E] bg-[#F0FDFA] text-[#0F766E]'
+                  : 'border-[#D4D4D8] bg-white text-[#52525B] hover:bg-[#F4F4F5]'
+              "
+              @click="reportingCurrency = preset"
+            >
+              {{ preset }}
+            </button>
+            <input
+              v-model="reportingCurrency"
+              maxlength="3"
+              aria-label="Gateway reporting currency ISO code"
+              placeholder="USD"
+              class="min-h-8 w-20 rounded border border-[#D4D4D8] bg-white px-2.5 py-1 font-mono-data text-xs uppercase text-[#09090B]"
+              @input="reportingCurrency = reportingCurrency.toUpperCase()"
+            />
+            <Button
+              data-variant="primary"
+              class="min-h-9 text-xs"
+              :disabled="savingCurrency || !session?.is_admin"
+              @click="saveReportingCurrency"
+            >
+              {{ savingCurrency ? "Saving…" : "Save Reporting Currency" }}
+            </Button>
           </div>
         </div>
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">

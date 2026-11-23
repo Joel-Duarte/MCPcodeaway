@@ -107,15 +107,42 @@ const editDrawerOpen = ref(false);
 const editTarget = ref<WorkflowCatalogEntry | null>(null);
 const editSaving = ref(false);
 const editDrawerError = ref("");
+const gatewayCurrency = ref("USD");
 const editForm = ref({
   name: "",
   description: "",
   manual_baseline_minutes: 10,
+  review_minutes: "",
+  correction_minutes: "",
+  loaded_labor_cost_per_hour: "",
+  effective_from: new Date().toISOString().slice(0, 10),
+  regional_rates: [] as { region: string; rate: string }[],
   baseline_source: "administrator_estimate",
   confidence: "unvalidated",
   evidence_note: "",
   intent_examples_text: "",
   enabled: true,
+});
+
+const editNetSavingsPreview = computed(() => {
+  const base = Number(editForm.value.manual_baseline_minutes);
+  if (!Number.isFinite(base) || base <= 0) return null;
+  const rev =
+    editForm.value.review_minutes.trim() !== "" ? Number(editForm.value.review_minutes) : null;
+  const corr =
+    editForm.value.correction_minutes.trim() !== ""
+      ? Number(editForm.value.correction_minutes)
+      : null;
+  if (rev === null || corr === null || !Number.isFinite(rev) || !Number.isFinite(corr)) {
+    return null;
+  }
+  const net = base - rev - corr;
+  const hourly =
+    editForm.value.loaded_labor_cost_per_hour.trim() !== ""
+      ? Number(editForm.value.loaded_labor_cost_per_hour)
+      : null;
+  const value = hourly !== null && Number.isFinite(hourly) ? (net * hourly) / 60.0 : null;
+  return { net, value };
 });
 
 const promoteDrawerOpen = ref(false);
@@ -124,6 +151,9 @@ const promoteSaving = ref(false);
 const promoteDrawerError = ref("");
 const promoteForm = ref({
   manual_baseline_minutes: 10,
+  review_minutes: "",
+  correction_minutes: "",
+  loaded_labor_cost_per_hour: "",
   baseline_source: "administrator_estimate",
   effective_from: new Date().toISOString().slice(0, 10),
   evidence_note: "Confirmed from discovered workflow candidate.",
@@ -348,20 +378,27 @@ async function loadCatalog() {
       workflows?: WorkflowCatalogEntry[];
       candidates?: DiscoveredCandidate[];
       episodes?: DetectedEpisode[];
+      reporting_currency?: string;
     }>("/admin/workflows/catalog"),
-    apiFetch<BusinessValueReport>("/admin/business-value/report"),
+    apiFetch<BusinessValueReport & { reporting_currency?: string }>("/admin/business-value/report"),
   ]);
   if (catResult.status === "fulfilled") {
     upstreams.value = catResult.value.upstreams ?? [];
     workflows.value = catResult.value.workflows ?? [];
     candidates.value = catResult.value.candidates ?? [];
     episodes.value = catResult.value.episodes ?? [];
+    if (catResult.value.reporting_currency) {
+      gatewayCurrency.value = catResult.value.reporting_currency;
+    }
   } else {
     loadError.value = extractErrorMessage(catResult.reason);
   }
   if (bvResult.status === "fulfilled") {
     bvReport.value = bvResult.value;
     bvFetchedAt.value = new Date();
+    if (bvResult.value.reporting_currency) {
+      gatewayCurrency.value = bvResult.value.reporting_currency;
+    }
   } else {
     bvReport.value = null;
     bvError.value = "";
@@ -429,10 +466,21 @@ function openEditDrawer(entry: WorkflowCatalogEntry) {
   const bv = wf.business_value ?? {};
   editDrawerError.value = "";
   editTarget.value = entry;
+  const regEntries = Object.entries(bv.regional_labor_rates ?? {}).map(([region, rate]) => ({
+    region: String(region),
+    rate: String(rate),
+  }));
   editForm.value = {
     name: String(wf.name ?? ""),
     description: String(wf.description ?? ""),
     manual_baseline_minutes: Number(bv.manual_baseline_minutes ?? 10),
+    review_minutes: bv.review_minutes?.minutes != null ? String(bv.review_minutes.minutes) : "",
+    correction_minutes:
+      bv.correction_minutes?.minutes != null ? String(bv.correction_minutes.minutes) : "",
+    loaded_labor_cost_per_hour:
+      bv.loaded_labor_cost_per_hour != null ? String(bv.loaded_labor_cost_per_hour) : "",
+    effective_from: String(bv.effective_from ?? new Date().toISOString().slice(0, 10)),
+    regional_rates: regEntries,
     baseline_source: String(bv.baseline_source ?? "administrator_estimate"),
     confidence: String(bv.confidence ?? "unvalidated"),
     evidence_note: String(bv.evidence_note ?? ""),
@@ -481,20 +529,52 @@ async function saveWorkflowEdit() {
       .split("\n")
       .map((line) => line.trim())
       .filter(Boolean);
+    const regionalMap: Record<string, number> = {};
+    for (const row of editForm.value.regional_rates) {
+      const cleanRegion = row.region.trim().toUpperCase();
+      if (!cleanRegion) continue;
+      const numericRate = Number(row.rate);
+      if (!Number.isFinite(numericRate) || numericRate < 0) {
+        throw new Error(`Regional rate for '${cleanRegion}' must be a non-negative number.`);
+      }
+      regionalMap[cleanRegion] = numericRate;
+    }
+    const hourlyRate =
+      editForm.value.loaded_labor_cost_per_hour.trim() !== ""
+        ? Number(editForm.value.loaded_labor_cost_per_hour)
+        : null;
+    if (hourlyRate !== null && (!Number.isFinite(hourlyRate) || hourlyRate < 0)) {
+      throw new Error("Loaded labor rate per hour must be non-negative.");
+    }
+    const reviewMinutes =
+      editForm.value.review_minutes.trim() !== "" ? Number(editForm.value.review_minutes) : null;
+    const correctionMinutes =
+      editForm.value.correction_minutes.trim() !== ""
+        ? Number(editForm.value.correction_minutes)
+        : null;
+    const bodyPayload: Record<string, any> = {
+      name: editForm.value.name.trim(),
+      description: editForm.value.description.trim(),
+      manual_baseline_minutes: minutes,
+      baseline_source: editForm.value.baseline_source,
+      confidence: editForm.value.confidence,
+      effective_from: editForm.value.effective_from || undefined,
+      evidence_note: editForm.value.evidence_note.trim() || null,
+      intent_examples: intentExamples,
+      enabled: editForm.value.enabled,
+      review_minutes: reviewMinutes,
+      correction_minutes: correctionMinutes,
+      loaded_labor_cost_per_hour: hourlyRate,
+      regional_labor_rates: regionalMap,
+    };
+    if (hourlyRate !== null || Object.keys(regionalMap).length > 0) {
+      bodyPayload.currency = gatewayCurrency.value;
+    }
     await apiFetch(
       `/admin/integration-definitions/${encodeURIComponent(target.upstream_name)}/workflows/${encodeURIComponent(String(target.workflow.id))}`,
       {
         method: "PATCH",
-        body: {
-          name: editForm.value.name.trim(),
-          description: editForm.value.description.trim(),
-          manual_baseline_minutes: minutes,
-          baseline_source: editForm.value.baseline_source,
-          confidence: editForm.value.confidence,
-          evidence_note: editForm.value.evidence_note.trim() || null,
-          intent_examples: intentExamples,
-          enabled: editForm.value.enabled,
-        },
+        body: bodyPayload,
       },
     );
     editDrawerOpen.value = false;
@@ -537,6 +617,9 @@ function openPromoteDrawer(cand: DiscoveredCandidate) {
   promoteTarget.value = cand;
   promoteForm.value = {
     manual_baseline_minutes: 10,
+    review_minutes: "",
+    correction_minutes: "",
+    loaded_labor_cost_per_hour: "",
     baseline_source: "administrator_estimate",
     effective_from: new Date().toISOString().slice(0, 10),
     evidence_note: "Activated from auto-discovered workflow candidate.",
@@ -560,18 +643,37 @@ async function confirmPromoteCandidate() {
         : promoteForm.value.baseline_source === "sampled_manual_measurement"
           ? "sampled"
           : "unvalidated";
+    const hourlyRate =
+      promoteForm.value.loaded_labor_cost_per_hour.trim() !== ""
+        ? Number(promoteForm.value.loaded_labor_cost_per_hour)
+        : null;
+    const reviewMinutes =
+      promoteForm.value.review_minutes.trim() !== ""
+        ? Number(promoteForm.value.review_minutes)
+        : null;
+    const correctionMinutes =
+      promoteForm.value.correction_minutes.trim() !== ""
+        ? Number(promoteForm.value.correction_minutes)
+        : null;
+    const promoteBody: Record<string, any> = {
+      manual_baseline_minutes: minutes,
+      baseline_source: promoteForm.value.baseline_source,
+      confidence,
+      effective_from: promoteForm.value.effective_from,
+      evidence_note: promoteForm.value.evidence_note.trim() || undefined,
+      publish: true,
+    };
+    if (reviewMinutes !== null) promoteBody.review_minutes = reviewMinutes;
+    if (correctionMinutes !== null) promoteBody.correction_minutes = correctionMinutes;
+    if (hourlyRate !== null) {
+      promoteBody.loaded_labor_cost_per_hour = hourlyRate;
+      promoteBody.currency = gatewayCurrency.value;
+    }
     await apiFetch(
       `/admin/workflows/discovered/${encodeURIComponent(promoteTarget.value.candidate_id)}/promote`,
       {
         method: "POST",
-        body: {
-          manual_baseline_minutes: minutes,
-          baseline_source: promoteForm.value.baseline_source,
-          confidence,
-          effective_from: promoteForm.value.effective_from,
-          evidence_note: promoteForm.value.evidence_note.trim() || undefined,
-          publish: true,
-        },
+        body: promoteBody,
       },
     );
     promoteDrawerOpen.value = false;
@@ -856,8 +958,21 @@ async function dismissAllSchemaSuggestions() {
                     <strong class="font-mono-data tabular-nums text-[#09090B]">
                       {{ entry.workflow.business_value?.manual_baseline_minutes }} min
                     </strong>
-                    <span v-if="entry.workflow.business_value?.loaded_labor_cost_per_hour">
-                      · {{ entry.workflow.business_value?.currency || "USD" }} {{ entry.workflow.business_value?.loaded_labor_cost_per_hour }}/hr
+                    <span v-if="entry.workflow.business_value?.loaded_labor_cost_per_hour != null">
+                      · {{ entry.workflow.business_value?.currency || gatewayCurrency }} {{ entry.workflow.business_value?.loaded_labor_cost_per_hour }}/hr
+                    </span>
+                    <span
+                      v-if="
+                        entry.workflow.business_value?.regional_labor_rates &&
+                        Object.keys(entry.workflow.business_value.regional_labor_rates).length
+                      "
+                      class="ml-1 text-[11px] text-[#71717A]"
+                    >
+                      ({{
+                        Object.entries(entry.workflow.business_value.regional_labor_rates)
+                          .map(([reg, rate]) => `${reg}: ${entry.workflow.business_value?.currency || gatewayCurrency} ${rate}/hr`)
+                          .join(" · ")
+                      }})
                     </span>
                   </span>
                   <span class="font-mono-data">
@@ -1157,6 +1272,114 @@ async function dismissAllSchemaSuggestions() {
               </Select>
             </Field>
           </div>
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field>
+              <FieldLabel for="edit-wf-review">Expected review (minutes)</FieldLabel>
+              <Input
+                id="edit-wf-review"
+                v-model="editForm.review_minutes"
+                type="number"
+                min="0"
+                max="1440"
+                step="0.1"
+                placeholder="e.g. 1.0"
+              />
+            </Field>
+            <Field>
+              <FieldLabel for="edit-wf-correction">Expected correction (minutes)</FieldLabel>
+              <Input
+                id="edit-wf-correction"
+                v-model="editForm.correction_minutes"
+                type="number"
+                min="0"
+                max="1440"
+                step="0.1"
+                placeholder="e.g. 0.5"
+              />
+            </Field>
+          </div>
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field>
+              <FieldLabel for="edit-wf-hourly">
+                Loaded labor rate ({{ gatewayCurrency }} / hr)
+              </FieldLabel>
+              <Input
+                id="edit-wf-hourly"
+                v-model="editForm.loaded_labor_cost_per_hour"
+                type="number"
+                min="0"
+                step="0.5"
+                placeholder="e.g. 95"
+              />
+              <FieldDescription>
+                Uses gateway currency
+                <strong class="font-mono-data">{{ gatewayCurrency }}</strong>.
+                <NuxtLink to="/settings" class="text-[#0F766E] underline underline-offset-2">
+                  Change currency
+                </NuxtLink>
+              </FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel for="edit-wf-effective">Effective date</FieldLabel>
+              <Input id="edit-wf-effective" v-model="editForm.effective_from" type="date" />
+            </Field>
+          </div>
+          <div
+            v-if="editNetSavingsPreview"
+            class="rounded border border-[#99F6E4] bg-[#F0FDFA] px-3 py-2 text-xs text-[#0F766E] tabular-nums"
+          >
+            Net savings per completion:
+            <strong>{{ editNetSavingsPreview.net.toFixed(1) }} min</strong>
+            <span v-if="editNetSavingsPreview.value != null">
+              · Estimated value:
+              <strong>{{ gatewayCurrency }} {{ editNetSavingsPreview.value.toFixed(2) }}</strong>
+            </span>
+          </div>
+          <div class="space-y-2 rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <span class="text-xs font-medium text-[#09090B]">
+                Country / region rate overrides ({{ gatewayCurrency }} / hr)
+              </span>
+              <Button
+                type="button"
+                class="min-h-8 text-xs"
+                @click="editForm.regional_rates.push({ region: '', rate: '' })"
+              >
+                + Add region rate
+              </Button>
+            </div>
+            <p class="text-[11px] text-[#52525B]">
+              Match verified caller region or country claims (e.g. US, EU, LATAM, BR) while pricing everything in {{ gatewayCurrency }}.
+            </p>
+            <div
+              v-for="(row, rIdx) in editForm.regional_rates"
+              :key="rIdx"
+              class="flex flex-wrap items-center gap-2"
+            >
+              <Input
+                v-model="row.region"
+                placeholder="Region (e.g. BR, US)"
+                aria-label="Edit region code"
+                class="w-32 font-mono-data uppercase"
+              />
+              <Input
+                v-model="row.rate"
+                type="number"
+                min="0"
+                step="0.5"
+                :placeholder="`Rate (${gatewayCurrency}/hr)`"
+                aria-label="Edit regional rate"
+                class="w-36"
+              />
+              <Button
+                type="button"
+                class="min-h-9 text-xs"
+                @click="editForm.regional_rates.splice(rIdx, 1)"
+              >
+                Remove
+              </Button>
+            </div>
+          </div>
           <Field>
             <FieldLabel>Baseline source</FieldLabel>
             <Select
@@ -1269,6 +1492,43 @@ async function dismissAllSchemaSuggestions() {
               </SelectContent>
             </Select>
           </Field>
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field>
+              <FieldLabel for="promote-review">Expected review (min)</FieldLabel>
+              <Input
+                id="promote-review"
+                v-model="promoteForm.review_minutes"
+                type="number"
+                min="0"
+                step="0.1"
+                placeholder="e.g. 1.0"
+              />
+            </Field>
+            <Field>
+              <FieldLabel for="promote-correction">Expected correction (min)</FieldLabel>
+              <Input
+                id="promote-correction"
+                v-model="promoteForm.correction_minutes"
+                type="number"
+                min="0"
+                step="0.1"
+                placeholder="e.g. 0.5"
+              />
+            </Field>
+          </div>
+          <Field>
+            <FieldLabel for="promote-hourly">
+              Loaded labor rate ({{ gatewayCurrency }} / hr, optional)
+            </FieldLabel>
+            <Input
+              id="promote-hourly"
+              v-model="promoteForm.loaded_labor_cost_per_hour"
+              type="number"
+              min="0"
+              step="0.5"
+              placeholder="e.g. 95"
+            />
+          </Field>
           <Field>
             <FieldLabel for="promote-note">Evidence note</FieldLabel>
             <Input id="promote-note" v-model="promoteForm.evidence_note" />
@@ -1288,6 +1548,7 @@ async function dismissAllSchemaSuggestions() {
       v-model:open="createWorkflowDrawerOpen"
       :upstreams="upstreams"
       :upstream="upstreamFilter !== '__all__' ? upstreamFilter : upstreams[0] || ''"
+      :gateway-currency="gatewayCurrency"
       @saved="handleCreatedWorkflowSaved"
     />
 

@@ -317,3 +317,134 @@ async def test_business_value_report_is_read_only_and_tenant_scoped(
         assert admin_report.json()["by_integration_workflow_day"][0]["selected_id"] == (
             "other-workflow"
         )
+
+
+@pytest.mark.asyncio
+async def test_gateway_currency_settings_and_regional_labor_rates_round_trip(
+    tmp_path: Path,
+) -> None:
+    from gateway.business_value_runtime import apply_regional_baseline
+    from gateway.workflow_detector import pick_schema_predicate
+
+    async with _admin_gateway(tmp_path) as (runtime, store, client, admin, viewer):
+        cur_get = await client.get("/admin/business-value/settings", headers=_auth(viewer))
+        assert cur_get.status_code == 200
+        assert cur_get.json()["reporting_currency"] == "USD"
+
+        viewer_put = await client.put(
+            "/admin/business-value/settings",
+            headers=_auth(viewer),
+            json={"reporting_currency": "EUR"},
+        )
+        assert viewer_put.status_code == 403
+
+        bad_put = await client.put(
+            "/admin/business-value/settings",
+            headers=_auth(admin),
+            json={"reporting_currency": "12$"},
+        )
+        assert bad_put.status_code == 422
+
+        saved_put = await client.put(
+            "/admin/business-value/settings",
+            headers=_auth(admin),
+            json={"reporting_currency": "eur"},
+        )
+        assert saved_put.status_code == 200
+        assert saved_put.json()["reporting_currency"] == "EUR"
+
+        tools = runtime.catalog.get_server_tools("support_api")
+        first_tool = tools[0].qualified_name
+        definition = _support_definition(runtime, display_name="Support Desk")
+        definition["workflows"] = [
+            {
+                "id": "support_ticket",
+                "name": "Support Ticket Flow",
+                "description": "Handle ticket workflow cleanly.",
+                "enabled": True,
+                "participating_tools": [first_tool],
+                "required_evidence": [{"tool": first_tool, "min_successful_calls": 1}],
+                "completion": {
+                    "kind": "terminal_tool_result",
+                    "tool": first_tool,
+                    "success_when": pick_schema_predicate(tools[0]),
+                },
+                "business_value": {
+                    "manual_baseline_minutes": 12.0,
+                    "baseline_source": "administrator_estimate",
+                    "confidence": "unvalidated",
+                    "effective_from": "2026-11-23",
+                },
+            }
+        ]
+        draft = await client.post(
+            "/admin/integration-definitions/drafts",
+            headers=_auth(admin),
+            json={"definition": definition},
+        )
+        assert draft.status_code == 200, draft.text
+        rev = draft.json()["revision"]
+        pub = await client.post(
+            "/admin/integration-definitions/support_api/publish",
+            headers=_auth(admin),
+            json={"revision": rev},
+        )
+        assert pub.status_code == 200, pub.text
+
+        patched = await client.patch(
+            "/admin/integration-definitions/support_api/workflows/support_ticket",
+            headers=_auth(admin),
+            json={
+                "manual_baseline_minutes": 10.0,
+                "baseline_source": "validated_external_measurement",
+                "confidence": "validated",
+                "loaded_labor_cost_per_hour": 90.0,
+                "review_minutes": 1.0,
+                "correction_minutes": 0.5,
+                "regional_labor_rates": {"us": 130.0, "br": 45.0},
+            },
+        )
+        assert patched.status_code == 200, patched.text
+        wf_bv = patched.json()["workflow"]["business_value"]
+        assert wf_bv["currency"] == "EUR"
+        assert wf_bv["loaded_labor_cost_per_hour"] == 90.0
+        assert wf_bv["regional_labor_rates"] == {"US": 130.0, "BR": 45.0}
+        assert wf_bv["review_minutes"] == {"kind": "expected_average", "minutes": 1.0}
+        assert wf_bv["correction_minutes"] == {"kind": "expected_average", "minutes": 0.5}
+
+        catalog = await client.get("/admin/workflows/catalog", headers=_auth(viewer))
+        assert catalog.status_code == 200
+        assert catalog.json()["reporting_currency"] == "EUR"
+
+        for idx, reg in enumerate(("US", "BR")):
+            snap = apply_regional_baseline(wf_bv, [reg])
+            await store.record_business_value_event(
+                {
+                    "event_id": f"ev-reg-{idx}",
+                    "tenant_id": "tenant-acme-dev",
+                    "business_execution_id": f"exec-reg-{idx}",
+                    "completion_key": f"reg-comp-{idx}",
+                    "upstream_name": "support_api",
+                    "outcome_namespace": None,
+                    "outcome_digest": None,
+                    "credited": 1,
+                    "created_at": "2026-11-23T14:00:00Z",
+                    "evidence": {
+                        "selected_id": "support_api/support_ticket",
+                        "selected_kind": "workflow",
+                        "integration_id": "support_desk",
+                        "integration_display_name": "Support Desk",
+                        "definition_revision": patched.json()["revision"],
+                        "baseline_snapshot": snap,
+                    },
+                }
+            )
+        report = await client.get("/admin/business-value/report", headers=_auth(viewer))
+        assert report.status_code == 200
+        body = report.json()
+        assert body["reporting_currency"] == "EUR"
+        by_region = {r["region"]: r for r in body["by_integration_workflow_day"]}
+        assert set(by_region) == {"US", "BR"}
+        assert by_region["US"]["estimated_labor_value"] == {"amount": 18.4167, "currency": "EUR"}
+        assert by_region["BR"]["estimated_labor_value"] == {"amount": 6.375, "currency": "EUR"}
+        assert "EUR" in body["totals_by_currency"]

@@ -35,6 +35,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import UpstreamMcpUiCatalog from "~/components/UpstreamMcpUiCatalog.vue";
 import McpUiPage from "~/pages/mcp-ui.vue";
 import OnboardingPage from "~/pages/onboarding.vue";
+import SettingsPage from "~/pages/settings.vue";
 import WorkflowsPage from "~/pages/workflows.vue";
 
 afterEach(() => {
@@ -981,6 +982,188 @@ test("Workflows & ROI renders top ROI summary, validation badges, per-workflow e
     await ledgerTab!.trigger("click");
     await vi.waitFor(() => expect(wrapper.text()).toContain("Outcome report"));
     expect(wrapper.text()).toContain("Enterprise CRM Accounts");
+  } finally {
+    wrapper.unmount();
+  }
+});
+
+test("Workflows Edit drawer configures hourly rate, review/correction minutes, and regional rates in gateway currency", async () => {
+  const patchBodies: any[] = [];
+  const catalog = {
+    reporting_currency: "EUR",
+    upstreams: ["crm_accounts"],
+    workflows: [
+      {
+        upstream_name: "crm_accounts",
+        definition_revision: 1,
+        workflow: {
+          id: "account_risk_review",
+          name: "Account Risk Review",
+          description: "Inspect enterprise accounts.",
+          enabled: true,
+          participating_tools: ["crm_accounts__list_crm_accounts"],
+          completion: {
+            kind: "verified_followup",
+            tool: "crm_accounts__list_crm_accounts_metrics",
+            success_when: { path: "/active_items", type: "integer" },
+          },
+          business_value: {
+            manual_baseline_minutes: 12,
+            baseline_source: "validated_external_measurement",
+            confidence: "validated",
+            loaded_labor_cost_per_hour: 95,
+            currency: "EUR",
+            regional_labor_rates: { US: 120 },
+            review_minutes: { kind: "expected_average", minutes: 1.5 },
+            correction_minutes: { kind: "expected_average", minutes: 0.5 },
+          },
+        },
+      },
+    ],
+    candidates: [],
+    episodes: [],
+  };
+
+  const apiFetch = vi.fn(async (path: string, options?: { method?: string; body?: any }) => {
+    if (path === "/admin/workflows/catalog") return catalog;
+    if (path === "/admin/business-value/report") {
+      return {
+        tenant_scope: "tenant-acme-dev",
+        reporting_currency: "EUR",
+        completed_count: 1,
+        execution_status_counts: {},
+        by_integration_workflow_day: [
+          {
+            integration_id: "crm_accounts",
+            integration_display_name: "Enterprise CRM Accounts",
+            upstream_name: "crm_accounts",
+            selected_kind: "workflow",
+            selected_id: "crm_accounts/account_risk_review",
+            definition_revision: 1,
+            period_utc: "2026-11-23",
+            baseline_source: "validated_external_measurement",
+            baseline_confidence: "validated",
+            currency: "EUR",
+            region: "US",
+            completed_count: 1,
+            estimated_manual_baseline_minutes: 12,
+            validated_manual_baseline_minutes: 12,
+            estimated_minutes_saved: 10,
+            estimated_labor_value: { amount: 20, currency: "EUR" },
+          },
+        ],
+        totals_by_currency: {},
+        validated_minutes_saved: 10,
+        cost_coverage: { captured_categories: [], missing_categories: [], roi_available: false },
+      };
+    }
+    if (
+      path === "/admin/integration-definitions/crm_accounts/workflows/account_risk_review" &&
+      options?.method === "PATCH"
+    ) {
+      patchBodies.push(options.body);
+      return { updated: true, workflow: catalog.workflows[0].workflow };
+    }
+    throw new Error(`Unexpected ${path}`);
+  });
+  vi.stubGlobal("useAdminApi", () => ({ apiFetch, session: ref({ is_admin: true }) }));
+
+  const wrapper = mount(WorkflowsPage, {
+    attachTo: document.body,
+    global: { components: sharedComponents },
+  });
+  try {
+    await vi.waitFor(() => expect(wrapper.text()).toContain("US: EUR 120/hr"));
+    await wrapper.findAll("button").find((b) => b.text().includes("Edit Timing & Triggers"))!.trigger("click");
+    await vi.waitFor(() => expect(document.querySelector("#edit-wf-hourly")).not.toBeNull());
+    expect(document.body.textContent).toContain("Loaded labor rate (EUR / hr)");
+    expect(document.body.textContent).toContain("Net savings per completion:");
+    expect(document.body.textContent).toContain("10.0 min");
+
+    await (
+      [...document.querySelectorAll("button")].find((b) => b.textContent?.includes("Add region rate")) as HTMLButtonElement
+    ).click();
+    await nextTick();
+    const regionInputs = document.querySelectorAll('[aria-label="Edit region code"]');
+    const rateInputs = document.querySelectorAll('[aria-label="Edit regional rate"]');
+    const lastRegion = regionInputs[regionInputs.length - 1] as HTMLInputElement;
+    const lastRate = rateInputs[rateInputs.length - 1] as HTMLInputElement;
+    lastRegion.value = "BR";
+    lastRegion.dispatchEvent(new Event("input", { bubbles: true }));
+    lastRate.value = "45";
+    lastRate.dispatchEvent(new Event("input", { bubbles: true }));
+
+    const formEl = document.querySelector('[data-slot="drawer-content"] form') as HTMLFormElement;
+    formEl.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+    await vi.waitFor(() => expect(patchBodies.length).toBe(1));
+    expect(patchBodies[0]).toMatchObject({
+      loaded_labor_cost_per_hour: 95,
+      currency: "EUR",
+      review_minutes: 1.5,
+      correction_minutes: 0.5,
+      regional_labor_rates: { US: 120, BR: 45 },
+    });
+  } finally {
+    wrapper.unmount();
+  }
+});
+
+test("Settings page updates gateway-wide reporting currency", async () => {
+  const savedCurrencies: string[] = [];
+  const apiFetch = vi.fn(async (path: string, options?: { method?: string; body?: any }) => {
+    if (path === "/admin/pricing/models") {
+      return { models: {}, custom_models: [], defaults: [], billing_note: "Note" };
+    }
+    if (path === "/admin/alerts/rules") {
+      return { error_rate_pct_max: 15, p95_latency_ms_max: 1500, grounding_blocks_max: 5, webhook_url: null, webhook_cooldown_seconds: 60 };
+    }
+    if (path === "/admin/audit/retention-policy") {
+      return { retention_days: 90, auto_interval: "off", s3_bucket: "" };
+    }
+    if (path === "/admin/telemetry/runtime") {
+      return { gateway: { profile: "demo", app_env: "sandbox", catalog_version: "v1" } };
+    }
+    if (path === "/admin/business-value/settings" && !options?.method) {
+      return { reporting_currency: "USD", env_default_currency: "USD", supported_presets: ["USD", "EUR", "GBP"] };
+    }
+    if (path === "/admin/business-value/settings" && options?.method === "PUT") {
+      savedCurrencies.push(options.body.reporting_currency);
+      return { saved: true, reporting_currency: options.body.reporting_currency };
+    }
+    if (path.startsWith("/admin/adaptive-execution")) {
+      return { adaptive_mode: "observe", rows: [] };
+    }
+    if (path.startsWith("/admin/vault/secrets")) {
+      return { secrets: [] };
+    }
+    throw new Error(`Unexpected ${path}`);
+  });
+  vi.stubGlobal("useAdminApi", () => ({
+    apiFetch,
+    session: ref({ authenticated: true, is_admin: true, can_access_admin_console: true, user: { email: "admin@test", roles: ["gateway_admin"] } }),
+    authConfig: ref({ auth_mode: "dev", oidc_enabled: false, profile: "demo" }),
+    runtimeMeta: ref({ profile: "demo", app_env: "sandbox", catalog_version: "v1" }),
+    loadAuthState: vi.fn().mockResolvedValue(undefined),
+    setRuntimeMeta: vi.fn(),
+  }));
+  vi.stubGlobal("useRoute", () => ({ query: {} }));
+
+  const wrapper = mount(SettingsPage, {
+    attachTo: document.body,
+    global: {
+      components: sharedComponents,
+      stubs: { DiscoveryReport: true, Radio: true, RadioGroup: true, RadioIndicator: true },
+    },
+  });
+  try {
+    await vi.waitFor(() => expect(wrapper.text()).toContain("Gateway Reporting Currency"));
+    expect(wrapper.text()).toContain("Active: USD");
+    const eurBtn = wrapper.findAll("button").find((b) => b.text().trim() === "EUR")!;
+    await eurBtn.trigger("click");
+    const saveBtn = wrapper.findAll("button").find((b) => b.text().includes("Save Reporting Currency"))!;
+    await saveBtn.trigger("click");
+    await vi.waitFor(() => expect(savedCurrencies).toEqual(["EUR"]));
+    expect(wrapper.text()).toContain("Saved gateway reporting currency (EUR)");
   } finally {
     wrapper.unmount();
   }
