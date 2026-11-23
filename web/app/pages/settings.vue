@@ -1,5 +1,14 @@
 <script setup lang="ts">
 import { extractErrorMessage } from "~/composables/useAdminApi";
+import {
+  AlertDialog,
+  AlertDialogBackdrop,
+  AlertDialogClose,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogTitle,
+} from "@ui-sdk/vue/alert-dialog";
+import { Radio, RadioGroup, RadioIndicator } from "@ui-sdk/vue/radio";
 
 interface ModelPricingMap {
   models: Record<string, { input: number; output: number }>;
@@ -56,6 +65,8 @@ const modelSearch = ref("");
 const modelPage = ref(1);
 const modelPageSize = 8;
 const editingModel = ref<string | null>(null);
+const modelDeleteConfirmOpen = ref(false);
+const pendingModelDelete = ref<string | null>(null);
 const editInPrice = ref("");
 const editOutPrice = ref("");
 const savingPricing = ref(false);
@@ -76,6 +87,13 @@ const newRuleOp = ref<CustomAlertRule["operator"]>(">=");
 const newRuleThreshold = ref("10");
 const newRuleSeverity = ref<CustomAlertRule["severity"]>("warning");
 const newRuleWebhook = ref("");
+const newRuleThresholdHelp = computed(() => {
+  if (newRuleMetric.value === "error_rate_pct") return "Use a percent; for example, 10 means 10%.";
+  if (newRuleMetric.value === "p95_latency_ms") return "Use milliseconds (ms).";
+  if (newRuleMetric.value === "grounding_blocks") return "Use the number of blocked runs.";
+  if (newRuleMetric.value === "subcall_errors") return "Use the number of failed upstream calls.";
+  return "Use the number of upstreams reported down.";
+});
 
 const retentionDays = ref("90");
 const autoInterval = ref("off");
@@ -142,21 +160,54 @@ async function loadSettings() {
   }
 }
 
-const adaptiveMode = ref<"observe" | "active">("observe");
+type AdaptiveMode = "observe" | "active";
+interface AdaptiveReportRow {
+  model: string;
+  workload: string;
+  evidence_tier?: string;
+  live_routing?: { recommended_mode: string | null } | null;
+}
+
+const adaptiveMode = ref<AdaptiveMode>("observe");
+const savedAdaptiveMode = ref<AdaptiveMode>("observe");
 const savingAdaptiveMode = ref(false);
+const adaptiveReportLoading = ref(true);
+const adaptiveReportError = ref("");
+const adaptiveRows = ref<AdaptiveReportRow[]>([]);
+const adaptiveRecommendationCount = computed(() => adaptiveRows.value.filter(
+  (row) => row.evidence_tier !== "demo_simulated" && row.live_routing?.recommended_mode
+).length);
+const adaptiveEvidenceCount = computed(() => adaptiveRows.value.filter(
+  (row) => row.evidence_tier !== "demo_simulated"
+).length);
 
 async function loadAdaptiveMode() {
+  adaptiveReportLoading.value = true;
+  adaptiveReportError.value = "";
   try {
-    const res = await apiFetch<{ adaptive_mode?: "observe" | "active" }>("/admin/adaptive-execution/report?window=30d");
-    adaptiveMode.value = res.adaptive_mode === "active" ? "active" : "observe";
-  } catch { adaptiveMode.value = "observe"; }
+    const res = await apiFetch<{
+      adaptive_mode?: AdaptiveMode;
+      rows?: AdaptiveReportRow[];
+    }>("/admin/adaptive-execution/report?window=30d");
+    const loadedMode = res.adaptive_mode === "active" ? "active" : "observe";
+    adaptiveMode.value = loadedMode;
+    savedAdaptiveMode.value = loadedMode;
+    adaptiveRows.value = res.rows || [];
+  } catch (err) {
+    adaptiveReportError.value = extractErrorMessage(err);
+  } finally {
+    adaptiveReportLoading.value = false;
+  }
 }
 
 async function saveAdaptiveMode() {
   savingAdaptiveMode.value = true;
   try {
     await apiFetch("/admin/adaptive-execution/settings", { method: "POST", body: { mode: adaptiveMode.value } });
-    statusMsg.value = `Adaptive routing set to ${adaptiveMode.value}.`;
+    savedAdaptiveMode.value = adaptiveMode.value;
+    statusMsg.value = adaptiveMode.value === "active"
+      ? "Adaptive recommendations will now apply to eligible Auto requests."
+      : "Adaptive recommendations will be recorded; Auto will keep choosing the mode.";
   } catch (err) { errorMsg.value = extractErrorMessage(err); }
   finally { savingAdaptiveMode.value = false; }
 }
@@ -258,6 +309,21 @@ function startEditModel(name: string, input: number, output: number) {
   editOutPrice.value = String(output);
 }
 
+function requestModelDelete(name: string) {
+  pendingModelDelete.value = name;
+  modelDeleteConfirmOpen.value = true;
+}
+
+function handleModelDeleteConfirmOpenChange(open: boolean, details: { returnValue?: string }) {
+  if (open) return;
+
+  const name = pendingModelDelete.value;
+  pendingModelDelete.value = null;
+  if (details.returnValue === "confirm" && name) {
+    void deleteModelPrice(name);
+  }
+}
+
 async function saveInlineModel(name: string) {
   const input = Number(editInPrice.value);
   const output = Number(editOutPrice.value);
@@ -287,14 +353,12 @@ async function saveInlineModel(name: string) {
   }
 }
 
-async function deleteModelPrice(name: string, wasDefault: boolean) {
+async function deleteModelPrice(name: string) {
   errorMsg.value = "";
   statusMsg.value = "";
   try {
     await apiFetch(`/admin/pricing/models/${encodeURIComponent(name)}`, { method: "DELETE" });
-    statusMsg.value = wasDefault
-      ? `Restored default API pricing for '${name}'.`
-      : `Removed custom model '${name}'.`;
+    statusMsg.value = `Removed custom model '${name}'.`;
     await loadSettings();
   } catch (err) {
     errorMsg.value = extractErrorMessage(err);
@@ -465,9 +529,9 @@ async function pruneAuditRuns() {
     <div v-if="loading" class="h-64 animate-pulse rounded-lg border border-[#E4E4E7] bg-white" />
 
     <template v-else>
-      <nav aria-label="Settings sections" class="flex gap-1 overflow-x-auto border-b border-[#E4E4E7]" role="tablist">
+      <nav aria-label="Settings sections" class="grid grid-cols-2 gap-x-1 border-b border-[#E4E4E7] sm:flex sm:flex-wrap sm:gap-1" role="tablist">
         <button v-for="tab in settingsTabs" :key="tab.id" type="button" role="tab" :aria-selected="activeSettingsTab === tab.id" :aria-controls="`settings-panel-${tab.id}`"
-          class="min-h-11 shrink-0 border-b-2 px-3 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
+          class="min-h-11 w-full border-b-2 px-2 text-center text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E] sm:w-auto sm:shrink-0 sm:whitespace-nowrap sm:px-3"
           :class="activeSettingsTab === tab.id ? 'border-[#0F766E] text-[#0F766E]' : 'border-transparent text-[#71717A] hover:text-[#09090B]'"
           @click="setSettingsTab(tab.id)">{{ tab.label }}</button>
       </nav>
@@ -520,6 +584,9 @@ async function pruneAuditRuns() {
 
         <div class="p-4 space-y-4">
           <p class="text-xs leading-5 text-[#52525B]">Models are populated from the detected model catalogue and configured defaults. Edit the input/output rates for a detected model below; there is no need to register model names manually here.</p>
+          <p class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 text-xs leading-5 text-[#52525B]">
+            Built-in rates can be edited, but this gateway does not provide a reset-to-default action for custom overrides. Built-in models cannot be removed here; only custom-only models can be removed, after confirmation.
+          </p>
 
           <div class="overflow-x-auto table-scroll rounded border border-[#E4E4E7]">
             <table class="w-full border-collapse text-left text-[13px]">
@@ -542,6 +609,7 @@ async function pruneAuditRuns() {
                       type="number"
                       step="0.01"
                       min="0"
+                      :aria-label="`Input price per 1 million tokens for ${m.name}`"
                       class="w-24 rounded border border-[#0F766E] px-2 py-1 text-right text-xs"
                     />
                     <span v-else>${{ m.input.toFixed(2) }}</span>
@@ -553,6 +621,7 @@ async function pruneAuditRuns() {
                       type="number"
                       step="0.01"
                       min="0"
+                      :aria-label="`Output price per 1 million tokens for ${m.name}`"
                       class="w-24 rounded border border-[#0F766E] px-2 py-1 text-right text-xs"
                     />
                     <span v-else>${{ m.output.toFixed(2) }}</span>
@@ -568,7 +637,7 @@ async function pruneAuditRuns() {
                             : 'border-[#E4E4E7] bg-[#F4F4F5] text-[#52525B]'
                       "
                     >
-                      {{ m.isOverridden ? "Overridden Default" : m.isCustomOnly ? "Custom" : "Default" }}
+                      {{ m.isOverridden ? "Overridden Default" : m.isCustomOnly ? "Custom only" : "Default" }}
                     </span>
                   </td>
                   <td class="px-3 py-2 text-right whitespace-nowrap space-x-2">
@@ -579,18 +648,19 @@ async function pruneAuditRuns() {
                     <template v-else>
                       <button
                         type="button"
-                        class="text-xs font-medium text-[#0F766E] hover:underline"
+                        class="inline-flex min-h-11 items-center px-2 text-xs font-medium text-[#0F766E] hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
                         @click="startEditModel(m.name, m.input, m.output)"
                       >
                         Edit
                       </button>
                       <button
+                        v-if="m.isCustomOnly"
                         type="button"
-                        class="text-xs font-medium text-[#DC2626] hover:underline"
-                        :title="`Deletes ${m.name} pricing, routing override and demo profile`"
-                        @click="deleteModelPrice(m.name, false)"
+                        class="inline-flex min-h-11 items-center px-2 text-xs font-medium text-[#DC2626] hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#DC2626]"
+                        :aria-label="`Remove custom model ${m.name}`"
+                        @click="requestModelDelete(m.name)"
                       >
-                        Delete
+                        Remove
                       </button>
                     </template>
                   </td>
@@ -662,18 +732,28 @@ async function pruneAuditRuns() {
 
           <div class="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
             <div>
-              <label class="block text-xs font-medium text-[#52525B]">Default Alert Webhook URL (Slack / PagerDuty / HTTPS)</label>
+              <label for="default-alert-webhook" class="block text-xs font-medium text-[#52525B]">Default Alert Webhook URL (Slack / PagerDuty / HTTPS)</label>
               <input
+                id="default-alert-webhook"
                 v-model="webhookUrl"
                 type="url"
                 placeholder="https://hooks.slack.com/services/... or https://your-tunnel.trycloudflare.com/webhook"
                 class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-[13px] font-mono-data"
               />
             </div>
-            <Button :disabled="testingWebhook || !webhookUrl.trim()" @click="testWebhook">
+            <Button
+              :disabled="testingWebhook || !webhookUrl.trim()"
+              focusable-when-disabled
+              aria-describedby="webhook-test-help"
+              class="min-h-11"
+              @click="testWebhook"
+            >
               {{ testingWebhook ? "Testing..." : "Test Webhook" }}
             </Button>
           </div>
+          <p id="webhook-test-help" class="text-xs leading-5 text-[#52525B]">
+            Enter a shared webhook URL to enable testing. A test sends a sample alert to that destination; it does not save the URL.
+          </p>
 
           <div
             v-if="webhookTestResult"
@@ -688,19 +768,28 @@ async function pruneAuditRuns() {
             {{ webhookTestResult.https_enforced ? "HTTPS TLS verified" : "Plain HTTP (dev only)" }}
           </div>
 
-          <div class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 text-xs text-[#52525B]">
-            <span class="font-medium text-[#09090B]">HTTPS Webhook Note:</span>
-            Production deployments terminate TLS at your load balancer / reverse proxy (AWS ALB, Caddy, Nginx).
-            For local HTTPS webhook testing behind NAT, expose your receiver with
-            <code class="font-mono-data">cloudflared tunnel --url http://localhost:9000</code> or <code class="font-mono-data">ngrok http 9000</code>.
+          <div class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 text-xs leading-5 text-[#52525B]">
+            <p><span class="font-medium text-[#09090B]">Webhook address:</span> Production webhooks must use HTTPS. For a receiver on your computer behind a firewall or router, use Cloudflare Tunnel or ngrok to create an HTTPS address, then paste that address above.</p>
+            <details class="mt-1">
+              <summary class="min-h-11 cursor-pointer py-3 font-medium text-[#0F766E] underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">Show setup commands for port 9000</summary>
+              <p class="pb-2">Run one command in a terminal while your receiver is listening on port 9000:</p>
+              <div class="flex flex-wrap gap-x-4 gap-y-1 pb-2">
+                <code class="font-mono-data">cloudflared tunnel --url http://localhost:9000</code>
+                <code class="font-mono-data">ngrok http 9000</code>
+              </div>
+            </details>
           </div>
 
           <div class="space-y-3 border-t border-[#E4E4E7] pt-4">
             <h3 class="text-xs font-semibold uppercase tracking-wide text-[#52525B]">Custom Alert Rules</h3>
+            <p class="text-xs leading-5 text-[#52525B]">
+              Add Rule places a rule in the draft list below. Save alert settings applies that list together with the built-in thresholds, shared webhook URL, and cooldown.
+            </p>
             <div class="grid gap-2 sm:grid-cols-8 sm:items-end">
               <div class="sm:col-span-2">
-                <label class="block text-xs text-[#52525B]">Rule Name</label>
+                <label for="custom-alert-rule-name" class="block text-xs text-[#52525B]">Rule Name</label>
                 <input
+                  id="custom-alert-rule-name"
                   v-model="newRuleName"
                   type="text"
                   placeholder="e.g. Subcall Error Spike"
@@ -709,7 +798,7 @@ async function pruneAuditRuns() {
               </div>
               <div>
                 <label class="block text-xs text-[#52525B]">Metric</label>
-                <select v-model="newRuleMetric" class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-2 py-1.5 text-xs">
+                <select v-model="newRuleMetric" aria-label="Alert rule metric" class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-2 py-1.5 text-xs">
                   <option value="error_rate_pct">Error Rate %</option>
                   <option value="p95_latency_ms">p95 Latency ms</option>
                   <option value="grounding_blocks">Grounding Blocks</option>
@@ -718,39 +807,53 @@ async function pruneAuditRuns() {
                 </select>
               </div>
               <div class="flex gap-1.5">
-                <select v-model="newRuleOp" class="mt-5 w-16 rounded-md border border-[#E4E4E7] bg-white px-1.5 py-1.5 text-xs">
+                <select v-model="newRuleOp" aria-label="Alert rule comparison" class="mt-5 w-16 rounded-md border border-[#E4E4E7] bg-white px-1.5 py-1.5 text-xs">
                   <option value=">=">&gt;=</option>
                   <option value=">">&gt;</option>
                   <option value="<=">&lt;=</option>
                   <option value="==">==</option>
                 </select>
                 <div class="flex-1">
-                  <label class="block text-xs text-[#52525B]">Threshold</label>
+                  <label for="custom-alert-threshold" class="block text-xs text-[#52525B]">Threshold</label>
                   <input
+                    id="custom-alert-threshold"
                     v-model="newRuleThreshold"
                     type="number"
                     step="0.5"
                     class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-2 py-1.5 text-xs tabular-nums"
                   />
+                  <p class="mt-1 text-[11px] leading-4 text-[#71717A]">{{ newRuleThresholdHelp }}</p>
                 </div>
               </div>
               <div>
                 <label class="block text-xs text-[#52525B]">Severity</label>
-                <select v-model="newRuleSeverity" class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-2 py-1.5 text-xs">
+                <select v-model="newRuleSeverity" aria-label="Alert rule severity" class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-2 py-1.5 text-xs">
                   <option value="warning">Warning</option>
                   <option value="critical">Critical</option>
                 </select>
               </div>
               <div class="sm:col-span-2">
-                <label class="block text-xs text-[#52525B]">Webhook override (optional)</label>
+                <label for="custom-alert-webhook" class="block text-xs text-[#52525B]">Webhook override (optional)</label>
                 <input
+                  id="custom-alert-webhook"
                   v-model="newRuleWebhook"
                   type="url"
                   placeholder="https://receiver.example.com/alerts"
                   class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-2.5 py-1.5 text-xs font-mono-data"
                 />
               </div>
-              <Button :disabled="!newRuleName.trim()" @click="addCustomRule">Add Rule</Button>
+              <div>
+                <Button
+                  :disabled="!newRuleName.trim()"
+                  focusable-when-disabled
+                  aria-describedby="add-alert-rule-help"
+                  class="min-h-11"
+                  @click="addCustomRule"
+                >Add Rule</Button>
+                <p id="add-alert-rule-help" class="mt-1 text-[11px] leading-4 text-[#71717A]">
+                  {{ newRuleName.trim() ? "Adds this rule to the unsaved list." : "Enter a rule name to add it to the unsaved list." }}
+                </p>
+              </div>
             </div>
 
             <div v-if="customRules.length" class="divide-y divide-[#E4E4E7] rounded border border-[#E4E4E7]">
@@ -783,8 +886,8 @@ async function pruneAuditRuns() {
           </div>
 
           <div>
-            <Button data-variant="primary" :disabled="savingAlerts" @click="saveAlertRules">
-              {{ savingAlerts ? "Saving..." : "Save All Alert Policies" }}
+            <Button data-variant="primary" :disabled="savingAlerts" class="min-h-11" @click="saveAlertRules">
+              {{ savingAlerts ? "Saving..." : "Save alert settings" }}
             </Button>
           </div>
         </div>
@@ -847,38 +950,75 @@ async function pruneAuditRuns() {
               Archive &amp; Purge Old Runs
             </Button>
             <Button :disabled="archiving" @click="archiveAuditRuns(false)">
-              Export JSONL Only (Keep DB)
+              Download JSONL (keep database)
             </Button>
             <Button data-variant="danger" :disabled="pruning" @click="requestRetentionAction('prune')">
               Purge Without Archive
             </Button>
           </div>
+          <p id="retention-action-help" class="border-t border-[#E4E4E7] pt-3 text-xs leading-5 text-[#52525B]">
+            Manual archive and purge actions include runs older than {{ Number(retentionDays) || 90 }} days. The gateway does not provide a matching-run count before the action; the completion message reports the exact totals. The schedule above controls automatic actions, while these buttons run immediately.
+          </p>
         </div>
       </section>
 
-      <section v-else-if="activeSettingsTab === 'routing'" id="settings-panel-routing" role="tabpanel" class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
-        <div>
-          <h2 class="text-sm font-semibold text-[#09090B]">
-            Adaptive execution routing
-          </h2>
-          <p class="mt-1 text-xs text-[#71717A]">
-            This controls whether qualified paired evidence can choose Classic or Code Mode for eligible Auto requests. Observe records the recommendation and leaves the normal Auto decision in place. Active applies the recommendation when the request has a known model and workload and only read-only tools. Explicit modes, upstream preferences, model overrides, A/B experiments, and safety checks still take precedence.
-          </p>
+      <section v-else-if="activeSettingsTab === 'routing'" id="settings-panel-routing" role="tabpanel" class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-4">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div class="max-w-2xl">
+            <h2 class="text-sm font-semibold text-[#09090B]">Adaptive execution routing</h2>
+            <p class="mt-1 text-xs leading-5 text-[#52525B]">
+              Adaptive routing uses paired Classic and Code Mode results to recommend a mode for an Auto request. It only changes the route when the evidence qualifies and routing is Active.
+            </p>
+          </div>
+          <div class="text-right text-xs text-[#52525B]" aria-live="polite">
+            <template v-if="adaptiveReportLoading">Checking recent evidence…</template>
+            <template v-else-if="adaptiveReportError">Evidence status unavailable</template>
+            <template v-else-if="adaptiveRecommendationCount">
+              <span class="block font-semibold text-[#09090B]">{{ adaptiveRecommendationCount }} recommendation{{ adaptiveRecommendationCount === 1 ? "" : "s" }} ready</span>
+              <span>from {{ adaptiveEvidenceCount }} real evidence cohort{{ adaptiveEvidenceCount === 1 ? "" : "s" }}</span>
+            </template>
+            <template v-else>
+              <span class="block font-semibold text-[#09090B]">No qualified recommendations</span>
+              <span>{{ adaptiveEvidenceCount ? "Recent evidence does not meet the routing gates." : "No real paired evidence in the last 30 days." }}</span>
+            </template>
+          </div>
         </div>
-        <div class="max-w-sm">
-          <label class="block text-xs font-medium text-[#52525B]" for="adaptive-routing-mode">Routing mode</label>
-          <select id="adaptive-routing-mode" v-model="adaptiveMode" class="mt-1 min-h-11 w-full rounded-md border border-[#D4D4D8] bg-white px-3 text-sm text-[#09090B] focus-visible:outline-2 focus-visible:outline-[#0F766E]">
-            <option value="observe">Observe recommendations only</option>
-            <option value="active">Apply to eligible Auto reads</option>
-          </select>
+
+        <fieldset :disabled="adaptiveReportLoading || !!adaptiveReportError" class="space-y-2">
+          <legend class="text-xs font-medium text-[#52525B]">When a recommendation qualifies</legend>
+          <RadioGroup v-model:value="adaptiveMode" aria-label="Adaptive routing behavior" class="divide-y divide-[#E4E4E7]">
+            <label class="flex min-h-16 cursor-pointer items-start gap-3 py-3 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-[#0F766E]">
+              <Radio value="observe" class="mt-0.5 h-5 w-5 shrink-0 rounded-full border border-[#A1A1AA] data-[checked]:border-[#0F766E] data-[checked]:bg-[#F0FDFA]"><RadioIndicator class="m-1 block h-2.5 w-2.5 rounded-full bg-[#0F766E]" /></Radio>
+              <span class="min-w-0">
+                <span class="block text-sm font-medium text-[#09090B]">Observe only — keep the normal Auto choice</span>
+                <span class="mt-0.5 block text-xs leading-5 text-[#52525B]">Record which mode the evidence recommends in request details. This does not collect paired evidence or change the route.</span>
+              </span>
+            </label>
+            <label class="flex min-h-16 cursor-pointer items-start gap-3 py-3 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-[#0F766E]">
+              <Radio value="active" class="mt-0.5 h-5 w-5 shrink-0 rounded-full border border-[#A1A1AA] data-[checked]:border-[#0F766E] data-[checked]:bg-[#F0FDFA]"><RadioIndicator class="m-1 block h-2.5 w-2.5 rounded-full bg-[#0F766E]" /></Radio>
+              <span class="min-w-0">
+                <span class="block text-sm font-medium text-[#09090B]">Active — apply the evidence recommendation</span>
+                <span class="mt-0.5 block text-xs leading-5 text-[#52525B]">For eligible Auto requests, route to Classic or Code Mode when a qualified recommendation exists. Otherwise, normal Auto routing stays in control.</span>
+              </span>
+            </label>
+          </RadioGroup>
+        </fieldset>
+
+        <div class="border-t border-[#E4E4E7] pt-3 text-xs leading-5 text-[#52525B]">
+          <p>Live recommendations use real paired evidence from the last 30 days: at least five matched repeats and at least 90% jointly correct and grounded results. Demo evidence never qualifies. The recommendation is only considered for Auto requests with a known model, a supported read-only workload, and eligible tools.</p>
+          <p class="mt-1">Service mode preferences, explicit request modes, model overrides, and A/B experiments can take precedence. Observe does not train the router; paired evidence must be imported from evaluated runs.</p>
         </div>
-        <div class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3 text-xs leading-5 text-[#52525B]">
-          Live routing always uses real paired evidence from the last 30 days. A recommendation needs at least five matched pairs and at least 90% jointly correct and grounded results. Simulated demo evidence never qualifies. If the model, workload, or evidence is missing or does not qualify, the normal Auto selector remains in control. See Model Performance → Adaptive routing for the evidence and decision reason.
+
+        <div v-if="adaptiveReportError" role="alert" class="text-xs text-[#B91C1C]">
+          Could not load adaptive routing status: {{ adaptiveReportError }}
+          <Button class="ml-2 min-h-11 rounded border border-[#D4D4D8] px-3 text-xs" @click="loadAdaptiveMode">Retry</Button>
         </div>
-        <div class="flex items-center gap-3">
-          <Button data-variant="primary" :disabled="savingAdaptiveMode" @click="saveAdaptiveMode">
-            {{ savingAdaptiveMode ? "Saving..." : "Save routing mode" }}
+        <div class="flex flex-wrap items-center gap-3">
+          <Button data-variant="primary" :disabled="savingAdaptiveMode || adaptiveReportLoading || !!adaptiveReportError || adaptiveMode === savedAdaptiveMode" @click="saveAdaptiveMode">
+            {{ savingAdaptiveMode ? "Saving..." : "Save mode" }}
           </Button>
+          <Button class="min-h-11 px-3 text-xs text-[#0F766E] underline underline-offset-2" @click="loadAdaptiveMode">Refresh evidence status</Button>
+          <NuxtLink to="/model-performance?tab=routing" class="min-h-11 py-3 text-xs font-medium text-[#0F766E] underline underline-offset-2">Review evidence and decision reasons</NuxtLink>
           <span v-if="statusMsg" role="status" class="text-xs text-[#0F766E]">{{ statusMsg }}</span>
         </div>
         <section class="border-t border-[#E4E4E7] pt-3" aria-labelledby="discovery-policy-title">
@@ -958,16 +1098,32 @@ async function pruneAuditRuns() {
         </div>
       </section>
 
+      <AlertDialog v-model:open="modelDeleteConfirmOpen" @open-change="handleModelDeleteConfirmOpenChange">
+        <AlertDialogBackdrop class="fixed inset-0 z-50 bg-[#09090B]/40" />
+        <AlertDialogContent class="fixed left-1/2 top-1/2 z-50 w-[calc(100vw-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 rounded-lg border border-[#E4E4E7] bg-white p-4 shadow-[0_4px_12px_rgba(9,9,11,0.08)]">
+          <div class="space-y-2">
+            <AlertDialogTitle class="text-[15px] font-semibold text-[#09090B]">Remove custom model {{ pendingModelDelete }}?</AlertDialogTitle>
+            <AlertDialogDescription class="text-sm leading-5 text-[#52525B]">
+              This removes the custom token prices, routing override, and demo profile entry for this model. There is no built-in default rate or undo action for a custom-only model.
+            </AlertDialogDescription>
+          </div>
+          <div class="mt-5 flex flex-wrap justify-end gap-2">
+            <AlertDialogClose class="inline-flex min-h-11 items-center rounded-md border border-[#D4D4D8] bg-white px-3.5 py-2 text-sm font-medium text-[#09090B] hover:bg-[#F4F4F5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">Cancel</AlertDialogClose>
+            <AlertDialogClose value="confirm" class="inline-flex min-h-11 items-center rounded-md border border-[#FECACA] bg-[#FEF2F2] px-3.5 py-2 text-sm font-medium text-[#B91C1C] hover:bg-[#FEE2E2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#DC2626]">Remove custom model</AlertDialogClose>
+          </div>
+        </AlertDialogContent>
+      </AlertDialog>
+
       <Dialog v-model:open="retentionConfirmOpen">
         <DialogBackdrop />
         <DialogContent>
           <DialogTitle>{{ pendingRetentionAction === "archive" ? "Archive and purge old audit runs?" : "Purge old audit runs without an archive?" }}</DialogTitle>
           <DialogDescription>
             <template v-if="pendingRetentionAction === 'archive'">
-              The gateway will export runs older than {{ retentionDays }} days and then remove them from the active database. Verify the archive destination before continuing.
+              The gateway will archive and remove runs older than {{ Number(retentionDays) || 90 }} days. Destination: {{ archiveS3Bucket.trim() ? `S3 bucket ${archiveS3Bucket.trim()}` : "a JSONL download to this device" }}. The gateway does not provide a matching-run count before the action; the completion message reports exact totals.
             </template>
             <template v-else>
-              This removes runs older than {{ retentionDays }} days from the active database without creating an archive. This action is destructive.
+              This permanently removes runs older than {{ Number(retentionDays) || 90 }} days from the active database without creating an archive. The gateway does not provide a matching-run count before the action; the completion message reports the number deleted.
             </template>
           </DialogDescription>
           <div class="flex flex-wrap justify-end gap-2 pt-2">

@@ -88,6 +88,7 @@ function promptModeChange(
   nextMode: string,
   tool?: string
 ) {
+  modeError.value = "";
   pendingModeChange.value = { kind, upstream, tool, nextMode };
   modeDialogOpen.value = true;
 }
@@ -96,6 +97,8 @@ async function confirmModeChange() {
   const pending = pendingModeChange.value;
   if (!pending) return;
   errorMessage.value = "";
+  modeError.value = "";
+  modeSaving.value = true;
   try {
     if (pending.kind === "server") {
       await setUpstreamPreferredMode(pending.upstream, pending.nextMode);
@@ -109,6 +112,9 @@ async function confirmModeChange() {
     await fetchData();
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
+    modeError.value = errorMessage.value;
+  } finally {
+    modeSaving.value = false;
   }
 }
 
@@ -172,9 +178,15 @@ const { apiFetch, setRuntimeMeta } = useAdminApi();
 const loading = ref(true);
 const errorMessage = ref("");
 const statusMessage = ref("");
+const catalogUpdatedAt = ref<Date | null>(null);
+const catalogRefreshing = ref(false);
+const deleteSaving = ref(false);
+const modeSaving = ref(false);
+const modeError = ref("");
 const upstreamsData = ref<UpstreamsResponse | null>(null);
 const deleteTarget = ref<string | null>(null);
 const deleteDialogOpen = ref(false);
+const deleteError = ref("");
 
 const searchQuery = ref(initialUpstream);
 const groupFilter = ref("");
@@ -200,6 +212,7 @@ async function fetchData(resetPage = false) {
 
     const ups = await apiFetch<UpstreamsResponse>(`/admin/upstreams?${params.toString()}`);
     upstreamsData.value = ups;
+    catalogUpdatedAt.value = new Date();
     setRuntimeMeta({
       profile: ups.profile,
       app_env: ups.app_env,
@@ -234,6 +247,7 @@ function clearFilters() {
 async function handleRefreshCatalog() {
   errorMessage.value = "";
   statusMessage.value = "";
+  catalogRefreshing.value = true;
   try {
     const res = await apiFetch<{ catalog_version: string; catalog_epoch?: number }>(
       "/admin/catalog/refresh",
@@ -244,10 +258,41 @@ async function handleRefreshCatalog() {
     catalogRefreshVersion.value += 1;
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
+  } finally {
+    catalogRefreshing.value = false;
   }
 }
 
+const catalogUpdatedLabel = computed(() => catalogUpdatedAt.value
+  ? `Updated ${catalogUpdatedAt.value.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`
+  : "Waiting for the first successful refresh");
+
+function groupSummary(upstream: UpstreamEntry) {
+  return upstream.allowed_groups?.length ? upstream.allowed_groups.join(", ") : "All groups";
+}
+
+function upstreamTypeLabel(type: string) {
+  return type === "mcp_http" ? "MCP over HTTP" : type === "openapi" ? "OpenAPI" : type.replaceAll("_", " ");
+}
+
+function authTypeLabel(authType: string) {
+  return authType === "none" ? "No gateway credential" : authType.replaceAll("_", " ");
+}
+
+function latencyLabel(upstream: UpstreamEntry) {
+  const mean = serverStats(upstream).avg_duration_ms;
+  return mean == null ? "Not captured" : `${mean} ms mean`;
+}
+
+function modeChangeImpact() {
+  if (!pendingModeChange.value) return "";
+  return pendingModeChange.value.kind === "server"
+    ? "This changes the default mode for calls to the whole upstream. Per-tool overrides and explicit request modes can still take precedence."
+    : "This pins only the selected tool to the chosen mode, overriding the upstream default for that tool.";
+}
+
 function promptDelete(name: string) {
+  deleteError.value = "";
   deleteTarget.value = name;
   deleteDialogOpen.value = true;
 }
@@ -256,6 +301,8 @@ async function confirmDelete() {
   if (!deleteTarget.value) return;
   const target = deleteTarget.value;
   errorMessage.value = "";
+  deleteError.value = "";
+  deleteSaving.value = true;
   try {
     await apiFetch(`/admin/upstreams/${encodeURIComponent(target)}`, { method: "DELETE" });
     statusMessage.value = `Deleted dynamic upstream '${target}'.`;
@@ -263,6 +310,9 @@ async function confirmDelete() {
     await fetchData();
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
+    deleteError.value = errorMessage.value;
+  } finally {
+    deleteSaving.value = false;
   }
 }
 
@@ -287,17 +337,17 @@ onMounted(() => {
           </span>
         </div>
         <p class="mt-0.5 text-[13px] text-[#52525B]">
-          Search, filter, and manage registered MCP/OpenAPI services and schema digests.
+          Find registered APIs, review their tool access and observed traffic, or open an upstream to manage its catalog.
         </p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
-        <Button pending-announcement="Refreshing catalog" @click="handleRefreshCatalog">
+        <Button :disabled="catalogRefreshing" pending-announcement="Refreshing catalog" @click="handleRefreshCatalog">
           <AppIcon name="refresh" :size="15" />
-          <span>Refresh Catalog</span>
+          <span>{{ catalogRefreshing ? "Refreshing…" : "Refresh catalog" }}</span>
         </Button>
         <NuxtLink
           to="/onboarding"
-          class="no-underline inline-flex items-center gap-1.5 rounded-md border border-[#0F766E] bg-[#0F766E] px-3.5 py-2 text-[13px] font-medium text-white hover:bg-[#115E59]"
+          class="no-underline inline-flex min-h-11 items-center gap-1.5 rounded-md border border-[#0F766E] bg-[#0F766E] px-3.5 py-2 text-[13px] font-medium text-white hover:bg-[#115E59] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
         >
           <AppIcon name="onboarding" :size="15" />
           <span>Onboard Service</span>
@@ -341,24 +391,25 @@ onMounted(() => {
     <section class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
       <div class="grid gap-3 sm:grid-cols-5">
         <div class="sm:col-span-2">
-          <label class="block text-xs font-medium text-[#52525B]">Search Service Name or URL</label>
+          <label for="upstreams-search" class="block text-xs font-medium text-[#52525B]">Search service name or URL</label>
           <input
+            id="upstreams-search"
             v-model="searchQuery"
             type="search"
             placeholder="e.g. billing, snowflake, https://..."
-            class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-xs text-[#09090B]"
+            class="mt-1 min-h-11 w-full rounded-md border border-[#E4E4E7] bg-white px-3 py-1.5 text-xs text-[#09090B] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
           />
         </div>
         <div>
           <label class="block text-xs font-medium text-[#52525B]">Allowed Group</label>
-          <select v-model="groupFilter" class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-2.5 py-1.5 text-xs">
+          <select v-model="groupFilter" class="mt-1 min-h-11 w-full rounded-md border border-[#E4E4E7] bg-white px-2.5 py-1.5 text-xs focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">
             <option value="">All Groups</option>
             <option v-for="g in upstreamsData?.facets?.groups || []" :key="g" :value="g">{{ g }}</option>
           </select>
         </div>
         <div>
           <label class="block text-xs font-medium text-[#52525B]">Auth Type</label>
-          <select v-model="authFilter" class="mt-1 w-full rounded-md border border-[#E4E4E7] bg-white px-2.5 py-1.5 text-xs">
+          <select v-model="authFilter" class="mt-1 min-h-11 w-full rounded-md border border-[#E4E4E7] bg-white px-2.5 py-1.5 text-xs focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">
             <option value="">All Auth</option>
             <option v-for="a in upstreamsData?.facets?.auth_types || []" :key="a" :value="a">{{ a }}</option>
           </select>
@@ -366,19 +417,19 @@ onMounted(() => {
         <div>
           <label class="block text-xs font-medium text-[#52525B]">Preferred Mode</label>
           <div class="mt-1">
-            <select v-model="modeFilter" class="w-full rounded-md border border-[#E4E4E7] bg-white px-2 py-1.5 text-xs">
+            <select v-model="modeFilter" class="min-h-11 w-full rounded-md border border-[#E4E4E7] bg-white px-2 py-1.5 text-xs focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">
               <option value="">All Modes</option>
               <option v-for="m in upstreamsData?.facets?.modes || []" :key="m" :value="m">{{ m }}</option>
             </select>
           </div>
         </div>
       </div>
-      <div class="flex items-center justify-between text-xs text-[#52525B]">
+      <div class="flex flex-col gap-1 text-xs text-[#52525B] sm:flex-row sm:items-center sm:justify-between">
         <span class="tabular-nums">
           Matching {{ upstreamsData?.total ?? upstreamsData?.upstreams?.length ?? 0 }} of
           {{ upstreamsData?.total_registered ?? upstreamsData?.upstreams?.length ?? 0 }} registered servers
         </span>
-        <button type="button" class="font-medium text-[#0F766E] hover:underline" @click="clearFilters">
+        <button type="button" class="min-h-11 self-start font-medium text-[#0F766E] underline underline-offset-2 hover:text-[#115E59] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E] sm:self-auto" @click="clearFilters">
           Reset Filters
         </button>
       </div>
@@ -388,11 +439,19 @@ onMounted(() => {
 
     <template v-else-if="upstreamsData">
       <section class="rounded-lg border border-[#E4E4E7] bg-white">
-        <div class="flex items-center justify-between border-b border-[#E4E4E7] px-4 py-3">
-          <h2 class="text-[15px] font-semibold text-[#09090B]">Registered Upstreams</h2>
-          <span class="text-xs text-[#52525B]">
-            {{ upstreamsData.dynamic_upstreams_permitted ? "Dynamic writes enabled" : "GitOps read-only mode" }}
-          </span>
+        <div class="flex flex-col gap-2 border-b border-[#E4E4E7] px-4 py-3 sm:flex-row sm:items-start sm:justify-between">
+          <div class="min-w-0">
+            <h2 class="text-[15px] font-semibold text-[#09090B]">Registered upstreams</h2>
+            <p class="mt-1 text-xs leading-5 text-[#52525B]">
+              Calls and latency use all retained gateway-observed tool traffic. “Not captured” means the gateway has no measurement for that field; it does not mean zero.
+            </p>
+            <p class="mt-1 text-xs leading-5 text-[#52525B]">
+              {{ upstreamsData.dynamic_upstreams_permitted
+                ? "Changes from this catalog apply to the running gateway after confirmation. Mode changes set a default; removing an upstream stops new calls immediately."
+                : "This catalog is read-only. Update the deployment configuration and redeploy to change upstreams or modes." }}
+            </p>
+          </div>
+          <span class="shrink-0 text-xs tabular-nums text-[#52525B]" aria-live="polite">{{ catalogUpdatedLabel }}</span>
         </div>
 
         <div v-if="upstreamsData.upstreams.length === 0" class="p-6 text-center text-[13px] text-[#71717A]">
@@ -440,6 +499,11 @@ onMounted(() => {
                     <div class="text-[10px] tabular-nums text-[#71717A]">
                       {{ u.request_timeout_seconds ?? 15 }}s · {{ u.max_requests_per_minute ?? "unlimited" }}/min · {{ u.max_concurrent_calls ?? "unlimited" }} in flight
                     </div>
+                    <div class="mt-1 grid gap-0.5 text-[11px] leading-4 text-[#52525B] lg:hidden">
+                      <span>{{ upstreamTypeLabel(u.type) }} · {{ authTypeLabel(u.auth_type) }}</span>
+                      <span class="break-words">Groups: {{ groupSummary(u) }}</span>
+                      <span class="tabular-nums md:hidden">{{ latencyLabel(u) }} · {{ aggregatedToolsForUpstream(u).reduce((sum, tool) => sum + tool.timeouts, 0) }} timeouts</span>
+                    </div>
                     <div v-if="u.health_check?.enabled" class="mt-1 text-[11px]" :class="healthForUpstream(u.name)?.status === 'healthy' ? 'text-[#059669]' : healthForUpstream(u.name)?.status === 'unhealthy' ? 'text-[#DC2626]' : 'text-[#71717A]'">
                       Probe: {{ healthForUpstream(u.name)?.status || "waiting" }}<span v-if="healthForUpstream(u.name)?.checked_at"> · {{ new Date(healthForUpstream(u.name)!.checked_at).toLocaleTimeString() }}</span>
                     </div>
@@ -456,11 +520,11 @@ onMounted(() => {
                   <td class="px-2.5 py-2 text-right font-mono-data tabular-nums whitespace-nowrap">
                     {{ serverStats(u).runs }}
                   </td>
-                  <td class="px-2.5 py-2 text-right font-mono-data tabular-nums whitespace-nowrap">
-                    {{ serverStats(u).errors == null ? "Unknown" : serverStats(u).errors }}
+                  <td class="px-2.5 py-2 text-right font-mono-data tabular-nums whitespace-nowrap" :title="serverStats(u).errors == null ? 'No error measurement was captured' : `${serverStats(u).errors} errors in retained telemetry`">
+                    {{ serverStats(u).errors == null ? "Not captured" : serverStats(u).errors }}
                   </td>
                   <td class="hidden md:table-cell px-2.5 py-2 text-right font-mono-data tabular-nums whitespace-nowrap">
-                    {{ serverStats(u).avg_duration_ms == null ? "Unknown" : `${serverStats(u).avg_duration_ms} ms` }}
+                    {{ serverStats(u).avg_duration_ms == null ? "Not captured" : `${serverStats(u).avg_duration_ms} ms` }}
                   </td>
                   <td class="hidden xl:table-cell px-2.5 py-2 text-right font-mono-data tabular-nums whitespace-nowrap">
                     {{ aggregatedToolsForUpstream(u).reduce((sum, tool) => sum + tool.timeouts, 0) }}
@@ -470,8 +534,8 @@ onMounted(() => {
                       :value="u.preferred_mode || 'auto'"
                       aria-label="Server preferred mode"
                       :disabled="!upstreamsData.dynamic_upstreams_permitted"
-                      :title="upstreamsData.dynamic_upstreams_permitted ? 'Set the preferred execution mode for this MCP server' : 'Modes are read-only here; change config/upstreams.yaml and deploy the configuration'"
-                      class="rounded border border-[#D4D4D8] bg-white px-2 py-1 text-xs font-mono-data disabled:cursor-not-allowed disabled:bg-[#F4F4F5] disabled:text-[#71717A]"
+                      :title="upstreamsData.dynamic_upstreams_permitted ? 'Change the default mode for this upstream. Individual tool overrides and explicit request modes may take precedence.' : 'Modes are read-only here; change config/upstreams.yaml and deploy the configuration'"
+                      class="min-h-11 rounded border border-[#D4D4D8] bg-white px-2 py-1 text-xs font-mono-data focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E] disabled:cursor-not-allowed disabled:bg-[#F4F4F5] disabled:text-[#71717A] sm:min-h-9"
                       @change="(e) => { const el = e.target as HTMLSelectElement; const next = el.value; el.value = u.preferred_mode || 'auto'; promptModeChange('server', u, next); }"
                     >
                       <option value="auto">auto</option>
@@ -482,7 +546,7 @@ onMounted(() => {
                   <td v-if="upstreamsData.dynamic_upstreams_permitted" class="w-10 px-2 py-2 text-right whitespace-nowrap" @click.stop>
                     <Button
                       data-variant="danger"
-                      class="px-2 py-1"
+                      class="min-h-11 min-w-11 px-2 py-1 sm:min-h-9 sm:min-w-9"
                       aria-label="Remove upstream"
                       title="Remove upstream"
                       @click="promptDelete(u.name)"
@@ -520,8 +584,24 @@ onMounted(() => {
                     <div v-if="aggregatedToolsForUpstream(u).length === 0" class="text-xs text-[#71717A]">
                       No calls recorded for this upstream yet.
                     </div>
-                    <div v-else class="overflow-x-auto">
-                      <p class="mb-2 text-[11px] leading-4 text-[#71717A]">Observed dispatcher subcalls, payload sizes, latency, failures, and known schema metadata. Historical fields that were not captured remain unknown.</p>
+                    <div v-else>
+                      <p class="mb-2 text-[11px] leading-4 text-[#71717A]">Observed dispatcher calls, payload sizes, latency, failures, and schema metadata. Values marked “Not captured” were not recorded in the available history.</p>
+                      <dl class="divide-y divide-[#E4E4E7] border-y border-[#E4E4E7] text-xs md:hidden">
+                        <div v-for="t in aggregatedToolsForUpstream(u)" :key="t.tool" class="space-y-2 py-3">
+                          <dt class="break-all font-mono-data font-medium text-[#09090B]">{{ t.tool }}</dt>
+                          <dd class="grid grid-cols-2 gap-x-3 gap-y-1 text-[#52525B]">
+                            <span class="tabular-nums">Calls: {{ t.count }}</span>
+                            <span class="tabular-nums">Bytes: {{ t.bytes.toLocaleString() }}</span>
+                            <span class="tabular-nums">Mean / p95: {{ t.mean_latency_ms == null ? "Not captured" : `${t.mean_latency_ms} / ${t.p95_latency_ms ?? "Not captured"} ms` }}</span>
+                            <span class="tabular-nums">Errors / timeouts: {{ t.errors == null ? "Not captured" : t.errors }} / {{ t.timeouts }}</span>
+                            <span>Error categories: {{ Object.entries(t.error_types || {}).map(([kind, count]) => `${kind}: ${count}`).join(", ") || "None recorded" }}</span>
+                            <span>Schema coverage: {{ t.schema_coverage_pct == null ? "Not captured" : `${t.schema_coverage_pct}%` }}</span>
+                            <span>Read / write calls: {{ t.read_calls == null ? "Not captured" : `${t.read_calls} / ${t.write_calls ?? "Not captured"}` }}</span>
+                            <span>Invalid arguments: {{ t.invalid_arguments == null ? "Not captured" : t.invalid_arguments }}</span>
+                          </dd>
+                        </div>
+                      </dl>
+                      <div class="hidden overflow-x-auto md:block">
                       <table class="w-full text-left text-xs tabular-nums">
                         <thead class="border-b border-[#E4E4E7] text-[#71717A]">
                           <tr>
@@ -541,15 +621,16 @@ onMounted(() => {
                             <td class="py-2 pr-3 font-mono-data text-[#09090B]">{{ t.tool }}</td>
                             <td class="py-2 pr-3 text-right font-mono-data tabular-nums">{{ t.count }}</td>
                             <td class="py-2 pr-3 text-right font-mono-data tabular-nums">{{ t.bytes.toLocaleString() }}</td>
-                            <td class="py-2 pr-3 text-right font-mono-data tabular-nums">{{ t.mean_latency_ms == null ? "Unknown" : `${t.mean_latency_ms} / ${t.p95_latency_ms ?? "Unknown"} ms` }}</td>
-                            <td class="py-2 pr-3 text-right font-mono-data tabular-nums">{{ t.errors }} / {{ t.timeouts }}</td>
+                            <td class="py-2 pr-3 text-right font-mono-data tabular-nums">{{ t.mean_latency_ms == null ? "Not captured" : `${t.mean_latency_ms} / ${t.p95_latency_ms ?? "Not captured"} ms` }}</td>
+                            <td class="py-2 pr-3 text-right font-mono-data tabular-nums">{{ t.errors == null ? "Not captured" : t.errors }} / {{ t.timeouts }}</td>
                             <td class="py-2 pr-3 text-[#52525B]">{{ Object.entries(t.error_types || {}).map(([kind, count]) => `${kind}: ${count}`).join(", ") || "None recorded" }}</td>
-                            <td class="py-2 pr-3 tabular-nums">{{ t.schema_coverage_pct == null ? "Unknown" : `${t.schema_coverage_pct}%` }}</td>
-                            <td class="py-2 pr-3 tabular-nums">{{ t.read_calls == null ? "Unknown" : `${t.read_calls} / ${t.write_calls}` }}</td>
-                            <td class="py-2 tabular-nums">{{ t.invalid_arguments == null ? "Unknown" : t.invalid_arguments }}</td>
+                            <td class="py-2 pr-3 tabular-nums">{{ t.schema_coverage_pct == null ? "Not captured" : `${t.schema_coverage_pct}%` }}</td>
+                            <td class="py-2 pr-3 tabular-nums">{{ t.read_calls == null ? "Not captured" : `${t.read_calls} / ${t.write_calls ?? "Not captured"}` }}</td>
+                            <td class="py-2 tabular-nums">{{ t.invalid_arguments == null ? "Not captured" : t.invalid_arguments }}</td>
                           </tr>
                         </tbody>
                       </table>
+                      </div>
                     </div>
                   </td>
                 </tr>
@@ -595,17 +676,21 @@ onMounted(() => {
       <DialogContent>
         <DialogTitle>Delete dynamic upstream?</DialogTitle>
         <DialogDescription>
-          Removing <strong>{{ deleteTarget }}</strong> stops routing new MCP subcalls to it immediately.
+          Removing <strong>{{ deleteTarget }}</strong> stops new MCP calls to that service immediately. Reconnect it later through Onboarding or restore its GitOps configuration.
         </DialogDescription>
+        <p v-if="deleteError" role="alert" class="rounded-md border border-[#FECACA] bg-[#FEF2F2] p-3 text-xs text-[#991B1B]">
+          Removal failed: {{ deleteError }}. The upstream is still registered; retry or cancel.
+        </p>
         <div class="flex justify-end gap-2 pt-2">
           <DialogClose>Cancel</DialogClose>
           <Button
             data-variant="danger"
+            :disabled="deleteSaving"
             data-agent-confirm="Permanently delete dynamic upstream?"
             pending-announcement="Deleting upstream"
             @click="confirmDelete"
           >
-            Delete Upstream
+            {{ deleteSaving ? "Removing…" : "Remove upstream" }}
           </Button>
         </div>
       </DialogContent>
@@ -615,14 +700,19 @@ onMounted(() => {
       <DialogContent>
         <DialogTitle>Confirm Mode Change</DialogTitle>
         <DialogDescription v-if="pendingModeChange">
-          Switch
-          <strong>{{ pendingModeChange.kind === 'server' ? pendingModeChange.upstream.name : pendingModeChange.tool }}</strong>
-          to <code class="font-mono-data">{{ pendingModeChange.nextMode }}</code>?
+          <p>
+            Set <strong>{{ pendingModeChange.kind === 'server' ? pendingModeChange.upstream.name : pendingModeChange.tool }}</strong>
+            to <code class="font-mono-data">{{ pendingModeChange.nextMode }}</code>?
+          </p>
+          <p class="mt-2">{{ modeChangeImpact() }}</p>
         </DialogDescription>
+        <p v-if="modeError" role="alert" class="rounded-md border border-[#FECACA] bg-[#FEF2F2] p-3 text-xs text-[#991B1B]">
+          Change failed: {{ modeError }}. The saved mode is unchanged; retry or cancel.
+        </p>
         <div class="flex justify-end gap-2 pt-2">
-          <DialogClose @click="pendingModeChange = null">Cancel</DialogClose>
-          <Button data-variant="primary" @click="confirmModeChange">
-            Confirm Change
+          <DialogClose :disabled="modeSaving" @click="pendingModeChange = null">Cancel</DialogClose>
+          <Button data-variant="primary" :disabled="modeSaving" @click="confirmModeChange">
+            {{ modeSaving ? "Saving…" : "Save mode" }}
           </Button>
         </div>
       </DialogContent>

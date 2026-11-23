@@ -83,6 +83,7 @@ async function triggerAnalyticsBurst() {
 
 const loading = ref(true);
 const errorMessage = ref("");
+const lastUpdatedAt = ref<Date | null>(null);
 const activeTab = ref<string>("company-groups");
 const selectedModel = ref("qwen3.5-9b");
 const modelSearch = ref("");
@@ -149,6 +150,7 @@ async function fetchAnalytics() {
     } else {
       analytics.value = response;
     }
+    lastUpdatedAt.value = new Date();
     companyGroupPage.value = 1;
     userPage.value = 1;
     clientPage.value = 1;
@@ -197,6 +199,16 @@ onBeforeUnmount(() => {
 });
 
 const availableModelsList = computed(() => analytics.value?.pricing?.available_models || ["default"]);
+const reportWindowLabel = computed(() => ({
+  "1h": "Last hour",
+  "24h": "Last 24 hours",
+  "7d": "Last 7 days",
+  "30d": "Last 30 days",
+  all: "All time (retained telemetry)",
+}[selectedWindow.value]));
+const tenantScopeLabel = computed(() => analytics.value?.tenant_scope === "all_tenants"
+  ? "All tenants"
+  : analytics.value?.tenant_scope || "Tenant scope unavailable");
 
 const pairedModeRunCount = computed(() =>
   (analytics.value?.summary.codemode_runs || 0) + (analytics.value?.summary.classic_runs || 0),
@@ -260,6 +272,34 @@ function formatInt(n: number | undefined): string {
 function formatUsd(n: number | undefined): string {
   return `$${Number(n || 0).toFixed(4)}`;
 }
+
+function formatUpdatedAt(value: Date | null): string {
+  if (!value) return "Waiting for first report";
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(value);
+}
+
+function formatMode(mode: string): string {
+  if (mode === "codemode") return "Code Mode";
+  if (mode === "traditional" || mode === "traditional_discover" || mode === "classic") return "Classic MCP";
+  if (mode === "hybrid") return "Hybrid";
+  return mode.replaceAll("_", " ");
+}
+
+function formatDecisionReason(reason: string): string {
+  const adaptiveReason = reason.split(";").find((part) => part.trim().startsWith("adaptive_recommendation:"));
+  if (adaptiveReason) return "Adaptive routing recommendation";
+  if (reason.startsWith("explicit:")) return `Requested directly: ${formatMode(reason.slice("explicit:".length))}`;
+  if (reason.startsWith("admin_force:")) return `Administrator setting: ${formatMode(reason.slice("admin_force:".length))}`;
+  if (reason.startsWith("tool_override:")) return `Tool-specific setting: ${formatMode(reason.slice("tool_override:".length))}`;
+  if (reason.startsWith("model_profile_override:")) return `Model profile setting: ${formatMode(reason.slice("model_profile_override:".length))}`;
+  if (reason === "auto:execute_code->codemode") return "Automatic selection for a Code Mode execution";
+  if (reason.startsWith("auto:")) return "Automatic gateway selection";
+  return reason.replaceAll("_", " ").replaceAll("->", " to ");
+}
 </script>
 
 <template>
@@ -278,7 +318,7 @@ function formatUsd(n: number | undefined): string {
           </span>
         </div>
         <p class="mt-0.5 text-[13px] text-[#52525B]">
-          Track gateway traffic, tenant and client-group usage, user activity, and ABAC/PII governance. Cost figures are gateway estimates based on the configured model price catalogue, not invoice-reconciled spend.
+          Review gateway traffic and governance by group, client, and user. Cost figures are estimates based on gateway token estimates and the selected model price assumption; they are not invoice-reconciled spend.
         </p>
       </div>
     </div>
@@ -286,18 +326,18 @@ function formatUsd(n: number | undefined): string {
     <section class="rounded-lg border border-[#E4E4E7] bg-white p-4 space-y-3">
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Field>
-          <FieldLabel>Model</FieldLabel>
+          <FieldLabel>Model price assumption</FieldLabel>
           <Input
             v-model="modelSearch"
-            list="analytics-detected-models"
-            placeholder="Search detected models..."
-            aria-label="Search detected models"
+            list="analytics-priced-models"
+            placeholder="Search configured model prices..."
+            aria-label="Search configured model prices"
           />
-          <datalist id="analytics-detected-models">
+          <datalist id="analytics-priced-models">
             <option v-for="m in availableModelsList" :key="m" :value="m" />
           </datalist>
-          <p v-if="selectedModel" class="text-[11px] font-mono-data text-[#71717A]">
-            Active: {{ selectedModel }}
+          <p v-if="selectedModel" class="text-[11px] text-[#71717A]">
+            Applied rate: <span class="font-mono-data">{{ analytics?.pricing.model || selectedModel }}</span>
           </p>
         </Field>
 
@@ -392,7 +432,7 @@ function formatUsd(n: number | undefined): string {
 
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
           <div class="text-xs font-medium text-[#52525B]">
-            Estimated LLM Spend ({{ analytics.pricing.model }})
+            Estimated LLM cost ({{ analytics.pricing.model }} rates)
           </div>
           <div class="mt-1.5 text-2xl font-semibold text-[#09090B] tabular-nums">
             {{ formatUsd(analytics.summary.estimated_cost_usd) }}
@@ -403,14 +443,25 @@ function formatUsd(n: number | undefined): string {
         </div>
 
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-          <div class="text-xs font-medium text-[#52525B]">Gateway-estimated LLM cost reduction</div>
+          <div class="text-xs font-medium text-[#52525B]">Estimated input-token cost equivalent</div>
           <div class="mt-1.5 text-2xl font-semibold text-[#059669] tabular-nums">
             {{ formatUsd(analytics.summary.estimated_cost_saved_usd) }}
           </div>
           <div class="mt-1 text-xs text-[#71717A]">
-            Scope: {{ analytics.tenant_scope }}
+            At the selected model's input rate
           </div>
         </div>
+      </section>
+
+      <section class="border-y border-[#E4E4E7] py-3 text-xs leading-5 text-[#52525B]" aria-label="Report scope and estimate method">
+        <div class="flex flex-wrap gap-x-5 gap-y-1">
+          <span><strong class="font-medium text-[#09090B]">Report window:</strong> {{ reportWindowLabel }}</span>
+          <span><strong class="font-medium text-[#09090B]">Tenant scope:</strong> {{ tenantScopeLabel }}</span>
+          <span><strong class="font-medium text-[#09090B]">Last refreshed:</strong> {{ formatUpdatedAt(lastUpdatedAt) }}</span>
+        </div>
+        <p class="mt-2 max-w-5xl">
+          Spend applies gateway-estimated input and output tokens to the selected model's configured rates. The cost equivalent applies gateway-reported token reduction to that model's input rate. These are estimates, not invoice-verified costs or realized savings. Rates: {{ analytics.pricing.model }} — ${{ analytics.pricing.input_per_1m_usd }} input and ${{ analytics.pricing.output_per_1m_usd }} output per 1 million tokens.
+        </p>
       </section>
 
       <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
@@ -421,8 +472,12 @@ function formatUsd(n: number | undefined): string {
             <TabsTab value="client-groups">Client Groups</TabsTab>
             <TabsTab value="mode-decisions">Mode Decision Attribution</TabsTab>
           </TabsList>
+          <p class="mb-2 text-xs text-[#71717A] sm:hidden">Swipe the table horizontally to see every column and action.</p>
 
           <TabsPanel value="company-groups">
+            <p class="mb-3 text-xs leading-5 text-[#52525B]">
+              Rows filtered are records hidden by access rules (ABAC). PII redactions count sensitive fields removed before results were returned.
+            </p>
             <div v-if="analytics.by_company_group.length === 0" class="py-8 text-center text-[13px] text-[#71717A]">
               No company group runs match the current filters.
             </div>
@@ -435,9 +490,11 @@ function formatUsd(n: number | undefined): string {
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Runs</th>
                     <th class="px-3 py-2.5 whitespace-nowrap min-w-[140px]">Code / Classic share</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Gateway-reported token reduction</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Est. Cost</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Gateway-est. cost reduction</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap text-right">ABAC / PII</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Est. cost at selected rates</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Est. token cost equivalent</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Rows filtered (ABAC)</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Sensitive fields redacted (PII)</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap">Trace details</th>
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-[#E4E4E7]">
@@ -456,9 +513,15 @@ function formatUsd(n: number | undefined): string {
                     </td>
                     <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(g.tokens_saved) }}</td>
                     <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatUsd(g.estimated_cost_usd) }}</td>
-                    <td class="px-3 py-2.5 text-right tabular-nums text-[#0F766E] whitespace-nowrap">{{ formatUsd(g.estimated_cost_saved_usd) }}</td>
-                    <td class="px-3 py-2.5 text-right tabular-nums text-xs text-[#52525B] whitespace-nowrap">
-                      {{ g.abac_rows_filtered }} / {{ g.pii_redactions }}
+                    <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatUsd(g.estimated_cost_saved_usd) }}</td>
+                    <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(g.abac_rows_filtered) }}</td>
+                    <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(g.pii_redactions) }}</td>
+                    <td class="px-3 py-2.5 whitespace-nowrap">
+                      <NuxtLink
+                        :to="{ path: '/traces', query: { group: g.group, window: selectedWindow } }"
+                        class="inline-flex min-h-11 items-center rounded px-2 font-medium text-[#0F766E] underline underline-offset-2 hover:text-[#115E59] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
+                        :aria-label="`View traces for ${g.group} in ${reportWindowLabel}`"
+                      >View traces</NuxtLink>
                     </td>
                   </tr>
                 </tbody>
@@ -484,10 +547,10 @@ function formatUsd(n: number | undefined): string {
                     <th class="px-3 py-2.5 whitespace-nowrap">User</th>
                     <th class="px-3 py-2.5 whitespace-nowrap">Groups</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Runs (CM / CL)</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap">Top Upstreams</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap">Top upstreams (calls)</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Gateway-reported token reduction</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Est. Cost</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Gateway-est. cost reduction</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Est. cost at selected rates</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Est. token cost equivalent</th>
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-[#E4E4E7]">
@@ -501,7 +564,7 @@ function formatUsd(n: number | undefined): string {
                       {{ u.runs }} (<span class="text-[#0F766E]">{{ u.codemode_runs }}</span> / <span class="text-[#2563EB]">{{ u.classic_runs }}</span>)
                     </td>
                     <td class="px-3 py-2.5 text-xs font-mono-data text-[#52525B] whitespace-nowrap">
-                      {{ u.top_upstreams.map((x) => `${x.server}:${x.calls}`).join(", ") || "—" }}
+                      {{ u.top_upstreams.map((x) => `${x.server} (${formatInt(x.calls)} calls)`).join(", ") || "—" }}
                     </td>
                     <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(u.tokens_saved) }}</td>
                     <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatUsd(u.estimated_cost_usd) }}</td>
@@ -553,6 +616,9 @@ function formatUsd(n: number | undefined): string {
           </TabsPanel>
 
           <TabsPanel value="mode-decisions">
+            <p class="mb-3 text-xs leading-5 text-[#52525B]">
+              Auto score is shown only when a score was recorded for that decision. “—” means this run group has no recorded score.
+            </p>
             <div v-if="analytics.mode_decisions.length === 0" class="py-8 text-center text-[13px] text-[#71717A]">
               No mode decisions recorded yet.
             </div>
@@ -561,19 +627,25 @@ function formatUsd(n: number | undefined): string {
                 <thead>
                   <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-xs font-medium text-[#52525B]">
                     <th class="px-3 py-2.5 whitespace-nowrap">Selected Mode</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap">Decision Attribution Reason</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap">Why this mode was selected</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Runs</th>
-                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Avg Auto Score</th>
+                    <th class="px-3 py-2.5 whitespace-nowrap text-right">Avg Auto score</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Avg Gateway-reported token reduction</th>
                     <th class="px-3 py-2.5 whitespace-nowrap text-right">Avg Latency</th>
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-[#E4E4E7]">
                   <tr v-for="(d, idx) in analytics.mode_decisions" :key="idx" class="hover:bg-[#FAFAFA]">
-                    <td class="px-3 py-2.5 font-mono-data font-medium whitespace-nowrap" :class="d.mode.startsWith('codemode') ? 'text-[#0F766E]' : 'text-[#2563EB]'">
-                      {{ d.mode }}
+                    <td class="px-3 py-2.5 font-medium whitespace-nowrap" :class="d.mode.startsWith('codemode') ? 'text-[#0F766E]' : 'text-[#2563EB]'">
+                      {{ formatMode(d.mode) }}
                     </td>
-                    <td class="px-3 py-2.5 text-[#09090B] min-w-[240px]">{{ d.reason }}</td>
+                    <td class="px-3 py-2.5 text-[#09090B] min-w-[240px]">
+                      <span>{{ formatDecisionReason(d.reason) }}</span>
+                      <details class="mt-1 text-xs text-[#71717A]">
+                        <summary class="min-h-11 cursor-pointer py-3 underline underline-offset-2">Technical detail</summary>
+                        <code class="block whitespace-normal break-words text-[#52525B]">{{ d.reason }}</code>
+                      </details>
+                    </td>
                     <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(d.runs) }}</td>
                     <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ d.avg_score !== null ? d.avg_score.toFixed(1) : "—" }}</td>
                     <td class="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">{{ d.avg_tokens_saved.toFixed(0) }}</td>
@@ -586,41 +658,15 @@ function formatUsd(n: number | undefined): string {
         </Tabs>
       </section>
 
-      <section v-if="analytics.timeline_by_group?.length" class="rounded-lg border border-[#E4E4E7] bg-white">
-        <div class="border-b border-[#E4E4E7] px-4 py-3">
-          <h2 class="text-[15px] font-semibold text-[#09090B]">Aggregated Trace Timeline by Group</h2>
-          <p class="mt-0.5 text-xs text-[#52525B]">
-            Average stage latency per company group: Gateway Auth/Route, Monty Spawn, Monty Exec, Upstream Subcalls, and Security/Grounding.
-          </p>
+      <section class="flex flex-col gap-2 border-t border-[#E4E4E7] pt-4 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h2 class="text-[15px] font-semibold text-[#09090B]">Need to investigate latency?</h2>
+          <p class="mt-1 text-xs leading-5 text-[#52525B]">Open the trace timeline to inspect individual runs and their gateway, execution, upstream, and security stages.</p>
         </div>
-        <div class="overflow-x-auto table-scroll">
-          <table class="w-full border-collapse text-left text-[13px]">
-            <thead>
-              <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-xs font-medium text-[#52525B]">
-                <th class="px-4 py-2.5">Group</th>
-                <th class="px-4 py-2.5 text-right">Runs</th>
-                <th class="px-4 py-2.5 text-right">Gateway</th>
-                <th class="px-4 py-2.5 text-right">Monty Spawn</th>
-                <th class="px-4 py-2.5 text-right">Monty Exec</th>
-                <th class="px-4 py-2.5 text-right">Upstream</th>
-                <th class="px-4 py-2.5 text-right">Security</th>
-                <th class="px-4 py-2.5 text-right">Avg Total</th>
-              </tr>
-            </thead>
-            <tbody class="divide-y divide-[#E4E4E7]">
-              <tr v-for="tb in analytics.timeline_by_group" :key="tb.group" class="hover:bg-[#FAFAFA]">
-                <td class="px-4 py-2.5 font-medium text-[#09090B]">{{ tb.group }}</td>
-                <td class="px-4 py-2.5 text-right tabular-nums">{{ tb.runs }}</td>
-                <td class="px-4 py-2.5 text-right font-mono-data text-xs tabular-nums">{{ tb.avg_gateway_ms.toFixed(2) }} ms</td>
-                <td class="px-4 py-2.5 text-right font-mono-data text-xs text-[#0F766E] tabular-nums">{{ tb.avg_monty_spawn_ms.toFixed(2) }} ms</td>
-                <td class="px-4 py-2.5 text-right font-mono-data text-xs text-[#0F766E] tabular-nums">{{ tb.avg_monty_exec_ms.toFixed(2) }} ms</td>
-                <td class="px-4 py-2.5 text-right font-mono-data text-xs text-[#2563EB] tabular-nums">{{ tb.avg_upstream_ms.toFixed(2) }} ms</td>
-                <td class="px-4 py-2.5 text-right font-mono-data text-xs tabular-nums">{{ tb.avg_security_ms.toFixed(2) }} ms</td>
-                <td class="px-4 py-2.5 text-right font-semibold tabular-nums">{{ tb.avg_total_ms.toFixed(2) }} ms</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
+        <NuxtLink
+          :to="{ path: '/traces', query: { window: selectedWindow } }"
+          class="inline-flex min-h-11 shrink-0 items-center rounded border border-[#D4D4D8] bg-white px-3.5 text-sm font-medium text-[#09090B] hover:bg-[#F4F4F5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
+        >Open Traces &amp; Timeline</NuxtLink>
       </section>
     </template>
   </div>

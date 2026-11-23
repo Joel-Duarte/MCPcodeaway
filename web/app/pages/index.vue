@@ -51,20 +51,6 @@ interface AuditValueResponse {
     grounded_runs_verified: number;
     grounding_violations_blocked: number;
   };
-  by_upstream: Record<
-    string,
-    {
-      calls: number;
-      errors: number;
-      raw_bytes: number;
-      abac_rows_filtered: number;
-      redactions_count: number;
-      classic_calls: number;
-      codemode_calls: number;
-      avg_duration_ms: number;
-    }
-  >;
-  recommendations: { server: string; reason: string }[];
 }
 
 interface AnalyticsSummary {
@@ -102,8 +88,13 @@ async function triggerOverviewBurst() {
 }
 
 const loading = ref(true);
+const summaryRefreshing = ref(false);
 const errorMessage = ref("");
+const summaryUpdatedAt = ref("");
 const runtimeData = ref<RuntimeTelemetryResponse | null>(null);
+const runtimeUpdatedAt = ref("");
+const runtimeError = ref("");
+const runtimeLoading = ref(false);
 const valueData = ref<AuditValueResponse | null>(null);
 const analyticsData = ref<AnalyticsSummary | null>(null);
 const recoveryData = ref<RecoverySummary | null>(null);
@@ -111,6 +102,8 @@ const recoveryData = ref<RecoverySummary | null>(null);
 let refreshDebounce: ReturnType<typeof setTimeout> | null = null;
 
 async function fetchOverview() {
+  if (summaryRefreshing.value) return;
+  summaryRefreshing.value = true;
   errorMessage.value = "";
   try {
     const [val, ana] = await Promise.all([
@@ -119,39 +112,55 @@ async function fetchOverview() {
     ]);
     valueData.value = val;
     analyticsData.value = ana;
+    summaryUpdatedAt.value = new Date().toISOString();
     try {
       recoveryData.value = await apiFetch<RecoverySummary>("/admin/operations/metrics");
     } catch {
       recoveryData.value = null;
-    }
-    try {
-      const rt = await apiFetch<RuntimeTelemetryResponse>("/admin/telemetry/runtime", {}, true);
-      runtimeData.value = rt;
-      setRuntimeMeta({
-        profile: rt.gateway.profile,
-        app_env: rt.gateway.app_env,
-        catalog_version: rt.gateway.catalog_version,
-      });
-    } catch {
     }
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
   } finally {
     loading.value = false;
   }
+  await fetchRuntimeTelemetry();
+  summaryRefreshing.value = false;
+}
+
+async function fetchRuntimeTelemetry() {
+  if (runtimeLoading.value) return;
+  runtimeLoading.value = true;
+  runtimeError.value = "";
+  try {
+    const rt = await apiFetch<RuntimeTelemetryResponse>("/admin/telemetry/runtime", {}, true);
+    runtimeData.value = rt;
+    runtimeUpdatedAt.value = new Date().toISOString();
+    setRuntimeMeta({
+      profile: rt.gateway.profile,
+      app_env: rt.gateway.app_env,
+      catalog_version: rt.gateway.catalog_version,
+    });
+  } catch (err) {
+    runtimeError.value = extractErrorMessage(err);
+  } finally {
+    runtimeLoading.value = false;
+  }
 }
 
 watch(latestRuntime, (rt) => {
   if (rt && typeof rt === "object" && "gateway" in rt) {
     runtimeData.value = rt as unknown as RuntimeTelemetryResponse;
+    runtimeUpdatedAt.value = new Date().toISOString();
+    runtimeError.value = "";
   }
 });
 
 watch(totalRunsTick, () => {
-  if (refreshDebounce) clearTimeout(refreshDebounce);
+  if (refreshDebounce) return;
   refreshDebounce = setTimeout(() => {
+    refreshDebounce = null;
     void fetchOverview();
-  }, 600);
+  }, 5000);
 });
 
 onMounted(() => {
@@ -163,11 +172,6 @@ onBeforeUnmount(() => {
     clearTimeout(refreshDebounce);
     refreshDebounce = null;
   }
-});
-
-const upstreamRows = computed(() => {
-  const entries = Object.entries(valueData.value?.by_upstream || {});
-  return entries.map(([server, info]) => ({ server, ...info }));
 });
 
 const workerStats = computed<ProcessStats | null>(() => {
@@ -198,6 +202,38 @@ function formatInt(n: number | undefined): string {
 
 function formatUsd(n: number | undefined): string {
   return `$${Number(n || 0).toFixed(4)}`;
+}
+
+function formatUtcTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "time unavailable" : `${date.toISOString().slice(0, 19).replace("T", " ")} UTC`;
+}
+
+function alertRunsPath(alert: { id: string; filter_status?: string }): string | null {
+  const status = alert.filter_status;
+  if (status === "errors" || status === "grounding_blocked" || status === "ok") {
+    return `/audit?status=${status}`;
+  }
+  return alert.id === "high_error_rate" ? "/audit?status=errors" : null;
+}
+
+function cpuCapacity(stats: ProcessStats): number {
+  return Math.max(1, stats.cpu_count) * 100;
+}
+
+function formatCpu(n: number): string {
+  return `${Number(n || 0).toFixed(1)}% of one vCPU`;
+}
+
+function workerStatusLabel(status: string): string {
+  if (status === "in_process") return "Shared process";
+  if (status === "ok") return "Healthy";
+  if (status === "unreachable") return "Unreachable";
+  return status;
+}
+
+function isSharedWorker(worker: RuntimeTelemetryResponse["sandbox_worker"]): boolean {
+  return worker.status === "in_process" || worker.mode === "in_process";
 }
 </script>
 
@@ -239,12 +275,18 @@ function formatUsd(n: number | undefined): string {
             }}
           </span>
         </span>
-        <Button v-if="!wsConnected" data-variant="primary" pending-announcement="Refreshing metrics" @click="fetchOverview">
+        <Button :disabled="summaryRefreshing" class="min-h-11" data-variant="primary" pending-announcement="Refreshing metrics" @click="fetchOverview">
           <AppIcon name="refresh" :size="15" />
-          <span>Refresh</span>
+          <span>{{ summaryRefreshing ? "Refreshing…" : "Refresh summary" }}</span>
         </Button>
       </div>
     </div>
+
+    <p class="-mt-4 text-[11px] leading-5 text-[#71717A]" aria-live="polite">
+      Summary data refreshed: {{ summaryUpdatedAt ? formatUtcTime(summaryUpdatedAt) : "not yet refreshed" }}
+      <span v-if="wsConnectionState === 'live'"> · Activity stream connected</span>
+      <span v-else> · Activity stream {{ wsConnectionState }}</span>
+    </p>
 
     <div
       v-if="errorMessage"
@@ -265,7 +307,7 @@ function formatUsd(n: number | undefined): string {
 
     <template v-else>
       <section
-        v-if="demoStatus.enabled && (valueData?.window_runs ?? 0) === 0"
+        v-if="demoStatus.enabled && valueData && analyticsData && valueData.window_runs === 0 && analyticsData.summary.total_runs === 0"
         class="flex flex-col gap-3 rounded-lg border border-[#99F6E4] bg-[#F0FDFA] p-4 sm:flex-row sm:items-center sm:justify-between"
       >
         <div class="text-[13px] text-[#09090B]">
@@ -281,12 +323,22 @@ function formatUsd(n: number | undefined): string {
 
       <section aria-label="Active monitoring alerts" class="space-y-2">
         <div
-          v-if="liveAlerts.length === 0"
+          v-if="liveAlerts.length === 0 && wsConnected"
           class="flex items-center justify-between gap-2 rounded-lg border border-[#A7F3D0] bg-[#ECFDF5] px-4 py-2.5 text-xs text-[#059669]"
         >
           <span class="font-medium">System Health Nominal — 0 active SLA, drift, or security alerts.</span>
           <NuxtLink to="/settings" class="font-medium text-[#0F766E] hover:underline">
-            Configure Alert Rules →
+            Configure alert rules
+          </NuxtLink>
+        </div>
+        <div
+          v-else-if="liveAlerts.length === 0"
+          role="status"
+          class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#FDE68A] bg-[#FFFBEB] px-4 py-2.5 text-xs text-[#92400E]"
+        >
+          <span class="font-medium">Alert status is unavailable while the live connection is {{ wsConnectionState }}.</span>
+          <NuxtLink to="/settings" class="font-medium text-[#0F766E] hover:underline">
+            Alert rules
           </NuxtLink>
         </div>
         <div
@@ -312,14 +364,15 @@ function formatUsd(n: number | undefined): string {
             <div v-if="al.remediation" class="text-[11px] text-[#09090B]">
               <strong>Action:</strong> {{ al.remediation }}
             </div>
+            <div class="text-[11px] text-[#52525B]">Evaluated {{ formatUtcTime(al.observed_at) }}</div>
           </div>
           <div class="flex shrink-0 items-center gap-3">
             <NuxtLink
-              v-if="al.filter_status"
-              :to="`/audit?status=${encodeURIComponent(al.filter_status)}`"
+              v-if="alertRunsPath(al)"
+              :to="alertRunsPath(al)!"
               class="font-semibold underline"
             >
-              Inspect Offending Runs →
+              View affected runs
             </NuxtLink>
             <NuxtLink to="/settings" class="font-medium underline">Rules</NuxtLink>
           </div>
@@ -338,44 +391,55 @@ function formatUsd(n: number | undefined): string {
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
           <div class="text-xs font-medium text-[#52525B]">Gateway-reported token reduction</div>
           <div class="mt-1.5 text-2xl font-semibold text-[#09090B] tabular-nums">
-            {{ formatInt(valueData?.efficiency.total_tokens_saved) }}
+            {{ valueData ? formatInt(valueData.efficiency.total_tokens_saved) : "Unavailable" }}
           </div>
           <div class="mt-1 text-xs text-[#71717A] tabular-nums">
-            Payload: {{ formatInt(valueData?.efficiency.payload_tokens_saved) }} · Schema: {{ formatInt(valueData?.efficiency.schema_tokens_saved) }}
+            <template v-if="valueData">Payload: {{ formatInt(valueData.efficiency.payload_tokens_saved) }} · Schema: {{ formatInt(valueData.efficiency.schema_tokens_saved) }}</template>
+            <span v-else>Gateway report unavailable</span>
           </div>
         </div>
 
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
           <div class="text-xs font-medium text-[#52525B]">Gateway-estimated LLM cost reduction</div>
           <div class="mt-1.5 text-2xl font-semibold text-[#0F766E] tabular-nums">
-            {{ formatUsd(valueData?.efficiency.estimated_llm_cost_saved_usd) }}
+            {{ valueData ? formatUsd(valueData.efficiency.estimated_llm_cost_saved_usd) : "Unavailable" }}
           </div>
           <div class="mt-1 text-xs text-[#71717A] tabular-nums">
-            {{ formatInt(valueData?.efficiency.llm_turns_avoided) }} turns avoided · {{ formatInt(valueData?.efficiency.context_overflows_prevented) }} overflows prevented
+            <template v-if="valueData">{{ formatInt(valueData.efficiency.llm_turns_avoided) }} turns avoided · {{ formatInt(valueData.efficiency.context_overflows_prevented) }} overflows prevented</template>
+            <span v-else>Gateway report unavailable</span>
           </div>
         </div>
 
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
           <div class="text-xs font-medium text-[#52525B]">Payload Reduction</div>
           <div class="mt-1.5 text-2xl font-semibold text-[#09090B] tabular-nums">
-            {{ (valueData?.efficiency.payload_reduction_pct ?? 0).toFixed(1) }}%
+            {{ valueData ? `${valueData.efficiency.payload_reduction_pct.toFixed(1)}%` : "Unavailable" }}
           </div>
           <div class="mt-1 text-xs text-[#71717A] tabular-nums">
-            Across {{ formatInt(valueData?.window_runs) }} runs · OBO cache {{ (valueData?.efficiency.obo_cache_hit_rate_pct ?? 0).toFixed(0) }}%
+            <template v-if="valueData">Across {{ formatInt(valueData.window_runs) }} runs · OBO cache {{ valueData.efficiency.obo_cache_hit_rate_pct.toFixed(0) }}%</template>
+            <span v-else>Gateway report unavailable</span>
           </div>
         </div>
 
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
           <div class="text-xs font-medium text-[#52525B]">Security &amp; Grounding</div>
           <div class="mt-1.5 text-2xl font-semibold text-[#09090B] tabular-nums">
-            {{ formatInt(valueData?.security_and_governance.grounded_runs_verified) }} verified
+            {{ valueData ? `${formatInt(valueData.security_and_governance.grounded_runs_verified)} verified` : "Unavailable" }}
           </div>
           <div class="mt-1 text-xs text-[#71717A] tabular-nums">
-            ABAC filtered: {{ formatInt(valueData?.security_and_governance.abac_rows_filtered) }} · PII redacted: {{ formatInt(valueData?.security_and_governance.pii_secrets_redacted) }}
+            <template v-if="valueData">{{ formatInt(valueData.security_and_governance.grounding_violations_blocked) }} grounding blocks · {{ formatInt(valueData.security_and_governance.abac_rows_filtered) }} ABAC rows filtered</template>
+            <span v-else>Gateway report unavailable</span>
           </div>
         </div>
       </section>
-      <p class="-mt-3 text-[11px] leading-5 text-[#71717A]">Token reduction and USD reduction are gateway-reported estimates. USD uses configured model rates and is not reconciled against provider invoices.</p>
+      <div class="-mt-3 flex flex-wrap items-start justify-between gap-2 text-[11px] leading-5 text-[#71717A]">
+        <p v-if="valueData">Totals cover the latest {{ formatInt(valueData.window_runs) }} runs. Token and USD reductions are gateway estimates; USD uses configured model rates and is not reconciled against provider invoices.</p>
+        <p v-else>Summary metrics are unavailable until the gateway report loads. Token and USD reductions are gateway estimates.</p>
+        <div class="flex shrink-0 flex-wrap gap-x-3">
+          <NuxtLink to="/business-value" class="min-h-11 py-2 font-medium text-[#0F766E] underline underline-offset-2">Review business outcomes</NuxtLink>
+          <NuxtLink to="/audit" class="min-h-11 py-2 font-medium text-[#0F766E] underline underline-offset-2">Review audit activity</NuxtLink>
+        </div>
+      </div>
 
       <section
         aria-label="Live gateway activity stream"
@@ -403,16 +467,19 @@ function formatUsd(n: number | undefined): string {
             <thead>
               <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-[#52525B]">
                 <th class="px-3 py-2 whitespace-nowrap">Group</th>
+                <th class="px-3 py-2 whitespace-nowrap">Recorded (UTC)</th>
                 <th class="px-3 py-2 whitespace-nowrap">Target / Tool</th>
                 <th class="px-3 py-2 whitespace-nowrap">Mode</th>
                 <th class="px-3 py-2 text-right whitespace-nowrap">Reported reduction</th>
                 <th class="px-3 py-2 text-right whitespace-nowrap">Latency</th>
                 <th class="px-3 py-2 whitespace-nowrap">Status</th>
+                <th class="px-3 py-2 text-right whitespace-nowrap">Run</th>
               </tr>
             </thead>
             <tbody class="divide-y divide-[#E4E4E7]">
               <tr v-for="ev in liveEvents" :key="ev.run_id">
                 <td class="px-3 py-1.5 font-medium text-[#09090B] whitespace-nowrap">{{ ev.company_group }}</td>
+                <td class="px-3 py-1.5 text-[#71717A] tabular-nums whitespace-nowrap">{{ formatUtcTime(ev.created_at) }}</td>
                 <td class="px-3 py-1.5 font-mono-data text-[#52525B] whitespace-nowrap">{{ ev.tool_name }}</td>
                 <td class="px-3 py-1.5 whitespace-nowrap">
                   <span
@@ -429,8 +496,14 @@ function formatUsd(n: number | undefined): string {
                     class="rounded px-1.5 py-0.5 text-[11px] font-medium"
                     :class="ev.grounding_blocked ? 'bg-[#FEF2F2] text-[#DC2626]' : ev.ok ? 'bg-[#ECFDF5] text-[#059669]' : 'bg-[#FFFBEB] text-[#D97706]'"
                   >
-                    {{ ev.grounding_blocked ? "GROUNDING BLOCKED" : ev.ok ? "OK" : "DENIED/ERR" }}
+                    {{ ev.grounding_blocked ? "GROUNDING BLOCKED" : ev.ok ? "OK" : "UNSUCCESSFUL (DENIED OR FAILED)" }}
                   </span>
+                </td>
+                <td class="px-3 py-1.5 text-right whitespace-nowrap">
+                  <NuxtLink v-if="ev.run_id" :to="`/audit?run_id=${encodeURIComponent(ev.run_id)}`" class="inline-flex min-h-11 items-center py-2 font-medium text-[#0F766E] underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">
+                    Inspect run
+                  </NuxtLink>
+                  <span v-else class="text-[#71717A]">Unavailable</span>
                 </td>
               </tr>
             </tbody>
@@ -453,7 +526,19 @@ function formatUsd(n: number | undefined): string {
             <span>·</span>
             <span>Upstreams: <strong class="text-[#09090B]">{{ runtimeData.gateway.upstreams_count }}</strong></span>
           </div>
+          <div class="flex w-full flex-wrap items-center justify-between gap-2 text-[11px] text-[#71717A]">
+            <span aria-live="polite">Runtime telemetry {{ runtimeUpdatedAt ? `updated ${formatUtcTime(runtimeUpdatedAt)}` : "not yet available" }}</span>
+            <Button :disabled="runtimeLoading" class="min-h-11 px-2 text-xs text-[#0F766E] underline underline-offset-2" @click="fetchRuntimeTelemetry">
+              {{ runtimeLoading ? "Refreshing…" : "Refresh telemetry" }}
+            </Button>
+          </div>
         </div>
+
+        <div v-if="runtimeError" role="alert" class="mx-4 mt-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-3 py-2 text-xs text-[#B91C1C]">
+          <span>Runtime telemetry could not be refreshed: {{ runtimeError }}</span>
+          <Button :disabled="runtimeLoading" class="min-h-11 border border-[#D4D4D8] bg-white px-3 text-xs text-[#09090B] hover:bg-[#F4F4F5]" @click="fetchRuntimeTelemetry">Retry</Button>
+        </div>
+        <div v-if="!runtimeData && !runtimeError" class="m-4 h-24 animate-pulse rounded-lg border border-[#E4E4E7] bg-white" aria-label="Loading runtime telemetry" />
 
         <div v-if="runtimeData" class="grid grid-cols-1 divide-y divide-[#E4E4E7] md:grid-cols-2 md:divide-x md:divide-y-0">
           <div class="space-y-4 p-4">
@@ -466,30 +551,19 @@ function formatUsd(n: number | undefined): string {
 
             <div class="space-y-3">
               <Meter
-                :value="Math.min(100, runtimeData.gateway.cpu_percent)"
+                :value="Math.min(cpuCapacity(runtimeData.gateway), runtimeData.gateway.cpu_percent)"
                 :min="0"
-                :max="100"
-                :format="(v: number) => `${v.toFixed(1)}%`"
+                :max="cpuCapacity(runtimeData.gateway)"
+                :format="formatCpu"
               >
-                <MeterLabel>Process CPU</MeterLabel>
+                <MeterLabel>Process CPU (one vCPU = 100%)</MeterLabel>
                 <MeterValue class="tabular-nums text-xs font-medium" />
                 <MeterTrack>
                   <MeterIndicator />
                 </MeterTrack>
               </Meter>
 
-              <Meter
-                :value="Math.min(512, runtimeData.gateway.rss_mb)"
-                :min="0"
-                :max="512"
-                :format="(v: number) => `${v.toFixed(1)} MiB`"
-              >
-                <MeterLabel>Memory RSS</MeterLabel>
-                <MeterValue class="tabular-nums text-xs font-medium" />
-                <MeterTrack>
-                  <MeterIndicator />
-                </MeterTrack>
-              </Meter>
+              <p class="text-xs text-[#52525B]">Memory RSS <strong class="font-semibold tabular-nums text-[#09090B]">{{ runtimeData.gateway.rss_mb.toFixed(1) }} MiB</strong></p>
             </div>
 
             <dl class="grid grid-cols-3 gap-2 border-t border-[#E4E4E7] pt-3 text-xs">
@@ -516,7 +590,7 @@ function formatUsd(n: number | undefined): string {
 
           <div class="space-y-4 p-4">
             <div class="flex items-center justify-between gap-2">
-              <span class="text-sm font-semibold text-[#09090B]">
+                <span class="text-sm font-semibold text-[#09090B]">
                 Monty Sandbox Worker ({{ runtimeData.sandbox_worker.mode }})
               </span>
               <span
@@ -527,10 +601,13 @@ function formatUsd(n: number | undefined): string {
                     : 'border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]'
                 "
               >
-                {{ runtimeData.sandbox_worker.status }}
+                {{ workerStatusLabel(runtimeData.sandbox_worker.status) }}
               </span>
             </div>
 
+            <p v-if="isSharedWorker(runtimeData.sandbox_worker)" class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3 text-xs leading-5 text-[#52525B]">
+              This worker shares the gateway process. Its CPU, memory, uptime, and execution counts describe the same process capacity shown on the left.
+            </p>
             <div
               v-if="runtimeData.sandbox_worker.status === 'unreachable'"
               class="rounded-md border border-[#FECACA] bg-[#FEF2F2] p-3 text-xs text-[#DC2626]"
@@ -538,33 +615,22 @@ function formatUsd(n: number | undefined): string {
               Worker health check failed: {{ runtimeData.sandbox_worker.error }}
             </div>
 
-            <template v-else-if="workerStats">
+            <template v-else-if="workerStats && !isSharedWorker(runtimeData.sandbox_worker)">
               <div class="space-y-3">
                 <Meter
-                  :value="Math.min(100, workerStats.cpu_percent)"
+                  :value="Math.min(cpuCapacity(workerStats), workerStats.cpu_percent)"
                   :min="0"
-                  :max="100"
-                  :format="(v: number) => `${v.toFixed(1)}%`"
+                  :max="cpuCapacity(workerStats)"
+                  :format="formatCpu"
                 >
-                  <MeterLabel>Worker CPU</MeterLabel>
+                  <MeterLabel>Worker CPU (one vCPU = 100%)</MeterLabel>
                   <MeterValue class="tabular-nums text-xs font-medium" />
                   <MeterTrack>
                     <MeterIndicator />
                   </MeterTrack>
                 </Meter>
 
-                <Meter
-                  :value="Math.min(512, workerStats.rss_mb)"
-                  :min="0"
-                  :max="512"
-                  :format="(v: number) => `${v.toFixed(1)} MiB`"
-                >
-                  <MeterLabel>Worker Memory RSS</MeterLabel>
-                  <MeterValue class="tabular-nums text-xs font-medium" />
-                  <MeterTrack>
-                    <MeterIndicator />
-                  </MeterTrack>
-                </Meter>
+                <p class="text-xs text-[#52525B]">Memory RSS <strong class="font-semibold tabular-nums text-[#09090B]">{{ workerStats.rss_mb.toFixed(1) }} MiB</strong></p>
               </div>
 
               <dl class="grid grid-cols-3 gap-2 border-t border-[#E4E4E7] pt-3 text-xs">
@@ -592,97 +658,30 @@ function formatUsd(n: number | undefined): string {
         </div>
       </section>
 
-      <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-          <div class="flex flex-wrap items-start justify-between gap-2">
-            <div>
-              <h2 class="text-[15px] font-semibold text-[#09090B]">Execution mode distribution</h2>
-              <p class="mt-0.5 text-xs text-[#71717A]">Code Mode vs Classic share of observed requests, not a recommendation score.</p>
-            </div>
-            <span class="text-xs tabular-nums text-[#71717A]">{{ formatInt(pairedModeRunCount) }} requests</span>
+      <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
+        <div class="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <h2 class="text-[15px] font-semibold text-[#09090B]">Execution mode distribution</h2>
+            <p class="mt-0.5 text-xs text-[#71717A]">Code Mode vs Classic share of observed requests, not a recommendation score.</p>
           </div>
-          <div v-if="pairedModeRunCount" class="mt-4 flex items-center gap-5">
-            <div class="relative h-28 w-28 shrink-0 rounded-full" :style="executionMixStyle" role="img" :aria-label="`Code Mode ${codemodeSharePct}% and Classic ${classicSharePct}%`">
-              <div class="absolute inset-[14px] flex flex-col items-center justify-center rounded-full bg-white">
-                <strong class="text-lg font-semibold tabular-nums text-[#09090B]">{{ codemodeSharePct.toFixed(1) }}%</strong>
-                <span class="text-[10px] text-[#71717A]">Code Mode</span>
-              </div>
-            </div>
-            <div class="space-y-3">
-              <div class="flex items-start gap-2"><span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full bg-[#0F766E]" /><div><div class="text-xs font-medium text-[#52525B]">Code Mode MCP</div><div class="text-sm font-semibold tabular-nums">{{ formatInt(analyticsData?.summary.codemode_runs) }} <span class="text-xs font-normal text-[#71717A]">requests</span></div></div></div>
-              <div class="flex items-start gap-2"><span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full bg-[#2563EB]" /><div><div class="text-xs font-medium text-[#52525B]">Classic MCP</div><div class="text-sm font-semibold tabular-nums">{{ formatInt(analyticsData?.summary.classic_runs) }} <span class="text-xs font-normal text-[#71717A]">requests</span></div></div></div>
+          <span class="text-xs tabular-nums text-[#71717A]">{{ analyticsData ? `${formatInt(pairedModeRunCount)} requests` : "Usage summary unavailable" }}</span>
+        </div>
+        <div v-if="pairedModeRunCount" class="mt-4 flex items-center gap-5">
+          <div class="relative h-28 w-28 shrink-0 rounded-full" :style="executionMixStyle" role="img" :aria-label="`Code Mode ${codemodeSharePct}% and Classic ${classicSharePct}%`">
+            <div class="absolute inset-[14px] flex flex-col items-center justify-center rounded-full bg-white">
+              <strong class="text-lg font-semibold tabular-nums text-[#09090B]">{{ codemodeSharePct.toFixed(1) }}%</strong>
+              <span class="text-[10px] text-[#71717A]">Code Mode</span>
             </div>
           </div>
-          <p v-else class="mt-3 text-xs text-[#71717A]">No Code Mode or Classic MCP executions recorded yet. Send requests to <code class="font-mono-data">/mcp</code> or start Demo Control traffic.</p>
-          <p v-if="otherModeRunCount > 0" class="mt-3 text-[11px] text-[#71717A]">{{ formatInt(otherModeRunCount) }} other or Hybrid requests excluded.</p>
-        </section>
-
-        <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-          <h2 class="text-[15px] font-semibold text-[#09090B]">Security &amp; efficiency posture</h2>
-          <p class="mt-0.5 text-xs text-[#71717A]">Governance actions and savings in the last {{ formatInt(valueData?.window_runs) }} runs.</p>
-          <dl class="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
-            <div><dt class="text-[#71717A]">ABAC rows filtered</dt><dd class="mt-0.5 text-lg font-semibold tabular-nums">{{ formatInt(valueData?.security_and_governance?.abac_rows_filtered) }}</dd></div>
-            <div><dt class="text-[#71717A]">PII / secrets redacted</dt><dd class="mt-0.5 text-lg font-semibold tabular-nums">{{ formatInt(valueData?.security_and_governance?.pii_secrets_redacted) }}</dd></div>
-            <div><dt class="text-[#71717A]">Grounded runs verified</dt><dd class="mt-0.5 text-lg font-semibold tabular-nums text-[#059669]">{{ formatInt(valueData?.security_and_governance?.grounded_runs_verified) }}</dd></div>
-            <div><dt class="text-[#71717A]">Grounding violations blocked</dt><dd class="mt-0.5 text-lg font-semibold tabular-nums text-[#DC2626]">{{ formatInt(valueData?.security_and_governance?.grounding_violations_blocked) }}</dd></div>
-            <div><dt class="text-[#71717A]">Payload reduction</dt><dd class="mt-0.5 text-lg font-semibold tabular-nums">{{ (valueData?.efficiency?.payload_reduction_pct ?? 0).toFixed(1) }}%</dd></div>
-            <div><dt class="text-[#71717A]">Tokens saved (reported)</dt><dd class="mt-0.5 text-lg font-semibold tabular-nums">{{ formatInt(valueData?.efficiency?.total_tokens_saved) }}</dd></div>
-          </dl>
-        </section>
-      </div>
-
-      <section v-if="valueData?.recommendations?.length" class="rounded-lg border border-[#FDE68A] bg-[#FFFBEB] p-4">
-        <h2 class="text-[15px] font-semibold text-[#92400E]">
-          Optimization Recommendations
-        </h2>
-        <ul class="mt-2 space-y-1.5 text-[13px] text-[#78350F]">
-          <li v-for="rec in valueData.recommendations" :key="rec.server">
-            <strong class="font-mono-data">{{ rec.server }}</strong>: {{ rec.reason }}
-          </li>
-        </ul>
-      </section>
-
-      <section class="rounded-lg border border-[#E4E4E7] bg-white">
-        <div class="border-b border-[#E4E4E7] px-4 py-3">
-          <h2 class="text-[15px] font-semibold text-[#09090B]">
-            Upstream Execution Breakdown
-          </h2>
+          <div class="space-y-3">
+            <div class="flex items-start gap-2"><span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full bg-[#0F766E]" /><div><div class="text-xs font-medium text-[#52525B]">Code Mode MCP</div><div class="text-sm font-semibold tabular-nums">{{ formatInt(analyticsData?.summary.codemode_runs) }} <span class="text-xs font-normal text-[#71717A]">requests</span></div></div></div>
+            <div class="flex items-start gap-2"><span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full bg-[#2563EB]" /><div><div class="text-xs font-medium text-[#52525B]">Classic MCP</div><div class="text-sm font-semibold tabular-nums">{{ formatInt(analyticsData?.summary.classic_runs) }} <span class="text-xs font-normal text-[#71717A]">requests</span></div></div></div>
+          </div>
         </div>
-
-        <div v-if="upstreamRows.length === 0" class="p-6 text-center text-[13px] text-[#71717A]">
-          No upstream tool subcalls recorded yet in this window.
-        </div>
-
-        <div v-else class="overflow-x-auto table-scroll">
-          <table class="w-full border-collapse text-left text-[13px]">
-            <thead>
-              <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-xs font-medium text-[#52525B]">
-                <th class="px-4 py-2.5 whitespace-nowrap">Upstream</th>
-                <th class="px-4 py-2.5 whitespace-nowrap text-right">Subcalls</th>
-                <th class="px-4 py-2.5 whitespace-nowrap text-right">Code Mode</th>
-                <th class="px-4 py-2.5 whitespace-nowrap text-right">Classic</th>
-                <th class="px-4 py-2.5 whitespace-nowrap text-right">Raw Bytes</th>
-                <th class="px-4 py-2.5 whitespace-nowrap text-right">Avg Latency</th>
-                <th class="px-4 py-2.5 whitespace-nowrap text-right">ABAC Filtered</th>
-                <th class="px-4 py-2.5 whitespace-nowrap text-right">PII Redacted</th>
-              </tr>
-            </thead>
-            <tbody class="divide-y divide-[#E4E4E7]">
-              <tr v-for="row in upstreamRows" :key="row.server" class="hover:bg-[#FAFAFA]">
-                <td class="px-4 py-2.5 font-mono-data font-medium text-[#09090B] whitespace-nowrap">
-                  {{ row.server }}
-                </td>
-                <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(row.calls) }}</td>
-                <td class="px-4 py-2.5 text-right tabular-nums text-[#0F766E] whitespace-nowrap">{{ formatInt(row.codemode_calls) }}</td>
-                <td class="px-4 py-2.5 text-right tabular-nums text-[#2563EB] whitespace-nowrap">{{ formatInt(row.classic_calls) }}</td>
-                <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(row.raw_bytes) }}</td>
-                <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ row.avg_duration_ms.toFixed(1) }} ms</td>
-                <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(row.abac_rows_filtered) }}</td>
-                <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(row.redactions_count) }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
+        <p v-else-if="analyticsData" class="mt-3 text-xs text-[#71717A]">No Code Mode or Classic MCP executions recorded yet. Send requests to <code class="font-mono-data">/mcp</code> or start Demo Control traffic.</p>
+        <p v-else class="mt-3 text-xs text-[#71717A]">Usage data could not be loaded. Refresh the summary to check again.</p>
+        <p v-if="otherModeRunCount > 0" class="mt-3 text-[11px] text-[#71717A]">{{ formatInt(otherModeRunCount) }} other or Hybrid requests excluded.</p>
+        <NuxtLink to="/analytics" class="mt-3 inline-flex min-h-11 items-center text-xs font-medium text-[#0F766E] underline underline-offset-2">Review traffic by group in Gateway Usage</NuxtLink>
       </section>
     </template>
   </div>

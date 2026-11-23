@@ -86,6 +86,13 @@ const limitOptions = [
   { value: "100", label: "100 per page" },
 ];
 
+const statusFilterLabels = {
+  all: "All runs",
+  errors: "Errors only",
+  grounding_blocked: "Grounding blocked",
+  ok: "Succeeded",
+} as const;
+
 const modeFilterOptions = [
   { value: "all", label: "All Modes" },
   { value: "codemode", label: "Code Mode (Deferred)" },
@@ -170,6 +177,37 @@ function setStatusFilter(val: "all" | "errors" | "grounding_blocked" | "ok") {
   void fetchRuns(true);
 }
 
+const filterSummary = computed(() => {
+  const scope = tenantFilter.value.trim()
+    ? `Tenant ${tenantFilter.value.trim()}`
+    : "Default tenant scope";
+  const mode = modeFilterOptions.find((option) => option.value === modeFilter.value)?.label || "All modes";
+  const search = searchQuery.value.trim();
+  return [
+    `Tenant: ${scope}`,
+    `Status: ${statusFilterLabels[statusFilter.value]}`,
+    `Mode: ${mode}`,
+    search ? `Search: “${search}”` : "No search text",
+  ].join(" · ");
+});
+
+const hasActiveFilters = computed(() =>
+  statusFilter.value !== "all"
+  || modeFilter.value !== "all"
+  || Boolean(searchQuery.value.trim())
+  || Boolean(tenantFilter.value.trim())
+);
+
+function clearFilters() {
+  if (searchDebounce) clearTimeout(searchDebounce);
+  const hasTextFilters = Boolean(searchQuery.value.trim() || tenantFilter.value.trim());
+  searchQuery.value = "";
+  tenantFilter.value = "";
+  statusFilter.value = "all";
+  modeFilter.value = "all";
+  if (!hasTextFilters) void fetchRuns(true);
+}
+
 function prevPage() {
   const step = Number.parseInt(limitFilter.value || "25", 10) || 25;
   offset.value = Math.max(0, offset.value - step);
@@ -197,7 +235,11 @@ async function inspectRun(runId: string) {
 async function confirmPrune() {
   errorMessage.value = "";
   statusMessage.value = "";
-  const days = Math.max(0, Number.parseInt(retentionDays.value || "30", 10) || 30);
+  const days = parsedRetentionDays.value;
+  if (days === null) {
+    errorMessage.value = "Enter a whole number from 0 to 3,650 days.";
+    return;
+  }
   try {
     const res = await apiFetch<{ deleted_runs: number; retention_days: number }>(
       `/admin/audit/prune?retention_days=${days}`,
@@ -209,6 +251,97 @@ async function confirmPrune() {
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
   }
+}
+
+const parsedRetentionDays = computed(() => {
+  const raw = retentionDays.value.trim();
+  if (!/^\d+$/.test(raw)) return null;
+  const days = Number.parseInt(raw, 10);
+  return days <= 3650 ? days : null;
+});
+
+const pruneCutoffPreview = computed(() => {
+  const days = parsedRetentionDays.value;
+  if (days === null) return "Enter a whole number from 0 to 3,650 days to see the retention cutoff.";
+  if (days === 0) return "All audit runs currently stored in this gateway will be deleted.";
+  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const date = new Intl.DateTimeFormat("en-GB", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone: "UTC",
+  }).format(cutoff);
+  return `Runs older than about ${date} UTC will be deleted from this gateway's audit store.`;
+});
+
+function runOutcomeLabel(run: AuditRun): string {
+  return run.ok ? "Succeeded" : "Failed";
+}
+
+function runOutcomeClass(run: AuditRun): string {
+  return run.ok
+    ? "border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]"
+    : "border-[#FECACA] bg-[#FEF2F2] text-[#DC2626]";
+}
+
+function groundingStatusLabel(run: AuditRun): string {
+  if (run.grounding_blocked) return "Blocked";
+  if (run.provenance?.grounded === true) return "Verified";
+  if (run.provenance?.grounded === false) return "Not verified";
+  return "Not supplied";
+}
+
+function groundingStatusClass(run: AuditRun): string {
+  if (run.provenance?.grounded === false) return "text-[#DC2626]";
+  if (run.grounding_blocked) return "text-[#92400E]";
+  if (run.provenance?.grounded === true) return "text-[#059669]";
+  return "text-[#71717A]";
+}
+
+function modeLabel(mode?: string | null): string {
+  if (mode === "codemode") return "Code Mode (deferred)";
+  if (mode === "codemode_upfront") return "Code Mode (upfront)";
+  if (mode === "traditional_discover") return "Classic (discover tools)";
+  if (mode === "traditional" || mode === "classic") return "Classic (upfront)";
+  if (mode === "hybrid") return "Hybrid";
+  return "the recorded mode";
+}
+
+function decisionExplanation(run: AuditRun): string {
+  const reason = run.mode_decision_reason?.trim() || "";
+  if (reason.startsWith("explicit:")) {
+    return `The request explicitly selected ${modeLabel(reason.slice("explicit:".length))}.`;
+  }
+  const autoMatch = reason.match(/^auto:(.+?)->([^;]+)$/);
+  if (autoMatch) return `Auto selected ${modeLabel(autoMatch[2])} for this request.`;
+  if (reason.startsWith("auto->")) {
+    return `Auto selected ${modeLabel(reason.slice("auto->".length).split(";")[0])} for this request.`;
+  }
+  if (reason.startsWith("adaptive_recommendation:")) {
+    const mode = reason.split(":").at(-1)?.split(";")[0];
+    return `Adaptive routing selected ${modeLabel(mode)} based on paired run evidence.`;
+  }
+  if (reason.startsWith("adaptive_")) {
+    return "Adaptive routing details are available in Raw Audit JSON.";
+  }
+  if (!reason) return `Applied ${modeLabel(run.mode)}; no selection reason was recorded.`;
+  return `Routing details are available in Raw Audit JSON. Applied ${modeLabel(run.mode)}.`;
+}
+
+function subcallStatusLabel(status?: string | null): string {
+  if (!status) return "Not reported";
+  const normalized = status.toLowerCase();
+  if (normalized === "ok" || normalized === "succeeded" || normalized === "success") return "Succeeded";
+  if (normalized === "error" || normalized === "failed" || normalized === "failure") return "Failed";
+  if (normalized === "blocked") return "Blocked";
+  return status;
+}
+
+function subcallStatusClass(status?: string | null): string {
+  const normalized = status?.toLowerCase();
+  if (normalized === "ok" || normalized === "succeeded" || normalized === "success") return "text-[#059669]";
+  if (normalized === "error" || normalized === "failed" || normalized === "failure") return "text-[#DC2626]";
+  if (normalized === "blocked") return "text-[#92400E]";
+  return "text-[#71717A]";
 }
 
 function reductionCredit(run: AuditRun): number {
@@ -364,14 +497,15 @@ function spanBarColor(stage: string, status: string) {
         </Field>
 
         <Field>
-          <FieldLabel>Tenant Scope (Admin override)</FieldLabel>
+          <FieldLabel>Tenant filter</FieldLabel>
           <Input v-model="tenantFilter" placeholder="Leave blank for default scope" />
+          <FieldDescription>Blank uses your default tenant. Enter a tenant ID to narrow this run list; it does not limit retention pruning.</FieldDescription>
         </Field>
       </div>
-      <div class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 text-xs text-[#52525B]">
-        <span class="font-medium text-[#09090B]">Detection Guide:</span>
-        <strong class="text-[#DC2626]">Errors Only</strong> shows failed upstream calls, RBAC/ABAC policy denials, or Monty syntax/runtime errors (<code class="font-mono-data">ok = false</code>).
-        <strong class="text-[#92400E]">Grounding Blocked</strong> isolates Code Mode runs where output verification caught ungrounded numbers/IDs that did not originate from any upstream subcall (<code class="font-mono-data">grounding_blocked = true</code>).
+      <div class="border-t border-[#E4E4E7] pt-3 text-xs leading-5 text-[#52525B]">
+        <span class="font-medium text-[#09090B]">Run filters:</span>
+        <strong class="text-[#DC2626]">Errors</strong> are requests that failed, including upstream, access-policy, or code errors.
+        <strong class="text-[#92400E]">Grounding blocked</strong> means Code Mode stopped output that could not be checked against upstream results.
       </div>
     </section>
 
@@ -396,13 +530,24 @@ function spanBarColor(stage: string, status: string) {
 
     <section v-else class="rounded-lg border border-[#E4E4E7] bg-white">
       <div class="border-b border-[#E4E4E7] px-4 py-3">
-        <h2 class="text-[15px] font-semibold text-[#09090B]">
-          Execution Log ({{ runs.length }})
-        </h2>
+        <div class="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <h2 class="text-[15px] font-semibold text-[#09090B]">Audit runs ({{ runs.length }})</h2>
+            <p class="mt-1 break-words text-xs leading-5 text-[#52525B]" aria-live="polite">
+              Scope and filters: {{ filterSummary }}
+            </p>
+          </div>
+          <Button v-if="hasActiveFilters" class="min-h-11 px-3 text-xs" @click="clearFilters">Clear filters</Button>
+        </div>
       </div>
 
       <div v-if="runs.length === 0" class="p-8 text-center text-[13px] text-[#71717A]">
-        No audit runs recorded in this tenant scope yet.
+        <template v-if="hasActiveFilters">
+          No runs match these filters. Clear filters or change your search.
+        </template>
+        <template v-else>
+          No audit runs are recorded in this tenant scope yet.
+        </template>
       </div>
 
       <div v-else class="overflow-x-auto table-scroll">
@@ -412,7 +557,7 @@ function spanBarColor(stage: string, status: string) {
               <th class="px-4 py-2.5 whitespace-nowrap">Run ID</th>
               <th class="px-4 py-2.5 whitespace-nowrap">Mode</th>
               <th class="px-4 py-2.5 whitespace-nowrap">Caller / Groups</th>
-              <th class="px-4 py-2.5 whitespace-nowrap">Status</th>
+              <th class="px-4 py-2.5 whitespace-nowrap">Run result</th>
               <th class="px-4 py-2.5 whitespace-nowrap text-right">Subcalls</th>
               <th class="px-4 py-2.5 whitespace-nowrap text-right">Estimated token reduction</th>
               <th class="px-4 py-2.5 whitespace-nowrap text-right">Duration</th>
@@ -434,16 +579,11 @@ function spanBarColor(stage: string, status: string) {
               <td class="px-4 py-2.5 whitespace-nowrap">
                 <span
                   class="rounded border px-2 py-0.5 text-xs font-medium"
-                  :class="
-                    r.grounding_blocked
-                      ? 'border-[#FDE68A] bg-[#FFFBEB] text-[#92400E]'
-                      : r.ok
-                        ? 'border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]'
-                        : 'border-[#FECACA] bg-[#FEF2F2] text-[#DC2626]'
-                  "
+                  :class="runOutcomeClass(r)"
                 >
-                  {{ r.grounding_blocked ? "grounding blocked" : r.ok ? "ok" : "error" }}
+                  {{ runOutcomeLabel(r) }}
                 </span>
+                <span v-if="r.grounding_blocked" class="mt-1 block text-[11px] text-[#92400E]">Grounding check blocked</span>
               </td>
               <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ r.subcall_count }}</td>
               <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap" :class="reductionCredit(r) > 0 ? 'text-[#0F766E]' : 'text-[#71717A]'" :title="reductionCreditNote(r)">
@@ -474,16 +614,11 @@ function spanBarColor(stage: string, status: string) {
           </Button>
         </div>
       </div>
-      <div class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 text-xs text-[#52525B]">
-        <span class="font-medium text-[#09090B]">Detection Guide:</span>
-        <strong class="text-[#DC2626]">Errors Only</strong> shows failed upstream calls, RBAC/ABAC policy denials, or Monty syntax/runtime errors (<code class="font-mono-data">ok = false</code>).
-        <strong class="text-[#92400E]">Grounding Blocked</strong> isolates Code Mode runs where output verification caught ungrounded numbers/IDs that did not originate from any upstream subcall (<code class="font-mono-data">grounding_blocked = true</code>).
-      </div>
     </section>
 
     <Drawer v-model:open="drawerOpen" side="right">
       <DrawerBackdrop />
-      <DrawerContent class="w-full max-w-[95vw] sm:w-[36rem] p-0">
+      <DrawerContent class="w-screen max-w-[36rem] p-0">
         <div class="flex items-center justify-between border-b border-[#E4E4E7] bg-[#FAFAFA] px-5 py-4">
           <div class="min-w-0">
             <div class="flex items-center gap-2">
@@ -493,28 +628,30 @@ function spanBarColor(stage: string, status: string) {
               <span
                 v-if="selectedRun"
                 class="rounded border px-2 py-0.5 text-[11px] font-medium"
-                :class="
-                  selectedRun.grounding_blocked
-                    ? 'border-[#FDE68A] bg-[#FFFBEB] text-[#92400E]'
-                    : selectedRun.ok
-                      ? 'border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]'
-                      : 'border-[#FECACA] bg-[#FEF2F2] text-[#DC2626]'
-                "
+                :class="runOutcomeClass(selectedRun)"
               >
-                {{ selectedRun.grounding_blocked ? "Grounding Blocked" : selectedRun.ok ? "Succeeded" : "Error" }}
+                {{ runOutcomeLabel(selectedRun) }}
               </span>
             </div>
             <DrawerDescription class="mt-0.5 truncate text-xs text-[#52525B]">
               {{ selectedRun?.mode }} · {{ selectedRun?.user_email || selectedRun?.user_sub }}
             </DrawerDescription>
           </div>
-          <DrawerClose aria-label="Close inspector" class="px-2">
+          <DrawerClose aria-label="Close inspector" class="min-h-[44px] min-w-[44px] shrink-0 rounded-md px-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">
             <AppIcon name="x" :size="16" />
           </DrawerClose>
         </div>
 
-        <div v-if="selectedRun" class="min-h-0 flex-1 space-y-6 overflow-y-auto p-5 text-xs">
-          <dl class="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4">
+        <div v-if="selectedRun" class="min-h-0 flex-1 space-y-6 overflow-y-auto p-4 text-xs sm:p-5">
+          <dl class="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3">
+            <div class="border-b border-[#E4E4E7] pb-2 sm:border-b-0 sm:border-r sm:pr-3">
+              <dt class="text-[11px] text-[#71717A]">Run result</dt>
+              <dd class="mt-1 text-sm font-semibold" :class="selectedRun.ok ? 'text-[#059669]' : 'text-[#DC2626]'">{{ runOutcomeLabel(selectedRun) }}</dd>
+            </div>
+            <div class="border-b border-[#E4E4E7] pb-2 sm:border-b-0 sm:border-r sm:pr-3">
+              <dt class="text-[11px] text-[#71717A]">Grounding check</dt>
+              <dd class="mt-1 text-sm font-semibold" :class="groundingStatusClass(selectedRun)">{{ groundingStatusLabel(selectedRun) }}</dd>
+            </div>
             <div class="border-b border-[#E4E4E7] pb-2 sm:border-b-0 sm:border-r sm:pr-3">
               <dt class="text-[11px] text-[#71717A]">Duration</dt>
               <dd class="mt-1 text-sm font-semibold tabular-nums text-[#09090B]">{{ selectedRun.duration_ms.toFixed(1) }} ms</dd>
@@ -580,15 +717,9 @@ function spanBarColor(stage: string, status: string) {
 
           <section class="grid grid-cols-2 gap-x-5 gap-y-4 border-t border-[#E4E4E7] pt-4">
             <div>
-              <div class="text-[#71717A]">Grounded Provenance</div>
-              <div class="mt-0.5 font-semibold" :class="selectedRun.provenance?.grounded === true ? 'text-[#059669]' : selectedRun.provenance?.grounded === false ? 'text-[#DC2626]' : 'text-[#52525B]'">
-                {{ selectedRun.provenance?.grounded === true ? "Grounding verified" : selectedRun.provenance?.grounded === false ? "Verification failed" : "Not supplied" }}
-              </div>
-            </div>
-            <div>
-              <div class="text-[#71717A]">Decision Attribution</div>
-              <div class="mt-0.5 text-[#09090B]">
-                {{ selectedRun.mode_decision_reason || "explicit" }}
+              <div class="text-[#71717A]">How mode was selected</div>
+              <div class="mt-0.5 leading-5 text-[#09090B]">
+                {{ decisionExplanation(selectedRun) }}
               </div>
             </div>
             <div>
@@ -624,25 +755,18 @@ function spanBarColor(stage: string, status: string) {
             <pre class="overflow-x-auto rounded border border-[#E4E4E7] bg-[#FAFAFA] p-3 font-mono-data text-xs text-[#09090B]">{{ selectedRun.code }}</pre>
           </section>
 
-          <section v-if="selectedRun.subcalls?.length" class="space-y-1.5 border-t border-[#E4E4E7] pt-4">
+          <section v-if="selectedRun.subcalls?.length" class="min-w-0 space-y-1.5 border-t border-[#E4E4E7] pt-4">
             <div class="font-semibold text-[#09090B]">Upstream Subcalls ({{ selectedRun.subcalls.length }})</div>
-            <div class="overflow-x-auto rounded border border-[#E4E4E7]">
-              <table class="w-full border-collapse text-left text-xs">
-                <thead>
-                  <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-[#52525B]">
-                    <th class="px-2.5 py-1.5">Server / Tool</th>
-                    <th class="px-2.5 py-1.5 text-right">Bytes</th>
-                    <th class="px-2.5 py-1.5 text-right">ms</th>
-                  </tr>
-                </thead>
-                <tbody class="divide-y divide-[#E4E4E7]">
-                  <tr v-for="(sc, idx) in selectedRun.subcalls" :key="idx">
-                    <td class="px-2.5 py-1.5 font-mono-data">{{ sc.server }}.{{ sc.tool }}</td>
-                    <td class="px-2.5 py-1.5 text-right tabular-nums">{{ sc.raw_bytes }}</td>
-                    <td class="px-2.5 py-1.5 text-right tabular-nums">{{ sc.duration_ms.toFixed(1) }}</td>
-                  </tr>
-                </tbody>
-              </table>
+            <div class="divide-y divide-[#E4E4E7] border-y border-[#E4E4E7]">
+              <div v-for="sc in selectedRun.subcalls" :key="`${sc.server}.${sc.tool}.${sc.raw_bytes}.${sc.duration_ms}`" class="grid min-w-0 grid-cols-2 gap-x-3 gap-y-1.5 py-2 sm:grid-cols-[minmax(0,1fr)_auto_auto_auto] sm:items-center">
+                <div class="col-span-2 min-w-0 break-words font-mono-data text-[11px] text-[#09090B] sm:col-span-1">{{ sc.server }}.{{ sc.tool }}</div>
+                <div class="text-[11px]" :class="subcallStatusClass(sc.status)">
+                  <span class="text-[#71717A]">Result:</span> {{ subcallStatusLabel(sc.status) }}
+                </div>
+                <div class="text-right text-[11px] tabular-nums text-[#52525B]">{{ sc.raw_bytes.toLocaleString("en-US") }} bytes</div>
+                <div class="text-right text-[11px] tabular-nums text-[#52525B]">{{ sc.duration_ms.toFixed(1) }} ms</div>
+                <p v-if="sc.error" class="col-span-full break-words text-[11px] leading-5 text-[#DC2626]">{{ sc.error }}</p>
+              </div>
             </div>
           </section>
 
@@ -663,13 +787,19 @@ function spanBarColor(stage: string, status: string) {
         </DialogDescription>
         <Field>
           <FieldLabel>Retention Window (days)</FieldLabel>
-          <Input v-model="retentionDays" inputmode="numeric" />
-          <FieldDescription>Use 0 to delete all recorded runs immediately.</FieldDescription>
+          <Input v-model="retentionDays" type="number" min="0" max="3650" step="1" inputmode="numeric" />
+          <FieldDescription>Use 0 to delete all recorded runs immediately. Enter a whole number up to 3,650.</FieldDescription>
         </Field>
+        <div class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3 text-xs leading-5 text-[#52525B]" aria-live="polite">
+          <p class="font-medium text-[#09090B]">Prune preview</p>
+          <p>{{ pruneCutoffPreview }}</p>
+          <p v-if="parsedRetentionDays !== null" class="mt-1">This action applies to all tenants in the gateway audit store; current list filters do not limit it. The exact deleted count is returned after pruning and is not available as a preview.</p>
+        </div>
         <div class="flex justify-end gap-2 pt-2">
           <DialogClose>Cancel</DialogClose>
           <Button
             data-variant="danger"
+            :disabled="parsedRetentionDays === null"
             data-agent-confirm="Permanently delete aged audit runs from storage?"
             pending-announcement="Pruning runs"
             @click="confirmPrune"

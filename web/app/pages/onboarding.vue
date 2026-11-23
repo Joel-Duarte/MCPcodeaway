@@ -133,11 +133,13 @@ const existingUpstreams = ref<string[]>([]);
 const errorMessage = ref("");
 const statusMessage = ref("");
 const registeredUpstream = ref("");
+const localDemoAvailable = ref(false);
+const localDemoNotice = "This option is available only after the gateway confirms a non-production demo profile. It uses the local HR mock service and does not change gateway network protections.";
 
 const draftName = ref("inventory_api");
 const draftType = ref("openapi");
-const draftUrl = ref("http://localhost:8001");
-const draftSpecUrl = ref("http://localhost:8001/openapi.json");
+const draftUrl = ref("");
+const draftSpecUrl = ref("");
 const draftAuthType = ref("none");
 const draftAuthorizationMode = ref("gateway");
 const draftAudience = ref("");
@@ -217,9 +219,9 @@ const authorizationModeOptions = computed(() => {
 });
 
 const modeOptions = [
-  { value: "auto", label: "Auto — gateway picks per request / per tool (Recommended)" },
-  { value: "codemode", label: "Code Mode for the whole service" },
-  { value: "traditional_discover", label: "Classic MCP for the whole service" },
+  { value: "auto", label: "Auto — gateway chooses for each request (Recommended)" },
+  { value: "codemode", label: "Code Mode — use for this service" },
+  { value: "traditional_discover", label: "Classic MCP — direct tools with deferred discovery" },
 ];
 const toolModeOptions = [
   { value: "inherit", label: "Inherit service mode" },
@@ -255,6 +257,57 @@ const accessPolicyValid = computed(() => {
 const testCallResult = ref<string>("");
 const testCallBusy = ref(false);
 const availableRoles = ref<string[]>([]);
+const existingDraftRegistered = computed(() => existingUpstreams.value.includes(draftName.value.trim()));
+const connectionFieldsValid = computed(() => {
+  const validName = /^[a-z][a-z0-9_]*$/.test(draftName.value.trim());
+  const hasUrl = Boolean(draftUrl.value.trim()) && (sourceKind.value !== "openapi_url" || Boolean(draftSpecUrl.value.trim()));
+  return validName && hasUrl;
+});
+const localHostBlockError = computed(() =>
+  /blocked local\/internal hostname|allowed_upstream_hosts|allowlisted.*host/i.test(errorMessage.value),
+);
+const callerAccessSummary = computed(() => {
+  if (draftAuthorizationMode.value === "upstream") return "The upstream authorizes each user through their user-scoped credential.";
+  if (draftAuthorizationMode.value === "shared_access") return draftAllowAllCallers.value
+    ? "Any authenticated gateway caller can use enabled operations with the shared upstream identity."
+    : "Shared access is selected; review the configured caller scope before saving.";
+  if (draftAllowAllCallers.value) return "Any authenticated gateway caller can use enabled operations.";
+  const roles = [...selectedRoleSet.value];
+  const groups = [...selectedGroupSet.value];
+  return roles.length || groups.length
+    ? `Allowed callers: ${[roles.length ? `roles ${roles.join(", ")}` : "", groups.length ? `groups ${groups.join(", ")}` : ""].filter(Boolean).join("; ")}.`
+    : "No roles or groups selected yet; choose who may use this upstream before saving.";
+});
+const enabledToolsSummary = computed(() => {
+  const enabled = Object.entries(draftToolEffects.value).filter(([, effect]) => effect !== "disabled");
+  if (!enabled.length) return "No operations enabled. Choose only the operations callers need.";
+  return `Enabled operations: ${enabled.map(([name, effect]) => `${name} (${effect})`).join(", ")}.`;
+});
+
+async function loadRuntimeContext() {
+  try {
+    const res = await apiFetch<{ gateway?: { profile?: string; app_env?: string } }>("/admin/telemetry/runtime", {}, true);
+    const profile = String(res.gateway?.profile || "").toLowerCase();
+    const environment = String(res.gateway?.app_env || "").toLowerCase();
+    localDemoAvailable.value = profile.includes("demo") && !/(^|[^a-z])prod(uction)?([^a-z]|$)/.test(environment);
+  } catch {
+    localDemoAvailable.value = false;
+  }
+}
+
+function useLocalDemo() {
+  if (!localDemoAvailable.value) return;
+  draftName.value = "hr_directory_demo";
+  draftUrl.value = "http://mock-backends:8001/hr";
+  draftSpecUrl.value = "http://mock-backends:8001/hr/openapi.json";
+}
+
+function setToolEffect(tool: string, effect: string) {
+  draftToolEffects.value[tool] = effect;
+  if (effect === "write" && !draftToolApprovalMessages.value[tool]?.trim()) {
+    draftToolApprovalMessages.value[tool] = `Confirm this write to ${tool}.`;
+  }
+}
 
 function selectAuthType(value: string) {
   draftAuthType.value = value;
@@ -297,7 +350,7 @@ async function loadRoles() {
   }
 }
 
-onMounted(() => { void loadRoles(); });
+onMounted(() => { void loadRoles(); void loadRuntimeContext(); });
 
 const selectedRoleSet = computed(() => {
   return new Set(
@@ -660,6 +713,10 @@ async function handleInspect() {
   errorMessage.value = "";
   statusMessage.value = "";
   testCallResult.value = "";
+  if (!connectionFieldsValid.value) {
+    errorMessage.value = "Enter an upstream name using lowercase letters, numbers, and underscores, plus the API URL and OpenAPI URL before inspecting.";
+    return;
+  }
   schemaInspectionState.value = "inspecting";
   inspectResult.value = null;
   try {
@@ -708,6 +765,10 @@ async function handleInspect() {
 }
 
 async function handleTestCall(toolName: string) {
+  if (!existingDraftRegistered.value) {
+    errorMessage.value = "Test calls are available after the upstream is saved and registered. Save it in Step 4, then return here to test a read-only operation.";
+    return;
+  }
   testCallBusy.value = true;
   errorMessage.value = "";
   testCallResult.value = "";
@@ -967,7 +1028,11 @@ async function openAgentPrompt() {
   errorMessage.value = "";
   try {
     const res = await apiFetch<{ prompt: string }>("/admin/upstreams/agent-prompt");
-    agentPromptText.value = res.prompt;
+    const canonicalSteps = "1. Connect & Inspect; 2. Access & Execution; 3. Define workflows; 4. Test & Save.";
+    agentPromptText.value = `${res.prompt
+      .replace(/3\.\s*Test\s*&\s*Activate/gi, "3. Define workflows")
+      .replace(/4\.\s*Review\s*&\s*Publish/gi, "4. Test & Save")
+      .trim()}\n\nOnboarding steps in this page: ${canonicalSteps}`;
     promptDialogOpen.value = true;
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
@@ -1103,6 +1168,11 @@ async function copyPromptText() {
       <AppIcon name="alert" :size="16" class="mt-0.5" />
       <span>{{ errorMessage }}</span>
     </div>
+    <div v-if="localHostBlockError" role="note" class="space-y-2 rounded-lg border border-[#FDE68A] bg-[#FFFBEB] px-4 py-3 text-[13px] leading-5 text-[#78350F]">
+      <p><strong>Why this was blocked:</strong> this gateway is running with production network protection, which rejects localhost, private, and internal service addresses.</p>
+      <p>Use an API host reachable under your gateway's existing policy. This page cannot add an allowed host or change SSRF protection.</p>
+      <p v-if="localDemoAvailable && !localHostBlockError">For a local walkthrough, use the verified demo mock option below.</p>
+    </div>
     <div v-if="upstreamsLoadError" role="alert" class="flex flex-col gap-2 rounded-lg border border-[#FECACA] bg-[#FEF2F2] px-4 py-3 text-[13px] text-[#991B1B] sm:flex-row sm:items-center sm:justify-between">
       <span>Could not load gateway registration settings: {{ upstreamsLoadError }}</span>
       <Button class="min-h-11" @click="loadUpstreams">Retry settings lookup</Button>
@@ -1126,7 +1196,7 @@ async function copyPromptText() {
           class="text-xs"
           @click="goToOnboardingStep('policy')"
         >
-          2. Policy &amp; Mode
+          2. Access &amp; Execution
         </Button>
         <Button
           :data-variant="onboardingStep === 'workflows' ? 'primary' : undefined"
@@ -1134,7 +1204,7 @@ async function copyPromptText() {
           class="text-xs"
           @click="goToOnboardingStep('workflows')"
         >
-          3. Build workflows
+          3. Define workflows
         </Button>
         <Button
           :data-variant="onboardingStep === 'publish' ? 'primary' : undefined"
@@ -1193,18 +1263,24 @@ async function copyPromptText() {
 
       <p class="text-xs leading-5 text-[#52525B]">A regular HTTP REST API is enough: provide its base URL plus an OpenAPI document, or define endpoints with the REST builder. The gateway exposes those operations as MCP tools. The API does <strong>not</strong> need to be OpenAI-compatible;</p>
 
+      <div v-if="localDemoAvailable && !localHostBlockError" class="flex flex-col gap-2 rounded border border-[#99F6E4] bg-[#F0FDFA] p-3 sm:flex-row sm:items-center sm:justify-between">
+        <p class="text-xs leading-5 text-[#115E59]">{{ localDemoNotice }}</p>
+        <Button class="min-h-11 shrink-0" @click="useLocalDemo">Use local HR demo API</Button>
+      </div>
+
       <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <Field>
           <FieldLabel>Upstream Name</FieldLabel>
-          <Input v-model="draftName" class="font-mono-data" />
+          <Input v-model="draftName" class="font-mono-data" placeholder="orders_api" />
+          <FieldDescription>Use lowercase letters, numbers, and underscores.</FieldDescription>
         </Field>
         <Field>
           <FieldLabel>Base / MCP Endpoint URL</FieldLabel>
-          <Input v-model="draftUrl" class="font-mono-data text-xs" />
+          <Input v-model="draftUrl" class="font-mono-data text-xs" placeholder="https://api.example.com" />
         </Field>
         <Field v-if="sourceKind === 'openapi_url'" class="sm:col-span-2">
           <FieldLabel>OpenAPI Spec URL</FieldLabel>
-          <Input v-model="draftSpecUrl" class="font-mono-data text-xs" />
+          <Input v-model="draftSpecUrl" class="font-mono-data text-xs" placeholder="https://api.example.com/openapi.json" />
         </Field>
         <Field v-if="sourceKind === 'openapi_inline'" class="sm:col-span-2">
           <FieldLabel>OpenAPI JSON Document</FieldLabel>
@@ -1236,12 +1312,12 @@ async function copyPromptText() {
       </div>
 
       <div class="flex flex-wrap items-center justify-between gap-2 border-t border-[#E4E4E7] pt-4">
-        <Button pending-announcement="Inspecting schema" @click="handleInspect">
+        <Button :disabled="!connectionFieldsValid" pending-announcement="Inspecting schema" @click="handleInspect">
           Inspect Schema
         </Button>
         <div class="flex items-center gap-2">
           <span v-if="schemaInspectionState === 'idle'" class="text-xs text-[#D97706]">
-            Inspect schema first to unlock Policy &amp; Guardrails
+            Enter connection details and inspect to unlock Access &amp; Execution
           </span>
           <span v-else-if="schemaInspectionState === 'inspecting'" role="status" class="text-xs text-[#52525B]">
             Checking the service schema...
@@ -1250,10 +1326,10 @@ async function copyPromptText() {
             Inspection failed. Review the error, then retry.
           </span>
           <span v-else role="status" class="text-xs text-[#0F766E]">
-            Schema verified. Policy &amp; Guardrails are unlocked.
+            Schema verified. Access &amp; Execution is unlocked.
           </span>
           <Button data-variant="primary" :disabled="!schemaVerified" @click="goToOnboardingStep('policy')">
-            Next: Policy &amp; Guardrails
+            Next: Access &amp; Execution
           </Button>
         </div>
       </div>
@@ -1268,6 +1344,7 @@ async function copyPromptText() {
         <p v-if="authDiscoverySummary" class="text-xs leading-5 text-[#52525B]">
           {{ authDiscoverySummary }}
         </p>
+        <p v-if="!existingDraftRegistered" class="text-xs leading-5 text-[#52525B]">Test calls are available after this upstream is registered. Save it in Step 4, then return to verify a read-only operation. Write operations are skipped here to avoid unintended changes.</p>
         <div class="max-h-56 overflow-x-auto overflow-y-auto rounded border border-[#E4E4E7] table-scroll">
           <table class="w-full border-collapse text-left text-xs">
             <thead>
@@ -1289,13 +1366,14 @@ async function copyPromptText() {
                 </td>
                 <td class="px-3 py-2 text-right whitespace-nowrap">
                   <Button
-                    v-if="!t.mutating"
+                    v-if="!t.mutating && existingDraftRegistered"
                     class="px-2 py-0.5 text-[11px]"
                     :disabled="testCallBusy"
                     @click="handleTestCall(t.name)"
                   >
                     Test Call
                   </Button>
+                  <span v-else-if="!t.mutating" class="text-[#71717A]">Available after registration</span>
                   <span v-else class="text-[#71717A]">write skipped</span>
                 </td>
               </tr>
@@ -1452,10 +1530,15 @@ async function copyPromptText() {
         </div>
       </div>
 
+      <div class="rounded border border-[#E4E4E7] bg-white p-3 text-xs leading-5 text-[#52525B]">
+        <p><strong class="text-[#09090B]">Caller access summary:</strong> {{ callerAccessSummary }}</p>
+        <p class="mt-1"><strong class="text-[#09090B]">Operation summary:</strong> {{ enabledToolsSummary }}</p>
+      </div>
+
       <div class="space-y-3 rounded border border-[#E4E4E7] bg-[#FAFAFA] p-4">
         <div>
           <h3 class="text-sm font-semibold text-[#09090B]">Execution mode</h3>
-          <p class="text-xs text-[#52525B]">Pick one mode for the whole service, or leave it on Auto and the gateway decides per tool and per request. Tool overrides below are optional.</p>
+          <p class="text-xs leading-5 text-[#52525B]">Choose how this service should normally run. Per-tool overrides below can pin individual tools to a different mode.</p>
         </div>
         <Select :items="modeOptions" :value="draftPreferredMode" @value-change="(v) => { if (v) draftPreferredMode = String(v) }">
           <SelectTrigger><SelectValue /><AppIcon name="chevron-down" :size="14" /></SelectTrigger>
@@ -1463,13 +1546,22 @@ async function copyPromptText() {
             <SelectItem v-for="m in modeOptions" :key="m.value" :value="m.value">{{ m.label }}<SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator></SelectItem>
           </SelectContent>
         </Select>
+        <p v-if="draftPreferredMode === 'auto'" class="text-xs leading-5 text-[#52525B]">
+          Auto lets the gateway choose for each request. Adaptive recommendations can change that choice only when Adaptive routing is set to Active and the request has a qualified evidence match.
+        </p>
+        <p v-else-if="draftPreferredMode === 'codemode'" class="text-xs leading-5 text-[#52525B]">
+          This sets Code Mode as the service preference. Adaptive routing only applies to Auto requests, so this service preference takes precedence.
+        </p>
+        <p v-else class="text-xs leading-5 text-[#52525B]">
+          This uses Classic MCP direct tool calls and deferred tool discovery for the service. Adaptive routing only applies to Auto requests, so this service preference takes precedence.
+        </p>
         <details v-if="inspectResult" class="rounded border border-[#E4E4E7] bg-white p-3">
           <summary class="min-h-11 cursor-pointer py-2 text-xs font-semibold text-[#09090B] sm:min-h-9">Per-tool execution and confirmation ({{ inspectResult.inspection.tool_count }} tools)</summary>
           <p class="mt-1 text-xs text-[#52525B]">Tools start disabled. Enable each operation deliberately and classify its effect. Writes require caller confirmation. Manager approval workflows are handled by upstream systems and are not configured here. Code Mode cannot invoke gated tools.</p>
           <div class="mt-3 max-h-72 space-y-1.5 overflow-y-auto">
             <div v-for="t in inspectResult.inspection.tools" :key="t.qualified_name" class="grid grid-cols-1 items-start gap-2 border-t border-[#E4E4E7] py-3 sm:grid-cols-[minmax(0,1fr)_minmax(12rem,0.8fr)_minmax(11rem,0.7fr)]">
               <div class="min-w-0"><div class="truncate font-mono-data text-xs text-[#09090B]">{{ t.name }}</div><div class="text-[11px] text-[#71717A]">Upstream reports {{ t.mutating ? "a possible write" : "read-only behavior" }}; classify according to your review.</div></div>
-              <Select :items="toolEffectOptions" :value="draftToolEffects[t.name] || 'disabled'" @value-change="(value) => { if (value) draftToolEffects[t.name] = String(value) }">
+              <Select :items="toolEffectOptions" :value="draftToolEffects[t.name] || 'disabled'" @value-change="(value) => { if (value) setToolEffect(t.name, String(value)) }">
                 <SelectTrigger :aria-label="`Access classification for ${t.name}`" class="min-h-11"><SelectValue /><AppIcon name="chevron-down" :size="14" /></SelectTrigger>
                 <SelectContent><SelectItem v-for="effect in toolEffectOptions" :key="effect.value" :value="effect.value">{{ effect.label }}<SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator></SelectItem></SelectContent>
               </Select>
@@ -1477,7 +1569,11 @@ async function copyPromptText() {
                 <SelectTrigger :aria-label="`Execution mode for ${t.name}`" class="min-h-11"><SelectValue /><AppIcon name="chevron-down" :size="14" /></SelectTrigger>
                 <SelectContent><SelectItem v-for="mode in toolModeOptions" :key="mode.value" :value="mode.value">{{ mode.label }}<SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator></SelectItem></SelectContent>
               </Select>
-              <Input v-if="draftToolEffects[t.name] === 'write'" v-model="draftToolApprovalMessages[t.name]" :aria-label="`Action summary for ${t.name}`" :placeholder="`Confirm this write to ${t.name}.`" maxlength="300" class="min-h-11 text-xs sm:col-span-3" />
+              <Field v-if="draftToolEffects[t.name] === 'write'" class="sm:col-span-3">
+                <FieldLabel>Caller confirmation prompt</FieldLabel>
+                <Input v-model="draftToolApprovalMessages[t.name]" :aria-label="`Caller confirmation prompt for ${t.name}`" :placeholder="`Confirm this write to ${t.name}.`" maxlength="300" class="min-h-11 text-xs" />
+                <FieldDescription>This exact text is shown to the caller before the write runs. Name the change and its target so the caller can review it.</FieldDescription>
+              </Field>
               <div v-if="draftToolEffects[t.name] === 'write'" class="space-y-2 border-t border-[#E4E4E7] pt-3 sm:col-span-3">
                 <label class="flex min-h-11 items-center gap-2 text-xs font-medium text-[#09090B]">
                   <Checkbox
@@ -1584,7 +1680,7 @@ async function copyPromptText() {
 
       <div class="flex flex-wrap items-center justify-between gap-2 border-t border-[#E4E4E7] pt-4">
         <Button @click="goToOnboardingStep('connect')">Back to Connect</Button>
-        <Button data-variant="primary" :disabled="!schemaVerified" @click="goToOnboardingStep('workflows')">Next: Build workflows</Button>
+        <Button data-variant="primary" :disabled="!schemaVerified" @click="goToOnboardingStep('workflows')">Next: Define workflows</Button>
       </div>
     </div>
 
@@ -1592,7 +1688,7 @@ async function copyPromptText() {
       <div class="flex flex-col gap-3 border-b border-[#E4E4E7] pb-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h2 class="text-[15px] font-semibold text-[#09090B]">Step 3 — Define business workflows</h2>
-          <p class="mt-1 max-w-3xl text-[13px] leading-5 text-[#52525B]">Choose tools from this catalog and arrange them to explain the business activity. The displayed order is for people to understand the flow; calls may happen in any order. Required evidence and the terminal result determine whether a run receives credit.</p>
+          <p class="mt-1 max-w-3xl text-[13px] leading-5 text-[#52525B]">Describe a task a worker does, choose the tools involved, and say which successful result proves it is complete. Example: “Find an employee and verify their department” can use list employees, with the returned employee record as the completion result. This workflow describes and measures activity; its display order does not constrain runtime calls.</p>
         </div>
         <Button class="min-h-11 shrink-0" @click="addWorkflowDraft">Add another workflow</Button>
       </div>
@@ -1632,6 +1728,7 @@ async function copyPromptText() {
             <Field class="sm:col-span-2">
               <FieldLabel>What business activity does this measure?</FieldLabel>
               <Input v-model="workflow.description" :aria-label="`Workflow ${workflowIndex + 1} description`" placeholder="Find a customer, update their account, then confirm the saved record." class="min-h-11" />
+              <FieldDescription>Write this as a worker task and outcome. This definition labels successful activity for reporting; it does not create an automated sequence.</FieldDescription>
             </Field>
           </div>
 
@@ -1753,7 +1850,7 @@ async function copyPromptText() {
         </section>
 
         <div class="flex flex-col gap-3 border-t border-[#E4E4E7] pt-4 sm:flex-row sm:items-center sm:justify-between">
-          <Button class="min-h-11" @click="goToOnboardingStep('policy')">Back to Policy</Button>
+          <Button class="min-h-11" @click="goToOnboardingStep('policy')">Back to Access &amp; Execution</Button>
           <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
             <span v-if="workflowPublishMessage" role="status" class="text-sm text-[#0F766E]">{{ workflowPublishMessage }}</span>
             <Button data-variant="primary" class="min-h-11" :disabled="workflowSaveBusy || !dynamicPermitted" pending-announcement="Publishing workflows" @click="handleSaveWorkflows">{{ workflowSaveBusy ? "Publishing workflows…" : "Save and publish workflows" }}</Button>
