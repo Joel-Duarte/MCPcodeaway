@@ -47,6 +47,7 @@ async def run_load_benchmark(
         settings = GatewaySettings(
             auth_mode="dev",
             rate_limit_per_minute=10000,
+            monty_pool_checkout_timeout_seconds=5.0,
             sqlite_path=f"{tmpdir}/load.db",
         )
         dev_keys = LocalDevKeyManager(issuer=settings.oidc_issuer)
