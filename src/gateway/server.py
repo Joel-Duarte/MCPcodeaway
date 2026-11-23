@@ -617,6 +617,7 @@ class GatewayRuntime:
         self._retention_task: asyncio.Task[None] | None = None
         self._upstream_health_task: asyncio.Task[None] | None = None
         self._recovery_worker_task: asyncio.Task[None] | None = None
+        self._demo_auto_golden_task: asyncio.Task[None] | None = None
         self.recovery = OperationRecovery(self)
         self.lifecycle_state = GatewayLifecycleState.NEW
         self._postgres_readiness: bool | None = None
@@ -1154,6 +1155,12 @@ class GatewayRuntime:
             await self.workflow_detector.start()
             if self.settings.effective_profile_name == "demo":
                 await self.demo_traffic.ensure_demo_solutions()
+                if self.settings.demo_auto_golden:
+                    existing_runs = await self.store.list_runs(limit=1)
+                    if not existing_runs:
+                        self._demo_auto_golden_task = asyncio.create_task(
+                            self._run_demo_auto_golden()
+                        )
         except BaseException as exc:
             if isinstance(self.store, PostgresAuditStore) and isinstance(exc, Exception):
                 log_event(
@@ -1165,6 +1172,19 @@ class GatewayRuntime:
             self._transition_lifecycle(GatewayLifecycleState.FAILED)
             raise
         self._transition_lifecycle(GatewayLifecycleState.READY)
+
+    async def _run_demo_auto_golden(self) -> None:
+        try:
+            await self.demo_traffic.golden_run()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_event(
+                "demo.auto_golden_failed",
+                level=logging.WARNING,
+                error_type=type(exc).__name__,
+                detail=str(exc),
+            )
 
     async def is_ready(self) -> bool:
         """Check lifecycle state and required shared dependencies for readiness probes."""
@@ -1206,6 +1226,10 @@ class GatewayRuntime:
         self._transition_lifecycle(GatewayLifecycleState.STOPPING)
         try:
             await self.workflow_detector.stop()
+            if self._demo_auto_golden_task is not None and not self._demo_auto_golden_task.done():
+                self._demo_auto_golden_task.cancel()
+                await asyncio.gather(self._demo_auto_golden_task, return_exceptions=True)
+            self._demo_auto_golden_task = None
             await self.demo_traffic.stop()
             if self._retention_task is not None and not self._retention_task.done():
                 self._retention_task.cancel()

@@ -1,17 +1,14 @@
 <script setup lang="ts">
 import { Button } from "@ui-sdk/vue/button";
-import { Checkbox, CheckboxIndicator } from "@ui-sdk/vue/checkbox";
-import { Drawer, DrawerBackdrop, DrawerClose, DrawerContent, DrawerDescription, DrawerTitle } from "@ui-sdk/vue/drawer";
-import { Field, FieldDescription, FieldLabel } from "@ui-sdk/vue/field";
-import { Input } from "@ui-sdk/vue/input";
-import { Select, SelectContent, SelectItem, SelectItemIndicator, SelectTrigger, SelectValue } from "@ui-sdk/vue/select";
 import { Switch, SwitchThumb } from "@ui-sdk/vue/switch";
-import { Textarea } from "@ui-sdk/vue/textarea";
 import { computed, ref, watch } from "vue";
+import PromptBundleDrawer from "~/components/PromptBundleDrawer.vue";
+import WorkflowEditorDrawer from "~/components/WorkflowEditorDrawer.vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
 
 type Workflow = Record<string, any>;
 type Definition = Record<string, any>;
+
 const props = withDefaults(
   defineProps<{
     upstream: string;
@@ -23,6 +20,7 @@ const props = withDefaults(
   { autoDiscoveryEnabled: true },
 );
 defineEmits<{ (event: "refresh-catalog"): void }>();
+
 const { apiFetch } = useAdminApi();
 const localAutoDiscovery = ref(props.autoDiscoveryEnabled);
 watch(
@@ -47,20 +45,20 @@ async function toggleAutoDiscovery(enabled: boolean) {
     togglingAutoDiscovery.value = false;
   }
 }
+
 const definition = ref<Definition | null>(null);
 const loading = ref(true);
 const loadError = ref("");
-const open = ref(false);
-const editingId = ref<string | null>(null);
-const saving = ref(false);
-const error = ref("");
+const editorOpen = ref(false);
+const promptDrawerOpen = ref(false);
+const editingWorkflow = ref<Workflow | null>(null);
+const promotingCandidate = ref<Record<string, any> | null>(null);
 const statusMessage = ref("");
-const submissionStep = ref<"validate" | "save-draft" | "publish">("validate");
 const opener = ref<HTMLElement | null>(null);
 const discoveredCandidates = ref<Array<Record<string, any>>>([]);
 const discovering = ref(false);
 const discoverError = ref("");
-const promotingCandidateId = ref<string | null>(null);
+
 const dismissCandidate = async (candidate: Record<string, any>) => {
   const candidateId = String(candidate.candidate_id || "");
   if (!candidateId) return;
@@ -76,7 +74,7 @@ const dismissCandidate = async (candidate: Record<string, any>) => {
     discoverError.value = extractErrorMessage(err);
   }
 };
-const form = ref({ id: "", name: "", description: "", tools: [] as string[], requiredTools: [] as string[], evidenceMinCalls: {} as Record<string, number>, evidencePredicates: {} as Record<string, { path: string; type: string }>, completionTool: "", completionPath: "/status", completionType: "non_empty_string", minutes: "", source: "administrator_estimate", effectiveFrom: new Date().toISOString().slice(0, 10), evidenceNote: "" });
+
 const workflows = computed<Workflow[]>(() => definition.value?.workflows ?? []);
 
 const sourceLabels: Record<string, string> = {
@@ -91,95 +89,62 @@ const confidenceLabels: Record<string, string> = {
   sampled: "sampled",
   validated: "validated",
 };
-const confidenceLabel = (confidence: string) => confidenceLabels[confidence] ?? confidence.replaceAll("_", " ");
-
-function validJsonPointer(value: string) {
-  return value === "" || (value.startsWith("/") && !/(~(?![01]))/.test(value));
-}
-
-function validateForm() {
-  const issues: string[] = [];
-  if (!form.value.name.trim()) issues.push("Add a workflow name.");
-  else if (!cleanId(form.value.name)) issues.push("Use a name with letters or numbers so the workflow can get a stable ID.");
-  if (!form.value.description.trim()) issues.push("Describe the business activity in plain language.");
-  if (!form.value.tools.length) issues.push("Choose at least one participating tool.");
-  if (form.value.tools.some((tool) => !props.tools.includes(tool))) issues.push("One or more selected tools are no longer available. Refresh API tools and choose them again.");
-  if (form.value.requiredTools.some((tool) => !form.value.tools.includes(tool))) issues.push("Required evidence must use a participating tool.");
-  if (!form.value.completionTool || !form.value.tools.includes(form.value.completionTool)) issues.push("Choose the participating tool whose result proves this activity completed.");
-  if (!validJsonPointer(form.value.completionPath.trim())) issues.push("Use a valid JSON pointer for the completion result, such as /status. Escape ~ as ~0 and / as ~1.");
-  if (form.value.requiredTools.some((tool) => !Number.isInteger(form.value.evidenceMinCalls[tool] ?? 1) || (form.value.evidenceMinCalls[tool] ?? 1) < 1 || (form.value.evidenceMinCalls[tool] ?? 1) > 10)) issues.push("Set required successful calls to a whole number from 1 to 10.");
-  if (Object.values(form.value.evidencePredicates).some((predicate) => !validJsonPointer(predicate.path.trim()))) issues.push("Use a valid JSON pointer for each required evidence result.");
-  const minutes = Number(form.value.minutes);
-  if (!form.value.minutes.trim() || !Number.isFinite(minutes) || minutes <= 0) issues.push("Enter the manual time in minutes. This baseline is required for the Business Value comparison.");
-  if (!form.value.effectiveFrom) issues.push("Choose the date this baseline became accurate.");
-  return issues;
-}
-
-function validationErrorMessage(err: unknown) {
-  const record = err && typeof err === "object" ? err as Record<string, unknown> : {};
-  const response = record.response && typeof record.response === "object" ? record.response as Record<string, unknown> : {};
-  const data = (record.data && typeof record.data === "object" ? record.data : response._data) as Record<string, unknown> | undefined;
-  const detail = data?.detail;
-  const status = Number(record.statusCode ?? record.status ?? response.status ?? 0);
-  if (Array.isArray(detail)) {
-    const messages = detail.flatMap((item) => {
-      if (!item || typeof item !== "object") return [];
-      const issue = item as Record<string, unknown>;
-      const message = typeof issue.msg === "string" ? issue.msg : typeof issue.message === "string" ? issue.message : "";
-      if (!message) return [];
-      const location = Array.isArray(issue.loc)
-        ? issue.loc.map(String).filter((part) => !["body", "definition"].includes(part)).join(" · ")
-        : "Workflow definition";
-      return [`${location || "Workflow definition"}: ${message}`];
-    });
-    if (messages.length) return messages.join(" ");
-  }
-  if (typeof detail === "string" && detail.trim() && !/^(unprocessable content|validation error)$/i.test(detail.trim())) {
-    return detail.trim();
-  }
-  const message = extractErrorMessage(err);
-  if (status === 422 || /^(unprocessable content|validation error)$/i.test(message.trim())) {
-    if (submissionStep.value === "publish") {
-      return "The definition was validated and saved as a draft, but publication failed. Your entries are still here; retry publishing or refresh the upstream details before trying again.";
-    }
-    if (submissionStep.value === "save-draft") {
-      return "The definition passed validation, but the draft could not be saved. Your entries are still here; retry, or refresh API tools if a selected tool has changed.";
-    }
-    return "The gateway rejected this definition. Check that each selected tool is available, the completion tool is selected above, and its result pointer and expected type match the tool response. Your entries are still here; refresh API tools if a schema changed, then retry.";
-  }
-  return message;
-}
+const confidenceLabel = (confidence: string) =>
+  confidenceLabels[confidence] ?? confidence.replaceAll("_", " ");
 
 async function load() {
-  loading.value = true; loadError.value = "";
+  loading.value = true;
+  loadError.value = "";
   try {
-    const response = await apiFetch<{ current?: Definition | { definition?: Definition } | null }>(`/admin/integration-definitions/${encodeURIComponent(props.upstream)}`);
+    const response = await apiFetch<{ current?: Definition | { definition?: Definition } | null }>(
+      `/admin/integration-definitions/${encodeURIComponent(props.upstream)}`,
+    );
     const current = response.current;
-    definition.value = current && "definition" in current ? current.definition ?? null : current ?? null;
-  } catch (err) { loadError.value = extractErrorMessage(err); }
-  finally { loading.value = false; }
+    definition.value =
+      current && "definition" in current ? current.definition ?? null : current ?? null;
+  } catch (err) {
+    loadError.value = extractErrorMessage(err);
+  } finally {
+    loading.value = false;
+  }
 }
-watch(() => [props.upstream, props.refreshVersion] as const, () => { void load(); }, { immediate: true });
-watch(open, (value, previous) => { if (previous && !value) requestAnimationFrame(() => opener.value?.focus()); });
 
-function cleanId(value: string) { return value.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48); }
+watch(
+  () => [props.upstream, props.refreshVersion] as const,
+  () => {
+    void load();
+  },
+  { immediate: true },
+);
+
+watch(editorOpen, (value, previous) => {
+  if (previous && !value) requestAnimationFrame(() => opener.value?.focus());
+});
+
 function beginCreate(event: MouseEvent) {
   opener.value = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
-  editingId.value = null; promotingCandidateId.value = null; error.value = ""; statusMessage.value = "";
-  form.value = { id: "", name: "", description: "", tools: [], requiredTools: [], evidenceMinCalls: {}, evidencePredicates: {}, completionTool: "", completionPath: "/status", completionType: "non_empty_string", minutes: "", source: "administrator_estimate", effectiveFrom: new Date().toISOString().slice(0, 10), evidenceNote: "" };
-  open.value = true;
+  editingWorkflow.value = null;
+  promotingCandidate.value = null;
+  statusMessage.value = "";
+  editorOpen.value = true;
 }
+
 function beginEdit(workflow: Workflow, event: MouseEvent) {
   opener.value = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
-  editingId.value = workflow.id; promotingCandidateId.value = null; error.value = ""; statusMessage.value = "";
-  form.value = { id: workflow.id, name: workflow.name, description: workflow.description, tools: [...workflow.participating_tools], requiredTools: workflow.required_evidence.map((item: any) => item.tool), evidenceMinCalls: Object.fromEntries(workflow.required_evidence.map((item: any) => [item.tool, item.min_successful_calls])), evidencePredicates: Object.fromEntries(workflow.required_evidence.filter((item: any) => item.result_when).map((item: any) => [item.tool, { path: item.result_when.path, type: item.result_when.type }])), completionTool: workflow.completion.tool, completionPath: workflow.completion.success_when.path, completionType: workflow.completion.success_when.type, minutes: String(workflow.business_value.manual_baseline_minutes ?? ""), source: workflow.business_value.baseline_source, effectiveFrom: workflow.business_value.effective_from, evidenceNote: workflow.business_value.evidence_note ?? "" };
-  open.value = true;
+  editingWorkflow.value = workflow;
+  promotingCandidate.value = null;
+  statusMessage.value = "";
+  editorOpen.value = true;
 }
-function close() { open.value = false; }
+
 async function discoverWorkflows() {
-  discovering.value = true; discoverError.value = ""; error.value = "";
+  discovering.value = true;
+  discoverError.value = "";
   try {
-    const res = await apiFetch<{ candidates?: Array<Record<string, any>> }>(`/admin/integration-definitions/${encodeURIComponent(props.upstream)}/discover`, { method: "POST", body: {} });
+    const res = await apiFetch<{ candidates?: Array<Record<string, any>> }>(
+      `/admin/integration-definitions/${encodeURIComponent(props.upstream)}/discover`,
+      { method: "POST", body: {} },
+    );
     discoveredCandidates.value = res.candidates ?? [];
   } catch (err) {
     discoverError.value = extractErrorMessage(err);
@@ -187,163 +152,132 @@ async function discoverWorkflows() {
     discovering.value = false;
   }
 }
+
 function useDiscoveredCandidate(candidate: Record<string, any>, event: MouseEvent) {
-  const draft = candidate.draft_definition ?? {};
   opener.value = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
-  editingId.value = null;
-  promotingCandidateId.value = String(candidate.candidate_id || "") || null;
-  error.value = "";
-  const reqEv = Array.isArray(draft.required_evidence) ? draft.required_evidence : [];
-  form.value = {
-    id: String(draft.id ?? ""),
-    name: String(draft.name ?? ""),
-    description: String(draft.description ?? ""),
-    tools: Array.isArray(draft.participating_tools) ? [...draft.participating_tools] : [],
-    requiredTools: reqEv.map((item: any) => String(item.tool)),
-    evidenceMinCalls: Object.fromEntries(reqEv.map((item: any) => [item.tool, Number(item.min_successful_calls ?? 1)])),
-    evidencePredicates: Object.fromEntries(reqEv.filter((item: any) => item.result_when).map((item: any) => [item.tool, { path: String(item.result_when.path), type: String(item.result_when.type) }])),
-    completionTool: String(draft.completion?.tool ?? ""),
-    completionPath: String(draft.completion?.success_when?.path ?? "/status"),
-    completionType: String(draft.completion?.success_when?.type ?? "non_empty_string"),
-    minutes: "5",
-    source: "administrator_estimate",
-    effectiveFrom: new Date().toISOString().slice(0, 10),
-    evidenceNote: "Confirmed from auto-discovered workflow candidate.",
-  };
-  open.value = true;
+  editingWorkflow.value = null;
+  promotingCandidate.value = candidate;
+  statusMessage.value = "";
+  editorOpen.value = true;
 }
-function toggleTool(tool: string) {
-  form.value.tools = form.value.tools.includes(tool) ? form.value.tools.filter((item) => item !== tool) : [...form.value.tools, tool];
-  form.value.requiredTools = form.value.requiredTools.filter((item) => form.value.tools.includes(item));
-  if (!form.value.tools.includes(tool)) { delete form.value.evidencePredicates[tool]; delete form.value.evidenceMinCalls[tool]; }
-  if (!form.value.tools.includes(tool)) delete form.value.evidencePredicates[tool];
-  if (!form.value.tools.includes(form.value.completionTool)) form.value.completionTool = "";
+
+async function handleWorkflowSaved(payload: {
+  statusMessage: string;
+  upstream: string;
+  promotedCandidateId?: string | null;
+}) {
+  statusMessage.value = payload.statusMessage;
+  if (payload.promotedCandidateId) {
+    discoveredCandidates.value = discoveredCandidates.value.filter(
+      (cand) => String(cand.candidate_id || "") !== payload.promotedCandidateId,
+    );
+  }
+  await load();
 }
-function toggleRequiredEvidence(tool: string, checked: boolean) {
-  form.value.requiredTools = checked ? [...form.value.requiredTools, tool] : form.value.requiredTools.filter((item) => item !== tool);
-  if (checked) form.value.evidenceMinCalls[tool] ??= 1;
-}
-function toggleEvidencePredicate(tool: string, checked: boolean) {
-  if (checked) form.value.evidencePredicates[tool] = { path: "/status", type: "non_empty_string" };
-  else delete form.value.evidencePredicates[tool];
-}
-async function save() {
-  const issues = validateForm();
-  if (issues.length) { error.value = issues.join(" "); return; }
-  saving.value = true; error.value = "";
-  try {
-    const next = definition.value
-      ? JSON.parse(JSON.stringify(definition.value)) as Definition
-      : {
-        manifest_version: "1.0",
-        integration: { id: cleanId(props.upstream) || "integration", display_name: props.upstream, upstream_name: props.upstream, status: "draft", revision: 1 },
-        tool_refs: [], experiences: [], workflows: [], standalone_tool_values: [], publication: null,
-      } satisfies Definition;
-    const id = editingId.value ?? cleanId(form.value.name);
-    if (!id) throw new Error("Use a name that produces a valid workflow ID.");
-    for (const tool of [...new Set([...form.value.tools, ...next.tool_refs.map((ref: any) => ref.name)])]) {
-      if (!props.tools.includes(tool)) continue;
-      const detail = await apiFetch<{ schema_sha256: string }>(`/admin/upstreams/${encodeURIComponent(props.upstream)}/tools/${encodeURIComponent(tool)}/guidance`);
-      const index = next.tool_refs.findIndex((ref: any) => ref.name === tool);
-      const item = { name: tool, schema_sha256: detail.schema_sha256 };
-      if (index >= 0) next.tool_refs[index] = item; else next.tool_refs.push(item);
-    }
-    const existingWorkflow = next.workflows.find((item: Workflow) => item.id === id);
-    const previousCompletionPredicate = existingWorkflow?.completion?.success_when;
-    const completionPredicate = {
-      ...(previousCompletionPredicate?.type === form.value.completionType ? previousCompletionPredicate : {}),
-      path: form.value.completionPath.trim(), type: form.value.completionType,
-      ...(form.value.completionType === "boolean" ? { equals: true } : {}),
-    };
-    const previousEvidence = new Map<string, any>((existingWorkflow?.required_evidence ?? []).map((item: any) => [item.tool, item]));
-    const workflow = {
-      ...(existingWorkflow ?? {}),
-      id, name: form.value.name.trim(), description: form.value.description.trim(), participating_tools: [...form.value.tools],
-      required_evidence: form.value.requiredTools.map((tool) => {
-        const predicate = form.value.evidencePredicates[tool];
-        const previous = previousEvidence.get(tool);
-        const priorPredicate = previous?.result_when;
-        const resultWhen = predicate?.path.trim()
-          ? { ...(priorPredicate?.path === predicate.path.trim() && priorPredicate?.type === predicate.type ? priorPredicate : {}), path: predicate.path.trim(), type: predicate.type, ...(predicate.type === "boolean" ? { equals: true } : {}) }
-          : undefined;
-        return { ...(previous ?? {}), tool, min_successful_calls: form.value.evidenceMinCalls[tool] ?? 1, ...(resultWhen ? { result_when: resultWhen } : {}) };
-      }),
-      completion: { ...(existingWorkflow?.completion ?? {}), kind: "terminal_tool_result", tool: form.value.completionTool, success_when: completionPredicate },
-      business_value: { ...(existingWorkflow?.business_value ?? {}), manual_baseline_minutes: Number(form.value.minutes), baseline_source: form.value.source, confidence: form.value.source === "administrator_estimate" ? "unvalidated" : form.value.source === "sampled_manual_measurement" ? "sampled" : "validated", effective_from: form.value.effectiveFrom, evidence_note: form.value.evidenceNote.trim() || undefined },
-    };
-    const index = next.workflows.findIndex((item: Workflow) => item.id === id);
-    if (index >= 0) next.workflows[index] = workflow; else next.workflows.push(workflow);
-    next.integration.status = "draft"; next.integration.revision = 1; next.publication = null;
-    submissionStep.value = "validate";
-    await apiFetch("/admin/integration-definitions/validate", { method: "POST", body: { definition: next } });
-    submissionStep.value = "save-draft";
-    const draft = await apiFetch<{ revision: number }>("/admin/integration-definitions/drafts", { method: "POST", body: { definition: next } });
-    submissionStep.value = "publish";
-    await apiFetch(`/admin/integration-definitions/${encodeURIComponent(props.upstream)}/publish`, { method: "POST", body: { revision: draft.revision } });
-    if (promotingCandidateId.value) {
-      const promotedId = promotingCandidateId.value;
-      await apiFetch(`/admin/workflows/discovered/${encodeURIComponent(promotedId)}/promote`, {
-        method: "POST",
-        body: {
-          manual_baseline_minutes: Number(form.value.minutes),
-          baseline_source: form.value.source,
-          effective_from: form.value.effectiveFrom,
-          evidence_note: form.value.evidenceNote.trim() || undefined,
-          publish: false,
-          mark_promoted_only: true,
-        },
-      });
-      discoveredCandidates.value = discoveredCandidates.value.filter(
-        (cand) => String(cand.candidate_id || "") !== promotedId,
-      );
-      promotingCandidateId.value = null;
-    }
-    statusMessage.value = `${editingId.value ? "Updated" : "Published"} “${form.value.name.trim()}”. This definition measures tool-call outcomes; it does not execute a workflow.`;
-    close(); await load();
-  } catch (err) { error.value = validationErrorMessage(err); }
-  finally { saving.value = false; }
+
+async function handleBundleApplied(upstreamName: string) {
+  statusMessage.value = `Applied and published workflow bundle for “${upstreamName || props.upstream}”.`;
+  await load();
 }
 </script>
 
 <template>
-  <section class="mb-3 min-w-0 max-w-[calc(100vw-4rem)] border-b border-zinc-200 pb-3 lg:max-w-none" :aria-label="`Workflow catalog for ${upstream}`">
+  <section
+    class="mb-3 min-w-0 max-w-[calc(100vw-4rem)] border-b border-zinc-200 pb-3 lg:max-w-none"
+    :aria-label="`Workflow catalog for ${upstream}`"
+  >
     <div class="mb-2 flex flex-wrap items-start justify-between gap-2">
       <div class="min-w-0">
         <h3 class="text-[0.9375rem] font-semibold text-zinc-950">Workflow Catalog</h3>
-        <p class="mt-0.5 max-w-3xl text-xs leading-5 text-zinc-600">Business processes measured for this upstream. Listed tool order is descriptive and is not enforced.</p>
+        <p class="mt-0.5 max-w-3xl text-xs leading-5 text-zinc-600">
+          Business processes measured for this upstream. Listed tool order is descriptive and is not
+          enforced.
+        </p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
-        <NuxtLink
-          v-if="canEdit"
-          :to="{ path: '/onboarding', query: { upstream } }"
-          class="inline-flex min-h-9 items-center rounded-md border border-[#E4E4E7] bg-white px-3 text-xs font-medium text-[#09090B] hover:bg-[#F4F4F5]"
-        >
-          Generate Workflows via Prompt
-        </NuxtLink>
         <Button v-if="canEdit" class="min-h-9" @click="beginCreate">Create workflow</Button>
+        <Button v-if="canEdit" class="min-h-9" @click="promptDrawerOpen = true">
+          Generate Workflows via Prompt
+        </Button>
       </div>
     </div>
-    <p v-if="!canEdit" class="mb-2 text-xs text-[#52525B]">Read-only: workflow changes are disabled because dynamic upstream writes are not permitted.</p>
-    <p v-if="statusMessage" role="status" class="mb-2 text-xs leading-5 text-[#0F766E]">{{ statusMessage }}</p>
+
+    <p v-if="!canEdit" class="mb-2 text-xs text-[#52525B]">
+      Read-only: workflow changes are disabled because dynamic upstream writes are not permitted.
+    </p>
+    <p v-if="statusMessage" role="status" class="mb-2 text-xs leading-5 text-[#0F766E]">
+      {{ statusMessage }}
+    </p>
     <div v-if="loading" class="py-3 text-sm text-[#52525B]" role="status">Loading workflows…</div>
-    <div v-else-if="loadError" class="py-2 text-sm text-[#991B1B]" role="alert"><p>{{ loadError }}</p><Button class="mt-2 min-h-11" @click="load">Retry</Button></div>
-    <p v-else-if="!definition" class="py-2 text-sm text-[#52525B]">No integration definition or workflows exist for this upstream yet. Create a workflow to establish its first definition.</p>
-    <p v-else-if="!workflows.length" class="py-2 text-sm text-[#52525B]">No workflows are defined for this upstream.</p>
+    <div v-else-if="loadError" class="py-2 text-sm text-[#991B1B]" role="alert">
+      <p>{{ loadError }}</p>
+      <Button class="mt-2 min-h-11" @click="load">Retry</Button>
+    </div>
+    <p v-else-if="!definition" class="py-2 text-sm text-[#52525B]">
+      No integration definition or workflows exist for this upstream yet. Create a workflow to
+      establish its first definition.
+    </p>
+    <p v-else-if="!workflows.length" class="py-2 text-sm text-[#52525B]">
+      No workflows are defined for this upstream.
+    </p>
     <ul v-else class="grid grid-cols-1 gap-2 xl:grid-cols-2">
-      <li v-for="workflow in workflows" :key="workflow.id" class="rounded-md border border-[#E4E4E7] bg-white p-3">
+      <li
+        v-for="workflow in workflows"
+        :key="workflow.id"
+        class="rounded-md border border-[#E4E4E7] bg-white p-3"
+      >
         <div class="flex flex-wrap items-start justify-between gap-2">
-          <div class="min-w-0"><h4 class="text-sm font-semibold text-[#09090B]">{{ workflow.name }}</h4><p class="break-all font-mono-data text-[11px] text-[#71717A]">{{ workflow.id }}</p></div>
-          <Button v-if="canEdit" class="min-h-9" :aria-label="`Edit ${workflow.name}`" @click="beginEdit(workflow, $event)">Edit</Button>
+          <div class="min-w-0">
+            <h4 class="text-sm font-semibold text-[#09090B]">{{ workflow.name }}</h4>
+            <p class="break-all font-mono-data text-[11px] text-[#71717A]">{{ workflow.id }}</p>
+          </div>
+          <Button
+            v-if="canEdit"
+            class="min-h-9"
+            :aria-label="`Edit ${workflow.name}`"
+            @click="beginEdit(workflow, $event)"
+          >
+            Edit
+          </Button>
         </div>
         <p class="mt-2 text-xs leading-5 text-[#52525B]">{{ workflow.description }}</p>
         <dl class="mt-3 grid gap-x-4 gap-y-2 border-t border-[#E4E4E7] pt-3 text-xs sm:grid-cols-2">
-          <div><dt class="font-medium text-[#71717A]">Calls included</dt><dd class="break-words">{{ workflow.participating_tools.join(", ") }}</dd></div>
-          <div><dt class="font-medium text-[#71717A]">Calls required for completion</dt><dd>{{ workflow.required_evidence.length ? workflow.required_evidence.map((item: any) => `${item.tool} (${item.min_successful_calls} successful)`).join(", ") : "No required calls" }}</dd></div>
-          <div><dt class="font-medium text-[#71717A]">Completion result</dt><dd class="break-words">{{ workflow.completion.tool }} · {{ workflow.completion.success_when.path }} · {{ workflow.completion.success_when.type.replaceAll("_", " ") }}</dd></div>
-          <div><dt class="font-medium text-[#71717A]">Manual baseline</dt><dd class="tabular-nums">{{ workflow.business_value.manual_baseline_minutes }} min · {{ sourceLabel(workflow.business_value.baseline_source) }} ({{ confidenceLabel(workflow.business_value.confidence) }})</dd></div>
+          <div>
+            <dt class="font-medium text-[#71717A]">Calls included</dt>
+            <dd class="break-words">{{ (workflow.participating_tools ?? []).join(", ") }}</dd>
+          </div>
+          <div>
+            <dt class="font-medium text-[#71717A]">Calls required for completion</dt>
+            <dd>
+              {{
+                (workflow.required_evidence ?? []).length
+                  ? (workflow.required_evidence ?? [])
+                      .map((item: any) => `${item.tool} (${item.min_successful_calls} successful)`)
+                      .join(", ")
+                  : "No required calls"
+              }}
+            </dd>
+          </div>
+          <div>
+            <dt class="font-medium text-[#71717A]">Completion result</dt>
+            <dd class="break-words">
+              {{ workflow.completion.tool }} · {{ workflow.completion.success_when.path }} ·
+              {{ workflow.completion.success_when.type.replaceAll("_", " ") }}
+            </dd>
+          </div>
+          <div>
+            <dt class="font-medium text-[#71717A]">Manual baseline</dt>
+            <dd class="tabular-nums">
+              {{ workflow.business_value.manual_baseline_minutes }} min ·
+              {{ sourceLabel(workflow.business_value.baseline_source) }} ({{
+                confidenceLabel(workflow.business_value.confidence)
+              }})
+            </dd>
+          </div>
         </dl>
       </li>
     </ul>
+
     <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
       <div class="flex flex-wrap items-center gap-3">
         <label v-if="canEdit" class="inline-flex min-h-9 items-center gap-2 text-xs text-[#09090B]">
@@ -368,158 +302,61 @@ async function save() {
         Manage &amp; review unconfigured workflows →
       </NuxtLink>
     </div>
-    <p v-if="discoverError" role="alert" class="mt-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">{{ discoverError }}</p>
+
+    <p
+      v-if="discoverError"
+      role="alert"
+      class="mt-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800"
+    >
+      {{ discoverError }}
+    </p>
     <div v-if="discoveredCandidates.length" class="mt-3">
-      <div class="text-xs font-semibold text-[#09090B]">Auto-discovered workflow candidates (confirm human baseline to publish)</div>
+      <div class="text-xs font-semibold text-[#09090B]">
+        Auto-discovered workflow candidates (confirm human baseline to publish)
+      </div>
       <ul class="mt-2 divide-y divide-[#E4E4E7] border-y border-[#E4E4E7]">
-        <li v-for="cand in discoveredCandidates" :key="cand.candidate_id || cand.workflow_slug" class="flex flex-wrap items-center justify-between gap-2 py-2.5 text-xs">
-          <div><span class="font-medium text-[#09090B]">{{ cand.draft_definition?.name || cand.workflow_slug }}</span> <span class="text-[#71717A]">· {{ cand.origin }} · observed <span class="tabular-nums">{{ cand.observed_count }}×</span></span></div>
+        <li
+          v-for="cand in discoveredCandidates"
+          :key="cand.candidate_id || cand.workflow_slug"
+          class="flex flex-wrap items-center justify-between gap-2 py-2.5 text-xs"
+        >
+          <div>
+            <span class="font-medium text-[#09090B]">
+              {{ cand.draft_definition?.name || cand.workflow_slug }}
+            </span>
+            <span class="text-[#71717A]">
+              · {{ cand.origin }} · observed
+              <span class="tabular-nums">{{ cand.observed_count }}×</span>
+            </span>
+          </div>
           <div class="flex flex-wrap items-center gap-2">
-            <Button v-if="canEdit" class="min-h-11" @click="useDiscoveredCandidate(cand, $event)">Review &amp; set baseline</Button>
-            <Button v-if="canEdit" class="min-h-11" @click="dismissCandidate(cand)">Dismiss</Button>
+            <Button v-if="canEdit" class="min-h-11" @click="useDiscoveredCandidate(cand, $event)">
+              Review &amp; set baseline
+            </Button>
+            <Button v-if="canEdit" class="min-h-11" @click="dismissCandidate(cand)">
+              Dismiss
+            </Button>
           </div>
         </li>
       </ul>
     </div>
-    <Drawer v-model:open="open" side="right" prevent-edge-swipe>
-      <DrawerBackdrop />
-      <DrawerContent class="flex h-dvh w-full max-w-[95vw] flex-col gap-0 border-l border-[#E4E4E7] bg-white p-0 sm:w-[38rem]">
-        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-7">
-          <DrawerClose aria-label="Close workflow editor" class="absolute right-4 top-4 inline-flex min-h-11 min-w-11 items-center justify-center rounded-md border border-[#D4D4D8] bg-white hover:bg-[#F4F4F5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"><AppIcon name="x" :size="16" /></DrawerClose>
-          <DrawerTitle>{{ editingId ? "Edit workflow" : "Create workflow" }}</DrawerTitle>
-          <DrawerDescription>Group calls that belong to one business activity and define the evidence that marks it complete. This does not create an executable workflow or change which tools callers can access.</DrawerDescription>
-          <form class="mt-5 min-w-0 space-y-4 pb-2" @submit.prevent="save">
-            <fieldset class="min-w-0 max-w-full space-y-3 rounded-md border border-[#E4E4E7] p-3 sm:p-4">
-              <legend class="px-1 text-sm font-semibold text-[#09090B]">Name the activity</legend>
-              <Field>
-                <FieldLabel for="workflow-name">Workflow name</FieldLabel>
-                <Input id="workflow-name" v-model="form.name" autocomplete="off" required @input="!editingId && (form.id = cleanId(form.name))" />
-                <FieldDescription>Stable ID: {{ editingId || form.id || "generated from name" }}</FieldDescription>
-              </Field>
-              <Field>
-                <FieldLabel for="workflow-description">Business activity</FieldLabel>
-                <Textarea id="workflow-description" v-model="form.description" required />
-                <FieldDescription>Describe the business result in everyday terms.</FieldDescription>
-              </Field>
-            </fieldset>
 
-            <fieldset class="min-w-0 max-w-full space-y-3 rounded-md border border-[#E4E4E7] p-3 sm:p-4">
-              <legend class="px-1 text-sm font-semibold text-[#09090B]">Participating tools</legend>
-              <p class="text-xs leading-5 text-[#52525B]">Select tools that may be attributed to this workflow. Their display order is only for administrator organization.</p>
-              <div class="max-h-52 divide-y divide-[#E4E4E7] overflow-y-auto overflow-x-hidden">
-                <label v-for="tool in tools" :key="tool" class="flex min-h-11 min-w-0 items-center gap-3 break-all py-2 text-xs text-[#09090B] focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-[#0F766E]">
-                  <Checkbox :checked="form.tools.includes(tool)" :aria-label="`Participating tool ${tool}`" @checked-change="() => toggleTool(tool)"><CheckboxIndicator><AppIcon name="check" :size="13" /></CheckboxIndicator></Checkbox>
-                  <span class="min-w-0 break-all">{{ tool }}</span>
-                </label>
-              </div>
-              <p v-if="!tools.length" class="text-xs text-[#71717A]">No tools are available. Refresh the upstream catalog before creating a definition.</p>
-            </fieldset>
+    <WorkflowEditorDrawer
+      v-model:open="editorOpen"
+      :upstream="upstream"
+      :tools="tools"
+      :definition="definition"
+      :editing-workflow="editingWorkflow"
+      :promoting-candidate="promotingCandidate"
+      lock-upstream
+      @saved="handleWorkflowSaved"
+    />
 
-            <fieldset class="min-w-0 max-w-full space-y-3 rounded-md border border-[#E4E4E7] p-3 sm:p-4">
-              <legend class="px-1 text-sm font-semibold text-[#09090B]">Required completion evidence</legend>
-              <p class="text-xs leading-5 text-[#52525B]">Each selected tool call must succeed at least once before this workflow can count. Result matching is optional.</p>
-              <div v-if="form.tools.length" class="divide-y divide-[#E4E4E7]">
-                <div v-for="tool in form.tools" :key="tool" class="py-3 first:pt-0 last:pb-0">
-                  <label class="flex min-h-11 min-w-0 items-center gap-3 break-all text-xs text-[#09090B] focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-[#0F766E]">
-                    <Checkbox :checked="form.requiredTools.includes(tool)" :aria-label="`Required evidence tool ${tool}`" @checked-change="toggleRequiredEvidence(tool, $event === true)"><CheckboxIndicator><AppIcon name="check" :size="13" /></CheckboxIndicator></Checkbox>
-                    <span class="min-w-0 break-all">Require successful call: {{ tool }}</span>
-                  </label>
-                  <div v-if="form.requiredTools.includes(tool)" class="mt-2 space-y-2 pl-8">
-                    <Field>
-                      <FieldLabel :for="`minimum-calls-${cleanId(tool)}`">Minimum successful calls</FieldLabel>
-                      <Input :id="`minimum-calls-${cleanId(tool)}`" :model-value="String(form.evidenceMinCalls[tool] ?? 1)" :aria-label="`Minimum successful calls for ${tool}`" type="number" min="1" max="10" step="1" @update:model-value="form.evidenceMinCalls[tool] = Number($event)" />
-                    </Field>
-                    <label class="flex min-h-11 items-center gap-3 text-xs text-[#09090B] focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-[#0F766E]">
-                      <Checkbox :checked="Boolean(form.evidencePredicates[tool])" :aria-label="`Require result predicate for ${tool}`" @checked-change="toggleEvidencePredicate(tool, $event === true)"><CheckboxIndicator><AppIcon name="check" :size="13" /></CheckboxIndicator></Checkbox>
-                      <span>Also require a matching result</span>
-                    </label>
-                    <div v-if="form.evidencePredicates[tool]" class="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                      <Field class="min-w-0">
-                        <FieldLabel :for="`evidence-path-${cleanId(tool)}`">Result field (JSON pointer)</FieldLabel>
-                        <Input :id="`evidence-path-${cleanId(tool)}`" v-model="form.evidencePredicates[tool].path" :aria-label="`Required evidence result JSON pointer for ${tool}`" placeholder="/status" />
-                      </Field>
-                      <Field class="min-w-0">
-                        <FieldLabel>Expected value type</FieldLabel>
-                        <Select :value="form.evidencePredicates[tool].type" @value-change="(value) => { if (value) form.evidencePredicates[tool].type = String(value) }">
-                          <SelectTrigger :aria-label="`Required evidence result type for ${tool}`" class="min-h-11 min-w-0"><SelectValue /><AppIcon name="chevron-down" :size="14" /></SelectTrigger>
-                          <SelectContent><SelectItem v-for="predicate in ['non_empty_string', 'string', 'boolean', 'object', 'non_empty_object', 'array', 'non_empty_array', 'number', 'integer', 'null']" :key="predicate" :value="predicate">{{ predicate.replaceAll('_', ' ') }}<SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator></SelectItem></SelectContent>
-                        </Select>
-                      </Field>
-                    </div>
-                  </div>
-                </div>
-              </div>
-              <p v-else class="text-xs text-[#71717A]">Choose participating tools first.</p>
-            </fieldset>
-
-            <fieldset class="min-w-0 max-w-full space-y-3 rounded-md border border-[#E4E4E7] p-3 sm:p-4">
-              <legend class="px-1 text-sm font-semibold text-[#09090B]">Terminal completion</legend>
-              <p class="text-xs leading-5 text-[#52525B]">The gateway checks the result of a call you select here; it does not call the tool or sequence the activity for you.</p>
-              <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <Field class="min-w-0">
-                  <FieldLabel>Tool proving completion</FieldLabel>
-                  <Select :value="form.completionTool" @value-change="(value) => { form.completionTool = String(value ?? '') }">
-                    <SelectTrigger aria-label="Tool proving completion" class="min-h-11 min-w-0"><SelectValue placeholder="Choose a tool" /><AppIcon name="chevron-down" :size="14" /></SelectTrigger>
-                    <SelectContent><SelectItem v-for="tool in form.tools" :key="tool" :value="tool">{{ tool }}<SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator></SelectItem></SelectContent>
-                  </Select>
-                </Field>
-                <Field class="min-w-0">
-                  <FieldLabel for="completion-path">Result JSON pointer</FieldLabel>
-                  <Input id="completion-path" v-model="form.completionPath" placeholder="/status" />
-                  <FieldDescription>Example: /status checks a top-level status value.</FieldDescription>
-                </Field>
-                <Field class="min-w-0">
-                  <FieldLabel>Expected result type</FieldLabel>
-                  <Select :value="form.completionType" @value-change="(value) => { if (value) form.completionType = String(value) }">
-                    <SelectTrigger aria-label="Expected completion result type" class="min-h-11 min-w-0"><SelectValue /><AppIcon name="chevron-down" :size="14" /></SelectTrigger>
-                    <SelectContent><SelectItem v-for="predicate in ['non_empty_string', 'string', 'boolean', 'object', 'non_empty_object', 'array', 'non_empty_array', 'number', 'integer', 'null']" :key="predicate" :value="predicate">{{ predicate.replaceAll('_', ' ') }}<SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator></SelectItem></SelectContent>
-                  </Select>
-                </Field>
-              </div>
-            </fieldset>
-
-            <fieldset class="min-w-0 max-w-full space-y-3 rounded-md border border-[#E4E4E7] p-3 sm:p-4">
-              <legend class="px-1 text-sm font-semibold text-[#09090B]">Human baseline</legend>
-              <p class="text-xs leading-5 text-[#52525B]">Enter the time this activity takes without the gateway. This baseline appears in Business Value; estimates remain marked as unvalidated.</p>
-              <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <Field class="min-w-0">
-                  <FieldLabel for="baseline-minutes">Manual workflow time (minutes)</FieldLabel>
-                  <Input id="baseline-minutes" v-model="form.minutes" type="number" min="0.01" step="0.01" required placeholder="For example, 8" />
-                </Field>
-                <Field class="min-w-0">
-                  <FieldLabel>Evidence source</FieldLabel>
-                  <Select :value="form.source" @value-change="(value) => { if (value) form.source = String(value) }">
-                    <SelectTrigger aria-label="Baseline evidence source" class="min-h-11 min-w-0"><SelectValue /><AppIcon name="chevron-down" :size="14" /></SelectTrigger>
-                    <SelectContent><SelectItem value="administrator_estimate">Administrator estimate</SelectItem><SelectItem value="sampled_manual_measurement">Sampled manual measurement</SelectItem><SelectItem value="validated_external_measurement">Validated external measurement</SelectItem></SelectContent>
-                  </Select>
-                  <FieldDescription>{{ form.source === "administrator_estimate" ? "Reported as an unvalidated estimate." : form.source === "sampled_manual_measurement" ? "Reported as a sampled measurement." : "Reported as a validated external measurement." }}</FieldDescription>
-                </Field>
-                <Field class="min-w-0">
-                  <FieldLabel for="baseline-effective">Effective date</FieldLabel>
-                  <Input id="baseline-effective" v-model="form.effectiveFrom" type="date" required />
-                </Field>
-                <Field class="min-w-0 sm:col-span-2">
-                  <FieldLabel for="baseline-note">Evidence note (optional)</FieldLabel>
-                  <Textarea id="baseline-note" v-model="form.evidenceNote" maxlength="1000" placeholder="Where the measurement came from or what it includes" />
-                </Field>
-              </div>
-            </fieldset>
-
-            <div v-if="error" role="alert" class="space-y-1 rounded-md border border-[#FECACA] bg-[#FEF2F2] p-3 text-sm text-[#991B1B]">
-              <p class="font-semibold">Could not publish this workflow definition</p>
-              <p>{{ error }}</p>
-              <p class="text-xs">Your entries are still in this form. Correct the fields above and try again.</p>
-            </div>
-            <div class="sticky bottom-0 flex flex-col-reverse gap-2 border-t border-[#E4E4E7] bg-white py-3 sm:flex-row sm:items-center sm:justify-between">
-              <p class="text-xs leading-5 text-[#52525B]">The gateway validates, saves a draft, then publishes. A failed step leaves this form open.</p>
-              <div class="flex justify-end gap-2">
-                <Button type="button" class="min-h-11" :disabled="saving" @click="close">Cancel</Button>
-                <Button type="submit" class="min-h-11" :disabled="saving" pending-announcement="Validating and publishing workflow">{{ saving ? (submissionStep === "validate" ? "Validating…" : submissionStep === "save-draft" ? "Saving draft…" : "Publishing…") : "Validate and publish" }}</Button>
-              </div>
-            </div>
-          </form>
-        </div>
-      </DrawerContent>
-    </Drawer>
+    <PromptBundleDrawer
+      v-model:open="promptDrawerOpen"
+      focus="workflows"
+      :upstream="upstream"
+      @applied="handleBundleApplied"
+    />
   </section>
 </template>

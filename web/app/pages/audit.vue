@@ -616,10 +616,10 @@ function spanBarColor(stage: string, status: string) {
       </div>
     </section>
 
-    <Drawer v-model:open="drawerOpen" side="right">
+    <Drawer v-model:open="drawerOpen" side="right" prevent-edge-swipe>
       <DrawerBackdrop />
-      <DrawerContent class="w-screen max-w-[36rem] p-0">
-        <div class="flex items-center justify-between border-b border-[#E4E4E7] bg-[#FAFAFA] px-5 py-4">
+      <DrawerContent class="flex h-dvh w-full max-w-[95vw] flex-col gap-0 border-l border-[#E4E4E7] bg-white p-0 sm:w-[36rem]">
+        <div class="flex shrink-0 items-center justify-between border-b border-[#E4E4E7] bg-[#FAFAFA] px-5 py-4">
           <div class="min-w-0">
             <div class="flex items-center gap-2">
               <DrawerTitle class="font-mono-data text-sm font-semibold text-[#09090B]">
@@ -642,7 +642,8 @@ function spanBarColor(stage: string, status: string) {
           </DrawerClose>
         </div>
 
-        <div v-if="selectedRun" class="min-h-0 flex-1 space-y-6 overflow-y-auto p-4 text-xs sm:p-5">
+        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5">
+          <div v-if="selectedRun" class="space-y-6 text-xs">
           <dl class="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3">
             <div class="border-b border-[#E4E4E7] pb-2 sm:border-b-0 sm:border-r sm:pr-3">
               <dt class="text-[11px] text-[#71717A]">Run result</dt>
@@ -774,6 +775,7 @@ function spanBarColor(stage: string, status: string) {
             <summary class="cursor-pointer font-medium text-[#09090B]">Raw Audit JSON</summary>
             <pre class="mt-2 max-h-64 overflow-auto rounded border border-[#E4E4E7] bg-[#FAFAFA] p-3 font-mono-data text-[11px] text-[#09090B]">{{ JSON.stringify(selectedRun, null, 2) }}</pre>
           </details>
+          </div>
         </div>
       </DrawerContent>
     </Drawer>

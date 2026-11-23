@@ -29,6 +29,7 @@ import {
 import { Textarea } from "@ui-sdk/vue/textarea";
 import { computed, ref, watch } from "vue";
 import McpAppHostPreview from "~/components/McpAppHostPreview.vue";
+import PromptBundleDrawer from "~/components/PromptBundleDrawer.vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
 
 const props = defineProps<{
@@ -44,6 +45,8 @@ const loading = ref(true);
 const loadError = ref("");
 const experiences = ref<Array<Record<string, any>>>([]);
 const actionError = ref("");
+const statusMessage = ref("");
+const promptDrawerOpen = ref(false);
 
 const previewOpen = ref(false);
 const previewExperience = ref<Record<string, any> | null>(null);
@@ -53,6 +56,7 @@ const previewBusy = ref(false);
 const editOpen = ref(false);
 const editingId = ref<string | null>(null);
 const saving = ref(false);
+const editDrawerError = ref("");
 const form = ref({
   id: "",
   tool: "",
@@ -133,6 +137,7 @@ function cleanSlug(value: string) {
 function beginCreate() {
   editingId.value = null;
   actionError.value = "";
+  editDrawerError.value = "";
   const firstTool = props.tools[0] || "";
   const slug = cleanSlug(`${firstTool.split("__").pop() || "widget"}_ui`) || "mcp_ui_widget";
   form.value = {
@@ -152,6 +157,7 @@ function beginCreate() {
 function beginEdit(exp: Record<string, any>) {
   editingId.value = String(exp.id || "");
   actionError.value = "";
+  editDrawerError.value = "";
   const comps = Array.isArray(exp.components) ? exp.components : [];
   const heading = comps.find((c: any) => c?.type === "heading");
   const text = comps.find((c: any) => c?.type === "text");
@@ -174,6 +180,7 @@ function beginEdit(exp: Record<string, any>) {
 async function saveExperience() {
   saving.value = true;
   actionError.value = "";
+  editDrawerError.value = "";
   try {
     const id = editingId.value || cleanSlug(form.value.id);
     if (!id || !form.value.tool || !form.value.resource_uri.trim() || !form.value.fallback.trim()) {
@@ -222,10 +229,15 @@ async function saveExperience() {
     editOpen.value = false;
     await load();
   } catch (err) {
-    actionError.value = extractErrorMessage(err);
+    editDrawerError.value = extractErrorMessage(err);
   } finally {
     saving.value = false;
   }
+}
+
+async function handleBundleApplied(upstreamName: string) {
+  statusMessage.value = `Applied and published MCP Apps UI bundle for “${upstreamName || props.upstream}”.`;
+  await load();
 }
 
 function promptRemove(exp: Record<string, any>) {
@@ -263,17 +275,16 @@ async function confirmRemove() {
         </p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
-        <NuxtLink
-          v-if="canEdit"
-          :to="{ path: '/onboarding', query: { upstream } }"
-          class="inline-flex min-h-9 items-center rounded-md border border-[#E4E4E7] bg-white px-3 text-xs font-medium text-[#09090B] hover:bg-[#F4F4F5]"
-        >
-          Generate UI via Prompt
-        </NuxtLink>
         <Button v-if="canEdit && tools.length" @click="beginCreate">Create MCP UI</Button>
+        <Button v-if="canEdit" class="min-h-9" @click="promptDrawerOpen = true">
+          Generate UI via Prompt
+        </Button>
       </div>
     </div>
 
+    <p v-if="statusMessage" role="status" class="mb-2 text-xs leading-5 text-[#0F766E]">
+      {{ statusMessage }}
+    </p>
     <p v-if="actionError" role="alert" class="mb-2 rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
       {{ actionError }}
     </p>
@@ -304,14 +315,21 @@ async function confirmRemove() {
     <Drawer v-model:open="previewOpen" side="right" prevent-edge-swipe>
       <DrawerBackdrop />
       <DrawerContent class="flex h-dvh w-full max-w-[95vw] flex-col gap-0 border-l border-[#E4E4E7] bg-white p-0 sm:w-[44rem]">
-        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-7 space-y-4">
-          <DrawerClose aria-label="Close UI preview" class="absolute right-4 top-4">
+        <div class="shrink-0 flex items-start justify-between gap-3 border-b border-[#E4E4E7] px-5 py-4">
+          <div class="min-w-0 space-y-1">
+            <DrawerTitle>{{ previewExperience ? experienceHeading(previewExperience) : "MCP App UI Preview" }}</DrawerTitle>
+            <DrawerDescription>
+              Interactive host sandbox (<code class="font-mono-data">{{ previewExperience?.resource_uri }}</code>). Submit the form or click Simulate Sample Result to preview live structured cards and tables.
+            </DrawerDescription>
+          </div>
+          <DrawerClose
+            aria-label="Close UI preview"
+            class="inline-flex min-h-9 min-w-9 shrink-0 items-center justify-center rounded-md border border-[#D4D4D8] bg-white text-[#09090B] hover:bg-[#F4F4F5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
+          >
             <AppIcon name="x" :size="16" />
           </DrawerClose>
-          <DrawerTitle>{{ previewExperience ? experienceHeading(previewExperience) : "MCP App UI Preview" }}</DrawerTitle>
-          <DrawerDescription>
-            Interactive host sandbox (<code class="font-mono-data">{{ previewExperience?.resource_uri }}</code>). Submit the form or click Simulate Sample Result to preview live structured cards and tables.
-          </DrawerDescription>
+        </div>
+        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-6 space-y-4">
           <McpAppHostPreview
             v-if="previewOpen && previewExperience"
             :title="experienceHeading(previewExperience)"
@@ -329,15 +347,25 @@ async function confirmRemove() {
     <Drawer v-model:open="editOpen" side="right" prevent-edge-swipe>
       <DrawerBackdrop />
       <DrawerContent class="flex h-dvh w-full max-w-[95vw] flex-col gap-0 border-l border-[#E4E4E7] bg-white p-0 sm:w-[34rem]">
-        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-7">
-          <DrawerClose aria-label="Close MCP UI editor" class="absolute right-4 top-4">
+        <div class="shrink-0 flex items-start justify-between gap-3 border-b border-[#E4E4E7] px-5 py-4">
+          <div class="min-w-0 space-y-1">
+            <DrawerTitle>{{ editingId ? "Edit MCP App UI" : "Create MCP App UI" }}</DrawerTitle>
+            <DrawerDescription>
+              Attach a constrained <code class="font-mono-data">mcpcodeaway-ui/1</code> widget directly to an upstream tool.
+            </DrawerDescription>
+          </div>
+          <DrawerClose
+            aria-label="Close MCP UI editor"
+            class="inline-flex min-h-9 min-w-9 shrink-0 items-center justify-center rounded-md border border-[#D4D4D8] bg-white text-[#09090B] hover:bg-[#F4F4F5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
+          >
             <AppIcon name="x" :size="16" />
           </DrawerClose>
-          <DrawerTitle>{{ editingId ? "Edit MCP App UI" : "Create MCP App UI" }}</DrawerTitle>
-          <DrawerDescription>
-            Attach a constrained <code class="font-mono-data">mcpcodeaway-ui/1</code> widget directly to an upstream tool.
-          </DrawerDescription>
-          <form class="mt-5 min-w-0 space-y-4" @submit.prevent="saveExperience">
+        </div>
+        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-6">
+          <p v-if="editDrawerError" role="alert" class="mb-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
+            {{ editDrawerError }}
+          </p>
+          <form class="min-w-0 space-y-4" @submit.prevent="saveExperience">
             <Field>
               <FieldLabel for="mcp-ui-id">Experience ID</FieldLabel>
               <Input id="mcp-ui-id" v-model="form.id" :disabled="Boolean(editingId)" class="font-mono-data text-xs" required />
@@ -422,5 +450,12 @@ async function confirmRemove() {
         </div>
       </DialogContent>
     </Dialog>
+
+    <PromptBundleDrawer
+      v-model:open="promptDrawerOpen"
+      focus="mcp_ui"
+      :upstream="upstream"
+      @applied="handleBundleApplied"
+    />
   </section>
 </template>

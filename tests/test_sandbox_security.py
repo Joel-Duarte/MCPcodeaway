@@ -13,7 +13,8 @@ from examples.mock_backends import create_mock_backends_app
 from gateway.auth import CallerIdentity, LocalDevKeyManager
 from gateway.config import GatewaySettings
 from gateway.dispatcher import SubcallRecord
-from gateway.sandbox import LocalMontyBackend, SandboxResult
+from gateway.sandbox import LocalMontyBackend, RemoteMontyWorkerBackend, SandboxResult
+from gateway.sandbox_worker import create_sandbox_worker_app
 from gateway.server import create_gateway_app
 from gateway.state import SQLiteAuditStore
 from gateway.upstream_clients import DiscoveredTool
@@ -496,3 +497,111 @@ async def test_call_budget_exhaustion_and_token_unreachability(tmp_path) -> None
             )
             assert not globals_resp.json()["result"]["structuredContent"]["ok"]
     await backend_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sandbox_worker_health_reports_pool_capacity_and_worker_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOSTNAME", "worker-replica-7")
+    worker_app = create_sandbox_worker_app(
+        min_processes=2,
+        max_processes=6,
+        max_concurrent_executions=8,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=worker_app), base_url="http://worker"
+    ) as client:
+        resp = await client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["service"] == "sandbox-worker"
+    assert body["worker_id"] == "worker-replica-7"
+    assert body["min_processes"] == 2
+    assert body["max_processes"] == 6
+    assert body["max_concurrent_executions"] == 8
+    assert "cpu_percent" in body
+    assert "rss_mb" in body
+
+
+@pytest.mark.asyncio
+async def test_remote_monty_worker_backend_round_robins_comma_and_dns_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import socket
+
+    connected_urls: list[str] = []
+
+    class _FakeWs:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        async def __aenter__(self) -> _FakeWs:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def send(self, _payload: str) -> None:
+            return None
+
+        async def recv(self) -> str:
+            return json.dumps(
+                {
+                    "type": "done",
+                    "sandbox_result": SandboxResult(ok=True, result=self.url).model_dump(),
+                }
+            )
+
+    def _fake_connect(url: str, **_kwargs: object) -> _FakeWs:
+        connected_urls.append(url)
+        return _FakeWs(url)
+
+    monkeypatch.setattr("gateway.sandbox.websockets.connect", _fake_connect)
+
+    multi_backend = RemoteMontyWorkerBackend(
+        "ws://127.0.0.1:9001/ws/execute, ws://127.0.0.1:9002/ws/execute"
+    )
+    results = [
+        await multi_backend.execute("1 + 1", external_functions={}, timeout_seconds=1.0)
+        for _ in range(4)
+    ]
+    assert [r.result for r in results] == [
+        "ws://127.0.0.1:9001/ws/execute",
+        "ws://127.0.0.1:9002/ws/execute",
+        "ws://127.0.0.1:9001/ws/execute",
+        "ws://127.0.0.1:9002/ws/execute",
+    ]
+    assert connected_urls == [r.result for r in results]
+
+    connected_urls.clear()
+    loop = asyncio.get_running_loop()
+
+    async def _fake_getaddrinfo(
+        host: str, port: int, **_kwargs: object
+    ) -> list[tuple[object, ...]]:
+        if host == "sandbox-worker":
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.20.0.12", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.20.0.11", port)),
+            ]
+        raise socket.gaierror("unresolved")
+
+    monkeypatch.setattr(loop, "getaddrinfo", _fake_getaddrinfo)
+    dns_backend = RemoteMontyWorkerBackend("ws://sandbox-worker:8002/ws/execute")
+    dns_results = await asyncio.gather(
+        dns_backend.execute("1", external_functions={}, timeout_seconds=1.0),
+        dns_backend.execute("2", external_functions={}, timeout_seconds=1.0),
+        dns_backend.execute("3", external_functions={}, timeout_seconds=1.0),
+    )
+    assert [r.result for r in dns_results] == [
+        "ws://10.20.0.11:8002/ws/execute",
+        "ws://10.20.0.12:8002/ws/execute",
+        "ws://10.20.0.11:8002/ws/execute",
+    ]
+
+    fallback_backend = RemoteMontyWorkerBackend("ws://unknown-worker:8002/ws/execute")
+    fb_res = await fallback_backend.execute("1", external_functions={}, timeout_seconds=1.0)
+    assert fb_res.ok
+    assert fb_res.result == "ws://unknown-worker:8002/ws/execute"

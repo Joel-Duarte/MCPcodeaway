@@ -47,6 +47,8 @@ test("business-value page renders auto-detected episode activity and pending bas
   expect(wrapper.text()).toContain("Passive episodes observed");
   expect(wrapper.text()).toContain("Pending baseline candidates");
   expect(wrapper.text()).toContain("Review & confirm baselines");
+  expect(wrapper.find('a[href="/workflows"]').exists()).toBe(true);
+  expect(wrapper.find('a[href="/onboarding"]').exists()).toBe(false);
   wrapper.unmount();
 });
 

@@ -152,7 +152,8 @@ onMounted(() => { void loadReport(); });
         <details class="mt-3 border-t border-[#E4E4E7] pt-3 text-xs text-[#52525B]"><summary class="min-h-11 cursor-pointer py-3 font-medium text-[#0F766E] underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-[#0F766E]">How estimates and ROI work</summary><div class="space-y-2 pb-2 leading-5"><p>Estimated minutes saved are calculated from the administrator-entered human baseline minus expected review and correction time. Estimated labor value is estimated minutes saved multiplied by the loaded labor cost per hour, divided by 60.</p><p>Gross baseline is not net savings. A dollar ROI requires validated outcome evidence and captured LLM inference, gateway operations, and upstream or vendor costs. This report does not return a dollar ROI amount while those inputs are missing; missing costs are not counted as zero.</p></div></details>
       </div>
       <div v-else-if="!reportError" class="mt-5 rounded-md border border-dashed border-[#D4D4D8] p-6 text-center">
-        <h3 class="text-sm font-semibold text-[#09090B]">No attributed business outcomes yet</h3><p class="mt-1 text-sm text-[#52525B]">Create a workflow during upstream onboarding, choose its catalog tools and completion evidence, and record a human-time baseline. Eligible completions will appear here.</p>
+        <h3 class="text-sm font-semibold text-[#09090B]">No attributed business outcomes yet</h3><p class="mt-1 text-sm text-[#52525B]">Create a workflow on Workflows, choose its catalog tools and completion evidence, and record a human-time baseline. Eligible completions will appear here.</p>
+        <div class="mt-3"><NuxtLink to="/workflows" class="inline-flex min-h-9 items-center rounded-md border border-[#D4D4D8] bg-white px-3.5 text-sm font-medium text-[#09090B] hover:bg-[#F4F4F5]">Go to Workflows</NuxtLink></div>
       </div>
     </section>
 
@@ -162,7 +163,7 @@ onMounted(() => { void loadReport(); });
           <h2 id="auto-activity-heading" class="text-[15px] font-semibold text-[#09090B]">Auto-detected workflow activity</h2>
           <p class="mt-1 text-[13px] text-[#52525B]">Passive workflow episodes are tracked automatically from normal tool calls. Unbaselined discoveries do not receive financial ROI credit until an administrator confirms a manual baseline.</p>
         </div>
-        <NuxtLink to="/onboarding" class="inline-flex min-h-11 items-center rounded-md border border-[#D4D4D8] bg-white px-3.5 text-sm font-medium text-[#09090B] hover:bg-[#F4F4F5]">Review &amp; confirm baselines</NuxtLink>
+        <NuxtLink to="/workflows" class="inline-flex min-h-11 items-center rounded-md border border-[#D4D4D8] bg-white px-3.5 text-sm font-medium text-[#09090B] hover:bg-[#F4F4F5]">Review &amp; confirm baselines</NuxtLink>
       </div>
       <div class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <div class="rounded-md bg-[#F4F4F5] p-3"><div class="text-xs text-[#52525B]">Passive episodes observed</div><div class="mt-1 text-lg font-semibold tabular-nums text-[#09090B]">{{ number(report.episode_summary.total, 0) }}</div></div>

@@ -4,9 +4,17 @@ export type IconName =
   | "x"
   | "overview"
   | "analytics"
+  | "traces"
+  | "operations"
+  | "models"
+  | "business-value"
+  | "workflows"
   | "onboarding"
   | "upstreams"
   | "audit"
+  | "mcp-ui"
+  | "settings"
+  | "demo"
   | "logout"
   | "refresh"
   | "check"
@@ -61,6 +69,29 @@ withDefaults(
       <rect x="10.5" y="6" width="3" height="14" rx=".5" />
       <rect x="16" y="9" width="3" height="11" rx=".5" />
     </template>
+    <template v-else-if="name === 'traces'">
+      <rect x="3" y="4" width="6" height="4" rx="1" />
+      <rect x="9" y="10" width="8" height="4" rx="1" />
+      <rect x="13" y="16" width="8" height="4" rx="1" />
+      <path d="M6 8v4h3M11 14v4h2" />
+    </template>
+    <template v-else-if="name === 'operations'">
+      <path d="M22 12h-4l-3 7-4-14-3 7H2" />
+    </template>
+    <template v-else-if="name === 'models'">
+      <path d="m12 3 8 4.5v9L12 21l-8-4.5v-9z" />
+      <path d="M12 12v9M4 7.5l8 4.5 8-4.5" />
+    </template>
+    <template v-else-if="name === 'business-value'">
+      <path d="M3 17l6-6 4 4 8-8" />
+      <path d="M16 7h5v5" />
+    </template>
+    <template v-else-if="name === 'workflows'">
+      <circle cx="5" cy="12" r="2.5" />
+      <circle cx="19" cy="6" r="2.5" />
+      <circle cx="19" cy="18" r="2.5" />
+      <path d="M7.5 12H11a3 3 0 0 0 3-3V6h2.5M11 12a3 3 0 0 1 3 3v3h2.5" />
+    </template>
     <template v-else-if="name === 'onboarding'">
       <path d="M12 5v14M5 12h14" />
       <rect x="3" y="3" width="18" height="18" rx="2" />
@@ -73,6 +104,18 @@ withDefaults(
     <template v-else-if="name === 'audit'">
       <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
       <path d="M14 2v6h6M8 13h8M8 17h5" />
+    </template>
+    <template v-else-if="name === 'mcp-ui'">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M3 9h18M9 9v11" />
+    </template>
+    <template v-else-if="name === 'settings'">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+    </template>
+    <template v-else-if="name === 'demo'">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="m10 8.5 6 3.5-6 3.5z" />
     </template>
     <template v-else-if="name === 'logout'">
       <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />

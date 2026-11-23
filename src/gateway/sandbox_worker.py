@@ -6,6 +6,7 @@ import asyncio
 import hmac
 import math
 import os
+import socket
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -107,7 +108,15 @@ def create_sandbox_worker_app(
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        return {"status": "ok", "service": "sandbox-worker", **stats.snapshot()}
+        return {
+            "status": "ok",
+            "service": "sandbox-worker",
+            "worker_id": os.getenv("HOSTNAME", socket.gethostname()),
+            "min_processes": min_processes,
+            "max_processes": max_processes,
+            "max_concurrent_executions": max_concurrent_executions,
+            **stats.snapshot(),
+        }
 
     @app.websocket("/ws/execute")
     async def ws_execute(ws: WebSocket) -> None:

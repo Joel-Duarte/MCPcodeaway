@@ -29,6 +29,8 @@ import {
 import { Switch, SwitchThumb } from "@ui-sdk/vue/switch";
 import { Textarea } from "@ui-sdk/vue/textarea";
 import { computed, onMounted, ref } from "vue";
+import PromptBundleDrawer from "~/components/PromptBundleDrawer.vue";
+import WorkflowEditorDrawer from "~/components/WorkflowEditorDrawer.vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
 
 interface WorkflowCatalogEntry {
@@ -88,6 +90,7 @@ const togglingKey = ref("");
 const editDrawerOpen = ref(false);
 const editTarget = ref<WorkflowCatalogEntry | null>(null);
 const editSaving = ref(false);
+const editDrawerError = ref("");
 const editForm = ref({
   name: "",
   description: "",
@@ -102,12 +105,16 @@ const editForm = ref({
 const promoteDrawerOpen = ref(false);
 const promoteTarget = ref<DiscoveredCandidate | null>(null);
 const promoteSaving = ref(false);
+const promoteDrawerError = ref("");
 const promoteForm = ref({
   manual_baseline_minutes: 10,
   baseline_source: "administrator_estimate",
   effective_from: new Date().toISOString().slice(0, 10),
   evidence_note: "Confirmed from discovered workflow candidate.",
 });
+
+const createWorkflowDrawerOpen = ref(false);
+const promptDrawerOpen = ref(false);
 
 const deleteDialogOpen = ref(false);
 const deleteTarget = ref<WorkflowCatalogEntry | null>(null);
@@ -254,6 +261,7 @@ async function toggleWorkflowEnabled(entry: WorkflowCatalogEntry, enabled: boole
 function openEditDrawer(entry: WorkflowCatalogEntry) {
   const wf = entry.workflow;
   const bv = wf.business_value ?? {};
+  editDrawerError.value = "";
   editTarget.value = entry;
   editForm.value = {
     name: String(wf.name ?? ""),
@@ -270,10 +278,33 @@ function openEditDrawer(entry: WorkflowCatalogEntry) {
   editDrawerOpen.value = true;
 }
 
+function onEditConfidenceChange(val: string) {
+  editForm.value.confidence = val;
+  if (val === "validated" && editForm.value.baseline_source === "administrator_estimate") {
+    editForm.value.baseline_source = "validated_external_measurement";
+  } else if (val === "sampled" && editForm.value.baseline_source === "administrator_estimate") {
+    editForm.value.baseline_source = "sampled_manual_measurement";
+  } else if (val === "unvalidated") {
+    editForm.value.baseline_source = "administrator_estimate";
+  }
+}
+
+function onEditBaselineSourceChange(val: string) {
+  editForm.value.baseline_source = val;
+  if (val === "administrator_estimate") {
+    editForm.value.confidence = "unvalidated";
+  } else if (val === "sampled_manual_measurement" && editForm.value.confidence === "unvalidated") {
+    editForm.value.confidence = "sampled";
+  } else if (val === "validated_external_measurement") {
+    editForm.value.confidence = "validated";
+  }
+}
+
 async function saveWorkflowEdit() {
   if (!editTarget.value) return;
   const target = editTarget.value;
   editSaving.value = true;
+  editDrawerError.value = "";
   actionError.value = "";
   try {
     const minutes = Number(editForm.value.manual_baseline_minutes);
@@ -304,7 +335,7 @@ async function saveWorkflowEdit() {
     statusMessage.value = `Updated workflow '${editForm.value.name}'.`;
     await loadCatalog();
   } catch (err) {
-    actionError.value = extractErrorMessage(err);
+    editDrawerError.value = extractErrorMessage(err);
   } finally {
     editSaving.value = false;
   }
@@ -336,6 +367,7 @@ async function performDeleteWorkflow() {
 }
 
 function openPromoteDrawer(cand: DiscoveredCandidate) {
+  promoteDrawerError.value = "";
   promoteTarget.value = cand;
   promoteForm.value = {
     manual_baseline_minutes: 10,
@@ -349,12 +381,19 @@ function openPromoteDrawer(cand: DiscoveredCandidate) {
 async function confirmPromoteCandidate() {
   if (!promoteTarget.value) return;
   promoteSaving.value = true;
+  promoteDrawerError.value = "";
   actionError.value = "";
   try {
     const minutes = Number(promoteForm.value.manual_baseline_minutes);
     if (!Number.isFinite(minutes) || minutes <= 0) {
       throw new Error("Manual baseline minutes must be greater than zero.");
     }
+    const confidence =
+      promoteForm.value.baseline_source === "validated_external_measurement"
+        ? "validated"
+        : promoteForm.value.baseline_source === "sampled_manual_measurement"
+          ? "sampled"
+          : "unvalidated";
     await apiFetch(
       `/admin/workflows/discovered/${encodeURIComponent(promoteTarget.value.candidate_id)}/promote`,
       {
@@ -362,6 +401,7 @@ async function confirmPromoteCandidate() {
         body: {
           manual_baseline_minutes: minutes,
           baseline_source: promoteForm.value.baseline_source,
+          confidence,
           effective_from: promoteForm.value.effective_from,
           evidence_note: promoteForm.value.evidence_note.trim() || undefined,
           publish: true,
@@ -372,10 +412,20 @@ async function confirmPromoteCandidate() {
     statusMessage.value = `Activated workflow '${promoteTarget.value.draft_definition?.name || promoteTarget.value.workflow_slug}'.`;
     await loadCatalog();
   } catch (err) {
-    actionError.value = extractErrorMessage(err);
+    promoteDrawerError.value = extractErrorMessage(err);
   } finally {
     promoteSaving.value = false;
   }
+}
+
+async function handleCreatedWorkflowSaved(payload: { statusMessage: string }) {
+  statusMessage.value = payload.statusMessage;
+  await loadCatalog();
+}
+
+async function handleBundleApplied(upstreamName: string) {
+  statusMessage.value = `Applied and published workflow bundle${upstreamName ? ` for '${upstreamName}'` : ""}.`;
+  await loadCatalog();
 }
 
 async function dismissCandidate(cand: DiscoveredCandidate) {
@@ -429,12 +479,17 @@ async function dismissAllSchemaSuggestions() {
           <AppIcon name="refresh" :size="14" />
           <span>Refresh</span>
         </Button>
-        <NuxtLink
-          to="/onboarding"
-          class="inline-flex min-h-11 items-center rounded-md border border-[#E4E4E7] bg-white px-3 text-[13px] font-medium text-[#09090B] hover:bg-[#F4F4F5] sm:min-h-9"
+        <Button class="min-h-11 sm:min-h-9" @click="promptDrawerOpen = true">
+          Generate Workflows via Prompt
+        </Button>
+        <Button
+          data-variant="primary"
+          class="min-h-11 sm:min-h-9"
+          :disabled="!upstreams.length"
+          @click="createWorkflowDrawerOpen = true"
         >
-          New Onboarding Bundle
-        </NuxtLink>
+          Create Workflow
+        </Button>
       </div>
     </div>
 
@@ -527,10 +582,24 @@ async function dismissAllSchemaSuggestions() {
       <div v-if="loading" class="py-6 text-[13px] text-[#52525B]" role="status">
         Loading workflow catalog…
       </div>
-      <div v-else-if="!filteredWorkflows.length" class="py-6 text-[13px] text-[#52525B]">
-        No workflows configured yet. Paste an agent-generated bundle on
-        <NuxtLink to="/onboarding" class="font-medium text-[#0F766E] underline">Onboarding</NuxtLink>
-        or run discovery above.
+      <div v-else-if="!filteredWorkflows.length" class="py-6 text-[13px] text-[#52525B] space-y-3">
+        <p>
+          No workflows configured yet. Create one directly here, generate an agent bundle via
+          prompt, or run discovery above.
+        </p>
+        <div class="flex flex-wrap items-center gap-2">
+          <Button
+            data-variant="primary"
+            class="min-h-9 text-xs"
+            :disabled="!upstreams.length"
+            @click="createWorkflowDrawerOpen = true"
+          >
+            Create Workflow
+          </Button>
+          <Button class="min-h-9 text-xs" @click="promptDrawerOpen = true">
+            Generate Workflows via Prompt
+          </Button>
+        </div>
       </div>
       <div v-else class="divide-y divide-[#E4E4E7]">
         <div
@@ -740,15 +809,30 @@ async function dismissAllSchemaSuggestions() {
     <Drawer v-model:open="editDrawerOpen" side="right" prevent-edge-swipe>
       <DrawerBackdrop />
       <DrawerContent class="flex h-dvh w-full max-w-[95vw] flex-col gap-0 border-l border-[#E4E4E7] bg-white p-0 sm:w-[36rem]">
-        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-7">
-          <DrawerClose aria-label="Close workflow editor" class="absolute right-4 top-4">
+        <div class="shrink-0 flex items-start justify-between gap-3 border-b border-[#E4E4E7] px-5 py-4">
+          <div class="min-w-0 space-y-1">
+            <DrawerTitle>Edit Workflow Timing &amp; Triggers</DrawerTitle>
+            <DrawerDescription>
+              Adjust manual time assumptions, confidence, active status, or trigger phrases for {{ editTarget?.workflow?.id }}.
+            </DrawerDescription>
+          </div>
+          <DrawerClose
+            aria-label="Close workflow editor"
+            class="inline-flex min-h-9 min-w-9 shrink-0 items-center justify-center rounded-md border border-[#D4D4D8] bg-white text-[#09090B] hover:bg-[#F4F4F5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
+          >
             <AppIcon name="x" :size="16" />
           </DrawerClose>
-          <DrawerTitle>Edit Workflow Timing &amp; Triggers</DrawerTitle>
-          <DrawerDescription>
-            Adjust manual time assumptions, confidence, active status, or trigger phrases for {{ editTarget?.workflow?.id }}.
-          </DrawerDescription>
-          <form class="mt-5 min-w-0 space-y-4" @submit.prevent="saveWorkflowEdit">
+        </div>
+        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-6">
+          <div
+            v-if="editDrawerError"
+            role="alert"
+            class="mb-4 flex items-start gap-2 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-3 py-2.5 text-[12px] text-[#DC2626]"
+          >
+            <AppIcon name="alert" :size="15" class="mt-0.5 shrink-0" />
+            <span>{{ editDrawerError }}</span>
+          </div>
+          <form class="min-w-0 space-y-4" @submit.prevent="saveWorkflowEdit">
           <Field>
             <FieldLabel for="edit-wf-name">Workflow name</FieldLabel>
             <Input id="edit-wf-name" v-model="editForm.name" required />
@@ -775,7 +859,7 @@ async function dismissAllSchemaSuggestions() {
               <Select
                 :items="confidenceOptions"
                 :value="editForm.confidence"
-                @value-change="(val) => { if (val) editForm.confidence = String(val); }"
+                @value-change="(val) => { if (val) onEditConfidenceChange(String(val)); }"
               >
                 <SelectTrigger aria-label="Workflow confidence" class="min-h-10">
                   <SelectValue />
@@ -795,7 +879,7 @@ async function dismissAllSchemaSuggestions() {
             <Select
               :items="baselineSourceOptions"
               :value="editForm.baseline_source"
-              @value-change="(val) => { if (val) editForm.baseline_source = String(val); }"
+              @value-change="(val) => { if (val) onEditBaselineSourceChange(String(val)); }"
             >
               <SelectTrigger aria-label="Baseline source" class="min-h-10">
                 <SelectValue />
@@ -808,6 +892,9 @@ async function dismissAllSchemaSuggestions() {
                 </SelectItem>
               </SelectContent>
             </Select>
+            <FieldDescription>
+              Administrator estimates are unvalidated; external/sampled measurements allow Validated confidence.
+            </FieldDescription>
           </Field>
           <Field>
             <FieldLabel for="edit-wf-intents">Trigger phrases / intents (one per line)</FieldLabel>
@@ -844,15 +931,30 @@ async function dismissAllSchemaSuggestions() {
     <Drawer v-model:open="promoteDrawerOpen" side="right" prevent-edge-swipe>
       <DrawerBackdrop />
       <DrawerContent class="flex h-dvh w-full max-w-[95vw] flex-col gap-0 border-l border-[#E4E4E7] bg-white p-0 sm:w-[32rem]">
-        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-7">
-          <DrawerClose aria-label="Close promotion drawer" class="absolute right-4 top-4">
+        <div class="shrink-0 flex items-start justify-between gap-3 border-b border-[#E4E4E7] px-5 py-4">
+          <div class="min-w-0 space-y-1">
+            <DrawerTitle>Set Human Baseline &amp; Activate</DrawerTitle>
+            <DrawerDescription>
+              Confirm how many minutes a person normally takes to finish '{{ promoteTarget?.draft_definition?.name || promoteTarget?.workflow_slug }}'.
+            </DrawerDescription>
+          </div>
+          <DrawerClose
+            aria-label="Close promotion drawer"
+            class="inline-flex min-h-9 min-w-9 shrink-0 items-center justify-center rounded-md border border-[#D4D4D8] bg-white text-[#09090B] hover:bg-[#F4F4F5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
+          >
             <AppIcon name="x" :size="16" />
           </DrawerClose>
-          <DrawerTitle>Set Human Baseline &amp; Activate</DrawerTitle>
-          <DrawerDescription>
-            Confirm how many minutes a person normally takes to finish '{{ promoteTarget?.draft_definition?.name || promoteTarget?.workflow_slug }}'.
-          </DrawerDescription>
-          <form class="mt-5 min-w-0 space-y-4" @submit.prevent="confirmPromoteCandidate">
+        </div>
+        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-6">
+          <div
+            v-if="promoteDrawerError"
+            role="alert"
+            class="mb-4 flex items-start gap-2 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-3 py-2.5 text-[12px] text-[#DC2626]"
+          >
+            <AppIcon name="alert" :size="15" class="mt-0.5 shrink-0" />
+            <span>{{ promoteDrawerError }}</span>
+          </div>
+          <form class="min-w-0 space-y-4" @submit.prevent="confirmPromoteCandidate">
           <Field>
             <FieldLabel for="promote-minutes">Manual workflow time (minutes)</FieldLabel>
             <Input
@@ -898,6 +1000,21 @@ async function dismissAllSchemaSuggestions() {
         </div>
       </DrawerContent>
     </Drawer>
+
+    <WorkflowEditorDrawer
+      v-model:open="createWorkflowDrawerOpen"
+      :upstreams="upstreams"
+      :upstream="upstreamFilter !== '__all__' ? upstreamFilter : upstreams[0] || ''"
+      @saved="handleCreatedWorkflowSaved"
+    />
+
+    <PromptBundleDrawer
+      v-model:open="promptDrawerOpen"
+      focus="workflows"
+      :upstreams="upstreams"
+      :upstream="upstreamFilter !== '__all__' ? upstreamFilter : upstreams[0] || ''"
+      @applied="handleBundleApplied"
+    />
 
     <Dialog v-model:open="deleteDialogOpen">
       <DialogBackdrop />

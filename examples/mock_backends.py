@@ -1963,6 +1963,25 @@ def create_mock_backends_app(
         ),
     )
 
+    class SimpleListResponse(BaseModel):
+        items: list[dict[str, Any]]
+        count: int
+
+    class SimpleSummaryResponse(BaseModel):
+        service: str
+        total_records: int
+        status: str
+
+    class SimpleHealthResponse(BaseModel):
+        service: str
+        healthy: bool
+        records: int
+
+    class SimpleMetricsResponse(BaseModel):
+        service: str
+        active_items: int
+        latency_p50_ms: float
+
     def _build_simple_enterprise_subapp(
         *,
         title: str,
@@ -1973,21 +1992,24 @@ def create_mock_backends_app(
     ) -> FastAPI:
         sub = FastAPI(title=title, version="1.0.0", servers=[{"url": mount_prefix}])
 
-        @sub.get(path, operation_id=op_id)
-        async def list_items(limit: int = Query(default=25, ge=1, le=100)) -> dict[str, Any]:
-            return {"items": rows[:limit], "count": len(rows[:limit])}
+        @sub.get(path, operation_id=op_id, response_model=SimpleListResponse)
+        async def list_items(
+            limit: int = Query(default=25, ge=1, le=100),
+        ) -> SimpleListResponse:
+            sliced = rows[:limit]
+            return SimpleListResponse(items=sliced, count=len(sliced))
 
-        @sub.get("/summary", operation_id=f"{op_id}_summary")
-        async def get_summary() -> dict[str, Any]:
-            return {"service": title, "total_records": len(rows), "status": "ok"}
+        @sub.get("/summary", operation_id=f"{op_id}_summary", response_model=SimpleSummaryResponse)
+        async def get_summary() -> SimpleSummaryResponse:
+            return SimpleSummaryResponse(service=title, total_records=len(rows), status="ok")
 
-        @sub.get("/health", operation_id=f"{op_id}_health")
-        async def get_health() -> dict[str, Any]:
-            return {"service": title, "healthy": True, "records": len(rows)}
+        @sub.get("/health", operation_id=f"{op_id}_health", response_model=SimpleHealthResponse)
+        async def get_health() -> SimpleHealthResponse:
+            return SimpleHealthResponse(service=title, healthy=True, records=len(rows))
 
-        @sub.get("/metrics", operation_id=f"{op_id}_metrics")
-        async def get_metrics() -> dict[str, Any]:
-            return {"service": title, "active_items": len(rows), "latency_p50_ms": 12.4}
+        @sub.get("/metrics", operation_id=f"{op_id}_metrics", response_model=SimpleMetricsResponse)
+        async def get_metrics() -> SimpleMetricsResponse:
+            return SimpleMetricsResponse(service=title, active_items=len(rows), latency_p50_ms=12.4)
 
         return sub
 

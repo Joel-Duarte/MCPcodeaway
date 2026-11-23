@@ -1,4 +1,13 @@
 <script setup lang="ts">
+import { Button } from "@ui-sdk/vue/button";
+import {
+  Meter,
+  MeterIndicator,
+  MeterLabel,
+  MeterTrack,
+  MeterValue,
+} from "@ui-sdk/vue/meter";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
 
 interface ProcessStats {
@@ -11,6 +20,32 @@ interface ProcessStats {
   total_executions: number;
 }
 
+interface SandboxWorkerPool {
+  min_processes?: number;
+  max_processes?: number;
+  max_concurrent_executions?: number;
+}
+
+interface SandboxWorkerEntry {
+  worker_id?: string;
+  mode: string;
+  status: string;
+  health_url?: string;
+  error?: string;
+  pool?: SandboxWorkerPool;
+  stats?: ProcessStats;
+}
+
+interface MontyTelemetry {
+  ephemeral?: boolean;
+  codemode_runs?: number;
+  grounding_blocked_runs?: number;
+  spawn_p50_ms?: number;
+  spawn_p95_ms?: number;
+  exec_p50_ms?: number;
+  exec_p95_ms?: number;
+}
+
 interface RuntimeTelemetryResponse {
   gateway: ProcessStats & {
     profile: string;
@@ -21,13 +56,24 @@ interface RuntimeTelemetryResponse {
     cache_backend: string;
     store_backend: string;
   };
-  sandbox_worker: {
-    mode: string;
-    status: string;
-    health_url?: string;
-    error?: string;
-    stats?: ProcessStats;
+  sandbox_worker: SandboxWorkerEntry & {
+    worker_count?: number;
+    healthy_count?: number;
   };
+  sandbox_workers?: SandboxWorkerEntry[];
+  monty_telemetry?: MontyTelemetry;
+}
+
+interface UpstreamBreakdownRow {
+  server: string;
+  calls: number;
+  errors?: number;
+  raw_bytes: number;
+  abac_rows_filtered: number;
+  redactions_count: number;
+  classic_calls: number;
+  codemode_calls: number;
+  avg_duration_ms: number;
 }
 
 interface AuditValueResponse {
@@ -51,6 +97,9 @@ interface AuditValueResponse {
     grounded_runs_verified: number;
     grounding_violations_blocked: number;
   };
+  by_upstream?: Record<string, Omit<UpstreamBreakdownRow, "server">>;
+  upstream_breakdown?: UpstreamBreakdownRow[];
+  recommendations?: { server: string; reason: string }[];
 }
 
 interface AnalyticsSummary {
@@ -71,6 +120,52 @@ interface RecoverySummary {
   upstream_health: { status: string }[];
 }
 
+interface BusinessValueReport {
+  completed_count: number;
+  summary?: {
+    estimated_manual_baseline_minutes?: number | null;
+  };
+  by_integration_workflow_day?: {
+    estimated_manual_baseline_minutes?: number | null;
+  }[];
+  totals_by_currency?: Record<
+    string,
+    {
+      completed_count?: number;
+      estimated_manual_baseline_minutes?: number;
+    }
+  >;
+}
+
+interface WorkflowsCatalogResponse {
+  upstreams?: string[];
+  workflows?: {
+    upstream_name: string;
+    workflow?: {
+      id?: string;
+      name?: string;
+      enabled?: boolean;
+    };
+  }[];
+  candidates?: {
+    candidate_id: string;
+    status: string;
+  }[];
+  episodes?: unknown[];
+}
+
+interface GoldenRunResult {
+  evidence_rows?: number;
+  traffic_requests?: number;
+  traffic_errors?: number;
+  recovery_operations_created?: number;
+  business_value_workflow?: {
+    status?: string;
+    completion_count?: number;
+    manual_baseline_minutes?: number;
+  };
+}
+
 const { apiFetch, setRuntimeMeta } = useAdminApi();
 const { status: demoStatus, busy: demoBusy, runBurst } = useDemoTraffic();
 const {
@@ -81,11 +176,6 @@ const {
   alerts: liveAlerts,
   totalRunsTick,
 } = useLiveTelemetry();
-
-async function triggerOverviewBurst() {
-  await runBurst(8);
-  await fetchOverview();
-}
 
 const loading = ref(true);
 const summaryRefreshing = ref(false);
@@ -98,25 +188,71 @@ const runtimeLoading = ref(false);
 const valueData = ref<AuditValueResponse | null>(null);
 const analyticsData = ref<AnalyticsSummary | null>(null);
 const recoveryData = ref<RecoverySummary | null>(null);
+const businessValueData = ref<BusinessValueReport | null>(null);
+const workflowsCatalogData = ref<WorkflowsCatalogResponse | null>(null);
+
+const goldenBusy = ref(false);
+const goldenNotice = ref("");
+const goldenError = ref("");
 
 let refreshDebounce: ReturnType<typeof setTimeout> | null = null;
+
+async function triggerOverviewBurst() {
+  goldenNotice.value = "";
+  goldenError.value = "";
+  await runBurst(8);
+  await fetchOverview();
+}
+
+async function triggerGoldenDemo() {
+  if (goldenBusy.value || demoBusy.value) return;
+  goldenBusy.value = true;
+  goldenNotice.value = "";
+  goldenError.value = "";
+  try {
+    const result = await apiFetch<GoldenRunResult>("/admin/demo/golden-run", {
+      method: "POST",
+      timeout: 60000,
+    });
+    const requests = Number(result?.traffic_requests ?? 0);
+    const evidenceRows = Number(result?.evidence_rows ?? 0);
+    goldenNotice.value = requests || evidenceRows
+      ? `Golden demo completed: ${formatInt(requests)} MCP calls and ${formatInt(evidenceRows)} simulated report rows recorded.`
+      : "Golden demo completed.";
+    await fetchOverview();
+  } catch (err) {
+    goldenError.value = extractErrorMessage(err);
+  } finally {
+    goldenBusy.value = false;
+  }
+}
 
 async function fetchOverview() {
   if (summaryRefreshing.value) return;
   summaryRefreshing.value = true;
   errorMessage.value = "";
   try {
-    const [val, ana] = await Promise.all([
+    const [valRes, anaRes, recRes, bvRes, wfRes] = await Promise.allSettled([
       apiFetch<AuditValueResponse>("/audit/value"),
       apiFetch<AnalyticsSummary>("/audit/analytics"),
+      apiFetch<RecoverySummary>("/admin/operations/metrics", {}, true),
+      apiFetch<BusinessValueReport>("/admin/business-value/report", {}, true),
+      apiFetch<WorkflowsCatalogResponse>("/admin/workflows/catalog", {}, true),
     ]);
-    valueData.value = val;
-    analyticsData.value = ana;
-    summaryUpdatedAt.value = new Date().toISOString();
-    try {
-      recoveryData.value = await apiFetch<RecoverySummary>("/admin/operations/metrics");
-    } catch {
-      recoveryData.value = null;
+
+    valueData.value = valRes.status === "fulfilled" ? valRes.value : null;
+    analyticsData.value = anaRes.status === "fulfilled" ? anaRes.value : null;
+    recoveryData.value = recRes.status === "fulfilled" ? recRes.value : null;
+    businessValueData.value = bvRes.status === "fulfilled" ? bvRes.value : null;
+    workflowsCatalogData.value = wfRes.status === "fulfilled" ? wfRes.value : null;
+
+    if (valRes.status === "fulfilled" || anaRes.status === "fulfilled") {
+      summaryUpdatedAt.value = new Date().toISOString();
+    }
+    if (valRes.status === "rejected") {
+      errorMessage.value = extractErrorMessage(valRes.reason);
+    } else if (anaRes.status === "rejected") {
+      errorMessage.value = extractErrorMessage(anaRes.reason);
     }
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
@@ -174,8 +310,86 @@ onBeforeUnmount(() => {
   }
 });
 
-const workerStats = computed<ProcessStats | null>(() => {
-  return runtimeData.value?.sandbox_worker?.stats || null;
+const normalizedSandboxWorkers = computed<SandboxWorkerEntry[]>(() => {
+  const rt = runtimeData.value;
+  if (!rt) return [];
+  if (Array.isArray(rt.sandbox_workers) && rt.sandbox_workers.length > 0) {
+    return rt.sandbox_workers;
+  }
+  if (rt.sandbox_worker) {
+    return [
+      {
+        worker_id: "primary",
+        ...rt.sandbox_worker,
+      },
+    ];
+  }
+  return [];
+});
+
+const totalWorkerCount = computed(() => {
+  const rt = runtimeData.value;
+  if (!rt) return 0;
+  if (Array.isArray(rt.sandbox_workers) && rt.sandbox_workers.length > 0) {
+    return rt.sandbox_workers.length;
+  }
+  return Math.max(normalizedSandboxWorkers.value.length, rt.sandbox_worker?.worker_count ?? 0);
+});
+
+const healthyWorkerCount = computed(() => {
+  const rt = runtimeData.value;
+  if (!rt) return 0;
+  if (Array.isArray(rt.sandbox_workers) && rt.sandbox_workers.length > 0) {
+    return rt.sandbox_workers.filter((w) => w.status === "ok" || w.status === "in_process").length;
+  }
+  if (typeof rt.sandbox_worker?.healthy_count === "number") {
+    return rt.sandbox_worker.healthy_count;
+  }
+  return normalizedSandboxWorkers.value.filter(
+    (w) => w.status === "ok" || w.status === "in_process",
+  ).length;
+});
+
+const upstreamRows = computed<UpstreamBreakdownRow[]>(() => {
+  if (Array.isArray(valueData.value?.upstream_breakdown)) {
+    return valueData.value.upstream_breakdown;
+  }
+  const entries = Object.entries(valueData.value?.by_upstream || {});
+  return entries.map(([server, info]) => ({ server, ...info }));
+});
+
+const totalWorkflowsCount = computed(() => workflowsCatalogData.value?.workflows?.length ?? 0);
+const activeWorkflowsCount = computed(
+  () =>
+    (workflowsCatalogData.value?.workflows ?? []).filter(
+      (entry) => entry.workflow?.enabled !== false,
+    ).length,
+);
+const pendingCandidatesCount = computed(
+  () =>
+    (workflowsCatalogData.value?.candidates ?? []).filter(
+      (cand) => cand.status === "pending_review",
+    ).length,
+);
+
+const estimatedBaselineMinutes = computed<number | null>(() => {
+  const bv = businessValueData.value;
+  if (!bv) return null;
+  const rows = bv.by_integration_workflow_day;
+  if (Array.isArray(rows) && rows.length > 0) {
+    if (rows.some((row) => row.estimated_manual_baseline_minutes == null)) return null;
+    return rows.reduce((sum, row) => sum + (row.estimated_manual_baseline_minutes ?? 0), 0);
+  }
+  if (typeof bv.summary?.estimated_manual_baseline_minutes === "number") {
+    return bv.summary.estimated_manual_baseline_minutes;
+  }
+  if (bv.totals_by_currency && Object.keys(bv.totals_by_currency).length > 0) {
+    return Object.values(bv.totals_by_currency).reduce(
+      (sum, item) => sum + (item.estimated_manual_baseline_minutes ?? 0),
+      0,
+    );
+  }
+  return 0;
 });
 
 const pairedModeRunCount = computed(() =>
@@ -229,11 +443,31 @@ function workerStatusLabel(status: string): string {
   if (status === "in_process") return "Shared process";
   if (status === "ok") return "Healthy";
   if (status === "unreachable") return "Unreachable";
+  if (status === "degraded") return "Degraded";
   return status;
 }
 
-function isSharedWorker(worker: RuntimeTelemetryResponse["sandbox_worker"]): boolean {
+function workerStatusBadgeClass(status: string): string {
+  if (status === "unreachable") {
+    return "border-[#FECACA] bg-[#FEF2F2] text-[#DC2626]";
+  }
+  if (status === "degraded") {
+    return "border-[#FDE68A] bg-[#FFFBEB] text-[#D97706]";
+  }
+  return "border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]";
+}
+
+function isSharedWorker(worker: SandboxWorkerEntry): boolean {
   return worker.status === "in_process" || worker.mode === "in_process";
+}
+
+function hasPoolConfig(worker: SandboxWorkerEntry): boolean {
+  return Boolean(
+    worker.pool &&
+      (worker.pool.min_processes != null ||
+        worker.pool.max_processes != null ||
+        worker.pool.max_concurrent_executions != null),
+  );
 }
 </script>
 
@@ -297,6 +531,23 @@ function isSharedWorker(worker: RuntimeTelemetryResponse["sandbox_worker"]): boo
       <span>{{ errorMessage }}</span>
     </div>
 
+    <div
+      v-if="goldenNotice"
+      role="status"
+      class="rounded-lg border border-[#99F6E4] bg-[#F0FDFA] px-4 py-3 text-[13px] text-[#0F766E]"
+    >
+      {{ goldenNotice }}
+    </div>
+
+    <div
+      v-if="goldenError"
+      role="alert"
+      class="flex items-start gap-2 rounded-lg border border-[#FECACA] bg-[#FEF2F2] px-4 py-3 text-[13px] text-[#DC2626]"
+    >
+      <AppIcon name="alert" :size="16" class="mt-0.5" />
+      <span>Golden demo failed: {{ goldenError }}</span>
+    </div>
+
     <div v-if="loading" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
       <div
         v-for="i in 4"
@@ -316,9 +567,18 @@ function isSharedWorker(worker: RuntimeTelemetryResponse["sandbox_worker"]): boo
             Generate real Classic, Code Mode, Auto, and custom-upstream traffic to inspect live telemetry and ROI.
           </span>
         </div>
-        <Button data-variant="primary" :disabled="demoBusy" @click="triggerOverviewBurst">
-          Run Demo Burst (+8)
-        </Button>
+        <div class="flex flex-wrap items-center gap-2">
+          <Button data-variant="primary" class="min-h-11" :disabled="demoBusy || goldenBusy" @click="triggerOverviewBurst">
+            Run Demo Burst (+8)
+          </Button>
+          <Button
+            class="min-h-11 border border-[#D4D4D8] bg-white text-[#09090B] hover:bg-[#F4F4F5]"
+            :disabled="demoBusy || goldenBusy"
+            @click="triggerGoldenDemo"
+          >
+            {{ goldenBusy ? "Running Golden Demo…" : "Run Golden Demo" }}
+          </Button>
+        </div>
       </section>
 
       <section aria-label="Active monitoring alerts" class="space-y-2">
@@ -513,11 +773,22 @@ function isSharedWorker(worker: RuntimeTelemetryResponse["sandbox_worker"]): boo
 
       <section class="rounded-lg border border-[#E4E4E7] bg-white">
         <div class="flex flex-wrap items-center justify-between gap-2 border-b border-[#E4E4E7] px-4 py-3">
-          <div class="flex items-center gap-2">
+          <div class="flex flex-wrap items-center gap-2">
             <AppIcon name="cpu" :size="16" class="text-[#0F766E]" />
             <h2 class="text-[15px] font-semibold text-[#09090B]">
               Compute &amp; Process Telemetry
             </h2>
+            <span
+              v-if="runtimeData && (totalWorkerCount > 1 || (runtimeData.sandbox_workers?.length ?? 0) > 0)"
+              class="rounded-full border px-2.5 py-0.5 text-xs font-medium tabular-nums"
+              :class="
+                healthyWorkerCount === totalWorkerCount
+                  ? 'border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]'
+                  : 'border-[#FDE68A] bg-[#FFFBEB] text-[#D97706]'
+              "
+            >
+              {{ healthyWorkerCount }} / {{ totalWorkerCount }} {{ totalWorkerCount === 1 ? "worker" : "workers" }} healthy
+            </span>
           </div>
           <div v-if="runtimeData" class="flex flex-wrap items-center gap-2 text-xs text-[#52525B] tabular-nums">
             <span>Cache: <strong class="text-[#09090B]">{{ runtimeData.gateway.cache_backend }}</strong></span>
@@ -540,148 +811,357 @@ function isSharedWorker(worker: RuntimeTelemetryResponse["sandbox_worker"]): boo
         </div>
         <div v-if="!runtimeData && !runtimeError" class="m-4 h-24 animate-pulse rounded-lg border border-[#E4E4E7] bg-white" aria-label="Loading runtime telemetry" />
 
-        <div v-if="runtimeData" class="grid grid-cols-1 divide-y divide-[#E4E4E7] md:grid-cols-2 md:divide-x md:divide-y-0">
-          <div class="space-y-4 p-4">
-            <div class="flex items-center justify-between">
-              <span class="text-sm font-semibold text-[#09090B]">Gateway Replica</span>
-              <span class="rounded border border-[#A7F3D0] bg-[#ECFDF5] px-2 py-0.5 text-xs font-medium text-[#059669]">
-                active · {{ runtimeData.gateway.cpu_count }} vCPU
-              </span>
-            </div>
-
-            <div class="space-y-3">
-              <Meter
-                :value="Math.min(cpuCapacity(runtimeData.gateway), runtimeData.gateway.cpu_percent)"
-                :min="0"
-                :max="cpuCapacity(runtimeData.gateway)"
-                :format="formatCpu"
-              >
-                <MeterLabel>Process CPU (one vCPU = 100%)</MeterLabel>
-                <MeterValue class="tabular-nums text-xs font-medium" />
-                <MeterTrack>
-                  <MeterIndicator />
-                </MeterTrack>
-              </Meter>
-
-              <p class="text-xs text-[#52525B]">Memory RSS <strong class="font-semibold tabular-nums text-[#09090B]">{{ runtimeData.gateway.rss_mb.toFixed(1) }} MiB</strong></p>
-            </div>
-
-            <dl class="grid grid-cols-3 gap-2 border-t border-[#E4E4E7] pt-3 text-xs">
-              <div>
-                <dt class="text-[#71717A]">1m Load</dt>
-                <dd class="mt-0.5 font-semibold text-[#09090B] tabular-nums">
-                  {{ runtimeData.gateway.load_avg_1m.toFixed(2) }}
-                </dd>
+        <template v-if="runtimeData">
+          <div class="grid grid-cols-1 divide-y divide-[#E4E4E7] lg:grid-cols-12 lg:divide-x lg:divide-y-0">
+            <div class="space-y-4 p-4 lg:col-span-4">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-sm font-semibold text-[#09090B]">Gateway Replica</span>
+                <span class="rounded border border-[#A7F3D0] bg-[#ECFDF5] px-2 py-0.5 text-xs font-medium text-[#059669]">
+                  active · {{ runtimeData.gateway.cpu_count }} vCPU
+                </span>
               </div>
-              <div>
-                <dt class="text-[#71717A]">Executions</dt>
-                <dd class="mt-0.5 font-semibold text-[#09090B] tabular-nums">
-                  {{ runtimeData.gateway.active_executions }} active / {{ runtimeData.gateway.total_executions }}
-                </dd>
-              </div>
-              <div>
-                <dt class="text-[#71717A]">Uptime</dt>
-                <dd class="mt-0.5 font-semibold text-[#09090B] tabular-nums">
-                  {{ Math.round(runtimeData.gateway.uptime_seconds) }}s
-                </dd>
-              </div>
-            </dl>
-          </div>
 
-          <div class="space-y-4 p-4">
-            <div class="flex items-center justify-between gap-2">
-                <span class="text-sm font-semibold text-[#09090B]">
-                Monty Sandbox Worker ({{ runtimeData.sandbox_worker.mode }})
-              </span>
-              <span
-                class="rounded border px-2 py-0.5 text-xs font-medium"
-                :class="
-                  runtimeData.sandbox_worker.status === 'unreachable'
-                    ? 'border-[#FECACA] bg-[#FEF2F2] text-[#DC2626]'
-                    : 'border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]'
-                "
-              >
-                {{ workerStatusLabel(runtimeData.sandbox_worker.status) }}
-              </span>
-            </div>
-
-            <p v-if="isSharedWorker(runtimeData.sandbox_worker)" class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3 text-xs leading-5 text-[#52525B]">
-              This worker shares the gateway process. Its CPU, memory, uptime, and execution counts describe the same process capacity shown on the left.
-            </p>
-            <div
-              v-if="runtimeData.sandbox_worker.status === 'unreachable'"
-              class="rounded-md border border-[#FECACA] bg-[#FEF2F2] p-3 text-xs text-[#DC2626]"
-            >
-              Worker health check failed: {{ runtimeData.sandbox_worker.error }}
-            </div>
-
-            <template v-else-if="workerStats && !isSharedWorker(runtimeData.sandbox_worker)">
               <div class="space-y-3">
                 <Meter
-                  :value="Math.min(cpuCapacity(workerStats), workerStats.cpu_percent)"
+                  :value="Math.min(cpuCapacity(runtimeData.gateway), runtimeData.gateway.cpu_percent)"
                   :min="0"
-                  :max="cpuCapacity(workerStats)"
+                  :max="cpuCapacity(runtimeData.gateway)"
                   :format="formatCpu"
                 >
-                  <MeterLabel>Worker CPU (one vCPU = 100%)</MeterLabel>
+                  <MeterLabel>Process CPU (one vCPU = 100%)</MeterLabel>
                   <MeterValue class="tabular-nums text-xs font-medium" />
                   <MeterTrack>
                     <MeterIndicator />
                   </MeterTrack>
                 </Meter>
 
-                <p class="text-xs text-[#52525B]">Memory RSS <strong class="font-semibold tabular-nums text-[#09090B]">{{ workerStats.rss_mb.toFixed(1) }} MiB</strong></p>
+                <p class="text-xs text-[#52525B]">Memory RSS <strong class="font-semibold tabular-nums text-[#09090B]">{{ runtimeData.gateway.rss_mb.toFixed(1) }} MiB</strong></p>
               </div>
 
               <dl class="grid grid-cols-3 gap-2 border-t border-[#E4E4E7] pt-3 text-xs">
                 <div>
                   <dt class="text-[#71717A]">1m Load</dt>
                   <dd class="mt-0.5 font-semibold text-[#09090B] tabular-nums">
-                    {{ workerStats.load_avg_1m.toFixed(2) }}
+                    {{ runtimeData.gateway.load_avg_1m.toFixed(2) }}
                   </dd>
                 </div>
                 <div>
                   <dt class="text-[#71717A]">Executions</dt>
                   <dd class="mt-0.5 font-semibold text-[#09090B] tabular-nums">
-                    {{ workerStats.active_executions }} active / {{ workerStats.total_executions }}
+                    {{ runtimeData.gateway.active_executions }} active / {{ runtimeData.gateway.total_executions }}
                   </dd>
                 </div>
                 <div>
                   <dt class="text-[#71717A]">Uptime</dt>
                   <dd class="mt-0.5 font-semibold text-[#09090B] tabular-nums">
-                    {{ Math.round(workerStats.uptime_seconds) }}s
+                    {{ Math.round(runtimeData.gateway.uptime_seconds) }}s
                   </dd>
                 </div>
               </dl>
-            </template>
-          </div>
-        </div>
-      </section>
+            </div>
 
-      <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
-        <div class="flex flex-wrap items-start justify-between gap-2">
-          <div>
-            <h2 class="text-[15px] font-semibold text-[#09090B]">Execution mode distribution</h2>
-            <p class="mt-0.5 text-xs text-[#71717A]">Code Mode vs Classic share of observed requests, not a recommendation score.</p>
-          </div>
-          <span class="text-xs tabular-nums text-[#71717A]">{{ analyticsData ? `${formatInt(pairedModeRunCount)} requests` : "Usage summary unavailable" }}</span>
-        </div>
-        <div v-if="pairedModeRunCount" class="mt-4 flex items-center gap-5">
-          <div class="relative h-28 w-28 shrink-0 rounded-full" :style="executionMixStyle" role="img" :aria-label="`Code Mode ${codemodeSharePct}% and Classic ${classicSharePct}%`">
-            <div class="absolute inset-[14px] flex flex-col items-center justify-center rounded-full bg-white">
-              <strong class="text-lg font-semibold tabular-nums text-[#09090B]">{{ codemodeSharePct.toFixed(1) }}%</strong>
-              <span class="text-[10px] text-[#71717A]">Code Mode</span>
+            <div class="lg:col-span-8">
+              <div
+                class="grid grid-cols-1 gap-px bg-[#E4E4E7]"
+                :class="normalizedSandboxWorkers.length > 1 ? 'md:grid-cols-2' : ''"
+              >
+                <div
+                  v-for="(worker, idx) in normalizedSandboxWorkers"
+                  :key="worker.worker_id || idx"
+                  class="space-y-4 bg-white p-4"
+                >
+                  <div class="flex flex-wrap items-start justify-between gap-2">
+                    <div class="min-w-0">
+                      <div class="text-sm font-semibold text-[#09090B]">
+                        {{ worker.worker_id || `Worker #${idx + 1}` }}
+                        <span class="font-normal text-[#52525B]">({{ worker.mode }})</span>
+                      </div>
+                      <div
+                        v-if="worker.health_url"
+                        class="mt-0.5 truncate font-mono-data text-[11px] text-[#71717A]"
+                        :title="worker.health_url"
+                      >
+                        {{ worker.health_url }}
+                      </div>
+                      <div v-if="hasPoolConfig(worker)" class="mt-1 text-xs text-[#52525B] tabular-nums">
+                        Pool: <strong class="font-medium text-[#09090B]">{{ worker.pool?.min_processes ?? 0 }}–{{ worker.pool?.max_processes ?? 0 }} processes</strong><span v-if="worker.pool?.max_concurrent_executions != null"> · {{ worker.pool.max_concurrent_executions }} max concurrent</span>
+                      </div>
+                    </div>
+                    <span
+                      class="shrink-0 rounded border px-2 py-0.5 text-xs font-medium"
+                      :class="workerStatusBadgeClass(worker.status)"
+                    >
+                      {{ workerStatusLabel(worker.status) }}
+                    </span>
+                  </div>
+
+                  <p v-if="isSharedWorker(worker)" class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-3 text-xs leading-5 text-[#52525B]">
+                    This worker shares the gateway process. Its CPU, memory, uptime, and execution counts describe the same process capacity shown on the left.
+                  </p>
+
+                  <div
+                    v-else-if="worker.status === 'unreachable'"
+                    class="rounded-md border border-[#FECACA] bg-[#FEF2F2] p-3 text-xs text-[#DC2626]"
+                  >
+                    Worker health check failed: {{ worker.error || "unreachable" }}
+                  </div>
+
+                  <template v-else-if="worker.stats">
+                    <div
+                      v-if="worker.error"
+                      class="rounded-md border border-[#FDE68A] bg-[#FFFBEB] p-2.5 text-xs text-[#92400E]"
+                    >
+                      {{ worker.error }}
+                    </div>
+
+                    <div class="space-y-3">
+                      <Meter
+                        :value="Math.min(cpuCapacity(worker.stats), worker.stats.cpu_percent)"
+                        :min="0"
+                        :max="cpuCapacity(worker.stats)"
+                        :format="formatCpu"
+                      >
+                        <MeterLabel>Worker CPU (one vCPU = 100%)</MeterLabel>
+                        <MeterValue class="tabular-nums text-xs font-medium" />
+                        <MeterTrack>
+                          <MeterIndicator />
+                        </MeterTrack>
+                      </Meter>
+
+                      <p class="text-xs text-[#52525B]">Memory RSS <strong class="font-semibold tabular-nums text-[#09090B]">{{ worker.stats.rss_mb.toFixed(1) }} MiB</strong></p>
+                    </div>
+
+                    <dl class="grid grid-cols-3 gap-2 border-t border-[#E4E4E7] pt-3 text-xs">
+                      <div>
+                        <dt class="text-[#71717A]">1m Load</dt>
+                        <dd class="mt-0.5 font-semibold text-[#09090B] tabular-nums">
+                          {{ worker.stats.load_avg_1m.toFixed(2) }}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt class="text-[#71717A]">Executions</dt>
+                        <dd class="mt-0.5 font-semibold text-[#09090B] tabular-nums">
+                          {{ worker.stats.active_executions }} active / {{ worker.stats.total_executions }}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt class="text-[#71717A]">Uptime</dt>
+                        <dd class="mt-0.5 font-semibold text-[#09090B] tabular-nums">
+                          {{ Math.round(worker.stats.uptime_seconds) }}s
+                        </dd>
+                      </div>
+                    </dl>
+                  </template>
+                </div>
+              </div>
             </div>
           </div>
-          <div class="space-y-3">
-            <div class="flex items-start gap-2"><span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full bg-[#0F766E]" /><div><div class="text-xs font-medium text-[#52525B]">Code Mode MCP</div><div class="text-sm font-semibold tabular-nums">{{ formatInt(analyticsData?.summary.codemode_runs) }} <span class="text-xs font-normal text-[#71717A]">requests</span></div></div></div>
-            <div class="flex items-start gap-2"><span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full bg-[#2563EB]" /><div><div class="text-xs font-medium text-[#52525B]">Classic MCP</div><div class="text-sm font-semibold tabular-nums">{{ formatInt(analyticsData?.summary.classic_runs) }} <span class="text-xs font-normal text-[#71717A]">requests</span></div></div></div>
+
+          <div class="border-t border-[#E4E4E7] bg-[#FAFAFA] px-4 py-3">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <span class="text-xs font-semibold text-[#09090B]">Monty Sandbox Execution Telemetry</span>
+              <span class="text-[11px] text-[#71717A]">
+                {{ runtimeData.monty_telemetry?.ephemeral === false ? "Persistent sandbox" : "Ephemeral checkout per run" }}
+              </span>
+            </div>
+            <dl class="mt-2 grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
+              <div>
+                <dt class="text-[#71717A]">Code Mode Runs</dt>
+                <dd class="mt-0.5 font-semibold text-[#09090B] tabular-nums">
+                  {{ formatInt(runtimeData.monty_telemetry?.codemode_runs) }}
+                </dd>
+              </div>
+              <div>
+                <dt class="text-[#71717A]">Spawn p50 / p95</dt>
+                <dd class="mt-0.5 font-semibold text-[#0F766E] tabular-nums">
+                  {{ Number(runtimeData.monty_telemetry?.spawn_p50_ms ?? 0).toFixed(2) }} ms / {{ Number(runtimeData.monty_telemetry?.spawn_p95_ms ?? 0).toFixed(2) }} ms
+                </dd>
+              </div>
+              <div>
+                <dt class="text-[#71717A]">Exec p50 / p95</dt>
+                <dd class="mt-0.5 font-semibold text-[#0F766E] tabular-nums">
+                  {{ Number(runtimeData.monty_telemetry?.exec_p50_ms ?? 0).toFixed(2) }} ms / {{ Number(runtimeData.monty_telemetry?.exec_p95_ms ?? 0).toFixed(2) }} ms
+                </dd>
+              </div>
+              <div>
+                <dt class="text-[#71717A]">Grounding Blocked</dt>
+                <dd class="mt-0.5 font-semibold text-[#DC2626] tabular-nums">
+                  {{ formatInt(runtimeData.monty_telemetry?.grounding_blocked_runs) }}
+                </dd>
+              </div>
+            </dl>
+          </div>
+        </template>
+      </section>
+
+      <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
+          <div class="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h2 class="text-[15px] font-semibold text-[#09090B]">Execution mode distribution</h2>
+              <p class="mt-0.5 text-xs text-[#71717A]">Code Mode vs Classic share of observed requests, not a recommendation score.</p>
+            </div>
+            <span class="text-xs tabular-nums text-[#71717A]">{{ analyticsData ? `${formatInt(pairedModeRunCount)} requests` : "Usage summary unavailable" }}</span>
+          </div>
+          <div v-if="pairedModeRunCount" class="mt-4 flex items-center gap-5">
+            <div class="relative h-28 w-28 shrink-0 rounded-full" :style="executionMixStyle" role="img" :aria-label="`Code Mode ${codemodeSharePct}% and Classic ${classicSharePct}%`">
+              <div class="absolute inset-[14px] flex flex-col items-center justify-center rounded-full bg-white">
+                <strong class="text-lg font-semibold tabular-nums text-[#09090B]">{{ codemodeSharePct.toFixed(1) }}%</strong>
+                <span class="text-[10px] text-[#71717A]">Code Mode</span>
+              </div>
+            </div>
+            <div class="space-y-3">
+              <div class="flex items-start gap-2"><span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full bg-[#0F766E]" /><div><div class="text-xs font-medium text-[#52525B]">Code Mode MCP</div><div class="text-sm font-semibold tabular-nums">{{ formatInt(analyticsData?.summary.codemode_runs) }} <span class="text-xs font-normal text-[#71717A]">requests</span></div></div></div>
+              <div class="flex items-start gap-2"><span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full bg-[#2563EB]" /><div><div class="text-xs font-medium text-[#52525B]">Classic MCP</div><div class="text-sm font-semibold tabular-nums">{{ formatInt(analyticsData?.summary.classic_runs) }} <span class="text-xs font-normal text-[#71717A]">requests</span></div></div></div>
+            </div>
+          </div>
+          <p v-else-if="analyticsData" class="mt-3 text-xs text-[#71717A]">No Code Mode or Classic MCP executions recorded yet. Send requests to <code class="font-mono-data">/mcp</code> or start Demo Control traffic.</p>
+          <p v-else class="mt-3 text-xs text-[#71717A]">Usage data could not be loaded. Refresh the summary to check again.</p>
+          <p v-if="otherModeRunCount > 0" class="mt-3 text-[11px] text-[#71717A]">{{ formatInt(otherModeRunCount) }} other or Hybrid requests excluded.</p>
+          <NuxtLink to="/analytics" class="mt-3 inline-flex min-h-11 items-center text-xs font-medium text-[#0F766E] underline underline-offset-2">Review traffic by group in Gateway Usage</NuxtLink>
+        </section>
+
+        <section class="rounded-lg border border-[#E4E4E7] bg-white p-4">
+          <h2 class="text-[15px] font-semibold text-[#09090B]">Security &amp; efficiency posture</h2>
+          <p class="mt-0.5 text-xs text-[#71717A]">Governance actions and savings in the last {{ formatInt(valueData?.window_runs) }} runs.</p>
+          <dl class="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
+            <div>
+              <dt class="text-[#71717A]">ABAC rows filtered</dt>
+              <dd class="mt-0.5 text-lg font-semibold tabular-nums text-[#09090B]">{{ formatInt(valueData?.security_and_governance?.abac_rows_filtered) }}</dd>
+            </div>
+            <div>
+              <dt class="text-[#71717A]">PII / secrets redacted</dt>
+              <dd class="mt-0.5 text-lg font-semibold tabular-nums text-[#09090B]">{{ formatInt(valueData?.security_and_governance?.pii_secrets_redacted) }}</dd>
+            </div>
+            <div>
+              <dt class="text-[#71717A]">Grounded runs verified</dt>
+              <dd class="mt-0.5 text-lg font-semibold tabular-nums text-[#059669]">{{ formatInt(valueData?.security_and_governance?.grounded_runs_verified) }}</dd>
+            </div>
+            <div>
+              <dt class="text-[#71717A]">Grounding violations blocked</dt>
+              <dd class="mt-0.5 text-lg font-semibold tabular-nums text-[#DC2626]">{{ formatInt(valueData?.security_and_governance?.grounding_violations_blocked) }}</dd>
+            </div>
+            <div>
+              <dt class="text-[#71717A]">Payload reduction</dt>
+              <dd class="mt-0.5 text-lg font-semibold tabular-nums text-[#09090B]">{{ (valueData?.efficiency?.payload_reduction_pct ?? 0).toFixed(1) }}%</dd>
+            </div>
+            <div>
+              <dt class="text-[#71717A]">Total tokens saved</dt>
+              <dd class="mt-0.5 text-lg font-semibold tabular-nums text-[#0F766E]">{{ formatInt(valueData?.efficiency?.total_tokens_saved) }}</dd>
+            </div>
+          </dl>
+        </section>
+      </div>
+
+      <section aria-label="Business value and workflows snapshot" class="rounded-lg border border-[#E4E4E7] bg-white p-4">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 class="text-[15px] font-semibold text-[#09090B]">Business Value &amp; Workflows</h2>
+            <p class="mt-0.5 text-xs text-[#71717A]">
+              Published workflow definitions, discovered candidates pending review, and completed human-time baselines.
+            </p>
+          </div>
+          <div class="flex flex-wrap items-center gap-3 text-xs">
+            <NuxtLink to="/workflows" class="inline-flex min-h-11 items-center font-medium text-[#0F766E] underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">
+              Manage workflows
+            </NuxtLink>
+            <NuxtLink to="/business-value" class="inline-flex min-h-11 items-center font-medium text-[#0F766E] underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">
+              Business Value report
+            </NuxtLink>
           </div>
         </div>
-        <p v-else-if="analyticsData" class="mt-3 text-xs text-[#71717A]">No Code Mode or Classic MCP executions recorded yet. Send requests to <code class="font-mono-data">/mcp</code> or start Demo Control traffic.</p>
-        <p v-else class="mt-3 text-xs text-[#71717A]">Usage data could not be loaded. Refresh the summary to check again.</p>
-        <p v-if="otherModeRunCount > 0" class="mt-3 text-[11px] text-[#71717A]">{{ formatInt(otherModeRunCount) }} other or Hybrid requests excluded.</p>
-        <NuxtLink to="/analytics" class="mt-3 inline-flex min-h-11 items-center text-xs font-medium text-[#0F766E] underline underline-offset-2">Review traffic by group in Gateway Usage</NuxtLink>
+
+        <dl class="mt-3 grid grid-cols-1 divide-y divide-[#E4E4E7] border-t border-[#E4E4E7] pt-3 sm:grid-cols-2 sm:divide-y-0 lg:grid-cols-4 lg:divide-x">
+          <div class="py-2 sm:pr-4 lg:py-0 lg:pl-4 lg:first:pl-0">
+            <dt class="text-xs font-medium text-[#52525B]">Configured Workflows</dt>
+            <dd class="mt-1 text-lg font-semibold text-[#09090B] tabular-nums">
+              <template v-if="workflowsCatalogData">{{ activeWorkflowsCount }} active / {{ totalWorkflowsCount }} total</template>
+              <span v-else class="text-sm font-normal text-[#71717A]">Unavailable</span>
+            </dd>
+          </div>
+          <div class="py-2 sm:pr-4 lg:py-0 lg:pl-4">
+            <dt class="text-xs font-medium text-[#52525B]">Pending Candidates</dt>
+            <dd class="mt-1 flex items-baseline gap-2 text-lg font-semibold text-[#09090B] tabular-nums">
+              <template v-if="workflowsCatalogData">
+                <span>{{ formatInt(pendingCandidatesCount) }}</span>
+                <NuxtLink to="/workflows" class="text-xs font-medium text-[#0F766E] underline underline-offset-2">
+                  Review
+                </NuxtLink>
+              </template>
+              <span v-else class="text-sm font-normal text-[#71717A]">Unavailable</span>
+            </dd>
+          </div>
+          <div class="py-2 sm:pr-4 lg:py-0 lg:pl-4">
+            <dt class="text-xs font-medium text-[#52525B]">Completed Outcomes</dt>
+            <dd class="mt-1 text-lg font-semibold text-[#09090B] tabular-nums">
+              <template v-if="businessValueData">{{ formatInt(businessValueData.completed_count) }}</template>
+              <span v-else class="text-sm font-normal text-[#71717A]">Unavailable</span>
+            </dd>
+          </div>
+          <div class="py-2 lg:py-0 lg:pl-4">
+            <dt class="text-xs font-medium text-[#52525B]">Estimated Baseline Minutes</dt>
+            <dd class="mt-1 text-lg font-semibold text-[#0F766E] tabular-nums">
+              <template v-if="businessValueData">
+                {{ estimatedBaselineMinutes !== null ? `${estimatedBaselineMinutes.toLocaleString("en-US", { maximumFractionDigits: 1 })} min` : "Unavailable" }}
+              </template>
+              <span v-else class="text-sm font-normal text-[#71717A]">Unavailable</span>
+            </dd>
+          </div>
+        </dl>
+      </section>
+
+      <section v-if="valueData?.recommendations?.length" class="rounded-lg border border-[#FDE68A] bg-[#FFFBEB] p-4">
+        <h2 class="text-[15px] font-semibold text-[#92400E]">
+          Optimization Recommendations
+        </h2>
+        <ul class="mt-2 space-y-1.5 text-[13px] text-[#78350F]">
+          <li v-for="rec in valueData.recommendations" :key="rec.server">
+            <strong class="font-mono-data">{{ rec.server }}</strong>: {{ rec.reason }}
+          </li>
+        </ul>
+      </section>
+
+      <section class="rounded-lg border border-[#E4E4E7] bg-white">
+        <div class="border-b border-[#E4E4E7] px-4 py-3">
+          <h2 class="text-[15px] font-semibold text-[#09090B]">
+            Upstream Execution Breakdown
+          </h2>
+        </div>
+
+        <div v-if="upstreamRows.length === 0" class="p-6 text-center text-[13px] text-[#71717A]">
+          No upstream tool subcalls recorded yet in this window.
+        </div>
+
+        <div v-else class="overflow-x-auto table-scroll">
+          <table class="w-full border-collapse text-left text-[13px]">
+            <thead>
+              <tr class="border-b border-[#E4E4E7] bg-[#F4F4F5] text-xs font-medium text-[#52525B]">
+                <th class="px-4 py-2.5 whitespace-nowrap">Upstream</th>
+                <th class="px-4 py-2.5 text-right whitespace-nowrap">Subcalls</th>
+                <th class="px-4 py-2.5 text-right whitespace-nowrap">Code Mode</th>
+                <th class="px-4 py-2.5 text-right whitespace-nowrap">Classic</th>
+                <th class="px-4 py-2.5 text-right whitespace-nowrap">Raw Bytes</th>
+                <th class="px-4 py-2.5 text-right whitespace-nowrap">Avg Latency</th>
+                <th class="px-4 py-2.5 text-right whitespace-nowrap">ABAC Filtered</th>
+                <th class="px-4 py-2.5 text-right whitespace-nowrap">PII Redacted</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-[#E4E4E7]">
+              <tr v-for="row in upstreamRows" :key="row.server" class="hover:bg-[#FAFAFA]">
+                <td class="px-4 py-2.5 font-mono-data font-medium text-[#09090B] whitespace-nowrap">
+                  {{ row.server }}
+                </td>
+                <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(row.calls) }}</td>
+                <td class="px-4 py-2.5 text-right text-[#0F766E] tabular-nums whitespace-nowrap">{{ formatInt(row.codemode_calls) }}</td>
+                <td class="px-4 py-2.5 text-right text-[#2563EB] tabular-nums whitespace-nowrap">{{ formatInt(row.classic_calls) }}</td>
+                <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(row.raw_bytes) }}</td>
+                <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ Number(row.avg_duration_ms || 0).toFixed(1) }} ms</td>
+                <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(row.abac_rows_filtered) }}</td>
+                <td class="px-4 py-2.5 text-right tabular-nums whitespace-nowrap">{{ formatInt(row.redactions_count) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </section>
     </template>
   </div>

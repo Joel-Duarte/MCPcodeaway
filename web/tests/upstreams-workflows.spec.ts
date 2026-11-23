@@ -133,3 +133,131 @@ test("editing replaces the matching workflow by stable ID without duplicating it
   expect(payload.definition.workflows[1]).toMatchObject({ id: "other_workflow", name: "Other workflow" });
   wrapper.unmount();
 });
+
+test("UpstreamWorkflowCatalog opens PromptBundleDrawer in-page and reloads after applying bundle", async () => {
+  let currentDef = { ...base, workflows: [] as any[] };
+  const apiFetch = vi.fn(async (path: string, options?: { method?: string; body?: any }) => {
+    if (path === "/admin/integration-definitions/support_api") {
+      return { current: { definition: currentDef } };
+    }
+    if (path === "/admin/onboarding/prompt-pack?upstream_name=support_api") {
+      return { prompt: "Inspect support_api and propose workflows." };
+    }
+    if (path === "/admin/onboarding/bundle/validate" && options?.method === "POST") {
+      return {
+        valid: true,
+        upstream: { name: "support_api", type: "openapi" },
+        integration_definition: options.body?.integration_definition,
+        warnings: [],
+      };
+    }
+    if (path === "/admin/onboarding/bundle/apply" && options?.method === "POST") {
+      currentDef = {
+        ...currentDef,
+        workflows: options.body?.integration_definition?.workflows ?? [],
+      };
+      return { applied: true, integration_definition: { upstream_name: "support_api", published: true } };
+    }
+    throw new Error(`Unexpected ${options?.method ?? "GET"} ${path}`);
+  });
+  vi.stubGlobal("useAdminApi", () => ({ apiFetch }));
+
+  const wrapper = mount(UpstreamWorkflowCatalog, {
+    attachTo: document.body,
+    props: {
+      upstream: "support_api",
+      tools: ["support_api__find_customer", "support_api__create_ticket"],
+      canEdit: true,
+      refreshVersion: 0,
+    },
+    global: {
+      components: {
+        Button,
+        Checkbox,
+        CheckboxIndicator,
+        Drawer,
+        DrawerBackdrop,
+        DrawerClose,
+        DrawerContent,
+        DrawerDescription,
+        DrawerTitle,
+        Field,
+        FieldDescription,
+        FieldLabel,
+        Input,
+        NuxtLink: NuxtLinkStub,
+        Select,
+        SelectContent,
+        SelectItem,
+        SelectItemIndicator,
+        SelectTrigger,
+        SelectValue,
+        Switch,
+        SwitchThumb,
+        Textarea,
+      },
+      stubs: {
+        Drawer: passthrough,
+        DrawerBackdrop: true,
+        DrawerClose: passthrough,
+        DrawerContent: passthrough,
+        DrawerDescription: passthrough,
+        DrawerTitle: passthrough,
+      },
+    },
+  });
+
+  await vi.waitFor(() => expect(wrapper.text()).toContain("No workflows are defined"));
+  await wrapper.findAll("button").find((b) => b.text().includes("Generate Workflows via Prompt"))!.trigger("click");
+  await nextTick();
+  expect(wrapper.text()).toContain("1. Target Upstream & Agent Prompt");
+
+  await wrapper.findAll("button").find((b) => b.text().includes("Preview Prompt"))!.trigger("click");
+  await vi.waitFor(() =>
+    expect(wrapper.text()).toContain("Inspect support_api and propose workflows."),
+  );
+  expect(wrapper.text()).toContain("Target Focus (Workflows)");
+
+  const bundle = {
+    integration_definition: {
+      manifest_version: "1.0",
+      integration: { id: "support_api", display_name: "Support", upstream_name: "support_api" },
+      workflows: [
+        {
+          id: "triage_ticket",
+          name: "Triage Ticket",
+          description: "Look up customer and create ticket",
+          enabled: true,
+          participating_tools: ["support_api__find_customer", "support_api__create_ticket"],
+          completion: {
+            kind: "terminal_tool_result",
+            tool: "support_api__create_ticket",
+            success_when: { path: "/id", type: "non_empty_string" },
+          },
+          business_value: {
+            manual_baseline_minutes: 8,
+            baseline_source: "administrator_estimate",
+            confidence: "unvalidated",
+            effective_from: "2026-11-23",
+          },
+        },
+      ],
+      experiences: [],
+    },
+  };
+
+  await wrapper.get('[aria-label="Paste agent OnboardingBundle JSON"]').setValue(JSON.stringify(bundle));
+  await wrapper.findAll("button").find((b) => b.text().includes("Validate & Preview Bundle"))!.trigger("click");
+  await vi.waitFor(() => expect(wrapper.text()).toContain("Triage Ticket"));
+
+  await wrapper.findAll("button").find((b) => b.text().trim() === "Apply & Publish")!.trigger("click");
+  await vi.waitFor(() => expect(wrapper.text()).toContain("Triage Ticket"));
+  expect(apiFetch).toHaveBeenCalledWith(
+    "/admin/onboarding/bundle/apply",
+    expect.objectContaining({ method: "POST", body: expect.objectContaining({ publish: true }) }),
+  );
+  expect(
+    apiFetch.mock.calls.filter(([path]) => path === "/admin/integration-definitions/support_api"),
+  ).toHaveLength(2);
+  wrapper.unmount();
+});

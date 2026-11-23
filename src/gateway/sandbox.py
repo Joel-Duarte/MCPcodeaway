@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import ipaddress
 import json
+import socket
 import time
 from collections.abc import Callable
 from typing import Any, Protocol
+from urllib.parse import urlparse, urlunparse
 
 import pydantic_monty
 import websockets
@@ -171,6 +174,29 @@ class LocalMontyBackend:
             )
 
 
+def _needs_dns_resolution(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    if hostname.lower() in {"localhost", "testserver", "localhost.localdomain"}:
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+        return False
+    except ValueError:
+        return True
+
+
+def _format_netloc(
+    host: str, port: int | None, username: str | None = None, password: str | None = None
+) -> str:
+    formatted_host = f"[{host}]" if ":" in host else host
+    netloc = f"{formatted_host}:{port}" if port is not None else formatted_host
+    if username:
+        auth = f"{username}:{password}" if password else username
+        netloc = f"{auth}@{netloc}"
+    return netloc
+
+
 class RemoteMontyWorkerBackend:
     """Executes Code Mode scripts on an egress-isolated sandbox worker over WebSocket RPC."""
 
@@ -178,9 +204,54 @@ class RemoteMontyWorkerBackend:
         self.worker_ws_url = worker_ws_url
         self.worker_secret = worker_secret
         self._primary_secret = next((s.strip() for s in worker_secret.split(",") if s.strip()), "")
+        self._raw_urls = [u.strip() for u in worker_ws_url.split(",") if u.strip()]
+        if not self._raw_urls:
+            self._raw_urls = [worker_ws_url]
+        self._rr_counter = 0
 
     async def close(self) -> None:
         return None
+
+    async def _resolve_endpoints(self) -> list[str]:
+        endpoints: list[str] = []
+        loop = asyncio.get_running_loop()
+        for raw_url in self._raw_urls:
+            parsed = urlparse(raw_url)
+            host = parsed.hostname
+            if not _needs_dns_resolution(host) or host is None:
+                endpoints.append(raw_url)
+                continue
+            port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+            try:
+                infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+                ips = sorted({str(info[4][0]) for info in infos if info[4]})
+            except OSError:
+                ips = []
+            if not ips:
+                endpoints.append(raw_url)
+                continue
+            for ip in ips:
+                netloc = _format_netloc(ip, parsed.port, parsed.username, parsed.password)
+                endpoints.append(
+                    urlunparse(
+                        (
+                            parsed.scheme,
+                            netloc,
+                            parsed.path,
+                            parsed.params,
+                            parsed.query,
+                            parsed.fragment,
+                        )
+                    )
+                )
+        deduped = list(dict.fromkeys(endpoints))
+        return deduped or [self.worker_ws_url]
+
+    async def _next_worker_url(self) -> str:
+        endpoints = await self._resolve_endpoints()
+        idx = self._rr_counter % len(endpoints)
+        self._rr_counter += 1
+        return endpoints[idx]
 
     async def execute(
         self,
@@ -198,7 +269,8 @@ class RemoteMontyWorkerBackend:
                 "X-Worker-Secret": self._primary_secret,
             }
         try:
-            async with websockets.connect(self.worker_ws_url, **connect_kwargs) as ws:
+            target_url = await self._next_worker_url()
+            async with websockets.connect(target_url, **connect_kwargs) as ws:
                 await ws.send(
                     json.dumps(
                         {

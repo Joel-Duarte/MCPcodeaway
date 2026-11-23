@@ -18,18 +18,23 @@ services:
       target: gateway-demo
     depends_on:
       - mock-backends
+      - sandbox-worker
     environment:
       GATEWAY_PROFILE: demo
       GATEWAY_APP_ENV: sandbox
       GATEWAY_AUTH_MODE: dev
       GATEWAY_UPSTREAMS_CONFIG_PATH: config/upstreams.docker.yaml
-      GATEWAY_SANDBOX_BACKEND: local
+      GATEWAY_SANDBOX_BACKEND: remote
+      GATEWAY_SANDBOX_WORKER_URL: ws://sandbox-worker:8002/ws/execute
+      GATEWAY_SANDBOX_WORKER_SECRET: ${GATEWAY_SANDBOX_WORKER_SECRET:-local-compose-worker-secret-change-me}
+      GATEWAY_DEMO_AUTO_GOLDEN: "true"
     ports:
       - "8000:8000"
     volumes:
       - gateway_data:/app/data
     networks:
       - control_plane
+      - sandbox_isolated
     profiles: ["", "default", "demo"]
 
   redis:
@@ -80,7 +85,7 @@ services:
       start_period: 20s
     networks:
       - sandbox_isolated
-    profiles: ["scaled"]
+    profiles: ["", "default", "demo", "scaled"]
 
   sandbox-worker-prod:
     build:

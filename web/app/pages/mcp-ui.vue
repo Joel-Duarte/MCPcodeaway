@@ -30,6 +30,7 @@ import { Tabs, TabsList, TabsPanel, TabsTab } from "@ui-sdk/vue/tabs";
 import { Textarea } from "@ui-sdk/vue/textarea";
 import { computed, onMounted, ref, watch } from "vue";
 import McpAppHostPreview from "~/components/McpAppHostPreview.vue";
+import PromptBundleDrawer from "~/components/PromptBundleDrawer.vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
 
 interface McpUiExperienceEntry {
@@ -69,6 +70,8 @@ const previewTab = ref("rendered");
 
 const createDrawerOpen = ref(false);
 const createSaving = ref(false);
+const createDrawerError = ref("");
+const promptDrawerOpen = ref(false);
 const createForm = ref({
   upstream: "",
   tool: "",
@@ -86,6 +89,7 @@ const createForm = ref({
 
 const editDrawerOpen = ref(false);
 const editSaving = ref(false);
+const editDrawerError = ref("");
 const editTarget = ref<McpUiExperienceEntry | null>(null);
 const editForm = ref({
   fallback: "",
@@ -233,6 +237,7 @@ function applyToolDefaults(upstream: string, toolQualifiedName: string) {
 
 function openCreateDrawer(prefillUpstream?: string, prefillTool?: string) {
   actionError.value = "";
+  createDrawerError.value = "";
   const chosenUpstream =
     prefillUpstream ||
     (upstreamFilter.value !== "__all__" ? upstreamFilter.value : "") ||
@@ -278,6 +283,7 @@ function handleCreateUpstreamChange(nextUpstream: string) {
 
 async function saveCreatedExperience() {
   createSaving.value = true;
+  createDrawerError.value = "";
   actionError.value = "";
   try {
     const upstream = createForm.value.upstream.trim();
@@ -380,7 +386,7 @@ async function saveCreatedExperience() {
     statusMessage.value = `Created and published MCP App UI '${expPayload.components[0]?.text || id}' for '${expPayload.tool}'.`;
     await loadExperiences();
   } catch (err) {
-    actionError.value = extractErrorMessage(err);
+    createDrawerError.value = extractErrorMessage(err);
   } finally {
     createSaving.value = false;
   }
@@ -464,6 +470,7 @@ onMounted(() => {
 });
 
 function openEditDrawer(entry: McpUiExperienceEntry) {
+  editDrawerError.value = "";
   editTarget.value = entry;
   editForm.value = {
     fallback: String(entry.experience.fallback ?? ""),
@@ -475,6 +482,7 @@ function openEditDrawer(entry: McpUiExperienceEntry) {
 async function saveExperienceEdit() {
   if (!editTarget.value) return;
   editSaving.value = true;
+  editDrawerError.value = "";
   actionError.value = "";
   try {
     const parsedComponents = JSON.parse(editForm.value.componentsJson || "[]") as Array<Record<string, any>>;
@@ -498,10 +506,15 @@ async function saveExperienceEdit() {
     statusMessage.value = `Saved MCP App UI '${experienceHeading(updatedExperience)}' for '${updatedExperience.tool}'.`;
     await loadExperiences();
   } catch (err) {
-    actionError.value = extractErrorMessage(err);
+    editDrawerError.value = extractErrorMessage(err);
   } finally {
     editSaving.value = false;
   }
+}
+
+async function handleBundleApplied(upstreamName: string) {
+  statusMessage.value = `Applied and published MCP Apps UI bundle${upstreamName ? ` for '${upstreamName}'` : ""}.`;
+  await loadExperiences();
 }
 
 function confirmDelete(entry: McpUiExperienceEntry) {
@@ -545,12 +558,9 @@ async function performDelete() {
           <AppIcon name="refresh" :size="14" />
           <span>Refresh</span>
         </Button>
-        <NuxtLink
-          to="/onboarding"
-          class="inline-flex min-h-11 items-center rounded-md border border-[#E4E4E7] bg-white px-3 text-[13px] font-medium text-[#09090B] hover:bg-[#F4F4F5] sm:min-h-9"
-        >
+        <Button class="min-h-11 sm:min-h-9" @click="promptDrawerOpen = true">
           Generate via Agent Prompt
-        </NuxtLink>
+        </Button>
         <Button
           v-if="upstreams.length"
           data-variant="primary"
@@ -627,17 +637,21 @@ async function performDelete() {
         <p>
           No endpoints currently have MCP Apps UI views attached{{ upstreamFilter !== "__all__" ? ` for '${upstreamFilter}'` : "" }}.
           Pick a tool below to create a visual card right here, or generate an OnboardingBundle JSON with
-          <code class="font-mono-data">experiences</code> on
-          <NuxtLink to="/onboarding" class="font-medium text-[#0F766E] underline">Onboarding</NuxtLink>.
+          <code class="font-mono-data">experiences</code> via an agent prompt.
         </p>
-        <Button
-          v-if="upstreams.length"
-          data-variant="primary"
-          class="min-h-9 text-xs"
-          @click="openCreateDrawer(upstreamFilter !== '__all__' ? upstreamFilter : undefined)"
-        >
-          Create UI for {{ upstreamFilter !== "__all__" ? upstreamFilter : "an Upstream Tool" }}
-        </Button>
+        <div class="flex flex-wrap items-center gap-2">
+          <Button
+            v-if="upstreams.length"
+            data-variant="primary"
+            class="min-h-9 text-xs"
+            @click="openCreateDrawer(upstreamFilter !== '__all__' ? upstreamFilter : undefined)"
+          >
+            Create UI for {{ upstreamFilter !== "__all__" ? upstreamFilter : "an Upstream Tool" }}
+          </Button>
+          <Button class="min-h-9 text-xs" @click="promptDrawerOpen = true">
+            Generate via Agent Prompt
+          </Button>
+        </div>
       </div>
 
       <div v-if="filteredExperiences.length" class="grid grid-cols-1 gap-6 lg:grid-cols-12">
@@ -782,15 +796,30 @@ async function performDelete() {
     <Drawer v-model:open="createDrawerOpen" side="right" prevent-edge-swipe>
       <DrawerBackdrop />
       <DrawerContent class="flex h-dvh w-full max-w-[95vw] flex-col gap-0 border-l border-[#E4E4E7] bg-white p-0 sm:w-[38rem]">
-        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-7">
-          <DrawerClose aria-label="Close MCP UI creator" class="absolute right-4 top-4">
+        <div class="shrink-0 flex items-start justify-between gap-3 border-b border-[#E4E4E7] px-5 py-4">
+          <div class="min-w-0 space-y-1">
+            <DrawerTitle>Create MCP App UI</DrawerTitle>
+            <DrawerDescription>
+              Select any registered upstream and tool to generate a safe declarative <code class="font-mono-data">mcpcodeaway-ui/1</code> widget.
+            </DrawerDescription>
+          </div>
+          <DrawerClose
+            aria-label="Close MCP UI creator"
+            class="inline-flex min-h-9 min-w-9 shrink-0 items-center justify-center rounded-md border border-[#D4D4D8] bg-white text-[#09090B] hover:bg-[#F4F4F5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
+          >
             <AppIcon name="x" :size="16" />
           </DrawerClose>
-          <DrawerTitle>Create MCP App UI</DrawerTitle>
-          <DrawerDescription>
-            Select any registered upstream and tool to generate a safe declarative <code class="font-mono-data">mcpcodeaway-ui/1</code> widget.
-          </DrawerDescription>
-          <form class="mt-5 min-w-0 space-y-4" @submit.prevent="saveCreatedExperience">
+        </div>
+        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-6">
+          <div
+            v-if="createDrawerError"
+            role="alert"
+            class="mb-4 flex items-start gap-2 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-3 py-2.5 text-[12px] text-[#DC2626]"
+          >
+            <AppIcon name="alert" :size="15" class="mt-0.5 shrink-0" />
+            <span>{{ createDrawerError }}</span>
+          </div>
+          <form class="min-w-0 space-y-4" @submit.prevent="saveCreatedExperience">
             <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Field class="min-w-0">
                 <FieldLabel>Upstream</FieldLabel>
@@ -887,15 +916,30 @@ async function performDelete() {
     <Drawer v-model:open="editDrawerOpen" side="right" prevent-edge-swipe>
       <DrawerBackdrop />
       <DrawerContent class="flex h-dvh w-full max-w-[95vw] flex-col gap-0 border-l border-[#E4E4E7] bg-white p-0 sm:w-[36rem]">
-        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-7">
-          <DrawerClose aria-label="Close UI editor" class="absolute right-4 top-4">
+        <div class="shrink-0 flex items-start justify-between gap-3 border-b border-[#E4E4E7] px-5 py-4">
+          <div class="min-w-0 space-y-1">
+            <DrawerTitle>Edit MCP App UI Experience</DrawerTitle>
+            <DrawerDescription>
+              Update the declarative layout (<code class="font-mono-data">mcpcodeaway-ui/1</code>) rendered for '{{ editTarget?.experience?.tool }}'.
+            </DrawerDescription>
+          </div>
+          <DrawerClose
+            aria-label="Close UI editor"
+            class="inline-flex min-h-9 min-w-9 shrink-0 items-center justify-center rounded-md border border-[#D4D4D8] bg-white text-[#09090B] hover:bg-[#F4F4F5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
+          >
             <AppIcon name="x" :size="16" />
           </DrawerClose>
-          <DrawerTitle>Edit MCP App UI Experience</DrawerTitle>
-          <DrawerDescription>
-            Update the declarative layout (<code class="font-mono-data">mcpcodeaway-ui/1</code>) rendered for '{{ editTarget?.experience?.tool }}'.
-          </DrawerDescription>
-          <form class="mt-5 min-w-0 space-y-4" @submit.prevent="saveExperienceEdit">
+        </div>
+        <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-6">
+          <div
+            v-if="editDrawerError"
+            role="alert"
+            class="mb-4 flex items-start gap-2 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-3 py-2.5 text-[12px] text-[#DC2626]"
+          >
+            <AppIcon name="alert" :size="15" class="mt-0.5 shrink-0" />
+            <span>{{ editDrawerError }}</span>
+          </div>
+          <form class="min-w-0 space-y-4" @submit.prevent="saveExperienceEdit">
             <Field>
               <FieldLabel for="edit-ui-fallback">Text fallback summary</FieldLabel>
               <Input id="edit-ui-fallback" v-model="editForm.fallback" required />
@@ -941,5 +985,13 @@ async function performDelete() {
         </div>
       </DialogContent>
     </Dialog>
+
+    <PromptBundleDrawer
+      v-model:open="promptDrawerOpen"
+      focus="mcp_ui"
+      :upstreams="upstreams"
+      :upstream="upstreamFilter !== '__all__' ? upstreamFilter : upstreams[0] || ''"
+      @applied="handleBundleApplied"
+    />
   </div>
 </template>

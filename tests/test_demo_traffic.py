@@ -358,3 +358,167 @@ async def test_gateway_demo_burst_exercises_write_and_failure_spectrum(tmp_path:
         key_file = tmp_path / ".mcpcodeaway-demo-recovery-keys.json"
         assert key_file.exists()
         assert key_file.stat().st_mode & 0o077 == 0
+
+
+@pytest.mark.asyncio
+async def test_ensure_demo_solutions_seeds_all_upstreams_with_zero_runs(tmp_path: Path) -> None:
+    keys = LocalDevKeyManager(issuer="http://127.0.0.1:8000/dev/oidc")
+    mock_app = create_mock_backends_app(
+        public_key_pem=keys.public_pem,
+        expected_issuer=keys.issuer,
+    )
+    upstream_config = {
+        "upstreams": [
+            {
+                "name": "global_ticketing",
+                "type": "openapi",
+                "url": "http://mock-backends/ticketing",
+                "openapi_spec_url": "http://mock-backends/ticketing/openapi.json",
+                "auth_type": "delegated_token",
+                "downstream_audience": "api://ticketing-system",
+                "downstream_scope": "mcp.tools ops.write",
+                "allowed_roles": [
+                    "ops_engineer",
+                    "ticketing_reader",
+                    "ticketing_writer",
+                    "gateway_admin",
+                    "admin",
+                ],
+                "allowed_groups": ["operations", "platform-admins"],
+                "allowed_operations": [
+                    "list_ticketing_queues",
+                    "list_tickets",
+                    "create_ticket",
+                    "get_ticket",
+                    "assign_ticket",
+                    "escalate_ticket",
+                    "resolve_ticket",
+                    "add_ticket_comment",
+                    "get_ticket_sla",
+                    "get_ticketing_metrics",
+                ],
+                "mutating_tools": [
+                    "create_ticket",
+                    "assign_ticket",
+                    "escalate_ticket",
+                    "resolve_ticket",
+                    "add_ticket_comment",
+                ],
+            },
+            {
+                "name": "hr_directory",
+                "type": "openapi",
+                "url": "http://mock-backends/hr",
+                "openapi_spec_url": "http://mock-backends/hr/openapi.json",
+                "auth_type": "none",
+                "allowed_roles": ["hr_ops", "hr_writer", "gateway_admin", "admin"],
+                "allowed_groups": ["hr", "platform-admins"],
+                "allowed_operations": [
+                    "list_hr_employees",
+                    "get_hr_employee",
+                    "update_hr_employee",
+                ],
+                "tool_approval_policies": {
+                    "update_hr_employee": {
+                        "mode": "requester_confirmation",
+                        "version": 1,
+                        "confirmation_message": "Confirm HR update.",
+                    }
+                },
+                "mutating_tools": ["update_hr_employee"],
+            },
+            {
+                "name": "crm_accounts",
+                "type": "openapi",
+                "url": "http://mock-backends/crm",
+                "openapi_spec_url": "http://mock-backends/crm/openapi.json",
+                "auth_type": "none",
+                "allowed_roles": ["sales_ops", "finance_analyst", "gateway_admin", "admin"],
+                "allowed_groups": ["sales", "finance", "platform"],
+                "allowed_operations": [
+                    "list_crm_accounts",
+                    "list_crm_accounts_summary",
+                    "list_crm_accounts_metrics",
+                ],
+            },
+            {
+                "name": "devops_ci",
+                "type": "openapi",
+                "url": "http://mock-backends/devops",
+                "openapi_spec_url": "http://mock-backends/devops/openapi.json",
+                "auth_type": "none",
+                "allowed_roles": ["platform_eng", "gateway_admin", "admin"],
+                "allowed_groups": ["engineering", "platform"],
+                "allowed_operations": [
+                    "list_ci_deployments",
+                    "list_ci_deployments_health",
+                    "list_ci_deployments_metrics",
+                ],
+            },
+        ]
+    }
+    config_path = tmp_path / "upstreams.json"
+    config_path.write_text(json.dumps(upstream_config), encoding="utf-8")
+    settings = GatewaySettings(
+        auth_mode="dev",
+        profile="demo",
+        upstreams_config_path=str(config_path),
+        sqlite_path=str(tmp_path / "solutions.db"),
+        allowed_tenants=["tenant-acme-dev"],
+    )
+    backend_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=mock_app), base_url="http://mock-backends"
+    )
+    app = create_gateway_app(
+        settings=settings,
+        dev_keys=keys,
+        store=SQLiteAuditStore(settings.sqlite_path),
+        http_client=backend_client,
+    )
+    try:
+        async with app.router.lifespan_context(app):
+            rt = app.state.runtime
+            runs_before = await rt.store.list_runs(limit=10)
+            assert runs_before == []
+
+            published = await rt.store.list_current_published_integration_definitions(
+                "tenant-acme-dev"
+            )
+            by_upstream = {row["upstream_name"]: row["definition"] for row in published}
+            assert set(by_upstream) == {
+                "global_ticketing",
+                "crm_accounts",
+                "devops_ci",
+            }
+            crm_exps = {exp["id"] for exp in by_upstream["crm_accounts"]["experiences"]}
+            devops_exps = {exp["id"] for exp in by_upstream["devops_ci"]["experiences"]}
+            crm_wfs = {wf["id"] for wf in by_upstream["crm_accounts"]["workflows"]}
+            devops_wfs = {wf["id"] for wf in by_upstream["devops_ci"]["workflows"]}
+            assert "crm_account_summary_ui" in crm_exps
+            assert "devops_build_status_ui" in devops_exps
+            assert "account_risk_review" in crm_wfs
+            assert "pipeline_incident_triage" in devops_wfs
+
+            golden = await rt.demo_traffic.golden_run()
+            assert golden["traffic"]["sent"] > 0
+            assert golden["ticketing_workflow"]["status"] == "completed"
+            assert golden["business_value_workflow"]["status"] == "completed"
+            published_after = await rt.store.list_current_published_integration_definitions(
+                "tenant-acme-dev"
+            )
+            hr_def = next(
+                row["definition"]
+                for row in published_after
+                if row["upstream_name"] == "hr_directory"
+            )
+            hr_wfs = {wf["id"] for wf in hr_def["workflows"]}
+            hr_exps = {exp["id"] for exp in hr_def["experiences"]}
+            assert {
+                "demo_fictional_employee_profile_update",
+                "employee_role_audit_and_update",
+            } <= hr_wfs
+            assert {"hr_employee_lookup_ui", "hr_employee_inspector_ui"} <= hr_exps
+            runs_after = await rt.store.list_runs(limit=10)
+            assert len(runs_after) > 0
+    finally:
+        await backend_client.aclose()

@@ -19,6 +19,7 @@ from gateway.auth import LocalDevKeyManager
 from gateway.config import AbacRuleConfig, GatewaySettings, UpstreamConfig
 from gateway.observability import JsonLogFormatter
 from gateway.profiles import resolve_profile
+from gateway.runtime_stats import collect_runtime_telemetry
 from gateway.server import GatewayRuntime, create_gateway_app
 from gateway.state import PostgresAuditStore
 from gateway.upstream_clients import DiscoveredTool, UpstreamClientManager
@@ -566,4 +567,185 @@ def test_multitarget_dockerfile_and_compose_prod_profile() -> None:
     assert "prod" in compose["services"]["postgres"]["profiles"]
     assert "prod" in compose["services"]["redis"]["profiles"]
     assert "scaled" in compose["services"]["sandbox-worker"]["profiles"]
+    assert "demo" in compose["services"]["sandbox-worker"]["profiles"]
+    assert compose["services"]["gateway"]["environment"]["GATEWAY_SANDBOX_BACKEND"] == "remote"
+    assert (
+        compose["services"]["gateway"]["environment"]["GATEWAY_SANDBOX_WORKER_URL"]
+        == "ws://sandbox-worker:8002/ws/execute"
+    )
+    assert compose["services"]["gateway"]["environment"]["GATEWAY_DEMO_AUTO_GOLDEN"] == "true"
+    assert "sandbox_isolated" in compose["services"]["gateway"]["networks"]
+    assert compose["services"]["sandbox-worker"]["networks"] == ["sandbox_isolated"]
     assert "prod" in compose["services"]["sandbox-worker-prod"]["profiles"]
+
+
+@pytest.mark.asyncio
+async def test_collect_runtime_telemetry_aggregates_multi_worker_health_and_local_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+
+    def _ok_handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://10.42.0.10:8002/health":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "service": "sandbox-worker",
+                    "worker_id": "worker-a",
+                    "min_processes": 1,
+                    "max_processes": 4,
+                    "max_concurrent_executions": 4,
+                    "cpu_percent": 10.0,
+                    "rss_mb": 120.0,
+                    "load_avg_1m": 0.4,
+                    "cpu_count": 2,
+                    "uptime_seconds": 30.0,
+                    "active_executions": 1,
+                    "total_executions": 5,
+                },
+            )
+        if str(request.url) == "http://10.42.0.11:8002/health":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "service": "sandbox-worker",
+                    "worker_id": "worker-b",
+                    "min_processes": 1,
+                    "max_processes": 4,
+                    "max_concurrent_executions": 4,
+                    "cpu_percent": 20.0,
+                    "rss_mb": 140.0,
+                    "load_avg_1m": 0.6,
+                    "cpu_count": 2,
+                    "uptime_seconds": 45.0,
+                    "active_executions": 2,
+                    "total_executions": 7,
+                },
+            )
+        return httpx.Response(503, text="worker down")
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(_ok_handler))
+    loop = asyncio.get_running_loop()
+
+    async def _fake_getaddrinfo(host: str, port: int, **_kwargs: object) -> list[tuple[Any, ...]]:
+        if host == "sandbox-worker":
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.42.0.11", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.42.0.10", port)),
+            ]
+        raise socket.gaierror("unresolved")
+
+    monkeypatch.setattr(loop, "getaddrinfo", _fake_getaddrinfo)
+    settings = GatewaySettings(
+        auth_mode="dev",
+        profile="demo",
+        sandbox_backend="remote",
+        sandbox_worker_url="ws://sandbox-worker:8002/ws/execute",
+        sqlite_path=str(tmp_path / "rt-multi.db"),
+        upstreams_config_path=str(tmp_path / "none.yaml"),
+    )
+    runtime = GatewayRuntime(settings=settings, http_client=http_client, preloaded_tools={})
+    await runtime.startup()
+    try:
+        telemetry = await collect_runtime_telemetry(runtime)
+        assert telemetry["sandbox_worker"]["status"] == "ok"
+        assert telemetry["sandbox_worker"]["worker_count"] == 2
+        assert telemetry["sandbox_worker"]["healthy_count"] == 2
+        assert telemetry["sandbox_worker"]["stats"]["cpu_percent"] == 15.0
+        assert telemetry["sandbox_worker"]["stats"]["rss_mb"] == 260.0
+        assert telemetry["sandbox_worker"]["stats"]["active_executions"] == 3
+        assert telemetry["sandbox_worker"]["stats"]["total_executions"] == 12
+        assert [w["worker_id"] for w in telemetry["sandbox_workers"]] == ["worker-a", "worker-b"]
+
+        runtime.settings.sandbox_worker_url = (
+            "ws://10.42.0.10:8002/ws/execute,ws://10.42.0.99:8002/ws/execute"
+        )
+        degraded = await collect_runtime_telemetry(runtime)
+        assert degraded["sandbox_worker"]["status"] == "degraded"
+        assert degraded["sandbox_worker"]["worker_count"] == 2
+        assert degraded["sandbox_worker"]["healthy_count"] == 1
+        statuses = {w["health_url"]: w["status"] for w in degraded["sandbox_workers"]}
+        assert statuses == {
+            "http://10.42.0.10:8002/health": "ok",
+            "http://10.42.0.99:8002/health": "unreachable",
+        }
+
+        runtime.settings.sandbox_worker_url = "ws://10.42.0.99:8002/ws/execute"
+        down = await collect_runtime_telemetry(runtime)
+        assert down["sandbox_worker"]["status"] == "unreachable"
+        assert down["sandbox_worker"]["healthy_count"] == 0
+    finally:
+        await runtime.shutdown()
+        await http_client.aclose()
+
+    local_settings = GatewaySettings(
+        auth_mode="dev",
+        profile="demo",
+        sandbox_backend="local",
+        sqlite_path=str(tmp_path / "rt-local.db"),
+        upstreams_config_path=str(tmp_path / "none.yaml"),
+    )
+    local_rt = GatewayRuntime(settings=local_settings, preloaded_tools={})
+    await local_rt.startup()
+    try:
+        local_tel = await collect_runtime_telemetry(local_rt)
+        assert local_tel["sandbox_worker"]["status"] == "in_process"
+        assert len(local_tel["sandbox_workers"]) == 1
+        assert local_tel["sandbox_workers"][0]["status"] == "in_process"
+        assert local_tel["sandbox_workers"][0]["worker_id"].endswith("-local")
+        assert local_tel["sandbox_workers"][0]["pool"]["max_processes"] == 4
+    finally:
+        await local_rt.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_demo_auto_golden_runs_once_only_when_store_is_empty(tmp_path: Path) -> None:
+    settings = GatewaySettings(
+        auth_mode="dev",
+        profile="demo",
+        demo_auto_golden=True,
+        sqlite_path=str(tmp_path / "auto-golden.db"),
+        upstreams_config_path=str(tmp_path / "none.yaml"),
+    )
+    dev_keys = LocalDevKeyManager(issuer=settings.oidc_issuer)
+    app = create_gateway_app(settings=settings, dev_keys=dev_keys, preloaded_tools={})
+    rt = app.state.runtime
+    called = asyncio.Event()
+    calls = 0
+
+    async def _fake_golden_run() -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        called.set()
+        return {"ok": True}
+
+    rt.demo_traffic.golden_run = _fake_golden_run
+    async with app.router.lifespan_context(app):
+        await asyncio.wait_for(called.wait(), timeout=2.0)
+    assert calls == 1
+
+    app2 = create_gateway_app(settings=settings, dev_keys=dev_keys, preloaded_tools={})
+    rt2 = app2.state.runtime
+    await rt2.store.init()
+    await rt2.store.record_run(
+        {
+            "run_id": "preexisting-run",
+            "tenant_id": "tenant-acme-dev",
+            "created_at": "2026-01-01T00:00:00Z",
+            "mode": "codemode",
+            "ok": True,
+        }
+    )
+    calls2 = 0
+
+    async def _fake_golden_run_2() -> dict[str, Any]:
+        nonlocal calls2
+        calls2 += 1
+        return {"ok": True}
+
+    rt2.demo_traffic.golden_run = _fake_golden_run_2
+    async with app2.router.lifespan_context(app2):
+        await asyncio.sleep(0.05)
+    assert calls2 == 0

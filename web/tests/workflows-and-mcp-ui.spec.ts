@@ -30,7 +30,7 @@ import {
 import { Switch, SwitchThumb } from "@ui-sdk/vue/switch";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "@ui-sdk/vue/tabs";
 import { Textarea } from "@ui-sdk/vue/textarea";
-import { defineComponent, h } from "vue";
+import { defineComponent, h, nextTick } from "vue";
 import { afterEach, expect, test, vi } from "vitest";
 import UpstreamMcpUiCatalog from "~/components/UpstreamMcpUiCatalog.vue";
 import McpUiPage from "~/pages/mcp-ui.vue";
@@ -563,4 +563,280 @@ test("MCP Apps UI page simulates host results and creates a new UI for an unconf
     ),
   );
   wrapper.unmount();
+});
+
+test("UpstreamMcpUiCatalog opens PromptBundleDrawer in-page and applies bundle", async () => {
+  const experiences: any[] = [];
+  const apiFetch = vi.fn(async (path: string, options?: { method?: string; body?: any }) => {
+    if (path === "/admin/integration-definitions/global_ticketing") {
+      return { current: { definition: { experiences: [...experiences] } } };
+    }
+    if (path === "/admin/onboarding/prompt-pack?upstream_name=global_ticketing") {
+      return { prompt: "Design MCP Apps UI for global_ticketing." };
+    }
+    if (path === "/admin/onboarding/bundle/validate" && options?.method === "POST") {
+      return {
+        valid: true,
+        upstream: { name: "global_ticketing", type: "openapi" },
+        integration_definition: options.body?.integration_definition,
+        warnings: [],
+      };
+    }
+    if (path === "/admin/mcp-ui/preview") {
+      return { valid: true, html: "<div>Generated Ticket Card</div>" };
+    }
+    if (path === "/admin/onboarding/bundle/apply" && options?.method === "POST") {
+      experiences.push(...(options.body?.integration_definition?.experiences ?? []));
+      return {
+        applied: true,
+        integration_definition: { upstream_name: "global_ticketing", published: true },
+      };
+    }
+    throw new Error(`Unexpected ${options?.method ?? "GET"} ${path}`);
+  });
+  vi.stubGlobal("useAdminApi", () => ({ apiFetch }));
+
+  const wrapper = mount(UpstreamMcpUiCatalog, {
+    attachTo: document.body,
+    props: {
+      upstream: "global_ticketing",
+      tools: ["global_ticketing__get_ticket"],
+      canEdit: true,
+      refreshVersion: 0,
+    },
+    global: { components: sharedComponents },
+  });
+
+  try {
+    await vi.waitFor(() =>
+      expect(wrapper.text()).toContain("No MCP Apps UI views attached to tools on this upstream yet."),
+    );
+    await wrapper.findAll("button").find((b) => b.text().includes("Generate UI via Prompt"))!.trigger("click");
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("1. Target Upstream & Agent Prompt"),
+    );
+
+    const previewBtn = [...document.querySelectorAll("button")].find((b) =>
+      b.textContent?.includes("Preview Prompt"),
+    )!;
+    previewBtn.click();
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("Design MCP Apps UI for global_ticketing."),
+    );
+    expect(document.body.textContent).toContain("Target Focus (MCP Apps UI)");
+
+    const bundle = {
+      integration_definition: {
+        manifest_version: "1.0",
+        integration: {
+          id: "global_ticketing",
+          display_name: "Global Ticketing",
+          upstream_name: "global_ticketing",
+        },
+        workflows: [],
+        experiences: [
+          {
+            id: "ticket_card_ui",
+            resource_uri: "ui://mcpcodeaway/global_ticketing/ticket_card/r1",
+            renderer_schema: "mcpcodeaway-ui/1",
+            tool: "global_ticketing__get_ticket",
+            fallback: "Ticket summary",
+            components: [{ type: "heading", text: "Generated Ticket Card" }],
+          },
+        ],
+      },
+    };
+
+    const textarea = document.querySelector(
+      'textarea[aria-label="Paste agent OnboardingBundle JSON"]',
+    ) as HTMLTextAreaElement;
+    textarea.value = JSON.stringify(bundle);
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+
+    const validateBtn = [...document.querySelectorAll("button")].find((b) =>
+      b.textContent?.includes("Validate & Preview Bundle"),
+    ) as HTMLButtonElement;
+    await vi.waitFor(() => expect(validateBtn.disabled).toBe(false));
+    validateBtn.click();
+    await vi.waitFor(() =>
+      expect(document.querySelector('iframe[title="Preview Generated Ticket Card"]')).not.toBeNull(),
+    );
+
+    const applyBtn = [...document.querySelectorAll("button")].find(
+      (b) => b.textContent?.trim() === "Apply & Publish",
+    ) as HTMLButtonElement;
+    await vi.waitFor(() => expect(applyBtn.disabled).toBe(false));
+    applyBtn.click();
+    await vi.waitFor(() => expect(wrapper.text()).toContain("Generated Ticket Card"));
+  } finally {
+    wrapper.unmount();
+  }
+});
+
+test("Workflows page syncs confidence and baseline_source, shows drawer errors inline, and opens Create Workflow & Prompt drawers in-page", async () => {
+  let failNextPatch = true;
+  const patchBodies: any[] = [];
+  const promoteBodies: any[] = [];
+  const apiFetch = vi.fn(async (path: string, options?: { method?: string; body?: any }) => {
+    if (path === "/admin/workflows/catalog") {
+      return {
+        upstreams: ["zendesk_support"],
+        workflows: [
+          {
+            upstream_name: "zendesk_support",
+            definition_revision: 2,
+            workflow: {
+              id: "resolve_ticket",
+              name: "Resolve support ticket",
+              description: "Verify ticket creation",
+              enabled: true,
+              participating_tools: ["zendesk_support__create_ticket"],
+              intent_examples: ["Open a ticket"],
+              completion: {
+                kind: "terminal_tool_result",
+                tool: "zendesk_support__create_ticket",
+                success_when: { path: "/status", type: "non_empty_string" },
+              },
+              business_value: {
+                manual_baseline_minutes: 12,
+                baseline_source: "administrator_estimate",
+                confidence: "unvalidated",
+                effective_from: "2026-11-22",
+              },
+            },
+          },
+        ],
+        candidates: [
+          {
+            candidate_id: "cand-1",
+            upstream_name: "zendesk_support",
+            workflow_slug: "auto_escalation",
+            origin: "auto_mined",
+            status: "pending_review",
+            observed_count: 4,
+            verified_count: 2,
+            sample_intents: ["Escalate billing dispute"],
+            draft_definition: {
+              id: "auto_escalation",
+              name: "Escalate ticket",
+              description: "Verified multi-step escalation",
+              participating_tools: ["zendesk_support__create_ticket"],
+            },
+          },
+        ],
+        episodes: [],
+      };
+    }
+    if (
+      path === "/admin/integration-definitions/zendesk_support/workflows/resolve_ticket" &&
+      options?.method === "PATCH"
+    ) {
+      if (failNextPatch) {
+        failNextPatch = false;
+        throw new Error("Inline validation failure from gateway");
+      }
+      patchBodies.push(options.body);
+      return { updated: true, workflow: { id: "resolve_ticket" } };
+    }
+    if (path === "/admin/workflows/discovered/cand-1/promote" && options?.method === "POST") {
+      promoteBodies.push(options.body);
+      return { promoted: true };
+    }
+    if (path === "/admin/upstreams") {
+      return {
+        upstreams: [{ name: "zendesk_support", tools: ["zendesk_support__create_ticket"] }],
+      };
+    }
+    if (path === "/admin/integration-definitions/zendesk_support") {
+      return { current: null };
+    }
+    throw new Error(`Unexpected ${options?.method ?? "GET"} ${path}`);
+  });
+  vi.stubGlobal("useAdminApi", () => ({ apiFetch }));
+
+  const wrapper = mount(WorkflowsPage, {
+    attachTo: document.body,
+    global: { components: sharedComponents },
+  });
+  try {
+    await vi.waitFor(() => expect(wrapper.text()).toContain("Resolve support ticket"));
+
+    await wrapper.findAll("button").find((b) => b.text().includes("Edit Timing"))!.trigger("click");
+    await vi.waitFor(() => expect(document.querySelector('[aria-label="Workflow confidence"]')).not.toBeNull());
+
+    const confTrigger = document.querySelector('[aria-label="Workflow confidence"]') as HTMLElement;
+    confTrigger.click();
+    await vi.waitFor(() =>
+      expect([...document.querySelectorAll('[role="option"]')].some((n) => n.textContent?.includes("Validated"))).toBe(true),
+    );
+    const validatedOption = [...document.querySelectorAll('[role="option"]')].find(
+      (n) => n.textContent?.trim() === "Validated",
+    ) as HTMLElement;
+    validatedOption.click();
+
+    await vi.waitFor(() =>
+      expect(document.querySelector('[aria-label="Baseline source"]')?.textContent).toContain(
+        "Validated external measurement",
+      ),
+    );
+
+    const editFormEl = document.querySelector('[data-slot="drawer-content"] form') as HTMLFormElement;
+    editFormEl.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-slot="drawer-content"]')?.textContent).toContain(
+        "Inline validation failure from gateway",
+      ),
+    );
+
+    editFormEl.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+    await vi.waitFor(() => expect(patchBodies.length).toBe(1));
+    expect(patchBodies[0]).toMatchObject({
+      confidence: "validated",
+      baseline_source: "validated_external_measurement",
+    });
+
+    await wrapper.findAll("button").find((b) => b.text().includes("Set Baseline & Activate"))!.trigger("click");
+    await vi.waitFor(() =>
+      expect(document.querySelector('[aria-label="Candidate baseline source"]')).not.toBeNull(),
+    );
+    const candSourceTrigger = document.querySelector(
+      '[aria-label="Candidate baseline source"]',
+    ) as HTMLElement;
+    candSourceTrigger.click();
+    await vi.waitFor(() =>
+      expect(
+        [...document.querySelectorAll('[role="option"]')].some((n) =>
+          n.textContent?.includes("Sampled manual measurement"),
+        ),
+      ).toBe(true),
+    );
+    (
+      [...document.querySelectorAll('[role="option"]')].find((n) =>
+        n.textContent?.includes("Sampled manual measurement"),
+      ) as HTMLElement
+    ).click();
+
+    const promoteFormEl = document.querySelector('[data-slot="drawer-content"] form') as HTMLFormElement;
+    promoteFormEl.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+    await vi.waitFor(() => expect(promoteBodies.length).toBe(1));
+    expect(promoteBodies[0]).toMatchObject({
+      baseline_source: "sampled_manual_measurement",
+      confidence: "sampled",
+      publish: true,
+    });
+
+    await wrapper.findAll("button").find((b) => b.text().trim() === "Create Workflow")!.trigger("click");
+    await vi.waitFor(() => expect(document.querySelector("#workflow-name")).not.toBeNull());
+    expect(document.querySelector('[aria-label="Workflow upstream"]')).not.toBeNull();
+    (document.querySelector('[aria-label="Close workflow editor"]') as HTMLElement).click();
+    await vi.waitFor(() => expect(document.querySelector("#workflow-name")).toBeNull());
+
+    await wrapper.findAll("button").find((b) => b.text().includes("Generate Workflows via Prompt"))!.trigger("click");
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("1. Target Upstream & Agent Prompt"),
+    );
+  } finally {
+    wrapper.unmount();
+  }
 });

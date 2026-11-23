@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
+import type { IconName } from "~/components/AppIcon.vue";
 
-const route = useRoute();
+const route = typeof useRoute === "function" ? useRoute() : { path: "/", fullPath: "/", query: {} as Record<string, string | undefined> };
 const currentPath = computed(() => route.path.replace(/\/+$/, "") || "/");
 const { session, loadAuthState, logout } = useAdminApi();
 const { initAgentBridge } = useUiAgentBridge();
@@ -12,7 +13,7 @@ const sessionReady = ref(false);
 const loggingOut = ref(false);
 const { selectedRange } = useReportRange();
 const isReportPage = computed(() => currentPath.value === "/analytics" ||
-  (currentPath.value === "/model-performance" && route.query.tab !== "discovery"));
+  (currentPath.value === "/model-performance" && route.query?.tab !== "discovery"));
 
 const navigation = [
   {
@@ -43,13 +44,13 @@ const navigation = [
     label: "Business Value",
     to: "/business-value",
     group: "Optimize",
-    icon: "analytics",
+    icon: "business-value",
   },
   {
     label: "Workflows",
     to: "/workflows",
     group: "Optimize",
-    icon: "analytics",
+    icon: "workflows",
   },
   {
     label: "Upstreams Catalog",
@@ -61,7 +62,7 @@ const navigation = [
     label: "Operations Recovery",
     to: "/operations",
     group: "Operate",
-    icon: "traces",
+    icon: "operations",
   },
   {
     label: "Audit & Compliance",
@@ -79,7 +80,7 @@ const navigation = [
     label: "MCP Apps UI",
     to: "/mcp-ui",
     group: "Configure",
-    icon: "upstreams",
+    icon: "mcp-ui",
   },
   {
     label: "Settings & Alerts",
@@ -93,7 +94,12 @@ const navigation = [
     group: "Demo",
     icon: "demo",
   },
-] as const;
+] as const satisfies readonly {
+  label: string;
+  to: string;
+  group: "Operate" | "Optimize" | "Govern" | "Configure" | "Demo";
+  icon: IconName;
+}[];
 
 const groupedNavigation = computed(() => {
   const groups = ["Operate", "Optimize", "Govern", "Configure", "Demo"] as const;
@@ -195,33 +201,7 @@ onBeforeUnmount(() => {
                 :class="activeItem.to === item.to ? 'bg-[#F0FDFA] text-[#0F766E]' : 'text-[#52525B]'"
                 :aria-current="activeItem.to === item.to ? 'page' : undefined"
               >
-                <svg v-if="item.icon === 'overview'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M4 18a8 8 0 1 1 16 0" /><path d="m12 14 4-4M7 18h10" />
-                </svg>
-                <svg v-else-if="item.icon === 'analytics'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M4 6h16M4 12h16M4 18h16" /><circle cx="7" cy="6" r="1" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="17" cy="18" r="1" fill="currentColor" stroke="none" />
-                </svg>
-                <svg v-else-if="item.icon === 'traces'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M4 6h5v5H4zM15 13h5v5h-5zM9 8h3a3 3 0 0 1 3 3v2M9 16h3" />
-                </svg>
-                <svg v-else-if="item.icon === 'models'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="m12 3 8 4.5v9L12 21l-8-4.5v-9zM12 3v18M4 7.5l8 4.5 8-4.5" />
-                </svg>
-                <svg v-else-if="item.icon === 'upstreams'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M7 7h10M7 17h10M5 5 3 7l2 2M19 15l2 2-2 2M12 7v10" />
-                </svg>
-                <svg v-else-if="item.icon === 'audit'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M6 3h9l4 4v14H6zM15 3v5h4M9 12h7M9 16h7" />
-                </svg>
-                <svg v-else-if="item.icon === 'onboarding'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 5v14M5 12h14" />
-                </svg>
-                <svg v-else-if="item.icon === 'settings'" aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.6 1.6-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5v.2h-2.3v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1-1.6-1.6.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H5v-2.3h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1 1.6-1.6.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.5V6h2.3v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1 1.6 1.6-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.5 1h.2v2.3h-.2a1.7 1.7 0 0 0-1.5.8Z" />
-                </svg>
-                <svg v-else aria-hidden="true" viewBox="0 0 24 24" class="h-[18px] w-[18px] shrink-0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="m8 5 11 7-11 7z"/><path d="M4 4v16" />
-                </svg>
+                <AppIcon :name="item.icon" :size="18" />
                 <span class="min-w-0 flex-1 truncate">{{ item.label }}</span>
                 <span v-if="item.group === 'Demo'" class="rounded border border-[#E4E4E7] px-1 py-0.5 text-[9px] font-semibold text-[#71717A]">SANDBOX</span>
               </NuxtLink>
@@ -257,7 +237,7 @@ onBeforeUnmount(() => {
               :aria-expanded="mobileNavigationOpen"
               @click="mobileNavigationOpen = true"
             >
-              <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+              <AppIcon name="menu" :size="20" />
             </button>
             <div class="min-w-0">
               <div class="truncate text-sm font-semibold text-[#09090B]">{{ activeItem.label }}</div>
@@ -298,7 +278,7 @@ onBeforeUnmount(() => {
             <span class="text-sm font-semibold">MCPcodeaway</span>
           </div>
           <button type="button" class="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#F4F4F5]" aria-label="Close navigation" @click="mobileNavigationOpen = false">
-            <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="m6 6 12 12M18 6 6 18" /></svg>
+            <AppIcon name="x" :size="20" />
           </button>
         </div>
         <nav aria-label="Mobile navigation" class="min-h-0 flex-1 overflow-y-auto px-3 py-4">
@@ -312,6 +292,7 @@ onBeforeUnmount(() => {
                 class="flex min-h-11 items-center gap-2.5 rounded-md px-2.5 py-2 text-[12px] font-medium no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]"
                 :class="activeItem.to === item.to ? 'bg-[#F0FDFA] text-[#0F766E]' : 'text-[#52525B] hover:bg-[#F4F4F5]'"
               >
+                <AppIcon :name="item.icon" :size="18" />
                 <span class="min-w-0 flex-1 truncate">{{ item.label }}</span>
                 <span v-if="item.group === 'Demo'" class="rounded border border-[#E4E4E7] px-1 py-0.5 text-[9px] font-semibold text-[#71717A]">SANDBOX</span>
               </NuxtLink>

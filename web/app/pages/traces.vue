@@ -1,5 +1,8 @@
 <script setup lang="ts">
-import { onBeforeUnmount } from "vue";
+import { Button } from "@ui-sdk/vue/button";
+import { Field, FieldLabel } from "@ui-sdk/vue/field";
+import { Switch, SwitchThumb } from "@ui-sdk/vue/switch";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
 import type { ReportRange } from "~/composables/useReportRange";
 
@@ -33,11 +36,25 @@ interface TimelineGroup {
   avg_security_ms: number;
 }
 
+interface SandboxWorkerSummaryEntry {
+  worker_id?: string;
+  mode?: string;
+  status?: string;
+  worker_count?: number;
+  healthy_count?: number;
+  stats?: {
+    active_executions?: number;
+    total_executions?: number;
+  };
+}
+
 interface RuntimeTelemetry {
   gateway?: {
     active_executions?: number;
     total_executions?: number;
   };
+  sandbox_worker?: SandboxWorkerSummaryEntry;
+  sandbox_workers?: SandboxWorkerSummaryEntry[];
   monty_telemetry?: {
     spawn_p50_ms?: number;
     spawn_p95_ms?: number;
@@ -49,8 +66,8 @@ interface RuntimeTelemetry {
 
 const { apiFetch } = useAdminApi();
 const { totalRunsTick } = useLiveTelemetry();
-const route = useRoute();
-const router = useRouter();
+const route = typeof useRoute === "function" ? useRoute() : null;
+const router = typeof useRouter === "function" ? useRouter() : null;
 const { selectedRange } = useReportRange();
 const reportRanges: ReportRange[] = ["1h", "24h", "7d", "30d", "all"];
 const rangeLabels: Record<ReportRange, string> = {
@@ -60,8 +77,8 @@ const rangeLabels: Record<ReportRange, string> = {
   "30d": "Last 30 days",
   all: "All available history",
 };
-const initialGroup = typeof route.query.group === "string" ? route.query.group : "";
-const initialRange = typeof route.query.window === "string" && reportRanges.includes(route.query.window as ReportRange)
+const initialGroup = typeof route?.query?.group === "string" ? route.query.group : "";
+const initialRange = typeof route?.query?.window === "string" && reportRanges.includes(route.query.window as ReportRange)
   ? route.query.window as ReportRange
   : null;
 if (initialRange) selectedRange.value = initialRange;
@@ -142,12 +159,13 @@ const timelineScopeDescription = computed(() =>
 );
 
 function syncRouteQuery() {
-  const query = { ...route.query };
+  if (!route || !router) return;
+  const query = { ...(route.query || {}) };
   const group = groupFilter.value.trim();
   if (group) query.group = group;
   else delete query.group;
   query.window = selectedRange.value;
-  if (query.group === route.query.group && query.window === route.query.window) return;
+  if (query.group === route.query?.group && query.window === route.query?.window) return;
   if (querySyncTimer) clearTimeout(querySyncTimer);
   querySyncTimer = setTimeout(() => void router.replace({ query }), 150);
 }
@@ -163,7 +181,7 @@ watch([groupFilter, selectedRange], () => {
   syncRouteQuery();
 });
 
-watch(() => [route.query.group, route.query.window] as const, ([group, window]) => {
+watch(() => [route?.query?.group, route?.query?.window] as const, ([group, window]) => {
   const nextGroup = typeof group === "string" ? group : "";
   const nextRange = typeof window === "string" && reportRanges.includes(window as ReportRange)
     ? window as ReportRange
@@ -191,6 +209,38 @@ const totalP50 = computed(() => {
 const totalP95 = computed(() => {
   const vals = matchingRuns.value.map((r) => r.duration_ms).sort((a, b) => a - b);
   return vals[Math.min(vals.length - 1, Math.max(0, Math.floor(0.95 * vals.length)))] ?? 0;
+});
+
+const sandboxWorkerSummary = computed(() => {
+  const rt = runtime.value;
+  if (!rt) return null;
+  if (Array.isArray(rt.sandbox_workers) && rt.sandbox_workers.length > 0) {
+    const total = rt.sandbox_workers.length;
+    const healthy = rt.sandbox_workers.filter(
+      (w) => w.status === "ok" || w.status === "in_process",
+    ).length;
+    const activeExecutions = rt.sandbox_workers.reduce(
+      (sum, w) => sum + Number(w.stats?.active_executions ?? 0),
+      0,
+    );
+    return { available: true, total, healthy, activeExecutions };
+  }
+  if (rt.sandbox_worker) {
+    const total = rt.sandbox_worker.worker_count ?? 1;
+    const healthy =
+      rt.sandbox_worker.healthy_count ??
+      (rt.sandbox_worker.status === "ok" || rt.sandbox_worker.status === "in_process" ? 1 : 0);
+    const activeExecutions = Number(
+      rt.sandbox_worker.stats?.active_executions ?? rt.gateway?.active_executions ?? 0,
+    );
+    return { available: true, total, healthy, activeExecutions };
+  }
+  return {
+    available: false,
+    total: 0,
+    healthy: 0,
+    activeExecutions: Number(rt.gateway?.active_executions ?? 0),
+  };
 });
 
 function clearGroupFilter() {
@@ -367,7 +417,7 @@ function otherStageMs(g: TimelineGroup): number {
       <Button class="ml-auto min-h-11 px-3 text-xs" @click="fetchTraces">Retry</Button>
     </div>
 
-    <section class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4" aria-label="Latency and live runtime metrics">
+    <section class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5" aria-label="Latency and live runtime metrics">
       <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
         <div class="text-xs text-[#52525B]">Request latency · p50 / p95</div>
         <div class="mt-1 text-lg font-semibold text-[#09090B] tabular-nums">
@@ -398,6 +448,31 @@ function otherStageMs(g: TimelineGroup): number {
           </div>
           <div class="mt-1 text-xs text-[#71717A] tabular-nums">
             Grounding blocks: {{ runtime.monty_telemetry?.grounding_blocked_runs ?? 0 }}
+          </div>
+        </div>
+        <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
+          <div class="flex items-center justify-between gap-2 text-xs text-[#52525B]">
+            <span>Sandbox Workers</span>
+            <span
+              v-if="sandboxWorkerSummary?.available"
+              class="rounded border px-1.5 py-0.5 text-[11px] font-medium"
+              :class="
+                sandboxWorkerSummary.healthy === sandboxWorkerSummary.total
+                  ? 'border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]'
+                  : 'border-[#FDE68A] bg-[#FFFBEB] text-[#D97706]'
+              "
+            >
+              {{ sandboxWorkerSummary.healthy === sandboxWorkerSummary.total ? "Healthy" : "Degraded" }}
+            </span>
+          </div>
+          <div class="mt-1 text-lg font-semibold text-[#09090B] tabular-nums">
+            <template v-if="sandboxWorkerSummary?.available">
+              {{ sandboxWorkerSummary.healthy }} / {{ sandboxWorkerSummary.total }} healthy
+            </template>
+            <span v-else class="text-sm font-normal text-[#71717A]">Unavailable</span>
+          </div>
+          <div class="mt-1 text-xs text-[#71717A] tabular-nums">
+            {{ sandboxWorkerSummary?.activeExecutions ?? 0 }} active worker executions
           </div>
         </div>
       </template>

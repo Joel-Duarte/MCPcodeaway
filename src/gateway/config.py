@@ -373,6 +373,7 @@ class GatewaySettings(BaseSettings):
     sandbox_backend: Literal["local", "remote"] = "local"
     sandbox_worker_url: str | None = None
     sandbox_worker_secret: str = ""
+    demo_auto_golden: bool = False
     require_tool_grounding: bool = False
     provenance_signing_secret: str = ""
     redis_url: str | None = None

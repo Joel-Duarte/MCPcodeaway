@@ -20,6 +20,7 @@ from gateway.mcp_protocol import (
     request_meta,
 )
 from gateway.upstream_clients import compute_schema_digest
+from gateway.workflow_detector import pick_schema_predicate
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -66,6 +67,7 @@ _BUILTIN_SERVERS = frozenset(
         "crm_accounts",
         "hr_directory",
         "devops_ci",
+        "global_ticketing",
         "recovery_workbench",
     }
 )
@@ -619,11 +621,94 @@ class DemoTrafficRunner:
                     )
                 )
         registry = getattr(self.runtime, "registry", None)
-        if registry is not None and not any(
-            upstream.name == "recovery_workbench" for upstream in registry.list_upstreams()
-        ):
+        registered_names = (
+            {upstream.name for upstream in registry.list_upstreams() if upstream.enabled}
+            if registry is not None
+            else set()
+        )
+        if registry is not None and "recovery_workbench" not in registered_names:
             workloads = [item for item in workloads if not item[2].startswith("recovery:")]
-        return workloads + dynamic_workloads
+        extra_codemode: list[tuple[str, str, str, dict[str, Any], dict[str, str] | None]] = []
+        if "crm_accounts" in registered_names:
+            extra_codemode.append(
+                (
+                    "gateway_admin",
+                    "mode=codemode",
+                    "crm_accounts:account_metrics_codemode",
+                    {
+                        "name": "execute_code",
+                        "arguments": {
+                            "code": (
+                                "accts = await crm_accounts__list_crm_accounts(limit=10)\n"
+                                "metrics = await crm_accounts__list_crm_accounts_metrics()\n"
+                                "{'accounts': accts.get('count', 0), "
+                                "'active': metrics.get('active_items', 0)}"
+                            )
+                        },
+                    },
+                    {"X-Model-Name": "claude-sonnet-4-5"},
+                )
+            )
+        if "devops_ci" in registered_names:
+            extra_codemode.append(
+                (
+                    "gateway_admin",
+                    "mode=codemode",
+                    "devops_ci:deployment_health_codemode",
+                    {
+                        "name": "execute_code",
+                        "arguments": {
+                            "code": (
+                                "deps = await devops_ci__list_ci_deployments(limit=10)\n"
+                                "health = await devops_ci__list_ci_deployments_health()\n"
+                                "{'deployments': deps.get('count', 0), "
+                                "'healthy': health.get('healthy', False)}"
+                            )
+                        },
+                    },
+                    {"X-Model-Name": "gpt-4o"},
+                )
+            )
+        if "hr_directory" in registered_names:
+            extra_codemode.append(
+                (
+                    "gateway_admin",
+                    "mode=codemode",
+                    "hr_directory:directory_redaction_codemode",
+                    {
+                        "name": "execute_code",
+                        "arguments": {
+                            "code": (
+                                "staff = await hr_directory__list_hr_employees(limit=5)\n"
+                                "{'count': staff.get('count', 0), "
+                                "'sample_emails': [e.get('email') for e in staff.get('items', [])]}"
+                            )
+                        },
+                    },
+                    {"X-Model-Name": "claude-sonnet-4-5"},
+                )
+            )
+        if "global_ticketing" in registered_names:
+            extra_codemode.append(
+                (
+                    "ops_engineer",
+                    "mode=codemode",
+                    "global_ticketing:queue_sla_codemode",
+                    {
+                        "name": "execute_code",
+                        "arguments": {
+                            "code": (
+                                "tickets = await global_ticketing__list_tickets(region='EU')\n"
+                                "metrics = await global_ticketing__get_ticketing_metrics()\n"
+                                "{'eu_tickets': tickets.get('count', 0), "
+                                "'open_total': metrics.get('open_tickets', 0)}"
+                            )
+                        },
+                    },
+                    {"X-Model-Name": "gemini-2.5-pro"},
+                )
+            )
+        return workloads + extra_codemode + dynamic_workloads
 
     async def _dispatch_one(
         self,
@@ -640,7 +725,7 @@ class DemoTrafficRunner:
         token_overrides = (
             {
                 "roles": ["gateway_admin", "admin"],
-                "groups": ["platform-admins"],
+                "groups": ["platform-admins", "platform"],
                 "scopes": ["mcp.tools", "mcp.write"],
             }
             if persona == "gateway_admin"
@@ -826,13 +911,21 @@ class DemoTrafficRunner:
         """Seed pre-built agent solution definitions in local demo mode."""
         if self._app is None or self.runtime.dev_keys is None:
             return
-        try:
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self._app), base_url="http://demo.local"
-            ) as client:
-                await self._ensure_ticketing_demo_workflows(client)
-        except Exception:
-            return
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self._app), base_url="http://demo.local"
+        ) as client:
+            seeders = [
+                self._ensure_ticketing_demo_workflows,
+                self._ensure_crm_demo_solutions,
+                self._ensure_devops_demo_solutions,
+            ]
+            if self.runtime.settings.demo_auto_golden:
+                seeders.append(self._ensure_hr_demo_workflow)
+            for seeder in seeders:
+                try:
+                    await seeder(client)
+                except Exception:
+                    continue
 
     async def _ensure_ticketing_demo_workflows(self, client: httpx.AsyncClient) -> str | None:
         upstream = self.runtime.registry.get("global_ticketing")
@@ -1156,7 +1249,11 @@ class DemoTrafficRunner:
             )
             await call_confirmed(
                 "global_ticketing__add_ticket_comment",
-                {"ticket_id": "TCK-1001", "body": "Restarted webhook relay in demo traffic."},
+                {
+                    "ticket_id": "TCK-1001",
+                    "body": "Restarted webhook relay in demo traffic.",
+                    "internal": False,
+                },
             )
             await call_confirmed(
                 "global_ticketing__resolve_ticket",
@@ -1188,21 +1285,19 @@ class DemoTrafficRunner:
         if not tenant_id or self.runtime.dev_keys is None:
             return None
         workflow_slug = "demo_fictional_employee_profile_update"
+        audit_slug = "employee_role_audit_and_update"
         workflow_id = f"hr_directory/{workflow_slug}"
         async with self._business_value_workflow_lock:
             current = await self.runtime.store.get_current_published_integration_definition(
                 tenant_id, "hr_directory"
             )
+            current_def = (current.get("definition") or {}) if current else {}
+            existing_wfs = {item.get("id") for item in current_def.get("workflows", [])}
+            existing_exps = {exp.get("id") for exp in current_def.get("experiences", [])}
             if (
                 current
-                and any(
-                    item.get("id") == workflow_slug
-                    for item in (current.get("definition") or {}).get("workflows", [])
-                )
-                and any(
-                    exp.get("id") == "hr_employee_lookup_ui"
-                    for exp in (current.get("definition") or {}).get("experiences", [])
-                )
+                and {workflow_slug, audit_slug} <= existing_wfs
+                and {"hr_employee_lookup_ui", "hr_employee_inspector_ui"} <= existing_exps
             ):
                 return workflow_id
 
@@ -1276,61 +1371,144 @@ class DemoTrafficRunner:
                         "csp": {"connect_domains": [], "resource_domains": [], "frame_domains": []},
                     }
                 )
-            definition.setdefault("workflows", []).append(
-                {
-                    "id": workflow_slug,
-                    "name": "Update and verify a fictional employee profile",
-                    "description": (
-                        "List the fictional HR directory, read an employee profile, update the "
-                        "employee role, and verify the saved profile with a terminal readback."
-                    ),
-                    "participating_tools": [
-                        tools["list_hr_employees"].qualified_name,
-                        tools["get_hr_employee"].qualified_name,
-                        tools["update_hr_employee"].qualified_name,
-                    ],
-                    "required_evidence": [
-                        {
-                            "tool": tools["list_hr_employees"].qualified_name,
-                            "result_when": {"path": "/items", "type": "non_empty_array"},
-                        },
-                        {
-                            "tool": tools["get_hr_employee"].qualified_name,
-                            "min_successful_calls": 2,
-                            "result_when": {
-                                "path": "/employee_id",
-                                "type": "non_empty_string",
+            if not any(
+                exp.get("id") == "hr_employee_inspector_ui" for exp in definition["experiences"]
+            ):
+                definition["experiences"].append(
+                    {
+                        "id": "hr_employee_inspector_ui",
+                        "resource_uri": "ui://mcpcodeaway/hr/employee-inspector/r1",
+                        "renderer_schema": "mcpcodeaway-ui/1",
+                        "tool": tools["list_hr_employees"].qualified_name,
+                        "fallback": (
+                            "Use hr_directory__list_hr_employees to inspect directory staff."
+                        ),
+                        "input_mapping": {},
+                        "components": [
+                            {"type": "heading", "text": "HR Directory Inspector"},
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Browse seeded employees across finance, engineering, "
+                                    "and operations."
+                                ),
                             },
-                        },
-                        {
-                            "tool": tools["update_hr_employee"].qualified_name,
-                            "result_when": {
+                            {"type": "button", "label": "List Employees", "action": "invoke_tool"},
+                            {"type": "record", "data": "tool_result"},
+                        ],
+                        "csp": {"connect_domains": [], "resource_domains": [], "frame_domains": []},
+                    }
+                )
+            definition.setdefault("workflows", [])
+            if not any(wf.get("id") == workflow_slug for wf in definition["workflows"]):
+                definition["workflows"].append(
+                    {
+                        "id": workflow_slug,
+                        "name": "Update and verify a fictional employee profile",
+                        "description": (
+                            "List the fictional HR directory, read an employee profile, update the "
+                            "employee role, and verify the saved profile with a terminal readback."
+                        ),
+                        "participating_tools": [
+                            tools["list_hr_employees"].qualified_name,
+                            tools["get_hr_employee"].qualified_name,
+                            tools["update_hr_employee"].qualified_name,
+                        ],
+                        "required_evidence": [
+                            {
+                                "tool": tools["list_hr_employees"].qualified_name,
+                                "result_when": {"path": "/items", "type": "non_empty_array"},
+                            },
+                            {
+                                "tool": tools["get_hr_employee"].qualified_name,
+                                "min_successful_calls": 2,
+                                "result_when": {
+                                    "path": "/employee_id",
+                                    "type": "non_empty_string",
+                                },
+                            },
+                            {
+                                "tool": tools["update_hr_employee"].qualified_name,
+                                "result_when": {
+                                    "path": "/role",
+                                    "type": "string",
+                                    "equals": "senior_controller",
+                                },
+                            },
+                        ],
+                        "completion": {
+                            "kind": "terminal_tool_result",
+                            "tool": tools["get_hr_employee"].qualified_name,
+                            "success_when": {
                                 "path": "/role",
                                 "type": "string",
                                 "equals": "senior_controller",
                             },
                         },
-                    ],
-                    "completion": {
-                        "kind": "terminal_tool_result",
-                        "tool": tools["get_hr_employee"].qualified_name,
-                        "success_when": {
-                            "path": "/role",
-                            "type": "string",
-                            "equals": "senior_controller",
+                        "business_value": {
+                            "manual_baseline_minutes": 8,
+                            "baseline_source": "administrator_estimate",
+                            "confidence": "unvalidated",
+                            "effective_from": datetime.now(UTC).date().isoformat(),
+                            "evidence_note": (
+                                "Demo-only estimate for the fictional HR profile update workflow."
+                            ),
                         },
-                    },
-                    "business_value": {
-                        "manual_baseline_minutes": 8,
-                        "baseline_source": "administrator_estimate",
-                        "confidence": "unvalidated",
-                        "effective_from": datetime.now(UTC).date().isoformat(),
-                        "evidence_note": (
-                            "Demo-only estimate for the fictional HR profile update workflow."
+                    }
+                )
+            if not any(wf.get("id") == audit_slug for wf in definition["workflows"]):
+                definition["workflows"].append(
+                    {
+                        "id": audit_slug,
+                        "name": "Employee Role Audit and Update",
+                        "description": (
+                            "Review directory staffing records, audit role assignments, "
+                            "and record a promotion."
                         ),
-                    },
-                }
-            )
+                        "enabled": True,
+                        "origin": "agent_prompt",
+                        "intent_examples": [
+                            "Audit directory staffing roles and promote a member",
+                        ],
+                        "participating_tools": [
+                            tools["list_hr_employees"].qualified_name,
+                            tools["get_hr_employee"].qualified_name,
+                            tools["update_hr_employee"].qualified_name,
+                        ],
+                        "required_evidence": [
+                            {
+                                "tool": tools["list_hr_employees"].qualified_name,
+                                "min_successful_calls": 1,
+                                "result_when": {"path": "/items", "type": "non_empty_array"},
+                            },
+                            {
+                                "tool": tools["update_hr_employee"].qualified_name,
+                                "min_successful_calls": 1,
+                                "result_when": {
+                                    "path": "/employee_id",
+                                    "type": "non_empty_string",
+                                },
+                            },
+                        ],
+                        "completion": {
+                            "kind": "verified_followup",
+                            "tool": tools["get_hr_employee"].qualified_name,
+                            "success_when": {
+                                "path": "/role",
+                                "type": "non_empty_string",
+                            },
+                        },
+                        "business_value": {
+                            "manual_baseline_minutes": 10,
+                            "baseline_source": "administrator_estimate",
+                            "confidence": "unvalidated",
+                            "effective_from": datetime.now(UTC).date().isoformat(),
+                            "evidence_note": (
+                                "Agent-generated HR role audit workflow demo solution."
+                            ),
+                        },
+                    }
+                )
             admin_token = self.runtime.dev_keys.issue_user_token(
                 persona="gateway_admin",
                 overrides={"tenant_id": tenant_id},
@@ -1352,6 +1530,239 @@ class DemoTrafficRunner:
             if published.status_code != 200:
                 raise RuntimeError(f"Could not publish the demo HR workflow: {published.text}")
             return workflow_id
+
+    async def _ensure_simple_demo_solution(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        upstream_name: str,
+        display_name: str,
+        tool_names: tuple[str, ...],
+        experience_spec: dict[str, Any],
+        workflow_spec: dict[str, Any],
+    ) -> str | None:
+        upstream = self.runtime.registry.get(upstream_name)
+        if upstream is None or not upstream.enabled:
+            return None
+        endpoint = upstream.url or upstream.openapi_spec_url or ""
+        if urlsplit(endpoint).hostname not in {"127.0.0.1", "localhost", "mock-backends"}:
+            return None
+        tenant_id = next(iter(self.runtime.settings.allowed_tenants), None)
+        if not tenant_id or self.runtime.dev_keys is None:
+            return None
+        async with self._business_value_workflow_lock:
+            current = await self.runtime.store.get_current_published_integration_definition(
+                tenant_id, upstream_name
+            )
+            discovery_identity = self.runtime._dev_discovery_identity()
+            await self.runtime.ensure_catalog_for_identity(discovery_identity)
+            tools = {
+                name: self.runtime.catalog.get_tool(f"{upstream_name}__{name}")
+                for name in tool_names
+            }
+            if any(tool is None for tool in tools.values()):
+                return None
+            resolved_tools = {name: tool for name, tool in tools.items() if tool is not None}
+            completion_tool = resolved_tools[workflow_spec["completion_tool_short"]]
+            has_output_props = isinstance(completion_tool.output_schema, dict) and bool(
+                completion_tool.output_schema.get("properties")
+            )
+            current_def = (current.get("definition") or {}) if current else {}
+            existing_exps = {exp.get("id") for exp in current_def.get("experiences", [])}
+            existing_wfs = {wf.get("id") for wf in current_def.get("workflows", [])}
+            needs_wf = has_output_props and workflow_spec["id"] not in existing_wfs
+            if current and experience_spec["id"] in existing_exps and not needs_wf:
+                return f"{upstream_name}/{workflow_spec['id']}"
+
+            if current:
+                definition = copy.deepcopy(current["definition"])
+                definition["integration"]["status"] = "draft"
+                definition["integration"]["revision"] = 1
+                definition["publication"] = None
+            else:
+                definition = {
+                    "manifest_version": "1.0",
+                    "integration": {
+                        "id": upstream_name,
+                        "display_name": display_name,
+                        "upstream_name": upstream_name,
+                        "status": "draft",
+                        "revision": 1,
+                    },
+                    "tool_refs": [],
+                    "experiences": [],
+                    "workflows": [],
+                    "standalone_tool_values": [],
+                    "publication": None,
+                }
+            refs = definition.setdefault("tool_refs", [])
+            existing_refs = {ref.get("name") for ref in refs}
+            for tool in resolved_tools.values():
+                if tool.qualified_name not in existing_refs:
+                    refs.append(
+                        {
+                            "name": tool.qualified_name,
+                            "schema_sha256": compute_schema_digest([tool]),
+                        }
+                    )
+            experiences = definition.setdefault("experiences", [])
+            if experience_spec["id"] not in {exp.get("id") for exp in experiences}:
+                experiences.append(experience_spec)
+            workflows = definition.setdefault("workflows", [])
+            if has_output_props and workflow_spec["id"] not in {wf.get("id") for wf in workflows}:
+                today = datetime.now(UTC).date().isoformat()
+                completion_pred = pick_schema_predicate(completion_tool)
+                workflows.append(
+                    {
+                        "id": workflow_spec["id"],
+                        "name": workflow_spec["name"],
+                        "description": workflow_spec["description"],
+                        "enabled": True,
+                        "origin": "agent_prompt",
+                        "intent_examples": workflow_spec["intent_examples"],
+                        "participating_tools": [
+                            resolved_tools[name].qualified_name for name in tool_names
+                        ],
+                        "required_evidence": [
+                            {
+                                "tool": resolved_tools[name].qualified_name,
+                                "min_successful_calls": 1,
+                                **(
+                                    {"result_when": pick_schema_predicate(resolved_tools[name])}
+                                    if isinstance(resolved_tools[name].output_schema, dict)
+                                    and resolved_tools[name].output_schema.get("properties")
+                                    else {}
+                                ),
+                            }
+                            for name in tool_names[:2]
+                        ],
+                        "completion": {
+                            "kind": "verified_followup",
+                            "tool": completion_tool.qualified_name,
+                            "success_when": completion_pred,
+                        },
+                        "business_value": {
+                            "manual_baseline_minutes": workflow_spec["manual_baseline_minutes"],
+                            "baseline_source": "administrator_estimate",
+                            "confidence": "unvalidated",
+                            "effective_from": today,
+                            "evidence_note": workflow_spec["evidence_note"],
+                        },
+                    }
+                )
+            admin_token = self.runtime.dev_keys.issue_user_token(
+                persona="gateway_admin",
+                overrides={"tenant_id": tenant_id},
+            )
+            headers = {"Authorization": f"Bearer {admin_token}"}
+            draft = await client.post(
+                "/admin/integration-definitions/drafts",
+                headers=headers,
+                json={"definition": definition},
+            )
+            if draft.status_code != 200:
+                return None
+            revision = str(draft.json()["revision"])
+            published = await client.post(
+                f"/admin/integration-definitions/{upstream_name}/publish",
+                headers=headers,
+                json={"revision": revision},
+            )
+            if published.status_code != 200:
+                return None
+            return f"{upstream_name}/{workflow_spec['id']}"
+
+    async def _ensure_crm_demo_solutions(self, client: httpx.AsyncClient) -> str | None:
+        return await self._ensure_simple_demo_solution(
+            client,
+            upstream_name="crm_accounts",
+            display_name="Enterprise CRM Accounts",
+            tool_names=(
+                "list_crm_accounts",
+                "list_crm_accounts_summary",
+                "list_crm_accounts_metrics",
+            ),
+            experience_spec={
+                "id": "crm_account_summary_ui",
+                "resource_uri": "ui://mcpcodeaway/crm_accounts/account_summary/r1",
+                "renderer_schema": "mcpcodeaway-ui/1",
+                "tool": "crm_accounts__list_crm_accounts",
+                "fallback": (
+                    "Inspect enterprise CRM accounts using crm_accounts__list_crm_accounts."
+                ),
+                "input_mapping": {},
+                "components": [
+                    {"type": "heading", "text": "Enterprise CRM Account Summary"},
+                    {
+                        "type": "text",
+                        "text": "Review enterprise ARR accounts, tiers, and live health metrics.",
+                    },
+                    {"type": "button", "label": "Load CRM Accounts", "action": "invoke_tool"},
+                    {"type": "record", "data": "tool_result"},
+                ],
+                "csp": {"connect_domains": [], "resource_domains": [], "frame_domains": []},
+            },
+            workflow_spec={
+                "id": "account_risk_review",
+                "name": "Account Risk Review",
+                "description": (
+                    "Inspect enterprise CRM accounts, review summary totals, and verify "
+                    "account metrics."
+                ),
+                "intent_examples": [
+                    "Review enterprise CRM accounts for risk and ARR concentration",
+                ],
+                "completion_tool_short": "list_crm_accounts_metrics",
+                "manual_baseline_minutes": 12,
+                "evidence_note": "Agent-generated CRM account risk review demo solution.",
+            },
+        )
+
+    async def _ensure_devops_demo_solutions(self, client: httpx.AsyncClient) -> str | None:
+        return await self._ensure_simple_demo_solution(
+            client,
+            upstream_name="devops_ci",
+            display_name="DevOps CI/CD Pipelines",
+            tool_names=(
+                "list_ci_deployments",
+                "list_ci_deployments_health",
+                "list_ci_deployments_metrics",
+            ),
+            experience_spec={
+                "id": "devops_build_status_ui",
+                "resource_uri": "ui://mcpcodeaway/devops_ci/build_status/r1",
+                "renderer_schema": "mcpcodeaway-ui/1",
+                "tool": "devops_ci__list_ci_deployments",
+                "fallback": (
+                    "Inspect recent CI/CD deployments using devops_ci__list_ci_deployments."
+                ),
+                "input_mapping": {},
+                "components": [
+                    {"type": "heading", "text": "DevOps CI/CD Build Status"},
+                    {
+                        "type": "text",
+                        "text": "Inspect recent production deployments, SHAs, and health status.",
+                    },
+                    {"type": "button", "label": "Refresh Deployments", "action": "invoke_tool"},
+                    {"type": "record", "data": "tool_result"},
+                ],
+                "csp": {"connect_domains": [], "resource_domains": [], "frame_domains": []},
+            },
+            workflow_spec={
+                "id": "pipeline_incident_triage",
+                "name": "Pipeline Incident Triage",
+                "description": (
+                    "Inspect active CI/CD deployments, check service health, and review "
+                    "deployment latency metrics."
+                ),
+                "intent_examples": [
+                    "Triage CI/CD deployment status and check pipeline health",
+                ],
+                "completion_tool_short": "list_ci_deployments_health",
+                "manual_baseline_minutes": 10,
+                "evidence_note": "Agent-generated DevOps pipeline triage demo solution.",
+            },
+        )
 
     async def _run_hr_business_value_workflow(self) -> dict[str, Any]:
         if self._app is None or self.runtime.dev_keys is None:
