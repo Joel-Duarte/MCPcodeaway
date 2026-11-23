@@ -762,6 +762,12 @@ flowchart LR
   [`src/gateway/sandbox_worker.py`](../src/gateway/sandbox_worker.py)
 - Protocol and detailed state transitions:
   [`docs/state-machines.md`](state-machines.md)
+- Complete MCP, user, and admin flow catalog & audit:
+  [`docs/flows.md`](flows.md)
+- MCP Tasks & durable write reconciliation:
+  [`docs/mcp-tasks.md`](mcp-tasks.md)
+- Unified Workflows, ROI currency/regional rates & multi-worker telemetry:
+  [`docs/workflows-and-roi.md`](workflows-and-roi.md)
 - Agent-driven onboarding, golden mocks, and E2E testing:
   [`docs/agent-onboarding-and-evaluation.md`](agent-onboarding-and-evaluation.md)
 - Authentication provider variants:

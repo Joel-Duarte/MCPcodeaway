@@ -217,7 +217,9 @@ Run the local verification suite:
 
 | Guide | Description |
 | :--- | :--- |
+| [System Flows & Audit](docs/flows.md) | Master catalog and audit of all MCP, End-User, and Admin flows across routes, UI pages, and tests. |
 | [Gateway Flow Map](docs/gateway-flow-map.md) | End-to-end request lifecycle, auth gates, and dispatch sequences. |
+| [MCP Tasks & Write Recovery](docs/mcp-tasks.md) | Sessionless `io.modelcontextprotocol/tasks` lifecycle, durable leases, and legacy status fallback. |
 | [Workflows, ROI & Multi-Worker Ops](docs/workflows-and-roi.md) | Unified Workflows & ROI control plane, gateway currency/regional rate overrides, and multi-worker Monty telemetry. |
 | [Agent Onboarding & Golden Testing](docs/agent-onboarding-and-evaluation.md) | AI-agent integration bundle flow, prompt pack, and golden ticketing test suite. |
 | [State Machines](docs/state-machines.md) | Lifecycle state transitions for gateway, approvals, and sessions. |
