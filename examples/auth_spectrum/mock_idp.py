@@ -283,6 +283,7 @@ def create_mock_idp_app(state: MockIdpState | None = None) -> FastAPI:
         allowed_origins = {
             ("http", "127.0.0.1", None): "127.0.0.1",
             ("http", "127.0.0.1", 8080): "127.0.0.1:8080",
+            ("http", "127.0.0.1", 8000): "127.0.0.1:8000",
             ("http", "localhost", None): "localhost",
             ("http", "localhost", 8080): "localhost:8080",
             ("https", "localhost", None): "localhost",

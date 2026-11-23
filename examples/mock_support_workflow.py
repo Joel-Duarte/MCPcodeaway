@@ -270,6 +270,14 @@ def create_mock_support_workflow_app(
             return _error(req_id, -32601, f"Unknown tool '{name}'")
         if name in fixture.scenario.upstream_error_tools:
             return _error(req_id, -32050, f"Configured upstream error for '{name}'")
+        tool = next(tool for tool in _TOOLS if tool["name"] == name)
+        for required_argument in tool["inputSchema"].get("required", ()):
+            if required_argument not in args:
+                return _error(
+                    req_id,
+                    -32602,
+                    f"Missing required argument '{required_argument}'",
+                )
         try:
             data = _tool_result(fixture, name, args)
         except KeyError:

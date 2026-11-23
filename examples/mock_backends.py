@@ -1153,6 +1153,10 @@ def _build_ticketing_subapp(verifier: _DownstreamTokenVerifier) -> FastAPI:
     return subapp
 
 
+class _SimulatedUpstreamRejection(Exception):
+    """Signals a deterministic, safe-to-return mock upstream failure."""
+
+
 def _jsonrpc_result(req_id: Any, result: Any) -> JSONResponse:
     if isinstance(result, dict):
         result.setdefault("resultType", "complete")
@@ -1219,6 +1223,8 @@ async def _handle_mcp_rpc(
             data = call_fn(name, args)
             if inspect.isawaitable(data):
                 data = await data
+        except _SimulatedUpstreamRejection:
+            return _jsonrpc_error(req_id, -32602, "Simulated upstream rejection before commit")
         except KeyError:
             return _jsonrpc_error(req_id, -32601, "Missing required tool argument")
         except ValueError:
@@ -1879,7 +1885,7 @@ def create_mock_backends_app(
                 raise ValueError("idempotency_key, resource_id, and change are required")
             if args.get("simulate_failure"):
                 demo_change_metrics["failures"] += 1
-                raise ValueError("Simulated upstream rejection before commit")
+                raise _SimulatedUpstreamRejection
             fingerprint = hashlib.sha256(
                 json.dumps({"resource_id": resource_id, "change": change}, sort_keys=True).encode()
             ).hexdigest()
