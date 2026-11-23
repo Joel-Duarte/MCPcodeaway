@@ -8,7 +8,7 @@ import json
 import secrets
 import time
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import jwt
 from cryptography.hazmat.primitives import serialization
@@ -279,6 +279,34 @@ def create_mock_idp_app(state: MockIdpState | None = None) -> FastAPI:
     ) -> RedirectResponse:
         if response_type != "code":
             raise HTTPException(status_code=400, detail="response_type must be code")
+        parsed_redirect = urlsplit(redirect_uri)
+        allowed_origins = {
+            ("http", "127.0.0.1", None): "127.0.0.1",
+            ("http", "127.0.0.1", 8080): "127.0.0.1:8080",
+            ("http", "127.0.0.1", 8000): "127.0.0.1:8000",
+            ("http", "localhost", None): "localhost",
+            ("http", "localhost", 8080): "localhost:8080",
+            ("https", "localhost", None): "localhost",
+            ("http", "gateway", None): "gateway",
+            ("https", "gateway", None): "gateway",
+            ("http", "gw.local", None): "gw.local",
+            ("https", "gw.local", None): "gw.local",
+        }
+        try:
+            origin = allowed_origins.get(
+                (parsed_redirect.scheme, parsed_redirect.hostname, parsed_redirect.port)
+            )
+        except ValueError:
+            origin = None
+        if (
+            origin is None
+            or parsed_redirect.username is not None
+            or parsed_redirect.password is not None
+            or not parsed_redirect.path.startswith("/")
+            or parsed_redirect.path.startswith("//")
+            or "\\" in parsed_redirect.path
+        ):
+            raise HTTPException(status_code=400, detail="Untrusted redirect_uri")
         code = f"extcode_{secrets.token_urlsafe(12)}"
         idp.auth_codes[code] = {
             "client_id": client_id,
@@ -287,17 +315,17 @@ def create_mock_idp_app(state: MockIdpState | None = None) -> FastAPI:
             "code_challenge_method": code_challenge_method,
             "user": idp.current_external_user,
         }
-        parsed_redirect = urlsplit(redirect_uri)
-        if parsed_redirect.scheme not in {"http", "https"} or parsed_redirect.hostname not in {
-            "127.0.0.1",
-            "localhost",
-            "gateway",
-            "gw.local",
-        }:
-            raise HTTPException(status_code=400, detail="Untrusted redirect_uri")
-        sep = "&" if parsed_redirect.query else "?"
+        redirect_query = urlencode(
+            [
+                *parse_qsl(parsed_redirect.query, keep_blank_values=True),
+                ("code", code),
+                ("state", state),
+            ]
+        )
         return RedirectResponse(
-            url=f"{redirect_uri}{sep}{urlencode({'code': code, 'state': state})}",
+            url=urlunsplit(
+                (parsed_redirect.scheme, origin, parsed_redirect.path, redirect_query, "")
+            ),
             status_code=302,
         )
 
