@@ -35,7 +35,7 @@ MCPcodeaway solves this with **server-side Code Mode**:
 4. The client receives a clean, grounded summary — reducing token usage by **46%+** and cutting latency in half.
 
 <p align="center">
-  <img src="docs/images/codemode-vs-classic.png" alt="Classic MCP turn-by-turn tool calls vs. MCPcodeaway server-side Code Mode in Monty sandbox" width="100%">
+  <img src="docs/images/codemode-vs-classic.png" alt="Classic MCP turn-by-turn tool calls vs. MCPcodeaway server-side Code Mode in Monty sandbox" width="820">
 </p>
 
 ---
@@ -43,7 +43,7 @@ MCPcodeaway solves this with **server-side Code Mode**:
 ## Architecture
 
 <p align="center">
-  <img src="docs/images/architecture.png" alt="MCPcodeaway Request Lifecycle and Zero-Trust Architecture" width="100%">
+  <img src="docs/images/architecture.png" alt="MCPcodeaway Request Lifecycle and Zero-Trust Architecture" width="840">
 </p>
 
 Every request on `POST /mcp` is stateless and passes through five enforced stages before reaching an upstream service or returning data to the caller:
@@ -116,59 +116,18 @@ Every request on `POST /mcp` is stateless and passes through five enforced stage
 - **Stateless & Sessionless MCP (`2026-07-28`):** Adheres strictly to the modern sessionless MCP specification. Requests are self-contained and independently authorized across load-balanced replicas.
 - **Operate Control Plane (`/dashboard`):** Fully responsive Nuxt 4 + `@ui-sdk/vue` web console with real-time WebSocket telemetry, multi-worker Monty sandbox health cards, unified `Workflows & ROI` governance (`/workflows`), gateway reporting currency & regional labor rate configuration (`/settings`), request traces (`/traces`), usage analytics (`/analytics`), model A/B testing (`/model-performance`), and in-page workflow/prompt drawers across upstreams and MCP Apps (`/upstreams`, `/mcp-ui`).
 
-### Inside a Code Mode Run
-
-Every execution is recorded with full latency attribution, token reduction accounting, executed Monty Python code, and cryptographic provenance verification in **Audit & Compliance**:
-
-<p align="center">
-  <img src="docs/images/ui-audit-waterfall.png" alt="Audit & Compliance inspection drawer showing Code Mode latency waterfall, Monty spawn timing, and grounding verification" width="100%">
-</p>
-
 ---
 
 ## Operate Control Plane (`/dashboard`)
 
-MCPcodeaway ships with an embedded **Nuxt 4** admin console designed for real-time operations, cost governance, and rapid upstream onboarding. All screenshots below are captured live from the demo profile (`docker compose up --build`).
+Embedded **Nuxt 4** admin console captured live against the running demo stack (`docker compose up --build`). Click any thumbnail to open the full-resolution view.
 
-### Overview, Live Stream & Multi-Worker Monty Telemetry
-
-Monitor overall human time saved, token and cost reductions, real-time WebSocket executions, and per-replica health across the gateway and remote `sandbox-worker` pods:
-
-<p align="center">
-  <img src="docs/images/ui-overview-runtime.png" alt="Operate Control Plane Overview showing overall gateway impact, alert rules, and live WebSocket activity stream" width="100%">
-</p>
-
-<p align="center">
-  <img src="docs/images/ui-compute-telemetry.png" alt="Compute and Process Telemetry showing gateway replica and two healthy remote Monty sandbox workers alongside execution mode distribution" width="100%">
-</p>
-
-### Traces & Per-Group Latency Breakdown
-
-Pinpoint where milliseconds go across **Gateway**, **Monty**, **Upstream**, and **Security** stages per caller group, alongside `p50/p95` ephemeral sandbox checkout (`0.10 ms`) and execution times:
-
-<p align="center">
-  <img src="docs/images/ui-traces-timeline.png" alt="Traces and Latency Timeline showing Monty spawn p50/p95 and stacked time spent by caller group" width="100%">
-</p>
-
-### Usage Attribution, Workflows & ROI
-
-Attribute token savings and estimated LLM spend across company groups, users, and client apps—and track verified human-time savings across multi-step workflows with regional labor rate overrides:
-
-<p align="center">
-  <img src="docs/images/ui-gateway-usage.png" alt="Gateway Usage, Groups and Cost Attribution showing per-group Code Mode share and estimated spend" width="100%">
-</p>
-
-<p align="center">
-  <img src="docs/images/ui-workflows-roi.png" alt="Workflows and ROI governance page showing validated baselines, tool chains, and estimated labor value" width="100%">
-</p>
-
-### Interactive MCP Apps UI (`ui://`)
-
-Bind declarative `ui://` views to upstream tools and preview simulated tool outputs inline before agents or end-user hosts render them:
-
-<p align="center">
-  <img src="docs/images/ui-mcp-apps.png" alt="MCP Apps UI view showing bound upstream endpoints and live simulated presentation preview" width="100%">
-</p>
+| Runtime, Telemetry & Traces | Execution, Governance & Apps |
+| :---: | :---: |
+| <a href="docs/images/ui-overview-runtime.png"><img src="docs/images/ui-overview-runtime.png" alt="Overview & Live Runtime" width="420"></a><br><sub>**Overview & Live Runtime** — Token/time savings, alert rules & live WebSocket feed</sub> | <a href="docs/images/ui-compute-telemetry.png"><img src="docs/images/ui-compute-telemetry.png" alt="Multi-Worker Monty Telemetry" width="420"></a><br><sub>**Multi-Worker Telemetry** — Gateway replica, remote `sandbox-worker` pods & mode split</sub> |
+| <a href="docs/images/ui-audit-waterfall.png"><img src="docs/images/ui-audit-waterfall.png" alt="Code Mode Audit & Latency Waterfall" width="420"></a><br><sub>**Audit & Latency Waterfall** — Per-stage ms breakdown, Monty spawn (`0.13 ms`) & HMAC grounding</sub> | <a href="docs/images/ui-traces-timeline.png"><img src="docs/images/ui-traces-timeline.png" alt="Traces & Per-Group Latency" width="420"></a><br><sub>**Traces & Latency Timeline** — `p50/p95` sandbox timing & time spent by caller group</sub> |
+| <a href="docs/images/ui-gateway-usage.png"><img src="docs/images/ui-gateway-usage.png" alt="Gateway Usage & Cost Attribution" width="420"></a><br><sub>**Gateway Usage & Cost** — Per-group Code Mode share, token reduction & spend estimates</sub> | <a href="docs/images/ui-workflows-roi.png"><img src="docs/images/ui-workflows-roi.png" alt="Workflows & ROI" width="420"></a><br><sub>**Workflows & ROI** — Validated time baselines, tool chains & regional labor value</sub> |
+| <a href="docs/images/ui-model-performance.png"><img src="docs/images/ui-model-performance.png" alt="Model Performance & Adaptive Routing" width="420"></a><br><sub>**Model Performance** — Paired Classic vs. Code Mode deltas powering Adaptive Routing</sub> | <a href="docs/images/ui-mcp-apps.png"><img src="docs/images/ui-mcp-apps.png" alt="Interactive MCP Apps UI" width="420"></a><br><sub>**Interactive MCP Apps (`ui://`)** — Declarative UI views & live simulated host preview</sub> |
 
 ---
 
@@ -275,13 +234,7 @@ In paired benchmarks comparing Classic MCP against Code Mode on enterprise workf
 | **GPT-6 Luna (Low)** — Standard Reconciliation | 49,374 tokens (17.3s) | 64,937 tokens (**11.1s**) | Faster execution | 1 vs 3 |
 | **Local Qwen3.5 9B** — Single Lookup | **2,287 tokens** (5/5 verified) | 3,160 tokens (5/5 verified) | Classic preferred | 1 vs 1 |
 
-> See [BENCHMARKS.md](BENCHMARKS.md) for full benchmark methodology, token accounting, and Cloudflare enterprise portal comparisons.
-
-In the console's **Model Performance** view, the gateway continuously compares matched Classic vs. Code Mode pairs per model and workload to power Adaptive Routing recommendations:
-
-<p align="center">
-  <img src="docs/images/ui-model-performance.png" alt="Model Performance page showing adaptive routing policy and matched cohort differences between Code Mode and Classic" width="100%">
-</p>
+> See [BENCHMARKS.md](BENCHMARKS.md) for full benchmark methodology, token accounting, and Cloudflare enterprise portal comparisons. See the **Model Performance** preview in the [Operate Control Plane](#operate-control-plane-dashboard) gallery above for live matched-cohort A/B deltas.
 
 ---
 
