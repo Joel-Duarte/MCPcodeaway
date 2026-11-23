@@ -3995,13 +3995,20 @@ def create_gateway_app(
                                 request_payload=payload,
                                 allowed_servers=allowed_servers,
                             )
-                        except BusinessExecutionConflict as exc:
+                        except BusinessExecutionConflict:
                             return _finish(
-                                _jsonrpc_err(req_id, -32602, str(exc)), status_label="error"
+                                _jsonrpc_err(req_id, -32602, "Business execution conflict."),
+                                status_label="error",
                             )
-                        except (PermissionError, ValueError) as exc:
+                        except PermissionError:
                             return _finish(
-                                _jsonrpc_err(req_id, -32602, str(exc)), status_label="error"
+                                _jsonrpc_err(req_id, -32602, "Operation is not permitted."),
+                                status_label="error",
+                            )
+                        except ValueError:
+                            return _finish(
+                                _jsonrpc_err(req_id, -32602, "Invalid request arguments."),
+                                status_label="error",
                             )
                         return _finish(
                             _jsonrpc_ok(
@@ -4055,17 +4062,20 @@ def create_gateway_app(
                                 wrapped_tool.input_schema,
                                 original_arguments,
                             )
-                        except BusinessExecutionConflict as exc:
+                        except BusinessExecutionConflict:
                             return _finish(
-                                _jsonrpc_err(req_id, -32602, str(exc)), status_label="error"
+                                _jsonrpc_err(req_id, -32602, "Business execution conflict."),
+                                status_label="error",
                             )
-                        except PermissionError as exc:
+                        except PermissionError:
                             return _finish(
-                                _jsonrpc_err(req_id, -31003, str(exc)), status_label="error"
+                                _jsonrpc_err(req_id, -31003, "Operation is not permitted."),
+                                status_label="error",
                             )
-                        except (KeyError, ValueError) as exc:
+                        except (KeyError, ValueError):
                             return _finish(
-                                _jsonrpc_err(req_id, -32602, str(exc)), status_label="error"
+                                _jsonrpc_err(req_id, -32602, "Invalid request arguments."),
+                                status_label="error",
                             )
                         attributed_context = {
                             "execution": execution_row,
@@ -4227,9 +4237,9 @@ def create_gateway_app(
                                     business_execution_id,
                                     None,
                                 )
-                            except PermissionError as exc:
+                            except PermissionError:
                                 return _finish(
-                                    _jsonrpc_err(req_id, -31003, str(exc)),
+                                    _jsonrpc_err(req_id, -31003, "Operation is not permitted."),
                                     status_label="error",
                                 )
                             code_attribution = {
@@ -4688,9 +4698,10 @@ def create_gateway_app(
                                 request_digest=attributed_context["request_digest"],
                                 arguments=arguments,
                             )
-                        except BusinessExecutionConflict as exc:
+                        except BusinessExecutionConflict:
                             return _finish(
-                                _jsonrpc_err(req_id, -32602, str(exc)), status_label="error"
+                                _jsonrpc_err(req_id, -32602, "Business execution conflict."),
+                                status_label="error",
                             )
                         attributed_is_write = (
                             target_tool.mutating
@@ -4833,7 +4844,7 @@ def create_gateway_app(
                                 session_key=effective_session_key,
                             )
                             recovery_status = "ok" if res.get("ok") else "error"
-                    except KeyError as exc:
+                    except KeyError:
                         await finish_attributed_error(unknown=False)
                         if (
                             manager_approval_record is not None
@@ -4844,8 +4855,11 @@ def create_gateway_app(
                                 "execution_failed",
                                 datetime.now(UTC).isoformat(),
                             )
-                        return _finish(_jsonrpc_err(req_id, -32601, str(exc)), status_label="error")
-                    except PermissionError as exc:
+                        return _finish(
+                            _jsonrpc_err(req_id, -32601, "Missing required value."),
+                            status_label="error",
+                        )
+                    except PermissionError:
                         await finish_attributed_error(unknown=False)
                         if (
                             manager_approval_record is not None
@@ -4856,8 +4870,11 @@ def create_gateway_app(
                                 "execution_failed",
                                 datetime.now(UTC).isoformat(),
                             )
-                        return _finish(_jsonrpc_err(req_id, -31003, str(exc)), status_label="error")
-                    except (ValueError, RuntimeError) as exc:
+                        return _finish(
+                            _jsonrpc_err(req_id, -31003, "Operation is not permitted."),
+                            status_label="error",
+                        )
+                    except (ValueError, RuntimeError):
                         await finish_attributed_error(unknown=False)
                         if (
                             manager_approval_record is not None
@@ -4868,7 +4885,10 @@ def create_gateway_app(
                                 "execution_failed",
                                 datetime.now(UTC).isoformat(),
                             )
-                        return _finish(_jsonrpc_err(req_id, -32602, str(exc)), status_label="error")
+                        return _finish(
+                            _jsonrpc_err(req_id, -32602, "Tool execution failed."),
+                            status_label="error",
+                        )
                     except Exception as exc:
                         await finish_attributed_error(unknown=attributed_is_write)
                         if (

@@ -272,10 +272,10 @@ def create_mock_support_workflow_app(
             return _error(req_id, -32050, f"Configured upstream error for '{name}'")
         try:
             data = _tool_result(fixture, name, args)
-        except KeyError as exc:
-            return _error(req_id, -32602, f"Missing required argument {exc}")
-        except ValueError as exc:
-            return _error(req_id, -32602, str(exc))
+        except KeyError:
+            return _error(req_id, -32602, "Missing required tool argument")
+        except ValueError:
+            return _error(req_id, -32602, "Invalid tool arguments")
 
         if (
             name == "create_ticket"

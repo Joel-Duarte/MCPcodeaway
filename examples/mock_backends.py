@@ -1219,10 +1219,10 @@ async def _handle_mcp_rpc(
             data = call_fn(name, args)
             if inspect.isawaitable(data):
                 data = await data
-        except KeyError as exc:
-            return _jsonrpc_error(req_id, -32601, str(exc))
-        except ValueError as exc:
-            return _jsonrpc_error(req_id, -32602, str(exc))
+        except KeyError:
+            return _jsonrpc_error(req_id, -32601, "Missing required tool argument")
+        except ValueError:
+            return _jsonrpc_error(req_id, -32602, "Invalid tool arguments")
         return _jsonrpc_result(
             req_id,
             {"content": [{"type": "text", "text": json.dumps(data)}], "structuredContent": data},
