@@ -13,6 +13,7 @@
 - **Barebones Profiles & Standalone Frontend**: `config/profiles.yaml` defaults custom profiles onto barebones `production`. The `gateway` Docker target contains zero Node.js, SPA bundle, or `examples/`. The Nuxt `@ui-sdk/vue` console can either be served at `/dashboard` via the `gateway-ui` image target or deployed standalone on S3/CloudFront/CDN setting `NUXT_PUBLIC_API_BASE` and `GATEWAY_CORS_ALLOWED_ORIGINS`.
 
 ### Kubernetes Topology Reference
+See the complete [Kubernetes Deployment Guide](kubernetes.md) for manifests, topology details, and kind cluster validation.
 - **Control Plane Deployment (`gateway` image)**: Mount `config/upstreams.yaml` & `config/profiles.yaml` as **ConfigMaps** (or enable Postgres dynamic sync), inject secrets via **External Secrets Operator** (AWS Secrets Manager / Vault / Key Vault), expose via Kubernetes `Ingress` / AWS ALB, and scale via HPA on HTTP RPS/latency.
 - **Execution Plane Deployment (`sandbox-worker` image)**: Dedicated Deployment inside a deny-all-egress `NetworkPolicy` namespace, scaled independently via HPA on CPU (`GET /health` reports live CPU % / RSS / active executions).
 

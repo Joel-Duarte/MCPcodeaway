@@ -2,9 +2,10 @@
 
 This suite uses the gateway's existing local IdP, mock upstreams, MCP protocol paths, SQLite journal, DNS-pinning controls, and recovery fixtures. Optional PostgreSQL tests exercise the real `PostgresAuditStore` against a disposable PostgreSQL 16 container. No test needs a production credential or external service.
 
-## Environment assessment
+## Prerequisites
 
-The development environment checked for this validation had Docker 29.10.0, Docker Compose 5.8.0, system Python 3.14.10, `uv` 0.13.9, and npm 12.2.3. The project virtual environment used by `uv run` is Python 3.13.18. The PostgreSQL client (`psql`) and Poetry were absent. The repository has a Python `uv.lock`, pytest/pytest-asyncio fixtures, in-process HTTP services via HTTPX ASGI/Mock transports, local mock OIDC routes, MCP protocol fixtures, DNS-pinning unit fixtures, `docker-compose.yml` PostgreSQL/Redis services, and `scripts/pre-ci.sh`. PostgreSQL 16's Alpine image was present locally. An existing Compose stack was running during inspection; the acceptance Compose file uses a separate project name, host-only port, test-only credentials, and a project-scoped named volume.
+- Python 3.12+ with `uv`
+- Docker & Docker Compose v2 (required only for PostgreSQL, process-crash, and multi-process suites)
 
 ## Run
 

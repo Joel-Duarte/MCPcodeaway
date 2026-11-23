@@ -53,12 +53,10 @@ docker compose -f docker-compose.yml -f docker-compose.readiness.yml --profile s
 
 For an observational CRM baseline, run `uv run python benchmarks/live_gateway_benchmark.py --mode traditional --requests 200 --concurrency 10 --warmup 20 --output /tmp/mvp-baseline.json`, then inspect `docker stats --no-stream`. Record the revision, host, and Compose settings with the output. Increase load gradually and watch latency, errors, CPU, memory, and worker saturation. There is no agreed workload or SLO gate for this MVP, so do not present a local mock result as a capacity claim.
 
-## Current decisions and next steps
+## Deployment & Pilot Guidelines
 
-- Keep integrations as local mocks until a pilot selects a real IdP, MCP client host, and upstream. Add cases when a contract gap appears; do not add vendor containers or SDKs just to mirror a provider.
-- Use a canary rollout for a customer pilot: start with one user, observe errors and resource use, then increase access in steps. Set deployment-specific traffic limits and objectives with the host team when the environment is known.
-- For a canary, record the deployed revision and configuration, start with one user or a small allowlisted group, observe authentication/policy denials, upstream errors, latency, and resource use, and pause expansion or roll back if the agreed limits are exceeded. Expand only after the current step meets the customer-defined objectives; this mock-backed MVP does not prescribe numeric customer SLOs.
-- Choose hosting, network/egress rules, secrets, and managed Redis/Postgres based on the customer's environment. The repository's Compose stack is a local exercise, not a deployment blueprint.
-- Before customer use, verify the actual client's login and confirmation experience, customer claim mapping, upstream permissions and error behavior, and the customer's approver groups. For production operations, also rehearse backup/restore and image rollback in the selected environment.
+- **Mock-First Verification:** Keep integrations validated against local mocks until a pilot selects a real IdP, MCP client host, and upstream. Add cases when contract gaps appear.
+- **Canary Rollouts:** For a production pilot, start with one user or a small allowlisted group. Monitor authentication/policy denials, upstream error rates, latency, and resource utilization before gradually expanding traffic.
+- **Infrastructure Requirements:** Select hosting, egress rules, secret management, Redis, and PostgreSQL based on enterprise environment needs (see [Cloud Scalability](cloud_scalability.md) and [Kubernetes Guide](kubernetes.md)).
+- **Pre-Production Checklist:** Verify IdP claim mapping, client confirmation UX, upstream permissions, and approver groups. Rehearse backup/restore and image rollbacks in staging.
 
-These items are deployment-specific follow-up, not blockers to developing and demonstrating the mock-backed MVP. The current mock and golden tests are the repeatable readiness checks to keep passing as code changes.

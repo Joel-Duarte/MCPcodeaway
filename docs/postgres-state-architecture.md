@@ -150,3 +150,37 @@ Version 3 business-value tables are included in runtime `SELECT`/`INSERT` grants
 ## Unavailable PostgreSQL
 
 If PostgreSQL is unavailable, production startup fails when schema connectivity/verification cannot be completed. Readiness subsequently reports PostgreSQL unavailable. Safe behavior takes precedence over write availability: operations that need the shared journal, approval, or nonce guarantees cannot safely execute on independent per-replica copies. Read-only features backed by durable audit/configuration data may also be unavailable. Local SQLite mode remains intended for local development and single-process use; it is not a substitute for shared multi-replica coordination.
+
+## Operational Signals & Incident Handling
+
+The gateway emits structured JSON log events and Prometheus metrics for state transitions and blocked retries. Log events contain safe statuses, error classes, and opaque operation IDs; they never include raw tool arguments, request bodies, or secrets.
+
+| Condition | Emitted Signal | Detection Method | Operator Action |
+|---|---|---|---|
+| PostgreSQL unavailable or pool failure | `database.postgres_startup_failed`, `database.postgres_readiness_changed` | `/ready` returns `503`; structured log `status=unavailable` | Check database reachability, TLS/hostname, credentials, and connection limits. Do not route sensitive writes while readiness is false. |
+| Sensitive write outcome is uncertain | `upstream.failed` with `outcome_unknown` and `journal_operation_id` | Search structured logs by `operation_id` and request correlation | Treat as potentially completed. Reconcile with authoritative upstream state before any manual action. Never replay automatically. |
+| Journal remains `executing` | Durable row in `sensitive_write_audits`; blocked retry emits `audit.sensitive_write_retry_blocked` | Query unresolved writes (see SQL below), comparing `updated_at` with expected duration | Check whether a worker is still active, then reconcile against upstream records. Do not mark successful based only on gateway logs. |
+| Same-correlation retry blocked | `audit.sensitive_write_retry_blocked` with `operation_id` and journal status | Search by request correlation in application logs and inspect journal row | Investigate using `operation_id`. A new correlation indicates a distinct operation. |
+| Terminal journal persistence failed | `audit.sensitive_write_status_failed` with `operation_id` and error type | Search structured logs and inspect journal status | Assume the side effect may have occurred if dispatch began. Reconcile upstream before resolving manually. |
+| Approval lifecycle events | `tool_approvals` status transitions (pending, approved, rejected, expired, invalidated, executing) | Query `/admin/approvals` endpoints with admin role | Confirm requester/approver context and TTL. Approval is not proof that the upstream action completed. |
+| OIDC / JWKS refresh failure | `auth.jwks_refresh_failed` | Search structured logs; distinguish from invalid-token denials | Check IdP reachability, DNS, TLS, and signing-key publication. Expired cached keys are never used as fallback. |
+
+### Read-Only Journal Inspection
+
+`sensitive_write_audits` contains operation ID, tenant and caller identifiers, upstream/tool names, request digest, correlation, dedupe key, status, and timestamps (raw arguments are excluded). Use an approved read-only role (`mcpcodeaway_operations`):
+
+```sql
+SELECT operation_id, tenant_id, upstream_name, tool_name, correlation_id,
+       status, created_at, updated_at
+FROM sensitive_write_audits
+WHERE status IN ('prepared', 'executing', 'outcome_unknown')
+ORDER BY updated_at ASC;
+```
+
+### Safe Handling by State
+
+- **`prepared`**: The protocol has not completed the atomic claim; upstream dispatch has not begun. Confirm no active request owns the row before retrying through the normal gateway path.
+- **`executing`**: Dispatch is in progress or crossed the network boundary. Do not retry or alter the row based solely on age; inspect worker state and authoritative upstream records.
+- **`outcome_unknown`**: Never automatically replay. Require authoritative upstream verification before deciding whether the action occurred.
+- **`succeeded` / `failed`**: Terminal states. The same correlation is never replayed.
+
