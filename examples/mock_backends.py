@@ -2275,9 +2275,9 @@ def create_mock_backends_app(
             "nonce": nonce,
             "expires_at": time.time() + 120,
         }
-        sep = "&" if "?" in redirect_uri else "?"
+        sep = "&" if "?" in mock_oidc_redirect_uri else "?"
         q = urlencode({"code": code, "state": state})
-        return RedirectResponse(url=f"{redirect_uri}{sep}{q}", status_code=302)
+        return RedirectResponse(url=f"{mock_oidc_redirect_uri}{sep}{q}", status_code=302)
 
     @app.post("/oidc/token")
     async def mock_oidc_token(request: Request) -> dict[str, Any]:

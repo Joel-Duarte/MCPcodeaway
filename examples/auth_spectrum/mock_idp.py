@@ -8,7 +8,7 @@ import json
 import secrets
 import time
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import jwt
 from cryptography.hazmat.primitives import serialization
@@ -287,7 +287,15 @@ def create_mock_idp_app(state: MockIdpState | None = None) -> FastAPI:
             "code_challenge_method": code_challenge_method,
             "user": idp.current_external_user,
         }
-        sep = "&" if "?" in redirect_uri else "?"
+        parsed_redirect = urlsplit(redirect_uri)
+        if parsed_redirect.scheme not in {"http", "https"} or parsed_redirect.hostname not in {
+            "127.0.0.1",
+            "localhost",
+            "gateway",
+            "gw.local",
+        }:
+            raise HTTPException(status_code=400, detail="Untrusted redirect_uri")
+        sep = "&" if parsed_redirect.query else "?"
         return RedirectResponse(
             url=f"{redirect_uri}{sep}{urlencode({'code': code, 'state': state})}",
             status_code=302,

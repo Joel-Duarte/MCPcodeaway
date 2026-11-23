@@ -7902,7 +7902,7 @@ def create_gateway_app(
                     "delivered": False,
                     "status_code": None,
                     "https_enforced": is_https,
-                    "detail": str(exc),
+                    "detail": f"Webhook delivery failed ({type(exc).__name__})",
                 }
 
         @app.post("/admin/upstreams/test-call")

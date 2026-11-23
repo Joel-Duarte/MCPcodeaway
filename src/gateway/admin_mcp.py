@@ -203,11 +203,16 @@ async def handle_admin_mcp_request(
             analytics_fn=analytics_fn,
             telemetry_fn=telemetry_fn,
         )
-    except PermissionError as exc:
+    except PermissionError:
         return JSONResponse(
-            {"jsonrpc": "2.0", "id": req_id, "error": {"code": -31003, "message": str(exc)}}
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -31003, "message": "Forbidden: admin role required"},
+            }
         )
     except Exception as exc:
+        err_msg = f"Admin tool execution failed ({type(exc).__name__})"
         return JSONResponse(
             {
                 "jsonrpc": "2.0",
@@ -215,8 +220,8 @@ async def handle_admin_mcp_request(
                 "result": _admin_mcp_result(
                     {
                         "isError": True,
-                        "content": [{"type": "text", "text": str(exc)}],
-                        "structuredContent": {"ok": False, "error": str(exc)},
+                        "content": [{"type": "text", "text": err_msg}],
+                        "structuredContent": {"ok": False, "error": err_msg},
                     }
                 ),
             }

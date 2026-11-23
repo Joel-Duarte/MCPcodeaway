@@ -102,9 +102,9 @@ async def test_secret_resolver_env_file_vault_akv_hcv(
     await vault.save_gateway_secret("stripe_key", "sk_live_vault_789", updated_by="admin")
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if "vault.azure.net" in str(request.url):
+        if request.url.host is not None and request.url.host.endswith(".vault.azure.net"):
             return httpx.Response(200, json={"value": "akv-secret-111"})
-        if "vault.internal:8200" in str(request.url):
+        if request.url.host == "vault.internal" and request.url.port == 8200:
             return httpx.Response(200, json={"data": {"data": {"token": "hcv-secret-222"}}})
         return httpx.Response(404, json={"error": "not found"})
 

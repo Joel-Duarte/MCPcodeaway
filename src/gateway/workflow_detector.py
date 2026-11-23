@@ -42,7 +42,7 @@ _MUTATION_INTENT_RE = re.compile(
 )
 _VERIFY_INTENT_RE = re.compile(r"\b(verify|confirm|check|read\s*back|validate|ensure)\b")
 _MULTI_COUNT_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])(?:all|multiple|both|two|three|four|five|[2-9]|[1-9]\d+)(?![A-Za-z0-9_-])"
+    r"(?<![A-Za-z0-9_-])(?:all|multiple|both|two|three|four|five|[2-9]|[1-9]\d{1,6})(?![A-Za-z0-9_-])"
 )
 _VERSION_KEYS = {"version", "rev", "revision", "etag", "updated_at", "modified_at"}
 

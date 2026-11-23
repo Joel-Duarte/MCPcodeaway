@@ -140,11 +140,13 @@ def create_user_connect_router(
         upstream = _get_per_user_upstream(upstream_name)
 
         if upstream.auth_type == "user_api_key":
-            esc_up = html.escape(upstream_name)
-            esc_ticket = html.escape(ticket)
-            action_url = f"/auth/connect/{quote(upstream_name, safe='')}/secret"
+            esc_up = html.escape(upstream.name, quote=True)
+            esc_ticket = html.escape(ticket, quote=True)
+            action_url = html.escape(
+                f"/auth/connect/{quote(upstream.name, safe='')}/secret", quote=True
+            )
             return _render_html(
-                f"Connect {upstream_name}",
+                f"Connect {upstream.name}",
                 f"<h1>Connect {esc_up}</h1>"
                 "<p>Enter your personal API key or Personal Access Token. "
                 "It will be encrypted at rest and never exposed to the AI agent.</p>"
