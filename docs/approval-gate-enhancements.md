@@ -1,6 +1,6 @@
 # Approval Gates and Central Enforcement — Proposal
 
-**Status:** MVP v1 includes requester confirmation and durable one-approver group decisions for direct MCP calls. Notifications, multi-step workflows, quorums, and automatic approval remain future work.
+**Status:** Requester confirmation remains available in onboarding. A narrow durable one-approver API exists for direct MCP calls, but the built-in inbox is hidden and onboarding no longer configures manager approval. Gateway-owned approver workflows and conditional rules remain out of scope; use upstream business workflows by default.
 
 ## Purpose
 
@@ -16,6 +16,14 @@ The gateway can become a central enforcement point because it already authentica
 - **Action execution** is a separate state from approval. `approved` does not mean the upstream action has completed.
 - **MCP request state** is short-lived state for resuming one stateless MCP request. It is not an MCP session, a general conversation ID, or durable business workflow storage.
 - **Business resource ID** identifies a domain object when a workflow refers to it across separate calls, such as a payment, export, or incident. It is optional and should be added only for a real workflow that needs it.
+
+## Business authorization boundary and deferred conditional approvals
+
+The upstream service remains authoritative for business permissions and business workflows: whether a caller may read a record, spend money, change a resource, or satisfy the service's own approval process. The gateway must continue to authenticate and authorize each call under its configured access model, but its approval gate is an optional, additional control before dispatch. It does not grant upstream permission, replace upstream checks, or make an upstream side effect transactional. In particular, a successful gateway approval must never cause a call that the upstream would reject to be treated as authorized.
+
+The existing gateway approval API supports a narrow, administrator-configured gate on an individual tool/operation. An operation can require the requester to confirm, or require requester confirmation followed by one decision from an eligible approver group. The configured group is the **approver** group; the current policy does not select a gate based on the requester's group or inspect argument values to decide whether approval is required. Onboarding no longer offers manager approval, and the built-in inbox is hidden. The external API remains available for integrations. The product does not currently express rules such as “require a manager when a member of group X requests a transfer above €1,000,” nor provide its own manager workflow for arbitrary reads and writes.
+
+Conditional, value-aware human approval is deferred. It would need a more precise policy and onboarding experience: per operation (including generated API endpoint), explicitly typed and validated argument conditions, requester and approver identity rules, a safe review summary showing the relevant values, and clear fail-closed behavior when inputs or policy evaluation are missing. Any such gateway rule would be an extra governance boundary for deployments that need it, not a substitute for the upstream's own authorization and approval workflow. Where the upstream already owns the approval process, prefer that workflow and use delegated user authorization when available. Add gateway-side conditional approvals only for a stated cross-cutting requirement that the upstream cannot enforce or that must be consistently enforced across multiple upstreams.
 
 ## Gate spectrum
 
@@ -77,11 +85,11 @@ Enforce the boundary in the host-side dispatcher immediately before every upstre
 
 For a future approved bulk workflow, split **prepare** from **execute**. Preparation produces a bounded, immutable list of intended actions and a digest; approval binds to that exact list, policy version, tenant, caller, and expiry. A durable workflow executor—not a re-run of the agent's script—executes the approved steps with per-step authorization, idempotency, and audit. Define partial-failure and compensation behavior before allowing multi-step side effects. If a customer needs to approve an entire Code Mode-generated plan, this prepare/approve/execute flow is a separate feature and must not be simulated by prompting in the middle of Code Mode.
 
-## MVP v1 — durable one-approver group decision
+## Existing backend capability — durable one-approver group decision
 
-The gateway now supports one narrow manager-approval path for direct tool calls. A policy classifies an operation as `high_impact` and names one or more customer-owned OIDC groups. The caller first confirms the exact request. The gateway persists a tenant-scoped action digest, requester, tool, policy version, group set, human-readable summary, and expiry in the configured SQLite or Postgres store. It does not hold the MCP request open or dispatch the action while approval is pending.
+The backend retains one narrow manager-approval path for direct tool calls for external workflow integrations. A policy classifies an operation as `high_impact` and names one or more customer-owned OIDC groups. The caller first confirms the exact request. The gateway persists a tenant-scoped action digest, requester, tool, policy version, group set, human-readable summary, and expiry in the configured SQLite or Postgres store. It does not hold the MCP request open or dispatch the action while approval is pending. Onboarding does not configure this path, and the built-in approver inbox is hidden.
 
-An authenticated `tool_approver` (configurable through `GATEWAY_APPROVAL_ROLES`) who belongs to an eligible group can approve or deny from `/admin/approvals` in the console or the approval API. The requester cannot approve their own action. Approval is bound to the exact argument digest and policy version. The requester retries the same call; the gateway re-authenticates and re-authorizes, atomically claims the approved record, dispatches at most once, and stores the outcome. A policy edit or expiry invalidates the approval. Without the required client input capability or an eligible approver, the action remains undispatched.
+An authenticated `tool_approver` (configurable through `GATEWAY_APPROVAL_ROLES`) who belongs to an eligible group can approve or deny through the approval API. The built-in console inbox is currently hidden; an external workflow UI can use the API. The requester cannot approve their own action. Approval is bound to the exact argument digest and policy version. The requester retries the same call; the gateway re-authenticates and re-authorizes, atomically claims the approved record, dispatches at most once, and stores the outcome. A policy edit or expiry invalidates the approval. Without the required client input capability or an eligible approver, the action remains undispatched.
 
 The administrator-configured `confirmation_message` is the review summary. It may include `{argument_name}` placeholders for top-level scalar arguments. Only those explicitly named fields are shown; secret-like field names and detected credentials/cards are redacted, non-scalar values are omitted, and substitutions are length-bounded. Treat this as a deliberate data disclosure choice: do not include personal or regulated fields unless the approver needs them.
 

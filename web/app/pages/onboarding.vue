@@ -230,7 +230,6 @@ const toolModeOptions = [
 const draftToolModes = ref<Record<string, string>>({});
 const draftToolApprovalMessages = ref<Record<string, string>>({});
 const draftToolEffects = ref<Record<string, string>>({});
-const draftToolApprovalGroups = ref<Record<string, string>>({});
 const draftToolRecovery = ref<Record<string, {
   enabled: boolean;
   keyArgument: string;
@@ -248,10 +247,6 @@ const rolesLoading = ref(true);
 
 const schemaInspectionState = ref<SchemaInspectionState>("idle");
 const schemaVerified = computed(() => schemaInspectionState.value === "verified");
-const approvalPoliciesValid = computed(() => Object.entries(draftToolEffects.value).every(([tool, effect]) => {
-  if (effect !== "high_impact") return true;
-  return Boolean(draftToolApprovalGroups.value[tool]?.split(",").some((group) => group.trim()));
-}));
 const accessPolicyValid = computed(() => {
   if (draftAuthorizationMode.value === "upstream") return true;
   if (draftAuthorizationMode.value === "shared_access") return draftAllowAllCallers.value;
@@ -467,7 +462,6 @@ const toolEffectOptions = [
   { value: "disabled", label: "Disabled" },
   { value: "read", label: "Read only" },
   { value: "write", label: "Write — caller confirms" },
-  { value: "high_impact", label: "High impact — manager approval" },
 ];
 const restMethodOptions = [
   { value: "get", label: "GET" },
@@ -476,15 +470,12 @@ const restMethodOptions = [
   { value: "delete", label: "DELETE" },
 ];
 
-function toolApprovalPoliciesPayload(): Record<string, { mode: string; version: number; confirmation_message?: string; approver_groups?: string[] }> {
-  const policies: Record<string, { mode: string; version: number; confirmation_message?: string; approver_groups?: string[] }> = {};
+function toolApprovalPoliciesPayload(): Record<string, { mode: string; version: number; confirmation_message?: string }> {
+  const policies: Record<string, { mode: string; version: number; confirmation_message?: string }> = {};
   for (const [tool, effect] of Object.entries(draftToolEffects.value)) {
     const message = draftToolApprovalMessages.value[tool]?.trim();
     if (effect === "write") {
       policies[tool] = { mode: "requester_confirmation", version: 1, confirmation_message: message || `Confirm this write to ${tool}.` };
-    } else if (effect === "high_impact") {
-      const groups = (draftToolApprovalGroups.value[tool] || "").split(",").map((group) => group.trim()).filter(Boolean);
-      policies[tool] = { mode: "manager_approval", version: 1, confirmation_message: message || `Approve this high impact action: ${tool}.`, approver_groups: groups };
     }
   }
   return policies;
@@ -492,7 +483,7 @@ function toolApprovalPoliciesPayload(): Record<string, { mode: string; version: 
 
 function toolRecoveryPoliciesPayload() {
   return Object.fromEntries(Object.entries(draftToolRecovery.value)
-    .filter(([tool, recovery]) => recovery.enabled && ["write", "high_impact"].includes(draftToolEffects.value[tool] || ""))
+    .filter(([tool, recovery]) => recovery.enabled && draftToolEffects.value[tool] === "write")
     .map(([tool, recovery]) => [tool, {
       enabled: true,
       idempotency_key_argument: recovery.keyArgument.trim(),
@@ -580,7 +571,7 @@ function buildUpstreamPayload(forInspection = false) {
     tool_recovery_policies: forInspection ? {} : toolRecoveryPoliciesPayload(),
     allowed_operations: forInspection ? null : Object.entries(draftToolEffects.value).filter(([, effect]) => effect !== "disabled").map(([tool]) => tool),
     tool_effects: forInspection ? {} : Object.fromEntries(Object.entries(draftToolEffects.value).filter(([, effect]) => effect !== "disabled")),
-    mutating_tools: forInspection ? [] : Object.entries(draftToolEffects.value).filter(([, effect]) => effect === "write" || effect === "high_impact").map(([tool]) => tool),
+    mutating_tools: forInspection ? [] : Object.entries(draftToolEffects.value).filter(([, effect]) => effect === "write").map(([tool]) => tool),
     enabled: true,
     health_check: {
       enabled: draftHealthCheckEnabled.value,
@@ -699,7 +690,6 @@ async function handleInspect() {
     draftToolEffects.value = Object.fromEntries(inspectResult.value.inspection.tools.map((tool) => [tool.name, "disabled"]));
     draftToolModes.value = {};
     draftToolApprovalMessages.value = {};
-    draftToolApprovalGroups.value = {};
     draftToolRecovery.value = Object.fromEntries(inspectResult.value.inspection.tools.map((tool) => [tool.name, {
       enabled: false,
       keyArgument: "idempotency_key",
@@ -756,7 +746,7 @@ async function handleRegister() {
     return;
   }
   if (Object.entries(draftToolRecovery.value).some(([tool, recovery]) => recovery.enabled && (
-    !["write", "high_impact"].includes(draftToolEffects.value[tool] || "") ||
+    draftToolEffects.value[tool] !== "write" ||
     !recovery.keyArgument.trim() || recovery.synchronousBudget <= 0 || recovery.synchronousBudget > 30 ||
     recovery.maxAttempts < 1 || recovery.maxAttempts > 3 || recovery.recoveryAge < 1 || recovery.recoveryAge > 3600 ||
     recovery.keyRetention < recovery.recoveryAge || recovery.keyRetention > 86400 ||
@@ -771,10 +761,6 @@ async function handleRegister() {
   }
   if (!accessPolicyValid.value) {
     errorMessage.value = "Select at least one allowed role or group, or explicitly allow all authenticated callers.";
-    return;
-  }
-  if (!approvalPoliciesValid.value) {
-    errorMessage.value = "Choose at least one approver group for each high impact operation.";
     return;
   }
   if (draftAuthorizationMode.value === "gateway" && rolesLoadError.value) {
@@ -1479,7 +1465,7 @@ async function copyPromptText() {
         </Select>
         <details v-if="inspectResult" class="rounded border border-[#E4E4E7] bg-white p-3">
           <summary class="min-h-11 cursor-pointer py-2 text-xs font-semibold text-[#09090B] sm:min-h-9">Per-tool execution and confirmation ({{ inspectResult.inspection.tool_count }} tools)</summary>
-          <p class="mt-1 text-xs text-[#52525B]">Tools start disabled. Enable each operation deliberately and classify its effect. Writes require caller confirmation; high impact actions require one eligible group approval. Code Mode cannot invoke gated tools.</p>
+          <p class="mt-1 text-xs text-[#52525B]">Tools start disabled. Enable each operation deliberately and classify its effect. Writes require caller confirmation. Manager approval workflows are handled by upstream systems and are not configured here. Code Mode cannot invoke gated tools.</p>
           <div class="mt-3 max-h-72 space-y-1.5 overflow-y-auto">
             <div v-for="t in inspectResult.inspection.tools" :key="t.qualified_name" class="grid grid-cols-1 items-start gap-2 border-t border-[#E4E4E7] py-3 sm:grid-cols-[minmax(0,1fr)_minmax(12rem,0.8fr)_minmax(11rem,0.7fr)]">
               <div class="min-w-0"><div class="truncate font-mono-data text-xs text-[#09090B]">{{ t.name }}</div><div class="text-[11px] text-[#71717A]">Upstream reports {{ t.mutating ? "a possible write" : "read-only behavior" }}; classify according to your review.</div></div>
@@ -1491,9 +1477,8 @@ async function copyPromptText() {
                 <SelectTrigger :aria-label="`Execution mode for ${t.name}`" class="min-h-11"><SelectValue /><AppIcon name="chevron-down" :size="14" /></SelectTrigger>
                 <SelectContent><SelectItem v-for="mode in toolModeOptions" :key="mode.value" :value="mode.value">{{ mode.label }}<SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator></SelectItem></SelectContent>
               </Select>
-              <Input v-if="draftToolEffects[t.name] === 'write' || draftToolEffects[t.name] === 'high_impact'" v-model="draftToolApprovalMessages[t.name]" :aria-label="`Action summary for ${t.name}`" :placeholder="draftToolEffects[t.name] === 'write' ? `Confirm this write to ${t.name}.` : `Approve this high impact action: ${t.name}.`" maxlength="300" class="min-h-11 text-xs sm:col-span-3" />
-              <Input v-if="draftToolEffects[t.name] === 'high_impact'" v-model="draftToolApprovalGroups[t.name]" :aria-label="`Approver groups for ${t.name}`" placeholder="Approver groups, comma separated" maxlength="300" class="min-h-11 text-xs sm:col-span-3" />
-              <div v-if="draftToolEffects[t.name] === 'write' || draftToolEffects[t.name] === 'high_impact'" class="space-y-2 border-t border-[#E4E4E7] pt-3 sm:col-span-3">
+              <Input v-if="draftToolEffects[t.name] === 'write'" v-model="draftToolApprovalMessages[t.name]" :aria-label="`Action summary for ${t.name}`" :placeholder="`Confirm this write to ${t.name}.`" maxlength="300" class="min-h-11 text-xs sm:col-span-3" />
+              <div v-if="draftToolEffects[t.name] === 'write'" class="space-y-2 border-t border-[#E4E4E7] pt-3 sm:col-span-3">
                 <label class="flex min-h-11 items-center gap-2 text-xs font-medium text-[#09090B]">
                   <Checkbox
                     :checked="draftToolRecovery[t.name]?.enabled === true"
@@ -1809,7 +1794,7 @@ async function copyPromptText() {
               <AppIcon name="flask" :size="15" />
               <span>Estimate Code Mode vs Classic</span>
             </Button>
-            <Button v-if="dynamicPermitted" data-variant="primary" :disabled="!approvalPoliciesValid || !accessPolicyValid || (draftAuthorizationMode === 'gateway' && (rolesLoading || Boolean(rolesLoadError)))" data-agent-confirm="Register or update this upstream service in the gateway?" pending-announcement="Registering upstream" @click="handleRegister">
+            <Button v-if="dynamicPermitted" data-variant="primary" :disabled="!accessPolicyValid || (draftAuthorizationMode === 'gateway' && (rolesLoading || Boolean(rolesLoadError)))" data-agent-confirm="Register or update this upstream service in the gateway?" pending-announcement="Registering upstream" @click="handleRegister">
               Save Upstream
             </Button>
             <Button @click="copyYaml">

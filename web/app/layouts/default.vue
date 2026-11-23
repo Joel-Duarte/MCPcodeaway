@@ -52,12 +52,6 @@ const navigation = [
     icon: "upstreams",
   },
   {
-    label: "Approvals",
-    to: "/approvals",
-    group: "Govern",
-    icon: "audit",
-  },
-  {
     label: "Operations Recovery",
     to: "/operations",
     group: "Operate",
@@ -92,11 +86,9 @@ const navigation = [
 const groupedNavigation = computed(() => {
   const groups = ["Operate", "Optimize", "Govern", "Configure", "Demo"] as const;
   const visibleNavigation = navigation.filter((item) => {
-    const canViewApprovals = item.to !== "/approvals" ||
-      session.value?.is_admin || session.value?.is_approver;
     const canViewOperations = item.to !== "/operations" || session.value?.is_admin ||
       session.value?.is_viewer;
-    return canViewApprovals && canViewOperations;
+    return canViewOperations;
   });
   return groups.map((group) => ({
     name: group,

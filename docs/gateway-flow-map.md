@@ -246,8 +246,9 @@ Owners: `gateway.server` (mode resolution and MCP entry), `gateway.catalog`,
 ## 5. Protected action flow
 
 Reads normally dispatch immediately. A configured write can require requester
-confirmation; a high-impact call can require requester confirmation followed
-by manager approval.
+confirmation. Existing high-impact manager approval remains available only
+through configured policy and the external approval API; onboarding does not
+offer it and the built-in inbox is hidden.
 
 ```mermaid
 stateDiagram-v2
@@ -283,9 +284,9 @@ upstream side effect is not started. If final audit persistence fails after an
 upstream success, the operation is treated as uncertain and its existing claim
 prevents a duplicate execution with the same correlation and request.
 
-Owners: `gateway.server` approval request/continuation handlers, `gateway.state`
-durable nonce and approval state, and `web/app/pages/approvals.vue` for the
-operator inbox.
+Owners: `gateway.server` approval request/continuation handlers and
+`gateway.state` durable nonce and approval state. The approval API is available
+to external workflow clients; the built-in console inbox is currently hidden.
 
 ## 6. Operator onboarding and configuration
 
@@ -349,7 +350,7 @@ The route families line up with these operator tasks:
 | --- | --- |
 | Sign in, check, or end an admin session | `/auth/admin/config`, `/auth/admin/login`, `/auth/admin/callback`, `/auth/admin/session`, `/auth/admin/logout`; dev/token login is available only when configured. |
 | Inspect, register, edit, test, refresh, or remove upstreams | `/admin/upstreams*`, `/admin/catalog/refresh` |
-| Review and decide protected actions | `/admin/approvals*` |
+| Review and decide protected actions through an external workflow client | `/admin/approvals*` |
 | Inspect live gateway and usage evidence | `/admin/telemetry/*`, `/admin/discovery/*`, `/admin/adaptive-execution/*`, `/admin/ab/*`, `/admin/routing/*`, `/audit/analytics` |
 | Tune policies, routing, alerts, pricing, and demo traffic | `/admin/upstreams/*`, `/admin/alerts/*`, `/admin/routing/*`, `/admin/pricing/*`, `/admin/demo/*` |
 | Maintain audit evidence and secrets | `/admin/audit/*`, `/admin/secrets/*` |
@@ -364,7 +365,7 @@ The console's main journeys are:
   performance, optimization, alerts, and runtime telemetry.
 - **Configure:** upstream onboarding/editing, access and effect policies,
   tool guidance/mode, model routing/pricing, A/B settings, and alert rules.
-- **Operate:** approval inbox, catalog refresh, demo traffic, audit retention,
+- **Operate:** catalog refresh, demo traffic, audit retention,
   audit archive, adaptive evidence/settings, and incident inspection.
 
 Each page owns its loading, empty, success, and error states. See
@@ -536,7 +537,7 @@ source of truth for methods and policy.
 | Personal connections | `/auth/connect/*`, `/me/connections*` | OAuth/API-key linking and lifecycle. |
 | Admin identity | `/auth/admin/*` | OIDC PKCE, optional development/bearer login, session management. |
 | Upstream control | `/admin/upstreams*`, `/admin/catalog/refresh`, `/admin/upstreams/agent-prompt`, `/admin/upstreams/inspect`, `/admin/upstreams/test-call` | Inspect, onboard, edit policy/mode, test, refresh, delete. |
-| Approval control | `/admin/approvals*` | View queue and approve/deny eligible actions. |
+| Approval control API | `/admin/approvals*` | List eligible actions and approve/deny them from an external workflow client; the built-in console inbox is currently hidden. |
 | Admin MCP | `/admin/mcp` | Expose a subset of control-plane operations as MCP tools. |
 | Audit and value | `/audit/*`, `/admin/audit/*` | Caller-scoped audit, admin retention/archive, analytics/value. |
 | Runtime and discovery | `/admin/telemetry/*`, `/admin/discovery/*`, `/admin/adaptive-execution/*` | Gateway/worker status, observed tool health, evidence, recommendations. |
