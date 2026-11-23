@@ -87,7 +87,7 @@ MCPcodeaway solves this with **server-side Code Mode**:
   - SSRF URL guards blocking cloud metadata and private network addresses.
 - **Requester Confirmation Gates:** Sensitive mutating tools pause execution and elicit caller confirmation via native MCP `input_required` protocol messages before dispatching upstream.
 - **Stateless & Sessionless MCP (`2026-07-28`):** Adheres strictly to the modern sessionless MCP specification. Requests are self-contained and independently authorized across load-balanced replicas.
-- **Operate Control Plane (`/dashboard`):** Fully responsive Nuxt 4 + `@ui-sdk/vue` web console with real-time WebSocket telemetry, request traces (`/traces`), usage analytics (`/analytics`), model A/B testing (`/model-performance`), and visual upstream onboarding (`/onboarding`).
+- **Operate Control Plane (`/dashboard`):** Fully responsive Nuxt 4 + `@ui-sdk/vue` web console with real-time WebSocket telemetry, multi-worker Monty sandbox health cards, unified `Workflows & ROI` governance (`/workflows`), gateway reporting currency & regional labor rate configuration (`/settings`), request traces (`/traces`), usage analytics (`/analytics`), model A/B testing (`/model-performance`), and in-page workflow/prompt drawers across upstreams and MCP Apps (`/upstreams`, `/mcp-ui`).
 
 ---
 
@@ -218,6 +218,8 @@ Run the local verification suite:
 | Guide | Description |
 | :--- | :--- |
 | [Gateway Flow Map](docs/gateway-flow-map.md) | End-to-end request lifecycle, auth gates, and dispatch sequences. |
+| [Workflows, ROI & Multi-Worker Ops](docs/workflows-and-roi.md) | Unified Workflows & ROI control plane, gateway currency/regional rate overrides, and multi-worker Monty telemetry. |
+| [Agent Onboarding & Golden Testing](docs/agent-onboarding-and-evaluation.md) | AI-agent integration bundle flow, prompt pack, and golden ticketing test suite. |
 | [State Machines](docs/state-machines.md) | Lifecycle state transitions for gateway, approvals, and sessions. |
 | [Cloud Scalability](docs/cloud_scalability.md) | Stateless scaling, remote Monty workers, and load balancing. |
 | [Kubernetes Deployment](docs/kubernetes.md) | Multi-replica architecture, egress isolation, and kind local testing. |
