@@ -108,6 +108,7 @@ class TelemetryRecorder:
         monty_spawn_ms: float = 0.0,
         monty_exec_ms: float = 0.0,
         trace_spans: list[dict[str, Any]] | None = None,
+        intent: str | None = None,
     ) -> dict[str, Any]:
         raw_upstream_bytes = sum(sc.raw_bytes for sc in subcalls)
         returned_bytes = len(json.dumps(returned_payload, default=str).encode("utf-8"))
@@ -298,6 +299,7 @@ class TelemetryRecorder:
             "monty_exec_ms": round(monty_exec_ms, 3),
             "trace_spans": trace_spans,
             "duration_ms": round(duration_ms, 3),
+            "intent": OutputRedactor.redact_intent(intent),
         }
         if provenance is not None:
             run["provenance"] = provenance
@@ -511,6 +513,40 @@ class TelemetryRecorder:
             else:
                 totals["estimated_minutes_saved"] = None
 
+        episodes = (
+            await self.store.list_workflow_episodes(tenant_id, limit=limit)
+            if hasattr(self.store, "list_workflow_episodes")
+            else []
+        )
+        episode_status_counts: dict[str, int] = {
+            status: 0
+            for status in (
+                "open",
+                "completed_verified",
+                "completed_unverified",
+                "partial_or_incomplete",
+                "abandoned",
+                "read_only",
+            )
+        }
+        attribution_mode_counts: dict[str, int] = {"passive_matched": 0, "explicit_legacy": 0}
+        for ep in episodes:
+            st = str(ep.get("status") or "unknown")
+            episode_status_counts[st] = episode_status_counts.get(st, 0) + 1
+        for event in events:
+            if not bool(event.get("credited")):
+                continue
+            ev = event.get("evidence") if isinstance(event.get("evidence"), dict) else {}
+            am = str(ev.get("attribution_mode") or "explicit_legacy")
+            attribution_mode_counts[am] = attribution_mode_counts.get(am, 0) + 1
+        pending_candidates = (
+            await self.store.list_discovered_workflow_candidates(
+                tenant_id, status="pending_review", limit=200
+            )
+            if hasattr(self.store, "list_discovered_workflow_candidates")
+            else []
+        )
+
         return {
             "tenant_scope": tenant_id,
             "since": since,
@@ -520,6 +556,12 @@ class TelemetryRecorder:
             "executions_truncated": len(executions) >= limit,
             "completed_count": sum(item["completed_count"] for item in by_period),
             "execution_status_counts": execution_status_counts,
+            "attribution_mode_counts": attribution_mode_counts,
+            "episode_summary": {
+                "total": len(episodes),
+                "status_counts": episode_status_counts,
+                "pending_baseline_candidates": len(pending_candidates),
+            },
             "by_integration_workflow_day": by_period,
             "totals_by_currency": totals_by_currency,
             "validated_minutes_saved": None,

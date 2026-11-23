@@ -36,7 +36,8 @@ test("business value report explains completed workflows, baselines, provenance,
   expect(wrapper.text()).toContain("Completed outcomes");
   expect(wrapper.text()).toContain("Gross estimated baseline");
   expect(wrapper.text()).toContain("Validated baseline");
-  expect(wrapper.text()).toContain("Net savings / ROI");
+  expect(wrapper.text()).toContain("Validated minutes saved");
+  expect(wrapper.text()).toContain("Dollar net savings and ROI unavailable");
   expect(wrapper.text()).toContain("Unavailable");
   expect(wrapper.text()).toContain("sampled manual measurement");
   expect(wrapper.text()).toContain("Gross baseline is not net savings");
@@ -74,6 +75,6 @@ test("report has an empty state and actionable access error", async () => {
   vi.stubGlobal("useAdminApi", () => ({ apiFetch: vi.fn().mockRejectedValue(new Error("permission denied")), session: ref({ is_admin: false }) }));
   const failed = mount(BusinessValuePage, installComponents());
   await vi.waitFor(() => expect(failed.get('[role="alert"]').text()).toContain("permission denied"));
-  expect(failed.text()).toContain("Check your admin or viewer access and retry");
+  expect(failed.text()).toContain("Check your access or connection, then retry.");
   failed.unmount();
 });

@@ -1,0 +1,353 @@
+{
+  "upstream": {
+    "name": "global_ticketing",
+    "type": "openapi",
+    "url": "http://mock-backends:8001/ticketing",
+    "openapi_spec_url": "http://mock-backends:8001/ticketing/openapi.json",
+    "auth_type": "delegated_token",
+    "authorization_mode": "gateway",
+    "downstream_audience": "api://ticketing-system",
+    "downstream_scope": "mcp.tools ops.write",
+    "allowed_roles": [
+      "ops_engineer",
+      "ticketing_reader",
+      "ticketing_writer",
+      "tool_approver",
+      "gateway_admin"
+    ],
+    "allowed_groups": [
+      "operations",
+      "platform-admins",
+      "operations-approvers"
+    ],
+    "allowed_operations": [
+      "list_ticketing_queues",
+      "list_tickets",
+      "create_ticket",
+      "search_tickets",
+      "get_ticket",
+      "update_ticket",
+      "assign_ticket",
+      "escalate_ticket",
+      "resolve_ticket",
+      "close_ticket",
+      "reopen_ticket",
+      "list_ticket_comments",
+      "add_ticket_comment",
+      "get_ticket_sla",
+      "add_ticket_watcher",
+      "set_ticket_tags",
+      "request_ticket_approval",
+      "get_ticketing_metrics"
+    ],
+    "mutating_tools": [
+      "create_ticket",
+      "update_ticket",
+      "assign_ticket",
+      "escalate_ticket",
+      "resolve_ticket",
+      "close_ticket",
+      "reopen_ticket",
+      "add_ticket_comment",
+      "add_ticket_watcher",
+      "set_ticket_tags",
+      "request_ticket_approval"
+    ],
+    "tool_effects": {
+      "list_ticketing_queues": "read",
+      "list_tickets": "read",
+      "search_tickets": "read",
+      "get_ticket": "read",
+      "list_ticket_comments": "read",
+      "get_ticket_sla": "read",
+      "get_ticketing_metrics": "read",
+      "create_ticket": "write",
+      "update_ticket": "write",
+      "assign_ticket": "write",
+      "escalate_ticket": "write",
+      "resolve_ticket": "write",
+      "close_ticket": "write",
+      "reopen_ticket": "write",
+      "add_ticket_comment": "write",
+      "add_ticket_watcher": "write",
+      "set_ticket_tags": "write",
+      "request_ticket_approval": "write"
+    },
+    "tool_approval_policies": {
+      "list_ticketing_queues": {"mode": "none", "version": 1},
+      "list_tickets": {"mode": "none", "version": 1},
+      "search_tickets": {"mode": "none", "version": 1},
+      "get_ticket": {"mode": "none", "version": 1},
+      "list_ticket_comments": {"mode": "none", "version": 1},
+      "get_ticket_sla": {"mode": "none", "version": 1},
+      "get_ticketing_metrics": {"mode": "none", "version": 1},
+      "create_ticket": {
+        "mode": "requester_confirmation",
+        "version": 1,
+        "confirmation_message": "Confirm creating a new ticket in Global Ticketing."
+      },
+      "update_ticket": {
+        "mode": "requester_confirmation",
+        "version": 1,
+        "confirmation_message": "Confirm updating ticket fields (priority, status, queue, or assignee)."
+      },
+      "assign_ticket": {
+        "mode": "requester_confirmation",
+        "version": 1,
+        "confirmation_message": "Confirm assigning this ticket to the specified owner and team."
+      },
+      "escalate_ticket": {
+        "mode": "requester_confirmation",
+        "version": 1,
+        "confirmation_message": "Confirm escalating this ticket to the specified incident tier."
+      },
+      "resolve_ticket": {
+        "mode": "requester_confirmation",
+        "version": 1,
+        "confirmation_message": "Confirm marking this ticket as resolved with the provided resolution summary."
+      },
+      "close_ticket": {
+        "mode": "requester_confirmation",
+        "version": 1,
+        "confirmation_message": "Confirm closing this ticket."
+      },
+      "reopen_ticket": {
+        "mode": "requester_confirmation",
+        "version": 1,
+        "confirmation_message": "Confirm reopening this ticket with the stated reason."
+      },
+      "add_ticket_comment": {
+        "mode": "requester_confirmation",
+        "version": 1,
+        "confirmation_message": "Confirm posting this comment to the ticket."
+      },
+      "add_ticket_watcher": {
+        "mode": "requester_confirmation",
+        "version": 1,
+        "confirmation_message": "Confirm adding this watcher email to the ticket."
+      },
+      "set_ticket_tags": {
+        "mode": "requester_confirmation",
+        "version": 1,
+        "confirmation_message": "Confirm replacing the tags on this ticket."
+      },
+      "request_ticket_approval": {
+        "mode": "requester_confirmation",
+        "version": 1,
+        "confirmation_message": "Confirm submitting an approval request for this ticket."
+      }
+    }
+  },
+  "integration_definition": {
+    "manifest_version": "1.0",
+    "integration": {
+      "id": "global_ticketing",
+      "display_name": "Enterprise Global Ticketing",
+      "upstream_name": "global_ticketing",
+      "status": "draft",
+      "revision": 1
+    },
+    "tool_refs": [],
+    "workflows": [
+      {
+        "id": "triage_and_resolve_ticket",
+        "name": "Triage and Resolve Ticket",
+        "description": "List or inspect an open ticket, assign it to an owner, document findings in a comment, resolve the ticket, and verify resolved status.",
+        "enabled": true,
+        "origin": "agent_prompt",
+        "intent_examples": [
+          "Triage open tickets, assign a ticket to an SRE, add a comment, and resolve it",
+          "Investigate a ticket, leave a resolution note, and mark the ticket resolved",
+          "Find open EU operations tickets and complete full triage and resolution"
+        ],
+        "participating_tools": [
+          "global_ticketing__list_tickets",
+          "global_ticketing__get_ticket",
+          "global_ticketing__assign_ticket",
+          "global_ticketing__add_ticket_comment",
+          "global_ticketing__resolve_ticket"
+        ],
+        "required_evidence": [
+          {
+            "tool": "global_ticketing__resolve_ticket",
+            "min_successful_calls": 1,
+            "result_when": {
+              "path": "/status",
+              "type": "string",
+              "equals": "resolved"
+            }
+          }
+        ],
+        "completion": {
+          "kind": "verified_followup",
+          "tool": "global_ticketing__get_ticket",
+          "success_when": {
+            "path": "/status",
+            "type": "string",
+            "equals": "resolved"
+          }
+        },
+        "business_value": {
+          "manual_baseline_minutes": 14,
+          "baseline_source": "administrator_estimate",
+          "confidence": "unvalidated",
+          "effective_from": "2026-11-23"
+        }
+      },
+      {
+        "id": "ticket_escalation_and_sla_review",
+        "name": "Ticket Escalation and SLA Review",
+        "description": "Check a ticket's SLA status, escalate the ticket to a higher incident tier, and verify the ticket's updated critical priority.",
+        "enabled": true,
+        "origin": "agent_prompt",
+        "intent_examples": [
+          "Check SLA compliance on a ticket and escalate it to tier3_incident",
+          "Review a ticket's SLA timer and escalate it to critical priority",
+          "Escalate an urgent ticket after checking its SLA risk"
+        ],
+        "participating_tools": [
+          "global_ticketing__get_ticket_sla",
+          "global_ticketing__escalate_ticket",
+          "global_ticketing__get_ticket"
+        ],
+        "required_evidence": [
+          {
+            "tool": "global_ticketing__escalate_ticket",
+            "min_successful_calls": 1,
+            "result_when": {
+              "path": "/status",
+              "type": "string",
+              "equals": "escalated"
+            }
+          }
+        ],
+        "completion": {
+          "kind": "verified_followup",
+          "tool": "global_ticketing__get_ticket",
+          "success_when": {
+            "path": "/priority",
+            "type": "string",
+            "equals": "critical"
+          }
+        },
+        "business_value": {
+          "manual_baseline_minutes": 10,
+          "baseline_source": "administrator_estimate",
+          "confidence": "unvalidated",
+          "effective_from": "2026-11-23"
+        }
+      },
+      {
+        "id": "intake_and_route_new_ticket",
+        "name": "Intake and Route New Ticket",
+        "description": "Discover available ticketing queues, create a new ticket in the target queue, and assign it to an engineer.",
+        "enabled": true,
+        "origin": "agent_prompt",
+        "intent_examples": [
+          "Check available queues, open a new support ticket, and assign it to tier2_sre",
+          "Create a new regional operations ticket and route it to an assignee",
+          "Intake a new incident ticket in the right queue and assign ownership"
+        ],
+        "participating_tools": [
+          "global_ticketing__list_ticketing_queues",
+          "global_ticketing__create_ticket",
+          "global_ticketing__assign_ticket"
+        ],
+        "required_evidence": [
+          {
+            "tool": "global_ticketing__create_ticket",
+            "min_successful_calls": 1,
+            "result_when": {
+              "path": "/ticket_id",
+              "type": "non_empty_string"
+            }
+          }
+        ],
+        "completion": {
+          "kind": "terminal_tool_result",
+          "tool": "global_ticketing__assign_ticket",
+          "success_when": {
+            "path": "/status",
+            "type": "non_empty_string"
+          }
+        },
+        "business_value": {
+          "manual_baseline_minutes": 6,
+          "baseline_source": "administrator_estimate",
+          "confidence": "unvalidated",
+          "effective_from": "2026-11-23"
+        }
+      }
+    ],
+    "experiences": [
+      {
+        "id": "ticket_inspector_ui",
+        "resource_uri": "ui://mcpcodeaway/global_ticketing/ticket_inspector/r1",
+        "renderer_schema": "mcpcodeaway-ui/1",
+        "tool": "global_ticketing__get_ticket",
+        "fallback": "Inspect a ticket by invoking global_ticketing__get_ticket with ticket_id.",
+        "input_mapping": {
+          "ticket_id": "/form/ticket_id"
+        },
+        "components": [
+          {
+            "type": "heading",
+            "text": "Global Ticket Inspector"
+          },
+          {
+            "type": "text",
+            "text": "Enter a ticket ID to inspect live ticket metadata, status, priority, and assignment."
+          },
+          {
+            "type": "text_input",
+            "id": "ticket_id",
+            "label": "Ticket ID",
+            "required": true
+          },
+          {
+            "type": "button",
+            "label": "Inspect Ticket",
+            "action": "invoke_tool"
+          },
+          {
+            "type": "record",
+            "data": "tool_result"
+          }
+        ]
+      },
+      {
+        "id": "ticketing_metrics_ui",
+        "resource_uri": "ui://mcpcodeaway/global_ticketing/metrics_dashboard/r1",
+        "renderer_schema": "mcpcodeaway-ui/1",
+        "tool": "global_ticketing__get_ticketing_metrics",
+        "fallback": "View ticketing operations metrics by invoking global_ticketing__get_ticketing_metrics.",
+        "input_mapping": {},
+        "components": [
+          {
+            "type": "heading",
+            "text": "Global Ticketing Operations Summary"
+          },
+          {
+            "type": "text",
+            "text": "Fetch live global ticketing volume, backlog, SLA, and resolution metrics."
+          },
+          {
+            "type": "button",
+            "label": "Refresh Metrics",
+            "action": "invoke_tool"
+          },
+          {
+            "type": "record",
+            "data": "tool_result"
+          }
+        ]
+      }
+    ]
+  },
+  "publish": true,
+  "manual_baselines": {
+    "triage_and_resolve_ticket": 14,
+    "ticket_escalation_and_sla_review": 10,
+    "intake_and_route_new_ticket": 6
+  }
+}

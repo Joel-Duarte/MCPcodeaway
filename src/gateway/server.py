@@ -109,13 +109,10 @@ from gateway.dispatcher import (
     build_provenance_envelope,
     summarize_value_shape,
 )
-from gateway.integration_definition import IntegrationDefinition
+from gateway.integration_definition import IntegrationDefinition, compute_workflow_fingerprint
 from gateway.integration_validation import (
     ATTRIBUTED_TOOL_PREFIX,
     START_BUSINESS_EXECUTION_TOOL,
-    attributed_tool_name,
-    build_attributed_tool_definition,
-    build_start_business_execution_definition,
     validate_attributed_arguments,
     validate_definition_against_catalog,
 )
@@ -142,6 +139,11 @@ from gateway.observability import (
     log_event,
     set_request_context,
     update_request_context,
+)
+from gateway.onboarding_prompts import (
+    OnboardingBundle,
+    build_onboarding_prompt_pack,
+    validate_onboarding_bundle_payload,
 )
 from gateway.recovery import OperationRecovery
 from gateway.runtime_stats import ProcessStatsCollector, collect_runtime_telemetry
@@ -172,6 +174,12 @@ from gateway.upstream_clients import (
     validate_upstream_url,
 )
 from gateway.user_connect import create_user_connect_router
+from gateway.workflow_detector import (
+    WorkflowEpisodeTracker,
+    mine_workflows_from_runs,
+    pick_schema_predicate,
+    synthesize_workflows_from_catalog,
+)
 
 _TRACER = trace.get_tracer("mcpcodeaway.server")
 
@@ -615,6 +623,13 @@ class GatewayRuntime:
         self._lifecycle_lock = asyncio.Lock()
         self.demo_traffic = DemoTrafficRunner(self)
         self.alert_evaluator = AlertEvaluator()
+        self.workflow_detector = WorkflowEpisodeTracker(
+            self.settings,
+            self.store,
+            self.catalog,
+            http_client=http_client,
+            registry=self.registry,
+        )
 
     def _transition_lifecycle(self, next_state: GatewayLifecycleState) -> None:
         """Apply one legal lifecycle transition, rejecting impossible runtime states."""
@@ -1136,6 +1151,9 @@ class GatewayRuntime:
                 self.upstream_health.run(self.registry.list_upstreams)
             )
             self._recovery_worker_task = asyncio.create_task(self.recovery.run_worker())
+            await self.workflow_detector.start()
+            if self.settings.effective_profile_name == "demo":
+                await self.demo_traffic.ensure_demo_solutions()
         except BaseException as exc:
             if isinstance(self.store, PostgresAuditStore) and isinstance(exc, Exception):
                 log_event(
@@ -1187,6 +1205,7 @@ class GatewayRuntime:
             return
         self._transition_lifecycle(GatewayLifecycleState.STOPPING)
         try:
+            await self.workflow_detector.stop()
             await self.demo_traffic.stop()
             if self._retention_task is not None and not self._retention_task.done():
                 self._retention_task.cancel()
@@ -1262,16 +1281,16 @@ class GatewayRuntime:
                 merged[k] = dict(v)
         return merged
 
-    async def business_value_tools_for_request(
+    async def business_value_ui_map_for_request(
         self,
         identity: CallerIdentity,
         *,
         allowed_servers: set[str] | None = None,
-    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-        """Return only current, caller-accessible attributed tool definitions."""
+    ) -> dict[str, str]:
+        """Return unambiguous MCP App resourceUris keyed by caller-accessible tool name."""
 
         if not hasattr(self.store, "list_current_published_integration_definitions"):
-            return None, []
+            return {}
         await self.ensure_catalog_for_identity(identity)
         rows = await self.store.list_current_published_integration_definitions(
             identity.tenant_id or ""
@@ -1283,14 +1302,16 @@ class GatewayRuntime:
             allowed_servers=allowed_servers,
         )
         accessible_by_name = {tool.qualified_name: tool for tool in accessible}
-        visible_rows: list[dict[str, Any]] = []
-        wrapper_tools: dict[str, dict[str, Any]] = {}
         catalog_names = {
             tool.qualified_name
             for server_name in self.registry.list_upstreams()
             for tool in self.catalog.get_server_tools(server_name.name)
         }
+        resource_by_tool: dict[str, str] = {}
+        ambiguous_experience_tools: set[str] = set()
         for row in rows:
+            if allowed_servers is not None and row["upstream_name"] not in allowed_servers:
+                continue
             try:
                 manifest = IntegrationDefinition.model_validate(row["definition"])
                 validate_definition_against_catalog(
@@ -1300,64 +1321,34 @@ class GatewayRuntime:
                 )
             except (ValueError, KeyError):
                 continue
-            manifest_data = manifest.model_dump(mode="json")
-            eligible_workflows = [
-                workflow
-                for workflow in manifest_data["workflows"]
-                if set(workflow["participating_tools"]) <= set(accessible_by_name)
-            ]
-            eligible_standalone = [
-                value
-                for value in manifest_data["standalone_tool_values"]
-                if value["tool"] in accessible_by_name
-            ]
-            if not eligible_workflows and not eligible_standalone:
-                continue
-            visible_manifest = {
-                **manifest_data,
-                "workflows": eligible_workflows,
-                "standalone_tool_values": eligible_standalone,
-            }
-            visible_rows.append(
-                {
-                    **row,
-                    "definition": visible_manifest,
-                }
-            )
-            referenced_tools = {
-                tool_name
-                for workflow in eligible_workflows
-                for tool_name in workflow["participating_tools"]
-            } | {value["tool"] for value in eligible_standalone}
-            resource_by_tool: dict[str, str] = {}
-            ambiguous_experience_tools: set[str] = set()
-            for experience in manifest_data.get("experiences", []):
-                experience_tool = accessible_by_name.get(experience["tool"])
-                if experience["tool"] not in referenced_tools or experience_tool is None:
+            for experience in manifest.experiences:
+                experience_tool = accessible_by_name.get(experience.tool)
+                if experience_tool is None:
                     continue
                 try:
                     validate_experience(
-                        experience,
+                        experience.model_dump(mode="json"),
                         tool_input_schema=experience_tool.input_schema,
                     )
                 except ValueError:
                     continue
-                if experience["tool"] in resource_by_tool:
-                    ambiguous_experience_tools.add(experience["tool"])
+                if experience.tool in resource_by_tool:
+                    ambiguous_experience_tools.add(experience.tool)
                 else:
-                    resource_by_tool[experience["tool"]] = experience["resource_uri"]
-            for ambiguous_tool in ambiguous_experience_tools:
-                resource_by_tool.pop(ambiguous_tool, None)
-            for tool_name in referenced_tools:
-                tool = accessible_by_name.get(tool_name)
-                if tool is None:
-                    continue
-                wrapper_tools[attributed_tool_name(tool_name)] = build_attributed_tool_definition(
-                    tool,
-                    resource_uri=resource_by_tool.get(tool_name),
-                )
-        start_tool = build_start_business_execution_definition(visible_rows)
-        return start_tool, [wrapper_tools[name] for name in sorted(wrapper_tools)]
+                    resource_by_tool[experience.tool] = experience.resource_uri
+        for ambiguous_tool in ambiguous_experience_tools:
+            resource_by_tool.pop(ambiguous_tool, None)
+        return resource_by_tool
+
+    async def business_value_tools_for_request(
+        self,
+        identity: CallerIdentity,
+        *,
+        allowed_servers: set[str] | None = None,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """Wrapper tools are retired; passive attribution tracks standard tools directly."""
+        _ = (identity, allowed_servers)
+        return None, []
 
     async def business_value_resources_for_request(
         self,
@@ -1366,17 +1357,11 @@ class GatewayRuntime:
         allowed_servers: set[str] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Return only unambiguous, caller-accessible published App resources."""
-        _, wrappers = await self.business_value_tools_for_request(
+        ui_map = await self.business_value_ui_map_for_request(
             identity,
             allowed_servers=allowed_servers,
         )
-        linked_uris = {
-            str(tool["_meta"]["ui"]["resourceUri"])
-            for tool in wrappers
-            if isinstance(tool.get("_meta"), dict)
-            and isinstance(tool["_meta"].get("ui"), dict)
-            and isinstance(tool["_meta"]["ui"].get("resourceUri"), str)
-        }
+        linked_uris = set(ui_map.values())
         if not linked_uris:
             return {}
         rows = await self.store.list_current_published_integration_definitions(
@@ -1432,11 +1417,7 @@ class GatewayRuntime:
     ) -> dict[str, Any]:
         """Create or replay an owner-bound execution pinned to a published definition."""
 
-        start_tool, _ = await self.business_value_tools_for_request(
-            identity,
-            allowed_servers=allowed_servers,
-        )
-        if start_tool is None:
+        if not hasattr(self.store, "list_current_published_integration_definitions"):
             raise ValueError("no eligible published business-value definition is available")
         kind = selection.get("kind")
         if kind not in {"workflow", "standalone_tool"}:
@@ -1450,26 +1431,32 @@ class GatewayRuntime:
         expected_prefix = "workflow_id" if kind == "workflow" else "tool_value_id"
         if expected_prefix not in selection or len(selection) != 2:
             raise ValueError("start request must contain only kind and its matching definition ID")
-        visible_ids = {
-            identifier
-            for variant in start_tool["inputSchema"]["oneOf"]
-            if variant["properties"]["kind"]["const"] == kind
-            for identifier in variant["properties"][expected_prefix].get("enum", [])
+        await self.ensure_catalog_for_identity(identity)
+        accessible_names = {
+            tool.qualified_name
+            for tool in self.catalog.list_accessible_tools(
+                identity, self.policy, self.registry, allowed_servers=allowed_servers
+            )
         }
-        if selected_id not in visible_ids:
-            raise ValueError("selected business-value definition is unavailable")
         for row in await self.store.list_current_published_integration_definitions(
             identity.tenant_id or ""
         ):
             if allowed_servers is not None and row["upstream_name"] not in allowed_servers:
                 continue
-            manifest = row["definition"]
+            manifest_data = row["definition"]
             item_key = "workflows" if kind == "workflow" else "standalone_tool_values"
-            for item in manifest.get(item_key, []):
+            for item in manifest_data.get(item_key, []):
                 qualified_id = f"{row['upstream_name']}/{item['id']}"
-                if qualified_id == selected_id:
+                if qualified_id != selected_id:
+                    continue
+                required_tools = (
+                    set(item.get("participating_tools", []))
+                    if kind == "workflow"
+                    else {item.get("tool")}
+                )
+                if required_tools <= accessible_names:
                     found = row, item
-                    break
+                break
             if found is not None:
                 break
         if found is None:
@@ -2018,12 +2005,20 @@ class GatewayRuntime:
                 guidance=guidance,
             )
 
-        start_tool, attributed_tools = await self.business_value_tools_for_request(
+        ui_map = await self.business_value_ui_map_for_request(
             identity,
             allowed_servers=effective_ceiling,
         )
-        if start_tool is not None:
-            tools = [start_tool, *tools, *attributed_tools]
+        if ui_map:
+            for tool_def in tools:
+                tool_name = tool_def.get("name")
+                if isinstance(tool_name, str) and tool_name in ui_map:
+                    meta = dict(tool_def.get("_meta") or {})
+                    meta["ui"] = {
+                        "visibility": ["model", "app"],
+                        "resourceUri": ui_map[tool_name],
+                    }
+                    tool_def["_meta"] = meta
 
         if cursor is not None or limit is not None:
             offset = max(0, int(cursor)) if cursor else 0
@@ -2090,6 +2085,8 @@ class GatewayRuntime:
         ab_variant: str | None = None,
         model_name: str | None = None,
         attribution_context: dict[str, Any] | None = None,
+        intent: str | None = None,
+        session_key: str | None = None,
     ) -> dict[str, Any]:
         """Run Code Mode Python script in SandboxBackend and record audit telemetry."""
         started = time.perf_counter()
@@ -2113,6 +2110,8 @@ class GatewayRuntime:
                 ab_variant=ab_variant,
                 model_name=model_name,
                 attribution_context=attribution_context,
+                intent=intent,
+                session_key=session_key,
             )
         finally:
             self.process_stats.active_executions = max(0, self.process_stats.active_executions - 1)
@@ -2136,6 +2135,8 @@ class GatewayRuntime:
         ab_variant: str | None = None,
         model_name: str | None = None,
         attribution_context: dict[str, Any] | None = None,
+        intent: str | None = None,
+        session_key: str | None = None,
     ) -> dict[str, Any]:
         await self.ensure_catalog_for_identity(identity)
         if allowed_servers is not None and servers is not None:
@@ -2168,6 +2169,7 @@ class GatewayRuntime:
         tool_call_slots = asyncio.Semaphore(self.settings.max_concurrent_tool_calls_per_execution)
         workflow_read_lock = asyncio.Lock()
         subcalls: list[SubcallRecord] = []
+        detector_calls: list[dict[str, Any]] = []
         attributed_pending_calls: list[dict[str, Any]] = []
         callback_ordinal = 0
         observed_tool_outputs: list[Any] = []
@@ -2326,6 +2328,27 @@ class GatewayRuntime:
                                 )
                         raise
                     subcalls.append(rec)
+                    tool_upstream = self.registry.get(t.server) or u
+                    detector_calls.append(
+                        {
+                            "upstream_name": t.server,
+                            "tool_qualified_name": t.qualified_name,
+                            "effect": (
+                                "write"
+                                if t.mutating
+                                or tool_upstream.tool_effects.get(t.name, "read") != "read"
+                                else "read"
+                            ),
+                            "status": (
+                                "outcome_unknown"
+                                if rec.outcome_unknown
+                                else ("succeeded" if rec.status == "ok" else "failed")
+                            ),
+                            "sensitive_write_journal_status": rec.sensitive_write_journal_status,
+                            "arguments": bound,
+                            "result": res,
+                        }
+                    )
                     if attributed_call is not None:
                         outcome_unknown = bool(rec.outcome_unknown)
                         call_status = (
@@ -2509,7 +2532,20 @@ class GatewayRuntime:
             model_name=model_name,
             monty_spawn_ms=sandbox_res.monty_spawn_ms,
             monty_exec_ms=sandbox_res.monty_exec_ms,
+            intent=intent,
         )
+        detected_episode: dict[str, Any] | None = None
+        if attribution_context is None and detector_calls:
+            detected_episode = await self.workflow_detector.observe_execution(
+                tenant_id=identity.tenant_id or "",
+                user_sub=identity.sub,
+                client_id=identity.client_id or "",
+                session_key=session_key,
+                intent=intent,
+                run_id=run["run_id"],
+                calls=detector_calls,
+                is_single_turn_batch=True,
+            )
         business_value_event: dict[str, Any] | None = None
         for attributed_call in attributed_pending_calls:
             value_event = await self.finalize_attributed_call(
@@ -2557,6 +2593,15 @@ class GatewayRuntime:
         payload["estimated_tokens_saved"] = run["estimated_tokens_saved"]
         if business_value_event is not None:
             payload["business_value_completion"] = business_value_event
+        if detected_episode is not None:
+            payload["workflow_detection"] = {
+                "episode_id": detected_episode["episode_id"],
+                "status": detected_episode["status"],
+                "completion_tier": detected_episode["completion_tier"],
+                "confidence": detected_episode["confidence"],
+                "completion_pct": detected_episode["completion_pct"],
+                "matched_workflow_id": detected_episode.get("matched_workflow_id"),
+            }
         if execution_cancelled:
             raise asyncio.CancelledError
         return payload
@@ -2577,6 +2622,8 @@ class GatewayRuntime:
         requester_confirmation_policy: ToolApprovalPolicy | None = None,
         request_timeout_seconds: float | None = None,
         workflow_call_id: str | None = None,
+        intent: str | None = None,
+        session_key: str | None = None,
     ) -> dict[str, Any]:
         """Invoke a single upstream tool directly (traditional / traditional_discover / hybrid)."""
         started = time.perf_counter()
@@ -2643,7 +2690,42 @@ class GatewayRuntime:
                 experiment_id=experiment_id,
                 ab_variant=ab_variant,
                 model_name=model_name,
+                intent=intent,
             )
+            detected_episode: dict[str, Any] | None = None
+            is_elicitation_pause = (
+                isinstance(result, dict) and result.get("resultType") == "input_required"
+            )
+            if workflow_call_id is None and not is_elicitation_pause:
+                detected_episode = await self.workflow_detector.observe_execution(
+                    tenant_id=identity.tenant_id or "",
+                    user_sub=identity.sub,
+                    client_id=identity.client_id or "",
+                    session_key=session_key,
+                    intent=intent,
+                    run_id=run["run_id"],
+                    calls=[
+                        {
+                            "upstream_name": tool.server,
+                            "tool_qualified_name": tool.qualified_name,
+                            "effect": (
+                                "write"
+                                if tool.mutating
+                                or upstream.tool_effects.get(tool.name, "read") != "read"
+                                else "read"
+                            ),
+                            "status": (
+                                "outcome_unknown"
+                                if rec.outcome_unknown
+                                else ("succeeded" if ok else "failed")
+                            ),
+                            "sensitive_write_journal_status": rec.sensitive_write_journal_status,
+                            "arguments": arguments,
+                            "result": result,
+                        }
+                    ],
+                    is_single_turn_batch=False,
+                )
             self._record_execution_metrics(
                 identity=identity,
                 mode=mode,
@@ -2652,7 +2734,7 @@ class GatewayRuntime:
                 run=run,
             )
             await self._publish_live_summary(run, identity)
-            return {
+            out_payload: dict[str, Any] = {
                 "ok": ok,
                 "result": result,
                 "error": rec.error,
@@ -2669,6 +2751,16 @@ class GatewayRuntime:
                 "returned_bytes": run["returned_bytes"],
                 "duration_ms": duration_ms,
             }
+            if detected_episode is not None:
+                out_payload["workflow_detection"] = {
+                    "episode_id": detected_episode["episode_id"],
+                    "status": detected_episode["status"],
+                    "completion_tier": detected_episode["completion_tier"],
+                    "confidence": detected_episode["confidence"],
+                    "completion_pct": detected_episode["completion_pct"],
+                    "matched_workflow_id": detected_episode.get("matched_workflow_id"),
+                }
+            return out_payload
         finally:
             self.process_stats.active_executions = max(0, self.process_stats.active_executions - 1)
 
@@ -3219,8 +3311,10 @@ def create_gateway_app(
         x_agent_model: str | None = Header(default=None),
         x_require_grounding: str | None = Header(default=None),
         x_request_id: str | None = Header(default=None),
+        x_workflow_run_id: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ) -> JSONResponse:
+        effective_session_key = (x_workflow_run_id or "").strip() or None
         req_corr_id = x_request_id or f"req_{uuid.uuid4().hex[:12]}"
         req_started = time.perf_counter()
         set_request_context(
@@ -3980,6 +4074,8 @@ def create_gateway_app(
                             ab_variant=ab_variant,
                             model_name=effective_model_name,
                             attribution_context=code_attribution,
+                            intent=effective_intent,
+                            session_key=effective_session_key,
                         )
                         return _finish(
                             _jsonrpc_ok(
@@ -4552,6 +4648,8 @@ def create_gateway_app(
                                     if attributed_call is not None
                                     else None
                                 ),
+                                intent=effective_intent,
+                                session_key=effective_session_key,
                             )
                             recovery_status = "ok" if res.get("ok") else "error"
                     except KeyError as exc:
@@ -5098,6 +5196,93 @@ def create_gateway_app(
                 since=since,
                 limit=limit,
             )
+
+        @app.get("/admin/onboarding/prompt-pack")
+        async def admin_onboarding_prompt_pack(
+            request: Request,
+            upstream_name: str | None = Query(default=None, min_length=1, max_length=120),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            tools = []
+            candidates: list[dict[str, Any]] = []
+            if upstream_name:
+                catalog_identity = identity or runtime._dev_discovery_identity()
+                if catalog_identity is None:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="An authenticated administrator is required to inspect the catalog.",
+                    )
+                await runtime.ensure_catalog_for_identity(catalog_identity)
+                tools = runtime.catalog.get_server_tools(upstream_name)
+                if hasattr(runtime.store, "list_discovered_workflow_candidates"):
+                    candidates = await runtime.store.list_discovered_workflow_candidates(
+                        tenant_id, upstream_name=upstream_name, status="pending_review", limit=50
+                    )
+            public_url = runtime.settings.gateway_public_url or str(request.base_url).rstrip("/")
+            return build_onboarding_prompt_pack(
+                gateway_public_url=public_url,
+                upstream_name=upstream_name,
+                tools=tools,
+                discovered_candidates=candidates,
+            )
+
+        @app.get("/admin/workflows/discovered")
+        async def admin_list_discovered_workflows(
+            request: Request,
+            upstream_name: str | None = Query(default=None, min_length=1, max_length=120),
+            status: str | None = Query(default=None, max_length=40),
+            limit: int = Query(default=100, ge=1, le=500),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            items = (
+                await runtime.store.list_discovered_workflow_candidates(
+                    tenant_id, upstream_name=upstream_name, status=status, limit=limit
+                )
+                if hasattr(runtime.store, "list_discovered_workflow_candidates")
+                else []
+            )
+            return {"count": len(items), "candidates": items}
+
+        @app.get("/admin/workflows/episodes")
+        async def admin_list_workflow_episodes(
+            request: Request,
+            status: str | None = Query(default=None, max_length=40),
+            limit: int = Query(default=100, ge=1, le=500),
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            episodes = (
+                await runtime.store.list_workflow_episodes(tenant_id, status=status, limit=limit)
+                if hasattr(runtime.store, "list_workflow_episodes")
+                else []
+            )
+            return {"count": len(episodes), "episodes": episodes}
 
         @app.get("/admin/integration-definitions/{upstream_name}")
         async def get_admin_integration_definitions(
@@ -5991,6 +6176,1020 @@ def create_gateway_app(
                 "revision": body.revision,
                 "previous_revision": current["revision"],
                 "definition_digest": digest,
+            }
+
+        @app.post("/admin/integration-definitions/{upstream_name}/discover")
+        async def discover_admin_workflows(
+            upstream_name: str,
+            request: Request,
+            body: dict[str, Any] | None = None,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            if runtime.registry.get(upstream_name) is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Upstream '{upstream_name}' not found."
+                )
+            catalog_identity = identity or runtime._dev_discovery_identity()
+            if catalog_identity is None:
+                raise HTTPException(
+                    status_code=401,
+                    detail="An authenticated administrator is required to inspect the catalog.",
+                )
+            await runtime.ensure_catalog_for_identity(catalog_identity)
+            tools = runtime.catalog.get_server_tools(upstream_name)
+            schema_candidates = synthesize_workflows_from_catalog(upstream_name, tools)
+            runs = await runtime.store.list_runs(limit=300, tenant_id=tenant_id)
+            min_support = int((body or {}).get("min_support", 2))
+            mined_candidates = mine_workflows_from_runs(
+                upstream_name, runs, min_support=max(1, min_support)
+            )
+            published_fps: set[str] = set()
+            current_pub = await runtime.store.get_current_published_integration_definition(
+                tenant_id, upstream_name
+            )
+            if current_pub and isinstance(current_pub.get("definition"), dict):
+                for existing_wf in current_pub["definition"].get("workflows", []):
+                    comp = existing_wf.get("completion") or {}
+                    if comp.get("tool") and existing_wf.get("participating_tools"):
+                        published_fps.add(
+                            compute_workflow_fingerprint(
+                                upstream_name=upstream_name,
+                                participating_tools=existing_wf.get("participating_tools") or [],
+                                completion_tool=str(comp.get("tool") or ""),
+                                completion_kind=str(comp.get("kind") or "terminal_tool_result"),
+                            )
+                        )
+            blocked_fps: set[str] = set()
+            if hasattr(runtime.store, "list_discovered_workflow_candidates"):
+                prior_cands = await runtime.store.list_discovered_workflow_candidates(
+                    tenant_id, upstream_name=upstream_name, limit=500
+                )
+                for item in prior_cands:
+                    if item.get("status") in {"dismissed", "promoted"}:
+                        blocked_fps.add(str(item.get("fingerprint") or item.get("workflow_slug")))
+
+            saved_candidates: list[dict[str, Any]] = []
+            seen_fps: set[str] = set()
+            for draft in [*schema_candidates, *mined_candidates]:
+                comp = draft.get("completion") or {}
+                fp = str(
+                    draft.get("fingerprint")
+                    or compute_workflow_fingerprint(
+                        upstream_name=upstream_name,
+                        participating_tools=draft.get("participating_tools") or [],
+                        completion_tool=str(comp.get("tool") or ""),
+                        completion_kind=str(comp.get("kind") or "terminal_tool_result"),
+                    )
+                )
+                if fp in published_fps or fp in blocked_fps or fp in seen_fps:
+                    continue
+                seen_fps.add(fp)
+                if hasattr(runtime.store, "upsert_discovered_workflow_candidate"):
+                    saved = await runtime.store.upsert_discovered_workflow_candidate(
+                        {
+                            "tenant_id": tenant_id,
+                            "upstream_name": upstream_name,
+                            "workflow_slug": draft["id"],
+                            "fingerprint": fp,
+                            "origin": draft.get("origin", "auto_schema"),
+                            "status": "pending_review",
+                            "observed_count": int(draft.get("observed_count", 1)),
+                            "verified_count": 0,
+                            "sample_intents": draft.get("intent_examples", []),
+                            "draft_definition": {**draft, "fingerprint": fp},
+                        }
+                    )
+                    saved_candidates.append(saved)
+            saved_candidates.sort(
+                key=lambda item: (
+                    -int(item.get("verified_count", 0)),
+                    -int(item.get("observed_count", 0)),
+                )
+            )
+            return {
+                "upstream_name": upstream_name,
+                "discovered_count": len(saved_candidates),
+                "candidates": saved_candidates,
+            }
+
+        @app.post("/admin/workflows/discovered/{candidate_id}/promote")
+        async def promote_discovered_workflow(
+            candidate_id: str,
+            body: dict[str, Any],
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            if not hasattr(runtime.store, "get_discovered_workflow_candidate"):
+                raise HTTPException(status_code=501, detail="Candidate store unavailable.")
+            candidate = await runtime.store.get_discovered_workflow_candidate(
+                tenant_id, candidate_id
+            )
+            if candidate is None:
+                raise HTTPException(status_code=404, detail="Discovered candidate not found.")
+            try:
+                minutes = float(body["manual_baseline_minutes"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="manual_baseline_minutes is required to promote a workflow.",
+                ) from exc
+            if minutes <= 0:
+                raise HTTPException(
+                    status_code=422, detail="manual_baseline_minutes must be greater than zero."
+                )
+            upstream_name = candidate["upstream_name"]
+            if bool(body.get("mark_promoted_only")):
+                await runtime.store.update_discovered_workflow_candidate_status(
+                    tenant_id, candidate_id, "promoted", datetime.now(UTC).isoformat()
+                )
+                return {
+                    "promoted": True,
+                    "candidate_id": candidate_id,
+                    "upstream_name": upstream_name,
+                    "revision": None,
+                    "published": False,
+                }
+            catalog_identity = identity or runtime._dev_discovery_identity()
+            if catalog_identity is None:
+                raise HTTPException(
+                    status_code=401,
+                    detail="An authenticated administrator is required to inspect the catalog.",
+                )
+            await runtime.ensure_catalog_for_identity(catalog_identity)
+            tools = runtime.catalog.get_server_tools(upstream_name)
+            tool_by_name = {t.qualified_name: t for t in tools}
+
+            current = await runtime.store.get_current_published_integration_definition(
+                tenant_id, upstream_name
+            )
+            base_def: dict[str, Any] = (
+                json.loads(json.dumps(current["definition"]))
+                if current
+                else {
+                    "manifest_version": "1.0",
+                    "integration": {
+                        "id": re.sub(r"[^a-z0-9]+", "_", upstream_name.lower()).strip("_")
+                        or "integration",
+                        "display_name": upstream_name,
+                        "upstream_name": upstream_name,
+                        "status": "draft",
+                        "revision": 1,
+                    },
+                    "tool_refs": [],
+                    "experiences": [],
+                    "workflows": [],
+                    "standalone_tool_values": [],
+                    "publication": None,
+                }
+            )
+            base_def["integration"]["status"] = "draft"
+            base_def["integration"]["revision"] = 1
+            base_def["publication"] = None
+
+            wf_draft = dict(candidate["draft_definition"])
+            for transient_key in (
+                "tool_refs",
+                "needs_baseline_confirmation",
+                "observed_count",
+                "verified_count",
+                "fingerprint",
+                "origin",
+            ):
+                wf_draft.pop(transient_key, None)
+            completion_cfg = dict(wf_draft.get("completion") or {})
+            terminal_name = str(completion_cfg.get("tool") or "")
+            success_when = dict(completion_cfg.get("success_when") or {})
+            if not success_when.get("path"):
+                completion_cfg["success_when"] = pick_schema_predicate(
+                    tool_by_name.get(terminal_name)
+                )
+            if (
+                terminal_name in tool_by_name
+                and tool_by_name[terminal_name].mutating
+                and "require_sensitive_write_journal_status" not in completion_cfg
+            ):
+                completion_cfg["require_sensitive_write_journal_status"] = "succeeded"
+            wf_draft["completion"] = completion_cfg
+            wf_draft["business_value"] = {
+                "manual_baseline_minutes": minutes,
+                "baseline_source": str(body.get("baseline_source") or "administrator_estimate"),
+                "confidence": str(body.get("confidence") or "unvalidated"),
+                "effective_from": str(
+                    body.get("effective_from") or datetime.now(UTC).date().isoformat()
+                ),
+                **(
+                    {"evidence_note": str(body["evidence_note"])}
+                    if body.get("evidence_note")
+                    else {}
+                ),
+            }
+            existing_wfs = [
+                w for w in base_def.get("workflows", []) if w.get("id") != wf_draft["id"]
+            ]
+            existing_wfs.append(wf_draft)
+            base_def["workflows"] = existing_wfs
+            needed_tools = {t for wf in existing_wfs for t in wf.get("participating_tools", [])} | {
+                e.get("tool") for e in base_def.get("experiences", []) if e.get("tool")
+            }
+            base_def["tool_refs"] = [
+                {
+                    "name": tname,
+                    "schema_sha256": compute_schema_digest([tool_by_name[tname]]),
+                }
+                for tname in sorted(needed_tools)
+                if tname in tool_by_name
+            ]
+            try:
+                definition = IntegrationDefinition.model_validate(base_def)
+                digest = await _validate_admin_integration_definition(
+                    definition, upstream_name, identity
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            saved = await runtime.store.save_integration_definition_version(
+                {
+                    "tenant_id": tenant_id,
+                    "upstream_name": upstream_name,
+                    "definition_digest": digest,
+                    "definition": definition.model_dump(mode="json", exclude_none=True),
+                }
+            )
+            if bool(body.get("publish", True)):
+                prev = current["revision"] if current else None
+                await runtime.store.append_integration_definition_publication(
+                    {
+                        "event_id": uuid.uuid4().hex,
+                        "tenant_id": tenant_id,
+                        "upstream_name": upstream_name,
+                        "action": "publish",
+                        "revision": saved["revision"],
+                        "actor_sub": identity.sub if identity else "local-admin",
+                        "created_at": datetime.now(UTC).isoformat(),
+                        "evidence": {
+                            "previous_revision": prev,
+                            "target_revision": saved["revision"],
+                            "promoted_candidate_id": candidate_id,
+                        },
+                    }
+                )
+            await runtime.store.update_discovered_workflow_candidate_status(
+                tenant_id, candidate_id, "promoted", datetime.now(UTC).isoformat()
+            )
+            return {
+                "promoted": True,
+                "candidate_id": candidate_id,
+                "upstream_name": upstream_name,
+                "revision": saved["revision"],
+                "published": bool(body.get("publish", True)),
+            }
+
+        @app.post("/admin/workflows/discovered/{candidate_id}/dismiss")
+        async def dismiss_discovered_workflow(
+            candidate_id: str,
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            if not hasattr(runtime.store, "update_discovered_workflow_candidate_status"):
+                raise HTTPException(status_code=501, detail="Candidate store unavailable.")
+            updated = await runtime.store.update_discovered_workflow_candidate_status(
+                tenant_id, candidate_id, "dismissed", datetime.now(UTC).isoformat()
+            )
+            if not updated:
+                raise HTTPException(status_code=404, detail="Discovered candidate not found.")
+            return {"dismissed": True, "candidate_id": candidate_id}
+
+        @app.post("/admin/workflows/discovered/dismiss-schema")
+        async def dismiss_schema_candidates(
+            request: Request,
+            body: dict[str, Any] | None = None,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            if not hasattr(runtime.store, "list_discovered_workflow_candidates"):
+                raise HTTPException(status_code=501, detail="Candidate store unavailable.")
+            target_upstream = str((body or {}).get("upstream_name") or "").strip() or None
+            candidates = await runtime.store.list_discovered_workflow_candidates(
+                tenant_id, upstream_name=target_upstream, limit=500
+            )
+            dismissed_ids: list[str] = []
+            now_iso = datetime.now(UTC).isoformat()
+            for item in candidates:
+                if (
+                    item.get("status") == "pending_review"
+                    and item.get("origin") == "auto_schema"
+                    and int(item.get("verified_count", 0)) == 0
+                ):
+                    ok = await runtime.store.update_discovered_workflow_candidate_status(
+                        tenant_id, item["candidate_id"], "dismissed", now_iso
+                    )
+                    if ok:
+                        dismissed_ids.append(item["candidate_id"])
+            return {"dismissed_count": len(dismissed_ids), "dismissed_ids": dismissed_ids}
+
+        @app.post("/admin/onboarding/bundle/validate")
+        async def validate_admin_onboarding_bundle(
+            body: dict[str, Any],
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            catalog_identity = identity or runtime._dev_discovery_identity()
+            if catalog_identity is None:
+                raise HTTPException(
+                    status_code=401,
+                    detail="An authenticated administrator is required to inspect the catalog.",
+                )
+            try:
+                await runtime.ensure_catalog_for_identity(catalog_identity)
+                return validate_onboarding_bundle_payload(
+                    body, settings=runtime.settings, catalog=runtime.catalog
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        @app.post("/admin/onboarding/bundle/apply")
+        async def apply_admin_onboarding_bundle(
+            body: dict[str, Any],
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            catalog_identity = identity or runtime._dev_discovery_identity()
+            if catalog_identity is None:
+                raise HTTPException(
+                    status_code=401,
+                    detail="An authenticated administrator is required to inspect the catalog.",
+                )
+            try:
+                bundle = OnboardingBundle.model_validate(body)
+                if bundle.upstream is None:
+                    await runtime.ensure_catalog_for_identity(catalog_identity)
+                preview = validate_onboarding_bundle_payload(
+                    body, settings=runtime.settings, catalog=runtime.catalog
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+            upstream_result: dict[str, Any] | None = None
+            if bundle.upstream is not None:
+                try:
+                    upstream_cfg = UpstreamConfig.model_validate(bundle.upstream)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                upstream_result = await add_admin_upstream(
+                    upstream_cfg,
+                    authorization=authorization,
+                    mcpcodeaway_admin_session=mcpcodeaway_admin_session,
+                )
+
+            definition_result: dict[str, Any] | None = None
+            if preview.get("integration_definition") is not None:
+                try:
+                    await runtime.ensure_catalog_for_identity(catalog_identity)
+                    refreshed = validate_onboarding_bundle_payload(
+                        body, settings=runtime.settings, catalog=runtime.catalog
+                    )
+                    def_model = IntegrationDefinition.model_validate(
+                        refreshed["integration_definition"]
+                    )
+                    upstream_name = def_model.integration.upstream_name
+                    tenant_id = _integration_definition_tenant(identity)
+                    draft_def = def_model.model_copy(
+                        update={
+                            "integration": def_model.integration.model_copy(
+                                update={"status": "draft", "revision": 1}
+                            ),
+                            "publication": None,
+                        }
+                    )
+                    digest = await _validate_admin_integration_definition(
+                        draft_def, upstream_name, identity
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                saved = await runtime.store.save_integration_definition_version(
+                    {
+                        "tenant_id": tenant_id,
+                        "upstream_name": upstream_name,
+                        "definition_digest": digest,
+                        "definition": draft_def.model_dump(mode="json", exclude_none=True),
+                    }
+                )
+                published = False
+                if bundle.publish:
+                    current = await runtime.store.get_current_published_integration_definition(
+                        tenant_id, upstream_name
+                    )
+                    await runtime.store.append_integration_definition_publication(
+                        {
+                            "event_id": uuid.uuid4().hex,
+                            "tenant_id": tenant_id,
+                            "upstream_name": upstream_name,
+                            "action": "publish",
+                            "revision": saved["revision"],
+                            "actor_sub": identity.sub if identity else "local-admin",
+                            "created_at": datetime.now(UTC).isoformat(),
+                            "evidence": {
+                                "previous_revision": current["revision"] if current else None,
+                                "target_revision": saved["revision"],
+                                "source": "onboarding_bundle_apply",
+                            },
+                        }
+                    )
+                    published = True
+                definition_result = {
+                    "upstream_name": upstream_name,
+                    "revision": saved["revision"],
+                    "definition_digest": digest,
+                    "published": published,
+                }
+            return {
+                "applied": True,
+                "upstream": upstream_result,
+                "integration_definition": definition_result,
+            }
+
+        async def _save_and_publish_definition_mutation(
+            *,
+            tenant_id: str,
+            upstream_name: str,
+            identity: CallerIdentity | None,
+            base_def: dict[str, Any],
+            previous_revision: int | None,
+            source: str,
+        ) -> dict[str, Any]:
+            catalog_identity = identity or runtime._dev_discovery_identity()
+            if catalog_identity is None:
+                raise HTTPException(
+                    status_code=401,
+                    detail="An authenticated administrator is required to update integrations.",
+                )
+            await runtime.ensure_catalog_for_identity(catalog_identity)
+            tools = runtime.catalog.get_server_tools(upstream_name)
+            tool_by_name = {t.qualified_name: t for t in tools}
+            base_def["integration"]["status"] = "draft"
+            base_def["integration"]["revision"] = 1
+            base_def["publication"] = None
+            needed_tools = {
+                t for wf in base_def.get("workflows", []) for t in wf.get("participating_tools", [])
+            } | {e.get("tool") for e in base_def.get("experiences", []) if e.get("tool")}
+            base_def["tool_refs"] = [
+                {
+                    "name": tname,
+                    "schema_sha256": compute_schema_digest([tool_by_name[tname]]),
+                }
+                for tname in sorted(needed_tools)
+                if tname in tool_by_name
+            ]
+            try:
+                definition = IntegrationDefinition.model_validate(base_def)
+                digest = await _validate_admin_integration_definition(
+                    definition, upstream_name, identity
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            saved = await runtime.store.save_integration_definition_version(
+                {
+                    "tenant_id": tenant_id,
+                    "upstream_name": upstream_name,
+                    "definition_digest": digest,
+                    "definition": definition.model_dump(mode="json", exclude_none=True),
+                }
+            )
+            await runtime.store.append_integration_definition_publication(
+                {
+                    "event_id": uuid.uuid4().hex,
+                    "tenant_id": tenant_id,
+                    "upstream_name": upstream_name,
+                    "action": "publish",
+                    "revision": saved["revision"],
+                    "actor_sub": identity.sub if identity else "local-admin",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "evidence": {
+                        "previous_revision": previous_revision,
+                        "target_revision": saved["revision"],
+                        "source": source,
+                    },
+                }
+            )
+            return {
+                "upstream_name": upstream_name,
+                "revision": saved["revision"],
+                "definition_digest": digest,
+                "definition": saved["definition"],
+            }
+
+        @app.get("/admin/workflows/catalog")
+        async def admin_workflows_catalog(
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            published_defs = await runtime.store.list_current_published_integration_definitions(
+                tenant_id
+            )
+            workflows: list[dict[str, Any]] = []
+            for row in published_defs:
+                definition = row.get("definition") or {}
+                for wf in definition.get("workflows", []):
+                    workflows.append(
+                        {
+                            "upstream_name": row["upstream_name"],
+                            "definition_revision": row["revision"],
+                            "workflow": wf,
+                        }
+                    )
+            candidates = (
+                await runtime.store.list_discovered_workflow_candidates(
+                    tenant_id, status="pending_review", limit=200
+                )
+                if hasattr(runtime.store, "list_discovered_workflow_candidates")
+                else []
+            )
+            episodes = (
+                await runtime.store.list_workflow_episodes(tenant_id, limit=100)
+                if hasattr(runtime.store, "list_workflow_episodes")
+                else []
+            )
+            return {
+                "upstreams": [u.name for u in runtime.registry.list_upstreams()],
+                "workflows": workflows,
+                "candidates": candidates,
+                "episodes": episodes,
+            }
+
+        @app.patch("/admin/integration-definitions/{upstream_name}/workflows/{workflow_id}")
+        async def update_admin_workflow(
+            upstream_name: str,
+            workflow_id: str,
+            body: dict[str, Any],
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            current = await runtime.store.get_current_published_integration_definition(
+                tenant_id, upstream_name
+            )
+            if current is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No published integration definition found for '{upstream_name}'.",
+                )
+            base_def = json.loads(json.dumps(current["definition"]))
+            target = next(
+                (w for w in base_def.get("workflows", []) if w.get("id") == workflow_id), None
+            )
+            if target is None:
+                raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found.")
+            if "enabled" in body:
+                target["enabled"] = bool(body["enabled"])
+            if "name" in body and isinstance(body["name"], str):
+                target["name"] = body["name"]
+            if "description" in body and isinstance(body["description"], str):
+                target["description"] = body["description"]
+            if "intent_examples" in body and isinstance(body["intent_examples"], list):
+                target["intent_examples"] = [
+                    str(x).strip() for x in body["intent_examples"] if str(x).strip()
+                ][:25]
+            if any(
+                key in body
+                for key in (
+                    "manual_baseline_minutes",
+                    "baseline_source",
+                    "confidence",
+                    "evidence_note",
+                )
+            ):
+                bv = dict(target.get("business_value") or {})
+                if "manual_baseline_minutes" in body:
+                    try:
+                        mins = float(body["manual_baseline_minutes"])
+                    except (TypeError, ValueError) as exc:
+                        raise HTTPException(
+                            status_code=422, detail="manual_baseline_minutes must be numeric."
+                        ) from exc
+                    if mins <= 0:
+                        raise HTTPException(
+                            status_code=422, detail="manual_baseline_minutes must exceed zero."
+                        )
+                    bv["manual_baseline_minutes"] = mins
+                if "baseline_source" in body:
+                    bv["baseline_source"] = str(body["baseline_source"])
+                if "confidence" in body:
+                    bv["confidence"] = str(body["confidence"])
+                if "evidence_note" in body:
+                    bv["evidence_note"] = (
+                        str(body["evidence_note"]) if body["evidence_note"] is not None else None
+                    )
+                target["business_value"] = bv
+            result = await _save_and_publish_definition_mutation(
+                tenant_id=tenant_id,
+                upstream_name=upstream_name,
+                identity=identity,
+                base_def=base_def,
+                previous_revision=current["revision"],
+                source="admin_workflow_patch",
+            )
+            updated_wf = next(
+                w for w in result["definition"].get("workflows", []) if w.get("id") == workflow_id
+            )
+            return {
+                "updated": True,
+                "upstream_name": upstream_name,
+                "revision": result["revision"],
+                "workflow": updated_wf,
+            }
+
+        @app.delete("/admin/integration-definitions/{upstream_name}/workflows/{workflow_id}")
+        async def delete_admin_workflow(
+            upstream_name: str,
+            workflow_id: str,
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            current = await runtime.store.get_current_published_integration_definition(
+                tenant_id, upstream_name
+            )
+            if current is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No published integration definition found for '{upstream_name}'.",
+                )
+            base_def = json.loads(json.dumps(current["definition"]))
+            existing = list(base_def.get("workflows", []))
+            remaining = [w for w in existing if w.get("id") != workflow_id]
+            if len(remaining) == len(existing):
+                raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found.")
+            base_def["workflows"] = remaining
+            result = await _save_and_publish_definition_mutation(
+                tenant_id=tenant_id,
+                upstream_name=upstream_name,
+                identity=identity,
+                base_def=base_def,
+                previous_revision=current["revision"],
+                source="admin_workflow_delete",
+            )
+            return {
+                "deleted": True,
+                "upstream_name": upstream_name,
+                "workflow_id": workflow_id,
+                "revision": result["revision"],
+            }
+
+        @app.get("/admin/mcp-ui/experiences")
+        async def admin_list_mcp_ui_experiences(
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            catalog_identity = identity or runtime._dev_discovery_identity()
+            if catalog_identity is not None:
+                await runtime.ensure_catalog_for_identity(catalog_identity)
+            published_defs = await runtime.store.list_current_published_integration_definitions(
+                tenant_id
+            )
+            experiences: list[dict[str, Any]] = []
+            for row in published_defs:
+                definition = row.get("definition") or {}
+                for exp in definition.get("experiences", []):
+                    tool_name = str(exp.get("tool") or "")
+                    tool_obj = runtime.catalog.get_tool(tool_name)
+                    experiences.append(
+                        {
+                            "upstream_name": row["upstream_name"],
+                            "definition_revision": row["revision"],
+                            "experience": exp,
+                            "tool_input_schema": (tool_obj.input_schema if tool_obj else None),
+                            "tool_description": (tool_obj.description if tool_obj else None),
+                        }
+                    )
+            registered_upstreams = runtime.registry.list_upstreams()
+            tools_by_upstream = {
+                u.name: [
+                    {
+                        "qualified_name": t.qualified_name,
+                        "name": t.name,
+                        "description": t.description,
+                        "mutating": t.mutating,
+                        "input_schema": t.input_schema,
+                    }
+                    for t in runtime.catalog.get_server_tools(u.name)
+                ]
+                for u in registered_upstreams
+            }
+            return {
+                "upstreams": [u.name for u in registered_upstreams],
+                "experiences": experiences,
+                "tools_by_upstream": tools_by_upstream,
+            }
+
+        @app.post("/admin/mcp-ui/preview")
+        async def admin_preview_mcp_ui_experience(
+            body: dict[str, Any],
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            _reject_integration_definition_tenant_override(request)
+            exp = body.get("experience") if isinstance(body.get("experience"), dict) else body
+            if not isinstance(exp, dict):
+                raise HTTPException(status_code=422, detail="experience payload must be an object.")
+            catalog_identity = identity or runtime._dev_discovery_identity()
+            if catalog_identity is not None:
+                await runtime.ensure_catalog_for_identity(catalog_identity)
+            tool_name = str(exp.get("tool") or "")
+            tool_obj = runtime.catalog.get_tool(tool_name) if tool_name else None
+            tool_input_schema = (
+                body.get("tool_input_schema")
+                if isinstance(body.get("tool_input_schema"), dict)
+                else (tool_obj.input_schema if tool_obj else None)
+            )
+            if tool_input_schema is None and isinstance(exp.get("input_mapping"), dict):
+                tool_input_schema = {
+                    "type": "object",
+                    "properties": {str(k): {"type": "string"} for k in exp["input_mapping"]},
+                    "required": [],
+                    "additionalProperties": False,
+                }
+            try:
+                rendered = render_mcp_app_resource(exp, tool_input_schema=tool_input_schema)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return {
+                "valid": True,
+                "uri": rendered["uri"],
+                "mimeType": rendered["mimeType"],
+                "html": rendered["text"],
+                "meta": rendered.get("_meta"),
+                "tool_input_schema": tool_input_schema,
+            }
+
+        @app.post("/admin/mcp-ui/simulate")
+        async def admin_simulate_mcp_ui_tool_call(
+            body: dict[str, Any],
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization,
+                mcpcodeaway_admin_session,
+                require_admin_role=True,
+                allow_viewer=True,
+            )
+            _reject_integration_definition_tenant_override(request)
+            tool_name = str(body.get("tool") or "").strip()
+            arguments = body.get("arguments")
+            if not tool_name:
+                raise HTTPException(status_code=422, detail="tool name is required.")
+            if arguments is None:
+                arguments = {}
+            if not isinstance(arguments, dict):
+                raise HTTPException(status_code=422, detail="arguments must be an object.")
+            catalog_identity = identity or runtime._dev_discovery_identity()
+            if catalog_identity is not None:
+                await runtime.ensure_catalog_for_identity(catalog_identity)
+            tool_obj = runtime.catalog.get_tool(tool_name)
+
+            def _sample_from_schema(
+                schema: Any, args_map: dict[str, Any], field_hint: str = "", row_idx: int = 0
+            ) -> Any:
+                if not isinstance(schema, dict):
+                    return {"status": "ok", "simulated": True, **args_map}
+                stype = schema.get("type")
+                if stype == "array":
+                    item_schema = schema.get("items") or {"type": "string"}
+                    if isinstance(item_schema, dict) and item_schema.get("type") == "object":
+                        return [
+                            _sample_from_schema(item_schema, args_map, row_idx=0),
+                            _sample_from_schema(item_schema, args_map, row_idx=1),
+                        ]
+                    return [_sample_from_schema(item_schema, args_map)]
+                if stype == "integer":
+                    return 42 + row_idx * 7
+                if stype == "number":
+                    return round(98.4 - row_idx * 3.2, 1)
+                if stype == "boolean":
+                    return field_hint != "sla_breached"
+                if stype == "string":
+                    hints = {
+                        "ticket_id": f"TCK-{1042 + row_idx}",
+                        "id": f"REC-{101 + row_idx}",
+                        "subject": "Checkout latency spike in eu-west",
+                        "title": "Checkout latency spike",
+                        "assignee": "sre-oncall" if row_idx == 0 else "platform-triage",
+                        "team": "core-checkout",
+                        "queue_id": "eu-priority",
+                        "region": "EU" if row_idx == 0 else "US",
+                        "status": "open" if row_idx == 0 else "resolved",
+                        "priority": "high" if row_idx == 0 else "medium",
+                        "requester_email": "ops-lead@example.com",
+                    }
+                    if field_hint in hints:
+                        return hints[field_hint]
+                    return f"sample_{field_hint or 'value'}"
+                props = schema.get("properties")
+                if isinstance(props, dict) and props:
+                    out: dict[str, Any] = {}
+                    for k, sub in props.items():
+                        if k in args_map and args_map[k] != "":
+                            out[k] = args_map[k]
+                        else:
+                            out[k] = _sample_from_schema(
+                                sub, {}, field_hint=str(k), row_idx=row_idx
+                            )
+                    return out
+                return {"status": "ok", "simulated": True, **args_map}
+
+            sample_payload = _sample_from_schema(
+                tool_obj.output_schema if tool_obj else None, arguments
+            )
+            if isinstance(sample_payload, dict):
+                for arg_k, arg_v in arguments.items():
+                    if arg_v not in (None, "") and arg_k not in sample_payload:
+                        sample_payload[arg_k] = arg_v
+            return {
+                "simulated": True,
+                "tool": tool_name,
+                "arguments": arguments,
+                "structuredContent": sample_payload,
+                "isError": False,
+            }
+
+        @app.put("/admin/integration-definitions/{upstream_name}/experiences/{experience_id}")
+        async def upsert_admin_mcp_ui_experience(
+            upstream_name: str,
+            experience_id: str,
+            body: dict[str, Any],
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            if runtime.registry.get(upstream_name) is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Upstream '{upstream_name}' not found."
+                )
+            exp_payload = dict(
+                body.get("experience") if isinstance(body.get("experience"), dict) else body
+            )
+            exp_payload["id"] = experience_id
+            current = await runtime.store.get_current_published_integration_definition(
+                tenant_id, upstream_name
+            )
+            base_def: dict[str, Any] = (
+                json.loads(json.dumps(current["definition"]))
+                if current
+                else {
+                    "manifest_version": "1.0",
+                    "integration": {
+                        "id": re.sub(r"[^a-z0-9]+", "_", upstream_name.lower()).strip("_")
+                        or "integration",
+                        "display_name": upstream_name,
+                        "upstream_name": upstream_name,
+                        "status": "draft",
+                        "revision": 1,
+                    },
+                    "tool_refs": [],
+                    "experiences": [],
+                    "workflows": [],
+                    "standalone_tool_values": [],
+                    "publication": None,
+                }
+            )
+            exps = [e for e in base_def.get("experiences", []) if e.get("id") != experience_id]
+            exps.append(exp_payload)
+            base_def["experiences"] = exps
+            result = await _save_and_publish_definition_mutation(
+                tenant_id=tenant_id,
+                upstream_name=upstream_name,
+                identity=identity,
+                base_def=base_def,
+                previous_revision=current["revision"] if current else None,
+                source="admin_experience_upsert",
+            )
+            saved_exp = next(
+                e
+                for e in result["definition"].get("experiences", [])
+                if e.get("id") == experience_id
+            )
+            return {
+                "saved": True,
+                "upstream_name": upstream_name,
+                "revision": result["revision"],
+                "experience": saved_exp,
+            }
+
+        @app.delete("/admin/integration-definitions/{upstream_name}/experiences/{experience_id}")
+        async def delete_admin_mcp_ui_experience(
+            upstream_name: str,
+            experience_id: str,
+            request: Request,
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            identity = await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            _reject_integration_definition_tenant_override(request)
+            tenant_id = _integration_definition_tenant(identity)
+            current = await runtime.store.get_current_published_integration_definition(
+                tenant_id, upstream_name
+            )
+            if current is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No published integration definition found for '{upstream_name}'.",
+                )
+            base_def = json.loads(json.dumps(current["definition"]))
+            existing = list(base_def.get("experiences", []))
+            remaining = [e for e in existing if e.get("id") != experience_id]
+            if len(remaining) == len(existing):
+                raise HTTPException(
+                    status_code=404, detail=f"MCP App experience '{experience_id}' not found."
+                )
+            base_def["experiences"] = remaining
+            result = await _save_and_publish_definition_mutation(
+                tenant_id=tenant_id,
+                upstream_name=upstream_name,
+                identity=identity,
+                base_def=base_def,
+                previous_revision=current["revision"],
+                source="admin_experience_delete",
+            )
+            return {
+                "deleted": True,
+                "upstream_name": upstream_name,
+                "experience_id": experience_id,
+                "revision": result["revision"],
             }
 
         @app.put("/admin/upstreams/{name}/tools/{tool_name}/guidance")
@@ -7266,6 +8465,30 @@ def create_gateway_app(
             await runtime.registry.save_upstream(updated)
             await runtime.bump_catalog_epoch()
             return {"upstream": name, "preferred_mode": updated.preferred_mode}
+
+        @app.patch("/admin/upstreams/{name}/auto-discovery")
+        async def admin_set_upstream_auto_discovery(
+            name: str,
+            payload: dict[str, Any],
+            authorization: str | None = Header(default=None),
+            mcpcodeaway_admin_session: str | None = Cookie(default=None),
+        ) -> dict[str, Any]:
+            await _authorize_control_plane(
+                authorization, mcpcodeaway_admin_session, require_admin_role=True
+            )
+            cfg = runtime.registry.get(name)
+            if cfg is None:
+                raise HTTPException(status_code=404, detail=f"Upstream '{name}' not found")
+            if not isinstance(payload.get("enabled"), bool):
+                raise HTTPException(status_code=422, detail="enabled must be a boolean.")
+            updated = cfg.model_copy(update={"auto_discovery_enabled": payload["enabled"]})
+            runtime.registry.upsert(updated)
+            if hasattr(runtime.store, "upsert_upstream"):
+                await runtime.store.upsert_upstream(updated.name, updated.model_dump())
+            return {
+                "upstream": name,
+                "auto_discovery_enabled": updated.auto_discovery_enabled,
+            }
 
         @app.patch("/admin/upstreams/{name}/tools/{tool_name}/mode")
         async def admin_set_tool_mode_override(

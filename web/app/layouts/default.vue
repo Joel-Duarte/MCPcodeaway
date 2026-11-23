@@ -46,6 +46,12 @@ const navigation = [
     icon: "analytics",
   },
   {
+    label: "Workflows",
+    to: "/workflows",
+    group: "Optimize",
+    icon: "analytics",
+  },
+  {
     label: "Upstreams Catalog",
     to: "/upstreams",
     group: "Govern",
@@ -68,6 +74,12 @@ const navigation = [
     to: "/onboarding",
     group: "Configure",
     icon: "onboarding",
+  },
+  {
+    label: "MCP Apps UI",
+    to: "/mcp-ui",
+    group: "Configure",
+    icon: "upstreams",
   },
   {
     label: "Settings & Alerts",

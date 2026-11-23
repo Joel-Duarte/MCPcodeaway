@@ -108,7 +108,7 @@ async def test_gateway_rejects_missing_or_unsupported_schema_without_ddl() -> No
             assert "to_regclass" in sql
             return None
 
-    with pytest.raises(RuntimeError, match="requires version 4"):
+    with pytest.raises(RuntimeError, match="requires version 6"):
         await verify_schema(MissingSchemaConnection())
 
     class NewerSchemaConnection:
@@ -116,9 +116,9 @@ async def test_gateway_rejects_missing_or_unsupported_schema_without_ddl() -> No
             if "to_regclass" in sql:
                 return "mcpcodeaway_schema_migrations"
             assert "MAX(version)" in sql
-            return 5
+            return 7
 
-    with pytest.raises(RuntimeError, match="requires version 4"):
+    with pytest.raises(RuntimeError, match="requires version 6"):
         await verify_schema(NewerSchemaConnection())
 
     class IncompatibleSchemaConnection:
@@ -130,7 +130,7 @@ async def test_gateway_rejects_missing_or_unsupported_schema_without_ddl() -> No
         async def fetch(self, _sql: str, _tables: list[str]) -> list[dict[str, str]]:
             return [{"table_name": "audit_runs", "column_name": "run_id"}]
 
-    with pytest.raises(RuntimeError, match="schema version 4 is incomplete"):
+    with pytest.raises(RuntimeError, match="schema version 6 is incomplete"):
         await verify_schema(IncompatibleSchemaConnection())
 
     class MissingSafetyIndexConnection:
@@ -161,7 +161,7 @@ async def test_gateway_rejects_missing_or_unsupported_schema_without_ddl() -> No
 
 
 def test_migration_list_is_ordered_and_token_cleanup_is_explicit() -> None:
-    assert [migration.version for migration in MIGRATIONS] == [1, 2, 3, 4]
+    assert [migration.version for migration in MIGRATIONS] == [1, 2, 3, 4, 5, 6]
     assert any(
         "DELETE FROM user_upstream_credentials" in statement
         for statement in MIGRATIONS[1].statements
@@ -176,10 +176,10 @@ async def test_empty_database_migrations_are_versioned_and_repeatable() -> None:
     def connect(*args: Any, **kwargs: Any) -> Any:
         return _fake_connect(database, *args, **kwargs)
 
-    assert await upgrade("postgresql://migration", connect=connect) == (0, 4)
+    assert await upgrade("postgresql://migration", connect=connect) == (0, 6)
     first_run_statement_count = len(database.statements)
-    assert database.versions == [1, 2, 3, 4]
-    assert await upgrade("postgresql://migration", connect=connect) == (4, 4)
+    assert database.versions == [1, 2, 3, 4, 5, 6]
+    assert await upgrade("postgresql://migration", connect=connect) == (6, 6)
     assert len(database.statements) == first_run_statement_count
 
 
@@ -194,8 +194,8 @@ async def test_existing_database_upgrade_keeps_rows_and_concurrent_jobs_serializ
         upgrade("postgresql://migration", connect=connect),
         upgrade("postgresql://migration", connect=connect),
     )
-    assert sorted(outcomes) == [(1, 4), (4, 4)]
-    assert database.versions == [1, 2, 3, 4]
+    assert sorted(outcomes) == [(1, 6), (6, 6)]
+    assert database.versions == [1, 2, 3, 4, 5, 6]
     assert database.existing_rows == {
         "audit_runs": ["preexisting-run"],
         "sensitive_write_audits": ["preexisting-journal"],
@@ -240,7 +240,7 @@ async def test_failed_migration_rolls_back_token_cleanup_and_restart_can_retry(
     ]
 
     monkeypatch.setattr(migrations, "MIGRATIONS", original_migrations)
-    assert await upgrade("postgresql://migration", connect=connect) == (1, 4)
+    assert await upgrade("postgresql://migration", connect=connect) == (1, 6)
     assert database.user_credentials == [{"auth_kind": "user_api_key"}]
     assert database.gateway_secrets == [{"name": "unrelated-secret", "ciphertext": "opaque"}]
 

@@ -85,6 +85,21 @@ subject, and client. Recovery is bounded by the configured attempt count and age
 unresolved writes become `needs_attention` for operator review. There is no
 manual replay control or push notification in this MVP.
 
+## Passive workflow episode lifecycle
+
+Implemented as `WorkflowEpisodeTracker` in `gateway.workflow_detector` and persisted in `workflow_episodes` (`gateway.state`).
+
+```mermaid
+stateDiagram-v2
+    [*] --> open: First matching call recorded
+    open --> completed_verified: Published predicate satisfied or post-write readback diff verified
+    open --> completed_unverified: Write succeeded cleanly; closed by idle TTL, batch end, or intent shift
+    open --> read_only: Read-only calls closed without mutation intent
+    open --> partial_or_incomplete: Failed write, missing mutation intent, or System-1 partial downgrade
+    open --> abandoned: No successful tool calls before closure
+    completed_unverified --> partial_or_incomplete: Async System-1 judge flags missing goals
+```
+
 ## Gateway operations and adaptive behavior
 
 | Flow | States and transitions | Owning code / representation |

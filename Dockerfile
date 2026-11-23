@@ -56,3 +56,27 @@ ENV GATEWAY_PROFILE=demo
 USER appuser
 EXPOSE 8000
 CMD ["uvicorn", "gateway.server:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS classifier-builder
+WORKDIR /app
+COPY pyproject.toml .python-version uv.lock ./
+COPY src ./src
+COPY config ./config
+RUN uv sync --frozen --no-dev --extra classifier
+
+FROM python:3.13-slim-bookworm AS workflow-classifier
+RUN useradd --create-home --uid 10001 appuser && mkdir -p /app/models && chown -R appuser:appuser /app
+WORKDIR /app
+COPY --from=classifier-builder /app/.venv /app/.venv
+COPY --from=classifier-builder /app/src /app/src
+COPY --from=classifier-builder /app/pyproject.toml /app/pyproject.toml
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TMPDIR=/tmp \
+    HF_HUB_OFFLINE=1 \
+    ORT_DISABLE_ALL_TELEMETRY=1 \
+    CLASSIFIER_MODEL_DIR=/app/models
+USER appuser
+EXPOSE 8003
+CMD ["uvicorn", "gateway.classifier_service:app", "--host", "0.0.0.0", "--port", "8003", "--proxy-headers"]

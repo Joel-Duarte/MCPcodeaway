@@ -64,7 +64,8 @@ def test_renderer_emits_safe_mcp_app_resource_with_product_host_bridge() -> None
     assert "ui/initialize" in body
     assert "ui/notifications/tool-input" in body
     assert "tools/call" in body
-    assert "mca_attr__orders_api__get_order" in body
+    assert "orders_api__get_order" in body
+    assert "mca_attr__" not in body
     assert "textContent" in body
     assert "onload=" not in body.lower()
 
@@ -165,3 +166,62 @@ def test_interactive_experience_requires_schema_and_complete_required_mapping() 
     schema["properties"]["order_id"] = {"type": "integer"}
     with pytest.raises(ValueError, match="declared string property"):
         validate_experience(spec, tool_input_schema=schema)
+
+
+def test_renderer_styles_structured_dom_and_select_component() -> None:
+    spec = {
+        "id": "ticket_filter",
+        "resource_uri": "ui://mcpcodeaway/global_ticketing/filter/r1",
+        "renderer_schema": "mcpcodeaway-ui/1",
+        "tool": "global_ticketing__list_tickets",
+        "fallback": "List tickets filtered by region.",
+        "input_mapping": {"region": "/form/region"},
+        "components": [
+            {"type": "heading", "text": "Regional Queue"},
+            {"type": "text", "text": "Pick a region to filter open tickets."},
+            {
+                "type": "select",
+                "id": "region",
+                "label": "Region",
+                "required": True,
+                "options": [
+                    {"value": "EU", "label": "Europe (EU)"},
+                    {"value": "US", "label": "United States (US)"},
+                ],
+            },
+            {"type": "button", "label": "Load Queue", "action": "invoke_tool"},
+            {"type": "record", "data": "tool_result"},
+        ],
+        "csp": {"connect_domains": [], "resource_domains": [], "frame_domains": []},
+    }
+    schema = {
+        "type": "object",
+        "properties": {"region": {"type": "string"}},
+        "required": ["region"],
+        "additionalProperties": False,
+    }
+    resource = render_mcp_app_resource(spec, tool_input_schema=schema)
+    body = resource["text"]
+    assert "<style>" in body
+    assert ".mca-card" in body
+    assert "mca-kv" in body
+    assert "mca-table" in body
+    assert '<select class="mca-select" id="region" name="region" required>' in body
+    assert '<option value="EU">Europe (EU)</option>' in body
+    assert "innerHTML" not in body
+
+    bad_select = {
+        **spec,
+        "components": [
+            spec["components"][0],
+            {
+                "type": "select",
+                "id": "region",
+                "label": "Region",
+                "options": [{"value": "<script>", "label": "Bad"}],
+            },
+            spec["components"][3],
+        ],
+    }
+    with pytest.raises(ValueError, match="HTML, JavaScript"):
+        validate_experience(bad_select, tool_input_schema=schema)

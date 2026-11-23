@@ -109,9 +109,11 @@ function mockApi() {
 }
 
 async function openWorkflowBuilder(wrapper: ReturnType<typeof mount>) {
+  await wrapper.get('input[placeholder="https://api.example.com"]').setValue("http://localhost:8001");
+  await wrapper.get('input[placeholder="https://api.example.com/openapi.json"]').setValue("http://localhost:8001/openapi.json");
   await wrapper.findAll("button").find((button) => button.text().includes("Inspect Schema"))!.trigger("click");
   await vi.waitFor(() => expect(wrapper.text()).toContain("Inspected 'inventory_api'"));
-  await wrapper.findAll("button").find((button) => button.text().includes("2. Policy & Mode"))!.trigger("click");
+  await wrapper.findAll("button").find((button) => button.text().includes("2. Access & Execution"))!.trigger("click");
   await wrapper.find("summary").trigger("click");
   await wrapper.get('[aria-label="Allow all authenticated callers"]').trigger("click");
   for (const tool of ["list_users", "update_user", "verify_user"]) {
@@ -125,7 +127,7 @@ async function openWorkflowBuilder(wrapper: ReturnType<typeof mount>) {
     (readOnlyOption as HTMLElement).click();
     await nextTick();
   }
-  await wrapper.findAll("button").find((button) => button.text().includes("3. Build workflows"))!.trigger("click");
+  await wrapper.findAll("button").find((button) => button.text().includes("3. Define workflows"))!.trigger("click");
   await nextTick();
 }
 
@@ -134,8 +136,8 @@ test("workflow builder turns an arranged catalog flow into evidence, completion,
   const wrapper = mount(OnboardingPage, { attachTo: document.body, global: { components } });
   await openWorkflowBuilder(wrapper);
 
-  expect(wrapper.text()).toContain("calls may happen in any order");
-  expect(wrapper.text()).toContain("Required evidence and the terminal result determine whether a run receives credit");
+  expect(wrapper.text()).toContain("its display order does not constrain runtime calls");
+  expect(wrapper.text()).toContain("Only a successful matching result completes the workflow");
 
   await wrapper.get('[aria-label="Workflow 1 name"]').setValue("Update and verify user");
   await wrapper.get('[aria-label="Workflow 1 description"]').setValue("Read the user, update their record, and verify the saved information.");

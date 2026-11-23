@@ -73,7 +73,7 @@ test("Model Performance exposes named filters, expandable workload details, and 
     steps: [{ ref: tabs!.ref, action: "setValue", args: ["efficiency"] }],
   });
   expect(efficiency.ok, efficiency.error?.message).toBe(true);
-  expect(wrapper.text()).toContain("Cost per completion (Code − Classic)");
+  expect(wrapper.text()).toContain("Cost per completion · Code minus Classic");
   expect(wrapper.text()).toContain("-$0.002000");
   expect(wrapper.text()).toContain("+20 ms");
   wrapper.unmount();

@@ -19,6 +19,7 @@ their owning flow.
 | The admin console or admin MCP endpoint | [Admin access and operations](#7-admin-access-and-operations) |
 | Audit, traces, metrics, and retention | [Evidence and operations flow](#8-evidence-and-operations-flow) |
 | Startup, readiness, upstream outage, or recovery | [Gateway lifecycle and failure paths](#9-gateway-lifecycle-and-failure-paths) and [upstream monitoring](#11-upstream-monitoring-and-error-recovery) |
+| Automatic workflow detection, MCP Apps UI, and agent onboarding | [Automatic workflow detection, UI, and onboarding](#12-automatic-workflow-detection-ui-and-onboarding) |
 | Which routes, pages, and tests cover a journey | [Flow inventory and coverage](#10-flow-inventory-and-coverage) |
 
 ## System at a glance
@@ -684,11 +685,65 @@ the corresponding runner supports it.
 | Downstream authentication variants | [`docs/auth_spectrum_flows.md`](auth_spectrum_flows.md), [`tests/test_auth_spectrum_golden.py`](../tests/test_auth_spectrum_golden.py) |
 | Per-user OAuth/API-key connections | [`tests/test_user_connect.py`](../tests/test_user_connect.py) |
 | Error categories, safe retry, probe thresholds, ambiguous write outcome, and circuit recovery | [`tests/test_upstream_monitoring.py`](../tests/test_upstream_monitoring.py), [`tests/test_upstream_recovery_golden.py`](../tests/test_upstream_recovery_golden.py), scaled [`scripts/readiness_smoke.py`](../scripts/readiness_smoke.py) |
+| Passive multi-replica workflow detection, readback verification, and strict baseline gate | `hr_fictional_user_update_verified_by_readback`, `demo_hr_passive_detection_and_mcp_app_ui` in [`tests/golden/flows.json`](../tests/golden/flows.json), [`test_business_value_hr_directory_golden.py`](../tests/test_business_value_hr_directory_golden.py), [`test_workflow_detector.py`](../tests/test_workflow_detector.py) |
+| Prompt-driven agent onboarding, bundle apply, and native MCP Apps UI delivery | [`test_onboarding_prompts_and_bundle.py`](../tests/test_onboarding_prompts_and_bundle.py), [`test_business_value_support_workflow_e2e.py`](../tests/test_business_value_support_workflow_e2e.py), [`test_mcp_app_renderer.py`](../tests/test_mcp_app_renderer.py) |
+
+## 12. Automatic workflow detection, UI, and onboarding
+
+MCPcodeaway tracks business workflows **without** requiring consumer models to
+call start/wrapper tools (`mcpcodeaway_start_business_execution` / `mca_attr__*`).
+Standard tools remain directly exposed in `tools/list`, and interactive MCP Apps
+UI (`text/html;profile=mcp-app`) attaches directly to those standard tools via
+`_meta.ui.resourceUri` when the client advertises the MCP Apps capability.
+
+### Passive episode correlation & two-tier completion verification
+
+```mermaid
+sequenceDiagram
+    participant C as MCP Client (Classic / Code Mode / UI)
+    participant G as Gateway Pod (Stateless)
+    participant S as Shared Store (Postgres / SQLite)
+    participant D as WorkflowEpisodeTracker
+    participant J as System-1 Classifier (Synthetic / ONNX / LM Studio)
+    C->>G: POST /mcp (+ optional X-Intent, X-Workflow-Run-Id)
+    G->>G: Authorize & dispatch standard tool(s)
+    G->>D: observe_execution(redacted_intent, hashed_entities, shape_diff)
+    D->>S: Correlate into open episode (shared across replicas)
+    alt Published predicate or readback diff verified
+        D->>S: Close episode (completed_verified)
+        D->>S: Record credited event if manual_baseline_minutes confirmed
+    else Uncatalogued write or idle TTL / intent shift
+        D->>S: Persist episode + upsert discovered_workflow_candidates (no ROI credit)
+    end
+    D-->>J: Async redacted episode summary (no raw PII)
+    J-->>D: {completed, confidence, completion_pct, verdict, missing_goals}
+    Note over D,J: Guardrail: System-1 judge can downgrade partial completions, never upgrade failed writes
+```
+
+### Prompt-driven onboarding & candidate promotion
+
+```mermaid
+flowchart LR
+    Admin["Admin"] -->|"1. Fetch Prompt Pack"| PP["GET /admin/onboarding/prompt-pack"]
+    PP -->|"2. Copy prompt + schema + discovered tools"| Agent["Admin's AI Agent"]
+    Agent -->|"3. Generate OnboardingBundle JSON"| Val["POST /admin/onboarding/bundle/validate"]
+    Val -->|"4. Apply upstream + workflows + MCP App UI"| Apply["POST /admin/onboarding/bundle/apply"]
+    Apply -->|"Optional auto-synthesis"| Disc["POST /admin/integration-definitions/{upstream}/discover"]
+    Disc -->|"Admin confirms manual_baseline_minutes"| Prom["POST /admin/workflows/discovered/{id}/promote"]
+```
 
 ## Code and documentation index
 
 - Runtime assembly, lifecycle, route registration, MCP and admin HTTP routes:
   [`src/gateway/server.py`](../src/gateway/server.py)
+- Passive workflow correlation, readback verification, schema/traffic discovery, and System-1 judge client:
+  [`src/gateway/workflow_detector.py`](../src/gateway/workflow_detector.py)
+- Standalone CPU ONNX System-1 microservice:
+  [`src/gateway/classifier_service.py`](../src/gateway/classifier_service.py)
+- Prompt-driven agent onboarding & bundle validation:
+  [`src/gateway/onboarding_prompts.py`](../src/gateway/onboarding_prompts.py)
+- Declarative MCP Apps UI renderer:
+  [`src/gateway/mcp_app_renderer.py`](../src/gateway/mcp_app_renderer.py)
 - Identity and caller policy: [`src/gateway/auth.py`](../src/gateway/auth.py)
 - Tool registry/catalog: [`src/gateway/config.py`](../src/gateway/config.py),
   [`src/gateway/catalog.py`](../src/gateway/catalog.py)
@@ -707,5 +762,7 @@ the corresponding runner supports it.
   [`src/gateway/sandbox_worker.py`](../src/gateway/sandbox_worker.py)
 - Protocol and detailed state transitions:
   [`docs/state-machines.md`](state-machines.md)
+- Agent-driven onboarding, golden mocks, and E2E testing:
+  [`docs/agent-onboarding-and-evaluation.md`](agent-onboarding-and-evaluation.md)
 - Authentication provider variants:
   [`docs/auth_spectrum_flows.md`](auth_spectrum_flows.md)

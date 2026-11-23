@@ -78,6 +78,12 @@ spec:
                 secretKeyRef:
                   name: gateway-secrets
                   key: task-dedupe-secret
+            - name: GATEWAY_WORKFLOW_CLASSIFIER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: workflow-classifier-secret
+                  optional: true
             - name: GATEWAY_DEV_OIDC_PRIVATE_KEY_PATH
               value: /run/gateway-secrets/dev-oidc-private.pem
           startupProbe:

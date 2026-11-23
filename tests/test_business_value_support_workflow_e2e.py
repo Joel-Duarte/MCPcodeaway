@@ -370,13 +370,9 @@ async def test_support_workflow_tools_list_and_direct_wrappers_complete_with_val
         )
         assert listing.status_code == 200
         tools = {tool["name"]: tool for tool in listing.json()["result"]["tools"]}
-        assert START_BUSINESS_EXECUTION_TOOL in tools
-        start_metadata = tools[START_BUSINESS_EXECUTION_TOOL]["_meta"]["ui"]
-        assert start_metadata["visibility"] == ["model", "app"]
-        wrapper_name = f"{ATTRIBUTED_TOOL_PREFIX}{_UPSTREAM}__create_ticket"
-        assert wrapper_name in tools, sorted(tools)
-        wrapper = tools[wrapper_name]
-        assert wrapper["_meta"]["ui"]["visibility"] == ["model", "app"]
+        assert START_BUSINESS_EXECUTION_TOOL not in tools
+        assert not any(name.startswith(ATTRIBUTED_TOOL_PREFIX) for name in tools)
+        assert f"{_UPSTREAM}__create_ticket" in tools, sorted(tools)
 
         execution_id = await _start_workflow(gateway, "start-direct-success")
         await _call_attributed(
@@ -613,9 +609,9 @@ async def test_mcp_apps_negotiates_and_reads_constrained_ui_resource(tmp_path: P
             supports_apps=True,
         )
         tools = {tool["name"]: tool for tool in listing.json()["result"]["tools"]}
-        wrapper = tools[f"{ATTRIBUTED_TOOL_PREFIX}{_UPSTREAM}__find_customer"]
-        assert wrapper["_meta"]["ui"]["visibility"] == ["model", "app"]
-        assert wrapper["_meta"]["ui"]["resourceUri"] == (
+        direct_tool = tools[f"{_UPSTREAM}__find_customer"]
+        assert direct_tool["_meta"]["ui"]["visibility"] == ["model", "app"]
+        assert direct_tool["_meta"]["ui"]["resourceUri"] == (
             "ui://mcpcodeaway/support/customer-lookup/r2"
         )
 
@@ -669,7 +665,7 @@ async def test_mcp_apps_metadata_and_resources_are_absent_without_negotiation(
             mode="traditional",
         )
         tools = {tool["name"]: tool for tool in listing.json()["result"]["tools"]}
-        assert "_meta" not in tools[f"{ATTRIBUTED_TOOL_PREFIX}{_UPSTREAM}__find_customer"]
+        assert "_meta" not in tools[f"{_UPSTREAM}__find_customer"]
 
         discovery = await _request(
             gateway.client,

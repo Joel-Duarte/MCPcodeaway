@@ -77,7 +77,7 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
     "Base / MCP Endpoint URL",
     "Inspect Schema",
     "Define REST endpoints",
-    "3. Build workflows",
+    "3. Define workflows",
     "4. Test & Save",
   ]) {
     expect(labels, `Missing control '${requiredLabel}' in agent snapshot`).toContain(requiredLabel);
@@ -87,6 +87,7 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
     steps: [
       { ref: "Upstream Name", action: "setValue", args: ["crm_partner_api"] },
       { ref: "Base / MCP Endpoint URL", action: "setValue", args: ["http://localhost:8001/crm"] },
+      { ref: "OpenAPI Spec URL", action: "setValue", args: ["http://localhost:8001/crm/openapi.json"] },
     ],
   });
   expect(editRes.ok, editRes.error?.message).toBe(true);
@@ -99,7 +100,7 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
   await Promise.resolve();
 
   const navStep2 = await agent.act({
-    steps: [{ ref: "2. Policy & Mode", action: "press" }],
+    steps: [{ ref: "2. Access & Execution", action: "press" }],
   });
   expect(navStep2.ok, navStep2.error?.message).toBe(true);
   expect(wrapper.text()).toContain("Execution mode");
@@ -117,7 +118,7 @@ test("UI agent discovers named controls, sets onboarding fields, and respects da
   expect(accessPolicy.ok, accessPolicy.error?.message).toBe(true);
 
   const navStep3 = await agent.act({
-    steps: [{ ref: "3. Build workflows", action: "press" }],
+    steps: [{ ref: "3. Define workflows", action: "press" }],
   });
   expect(navStep3.ok, navStep3.error?.message).toBe(true);
   expect(wrapper.text()).toContain("No catalog tools are available");

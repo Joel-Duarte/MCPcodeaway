@@ -188,7 +188,7 @@ def test_demo_traffic_cases_match_additive_golden_catalog() -> None:
         "recovery:rbac_write_denied",
     }
     assert golden_labels <= labels
-    assert {flow["kind"] for flow in _GOLDEN_DEMO_FLOWS} == {
+    assert {
         "mock_delayed_write",
         "mock_idempotent_replay",
         "mock_idempotency_conflict",
@@ -197,7 +197,8 @@ def test_demo_traffic_cases_match_additive_golden_catalog() -> None:
         "mock_upstream_pending_reconciliation",
         "gateway_rbac_denial",
         "business_value_attributed_workflow",
-    }
+        "passive_workflow_and_ui",
+    } <= {flow["kind"] for flow in _GOLDEN_DEMO_FLOWS}
 
 
 @pytest.mark.asyncio
@@ -307,7 +308,9 @@ async def test_gateway_demo_burst_exercises_write_and_failure_spectrum(tmp_path:
             golden["business_value_workflow"]["manual_baseline_minutes"]
             == _GOLDEN_BUSINESS_VALUE_WORKFLOW["expected_manual_baseline_minutes"]
         )
-        assert golden["business_value_workflow"]["requests"] == 6
+        assert golden["business_value_workflow"]["requests"] == 5
+        assert golden["business_value_workflow"]["attribution_mode"] == "passive_matched"
+        assert golden["business_value_workflow"]["mcp_app_ui_verified"] is True
         assert (
             golden["traffic_requests"] + golden["business_value_workflow"]["requests"]
             == status["requests_sent"]

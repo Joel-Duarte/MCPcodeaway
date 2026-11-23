@@ -6,7 +6,10 @@ not contain credentials, gateway authorization rules, or copied upstream schemas
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+from collections.abc import Iterable
 from datetime import date
 from typing import Any, Literal
 
@@ -164,10 +167,34 @@ class WorkflowExecutionSettings(DefinitionModel):
         return self
 
 
+def compute_workflow_fingerprint(
+    *,
+    upstream_name: str,
+    participating_tools: Iterable[str],
+    completion_tool: str,
+    completion_kind: str = "terminal_tool_result",
+) -> str:
+    """Build a canonical structural fingerprint shared across schema, live, and mined drafts."""
+
+    payload = {
+        "upstream_name": upstream_name.strip(),
+        "participating_tools": sorted(
+            {str(t).strip() for t in participating_tools if str(t).strip()}
+        ),
+        "completion_tool": completion_tool.strip(),
+        "completion_kind": completion_kind.strip() or "terminal_tool_result",
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"wfp_{hashlib.sha256(encoded).hexdigest()[:24]}"
+
+
 class WorkflowDefinition(DefinitionModel):
     id: str = Field(pattern=_SLUG_PATTERN)
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(min_length=1, max_length=1000)
+    enabled: bool = True
+    origin: Literal["manual", "auto_schema", "auto_mined", "agent_prompt"] = "manual"
+    intent_examples: list[str] = Field(default_factory=list, max_length=25)
     participating_tools: list[str] = Field(min_length=1, max_length=64)
     required_evidence: list[RequiredEvidence] = Field(default_factory=list, max_length=64)
     completion: CompletionRule

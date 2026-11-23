@@ -285,6 +285,87 @@
       "expected_role": "senior_controller",
       "expected_manual_baseline_minutes": 8,
       "expected_completions": 1
+    },
+    {
+      "id": "demo_hr_passive_detection_and_mcp_app_ui",
+      "kind": "passive_workflow_and_ui",
+      "workflow_id": "hr_directory/demo_fictional_employee_profile_update",
+      "employee_id": "EMP-01",
+      "expected_attribution_mode": "passive_matched",
+      "expected_status": "completed_verified",
+      "expected_mcp_app_resource_uri": "ui://mcpcodeaway/hr/employee-profile/r1"
+    }
+  ],
+  "auto_workflow_detection_flows": [
+    {
+      "id": "workflow_x_hr_openapi_verified_readback",
+      "upstream_name": "hr_directory",
+      "upstream_kind": "fake_openapi_api",
+      "mode": "traditional",
+      "expected_status": "completed_verified",
+      "expected_tier": "verified_readback",
+      "expected_candidate_present": true,
+      "manual_baseline_minutes": 8
+    },
+    {
+      "id": "workflow_y_support_mcp_ticket_created",
+      "upstream_name": "support_mcp",
+      "upstream_kind": "fake_mcp_server",
+      "mode": "traditional",
+      "expected_status": "completed_unverified",
+      "expected_candidate_present": true,
+      "manual_baseline_minutes": 12
+    },
+    {
+      "id": "workflow_z_ops_mcp_codemode_triage",
+      "upstream_name": "ops_mcp",
+      "upstream_kind": "fake_mcp_server_obo",
+      "mode": "codemode_upfront",
+      "expected_status": "completed_unverified",
+      "expected_candidate_present": true,
+      "manual_baseline_minutes": 10
+    },
+    {
+      "id": "negative_hr_browse_only_not_credited",
+      "upstream_name": "hr_directory",
+      "upstream_kind": "fake_openapi_api",
+      "mode": "traditional",
+      "expected_status": "read_only",
+      "expected_completed": false
+    },
+    {
+      "id": "negative_hr_partial_missing_requested_verification",
+      "upstream_name": "hr_directory",
+      "upstream_kind": "fake_openapi_api",
+      "mode": "traditional",
+      "expected_status": "partial_or_incomplete",
+      "expected_completed": false
+    },
+    {
+      "id": "negative_support_mcp_abandoned_error",
+      "upstream_name": "support_mcp",
+      "upstream_kind": "fake_mcp_server",
+      "mode": "traditional",
+      "expected_status": "abandoned",
+      "expected_completed": false
+    }
+  ],
+  "agent_onboarding_golden_flows": [
+    {
+      "id": "golden_global_ticketing_agent_onboarding_e2e",
+      "upstream_name": "global_ticketing",
+      "bundle_fixture": "ticketing_onboarding_bundle.json",
+      "expected_tool_count": 18,
+      "expected_workflows": [
+        "triage_and_resolve_ticket",
+        "ticket_escalation_and_sla_review",
+        "intake_and_route_new_ticket"
+      ],
+      "expected_mcp_ui_uris": [
+        "ui://mcpcodeaway/global_ticketing/ticket_inspector/r1",
+        "ui://mcpcodeaway/global_ticketing/metrics_dashboard/r1"
+      ],
+      "expected_audience": "api://ticketing-system"
     }
   ]
 }

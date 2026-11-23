@@ -55,6 +55,16 @@ spec:
     - to:
         - namespaceSelector:
             matchLabels:
+              kubernetes.io/metadata.name: mcpcodeaway-k1
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: workflow-classifier
+      ports:
+        - protocol: TCP
+          port: 8003
+    - to:
+        - namespaceSelector:
+            matchLabels:
               kubernetes.io/metadata.name: kube-system
           podSelector:
             matchLabels:

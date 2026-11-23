@@ -142,6 +142,7 @@ interface UpstreamEntry {
   tools?: string[];
   allowed_groups?: string[];
   enabled: boolean;
+  auto_discovery_enabled?: boolean;
   request_timeout_seconds?: number;
   max_requests_per_minute?: number | null;
   max_concurrent_calls?: number | null;
@@ -558,7 +559,18 @@ onMounted(() => {
                 <tr v-if="expandedUpstreamName === u.name" class="bg-[#FAFAFA]">
                   <td :colspan="upstreamsData.dynamic_upstreams_permitted ? 10 : 9" class="px-3 py-3 sm:px-6">
                     <section class="mb-3 max-w-[calc(100vw-4rem)] border-b border-zinc-200 pb-3 lg:max-w-none" aria-label="Tool catalog">
-                      <h3 class="mb-2 text-[0.9375rem] font-semibold text-zinc-950">Tool catalog</h3>
+                      <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <h3 class="text-[0.9375rem] font-semibold text-zinc-950">Tool catalog</h3>
+                          <p class="mt-0.5 text-xs text-zinc-600">
+                            Refreshes tools and schemas across every registered upstream.
+                          </p>
+                        </div>
+                        <Button class="min-h-9" @click="handleRefreshCatalog">
+                          <AppIcon name="refresh" :size="14" />
+                          <span>Refresh API tools</span>
+                        </Button>
+                      </div>
                       <ul v-if="u.tools?.length" class="flex flex-wrap gap-2">
                         <li v-for="tool in u.tools" :key="tool" class="min-w-0 max-w-full">
                           <Button class="min-h-11 max-w-full whitespace-normal break-all text-left sm:min-h-9" @click="openTool(u.name, tool, $event)">
@@ -573,7 +585,14 @@ onMounted(() => {
                       :tools="u.tools ?? []"
                       :can-edit="upstreamsData.dynamic_upstreams_permitted"
                       :refresh-version="catalogRefreshVersion"
+                      :auto-discovery-enabled="u.auto_discovery_enabled !== false"
                       @refresh-catalog="handleRefreshCatalog"
+                    />
+                    <UpstreamMcpUiCatalog
+                      :upstream="u.name"
+                      :tools="u.tools ?? []"
+                      :can-edit="upstreamsData.dynamic_upstreams_permitted"
+                      :refresh-version="catalogRefreshVersion"
                     />
                     <div v-if="healthForUpstream(u.name)" class="mb-3 border-b border-[#E4E4E7] pb-3 text-xs" role="status">
                       <span class="font-medium text-[#09090B]">Active probe: {{ healthForUpstream(u.name)?.status }}</span>

@@ -13,7 +13,7 @@ from uuid import uuid4
 import httpx
 from pydantic import BaseModel, Field, model_validator
 
-from gateway.integration_validation import ATTRIBUTED_TOOL_PREFIX, START_BUSINESS_EXECUTION_TOOL
+from gateway.mcp_app_renderer import MCP_APP_EXTENSION, MCP_APP_MIME_TYPE
 from gateway.mcp_protocol import (
     MCP_CLIENT_CAPABILITIES_META,
     request_headers,
@@ -811,14 +811,370 @@ class DemoTrafficRunner:
         discovery = await self._run_discovery()
         burst = await self.burst(count=min(max(1, len(workloads)), 100))
         business_value_workflow = await self._run_hr_business_value_workflow()
+        ticketing_workflow = await self._run_ticketing_business_value_workflow()
         self.golden_runs_count += 1
         return {
             "discovery": discovery,
             "traffic": burst,
             "workload_cases": min(len(workloads), 100),
             "business_value_workflow": business_value_workflow,
+            "ticketing_workflow": ticketing_workflow,
             "status": self.status(),
         }
+
+    async def ensure_demo_solutions(self) -> None:
+        """Seed pre-built agent solution definitions in local demo mode."""
+        if self._app is None or self.runtime.dev_keys is None:
+            return
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=self._app), base_url="http://demo.local"
+            ) as client:
+                await self._ensure_ticketing_demo_workflows(client)
+        except Exception:
+            return
+
+    async def _ensure_ticketing_demo_workflows(self, client: httpx.AsyncClient) -> str | None:
+        upstream = self.runtime.registry.get("global_ticketing")
+        if upstream is None or not upstream.enabled:
+            return None
+        endpoint = upstream.url or upstream.openapi_spec_url or ""
+        if urlsplit(endpoint).hostname not in {"127.0.0.1", "localhost", "mock-backends"}:
+            return None
+        tenant_id = next(iter(self.runtime.settings.allowed_tenants), None)
+        if not tenant_id or self.runtime.dev_keys is None:
+            return None
+        workflow_id = "global_ticketing/triage_and_resolve_ticket"
+        async with self._business_value_workflow_lock:
+            current = await self.runtime.store.get_current_published_integration_definition(
+                tenant_id, "global_ticketing"
+            )
+            if current is not None:
+                return workflow_id
+            discovery_identity = self.runtime._dev_discovery_identity()
+            await self.runtime.ensure_catalog_for_identity(discovery_identity)
+            tools = {
+                t.qualified_name: t
+                for t in self.runtime.catalog.get_server_tools("global_ticketing")
+            }
+            if not tools:
+                return None
+            today = datetime.now(UTC).date().isoformat()
+            needed = {
+                "global_ticketing__list_tickets",
+                "global_ticketing__get_ticket",
+                "global_ticketing__assign_ticket",
+                "global_ticketing__add_ticket_comment",
+                "global_ticketing__resolve_ticket",
+                "global_ticketing__get_ticket_sla",
+                "global_ticketing__escalate_ticket",
+                "global_ticketing__list_ticketing_queues",
+                "global_ticketing__create_ticket",
+                "global_ticketing__get_ticketing_metrics",
+            }
+            if not needed.issubset(tools):
+                return None
+            definition = {
+                "manifest_version": "1.0",
+                "integration": {
+                    "id": "global_ticketing",
+                    "display_name": "Enterprise Global Ticketing",
+                    "upstream_name": "global_ticketing",
+                    "status": "draft",
+                    "revision": 1,
+                },
+                "tool_refs": [
+                    {"name": name, "schema_sha256": compute_schema_digest([tools[name]])}
+                    for name in sorted(needed)
+                ],
+                "experiences": [
+                    {
+                        "id": "ticket_inspector_ui",
+                        "resource_uri": "ui://mcpcodeaway/global_ticketing/ticket_inspector/r1",
+                        "renderer_schema": "mcpcodeaway-ui/1",
+                        "tool": "global_ticketing__get_ticket",
+                        "fallback": (
+                            "Inspect a ticket by invoking global_ticketing__get_ticket "
+                            "with ticket_id."
+                        ),
+                        "input_mapping": {"ticket_id": "/form/ticket_id"},
+                        "components": [
+                            {"type": "heading", "text": "Global Ticket Inspector"},
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Enter a ticket ID to inspect live metadata, status, "
+                                    "priority, and assignment."
+                                ),
+                            },
+                            {
+                                "type": "text_input",
+                                "id": "ticket_id",
+                                "label": "Ticket ID",
+                                "required": True,
+                            },
+                            {"type": "button", "label": "Inspect Ticket", "action": "invoke_tool"},
+                            {"type": "record", "data": "tool_result"},
+                        ],
+                        "csp": {"connect_domains": [], "resource_domains": [], "frame_domains": []},
+                    },
+                    {
+                        "id": "ticketing_metrics_ui",
+                        "resource_uri": "ui://mcpcodeaway/global_ticketing/metrics_dashboard/r1",
+                        "renderer_schema": "mcpcodeaway-ui/1",
+                        "tool": "global_ticketing__get_ticketing_metrics",
+                        "fallback": (
+                            "View ticketing operations metrics via "
+                            "global_ticketing__get_ticketing_metrics."
+                        ),
+                        "input_mapping": {},
+                        "components": [
+                            {"type": "heading", "text": "Global Ticketing Operations Summary"},
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Fetch live global ticketing volume across EU, US, "
+                                    "APAC, and LATAM."
+                                ),
+                            },
+                            {"type": "button", "label": "Refresh Metrics", "action": "invoke_tool"},
+                            {"type": "record", "data": "tool_result"},
+                        ],
+                        "csp": {"connect_domains": [], "resource_domains": [], "frame_domains": []},
+                    },
+                ],
+                "workflows": [
+                    {
+                        "id": "triage_and_resolve_ticket",
+                        "name": "Triage and Resolve Ticket",
+                        "description": (
+                            "List or inspect an open ticket, assign an SRE, leave findings "
+                            "in comments, resolve, and verify status."
+                        ),
+                        "enabled": True,
+                        "origin": "agent_prompt",
+                        "intent_examples": [
+                            "Triage open tickets, assign SRE, comment, and resolve",
+                            "Investigate EU ticket and mark resolved with root cause",
+                        ],
+                        "participating_tools": [
+                            "global_ticketing__list_tickets",
+                            "global_ticketing__get_ticket",
+                            "global_ticketing__assign_ticket",
+                            "global_ticketing__add_ticket_comment",
+                            "global_ticketing__resolve_ticket",
+                        ],
+                        "required_evidence": [
+                            {
+                                "tool": "global_ticketing__resolve_ticket",
+                                "min_successful_calls": 1,
+                                "result_when": {
+                                    "path": "/status",
+                                    "type": "string",
+                                    "equals": "resolved",
+                                },
+                            }
+                        ],
+                        "completion": {
+                            "kind": "verified_followup",
+                            "tool": "global_ticketing__get_ticket",
+                            "success_when": {
+                                "path": "/status",
+                                "type": "string",
+                                "equals": "resolved",
+                            },
+                        },
+                        "business_value": {
+                            "manual_baseline_minutes": 14,
+                            "baseline_source": "administrator_estimate",
+                            "confidence": "unvalidated",
+                            "effective_from": today,
+                            "evidence_note": "Agent-generated workflow demo solution.",
+                        },
+                    },
+                    {
+                        "id": "ticket_escalation_and_sla_review",
+                        "name": "Ticket Escalation and SLA Review",
+                        "description": (
+                            "Check ticket SLA status, escalate to tier3_incident, and confirm "
+                            "critical priority."
+                        ),
+                        "enabled": True,
+                        "origin": "agent_prompt",
+                        "intent_examples": [
+                            "Check SLA timer and escalate urgent ticket to critical",
+                        ],
+                        "participating_tools": [
+                            "global_ticketing__get_ticket_sla",
+                            "global_ticketing__escalate_ticket",
+                            "global_ticketing__get_ticket",
+                        ],
+                        "required_evidence": [
+                            {
+                                "tool": "global_ticketing__escalate_ticket",
+                                "min_successful_calls": 1,
+                                "result_when": {
+                                    "path": "/status",
+                                    "type": "string",
+                                    "equals": "escalated",
+                                },
+                            }
+                        ],
+                        "completion": {
+                            "kind": "verified_followup",
+                            "tool": "global_ticketing__get_ticket",
+                            "success_when": {
+                                "path": "/priority",
+                                "type": "string",
+                                "equals": "critical",
+                            },
+                        },
+                        "business_value": {
+                            "manual_baseline_minutes": 10,
+                            "baseline_source": "administrator_estimate",
+                            "confidence": "unvalidated",
+                            "effective_from": today,
+                        },
+                    },
+                    {
+                        "id": "intake_and_route_new_ticket",
+                        "name": "Intake and Route New Ticket",
+                        "description": (
+                            "Inspect regional queues, open a new ticket, and assign an engineer."
+                        ),
+                        "enabled": True,
+                        "origin": "agent_prompt",
+                        "intent_examples": [
+                            "List regional queues, create ticket, and assign owner",
+                        ],
+                        "participating_tools": [
+                            "global_ticketing__list_ticketing_queues",
+                            "global_ticketing__create_ticket",
+                            "global_ticketing__assign_ticket",
+                        ],
+                        "required_evidence": [
+                            {
+                                "tool": "global_ticketing__create_ticket",
+                                "min_successful_calls": 1,
+                                "result_when": {
+                                    "path": "/ticket_id",
+                                    "type": "non_empty_string",
+                                },
+                            }
+                        ],
+                        "completion": {
+                            "kind": "terminal_tool_result",
+                            "tool": "global_ticketing__assign_ticket",
+                            "success_when": {
+                                "path": "/status",
+                                "type": "non_empty_string",
+                            },
+                        },
+                        "business_value": {
+                            "manual_baseline_minutes": 6,
+                            "baseline_source": "administrator_estimate",
+                            "confidence": "unvalidated",
+                            "effective_from": today,
+                        },
+                    },
+                ],
+                "standalone_tool_values": [],
+                "publication": None,
+            }
+            admin_token = self.runtime.dev_keys.issue_user_token(
+                persona="gateway_admin",
+                overrides={"tenant_id": tenant_id},
+            )
+            headers = {"Authorization": f"Bearer {admin_token}"}
+            draft = await client.post(
+                "/admin/integration-definitions/drafts",
+                headers=headers,
+                json={"definition": definition},
+            )
+            if draft.status_code != 200:
+                return None
+            revision = str(draft.json()["revision"])
+            published = await client.post(
+                "/admin/integration-definitions/global_ticketing/publish",
+                headers=headers,
+                json={"revision": revision},
+            )
+            if published.status_code != 200:
+                return None
+            return workflow_id
+
+    async def _run_ticketing_business_value_workflow(self) -> dict[str, Any]:
+        if self._app is None or self.runtime.dev_keys is None:
+            return {"status": "skipped", "reason": "gateway demo runtime is unavailable"}
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self._app), base_url="http://demo.local"
+        ) as client:
+            workflow_id = await self._ensure_ticketing_demo_workflows(client)
+            if workflow_id is None:
+                return {"status": "skipped", "reason": "local global_ticketing is unavailable"}
+            tenant_id = next(iter(self.runtime.settings.allowed_tenants), None)
+            if not tenant_id:
+                return {"status": "skipped", "reason": "demo tenant is unavailable"}
+            caller_token = self.runtime.dev_keys.issue_user_token(
+                persona="gateway_admin",
+                overrides={
+                    "tenant_id": tenant_id,
+                    "sub": "demo-sre-operator",
+                    "roles": ["ops_engineer", "ticketing_reader", "ticketing_writer", "admin"],
+                    "groups": ["operations", "platform-admins"],
+                    "scopes": ["mcp.tools", "ops.write"],
+                },
+            )
+            meta = request_meta(client_name="mcpcodeaway-demo-traffic")
+            meta[MCP_CLIENT_CAPABILITIES_META]["elicitation"] = {"form": {}}
+            intent = "Triage open EU ticket, assign SRE, comment, and resolve"
+
+            async def call_confirmed(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+                first = await self._business_value_rpc(
+                    client, caller_token, meta, tool, args, intent=intent
+                )
+                if first.get("resultType") == "input_required":
+                    self.write_calls_count += 1
+                    return await self._business_value_rpc(
+                        client,
+                        caller_token,
+                        meta,
+                        tool,
+                        args,
+                        request_state=str(first["requestState"]),
+                        input_responses={
+                            "confirm": {"action": "accept", "content": {"confirm": True}}
+                        },
+                        intent=intent,
+                    )
+                return first
+
+            listed = await call_confirmed("global_ticketing__list_tickets", {"region": "EU"})
+            await call_confirmed(
+                "global_ticketing__assign_ticket",
+                {"ticket_id": "TCK-1001", "assignee": "elena.rostova@example.test"},
+            )
+            await call_confirmed(
+                "global_ticketing__add_ticket_comment",
+                {"ticket_id": "TCK-1001", "body": "Restarted webhook relay in demo traffic."},
+            )
+            await call_confirmed(
+                "global_ticketing__resolve_ticket",
+                {
+                    "ticket_id": "TCK-1001",
+                    "resolution_summary": "Balanced webhook gateway pool",
+                    "root_cause": "connection_pool_exhaustion",
+                },
+            )
+            verified = await call_confirmed(
+                "global_ticketing__get_ticket", {"ticket_id": "TCK-1001"}
+            )
+            ok = (verified.get("result") or verified).get("status") == "resolved"
+            return {
+                "status": "completed" if ok else "failed",
+                "workflow_id": workflow_id,
+                "tickets_listed": ((listed.get("result") or listed).get("count") or 0),
+            }
 
     async def _ensure_hr_demo_workflow(self, client: httpx.AsyncClient) -> str | None:
         upstream = self.runtime.registry.get("hr_directory")
@@ -837,9 +1193,16 @@ class DemoTrafficRunner:
             current = await self.runtime.store.get_current_published_integration_definition(
                 tenant_id, "hr_directory"
             )
-            if current and any(
-                item.get("id") == workflow_slug
-                for item in (current.get("definition") or {}).get("workflows", [])
+            if (
+                current
+                and any(
+                    item.get("id") == workflow_slug
+                    for item in (current.get("definition") or {}).get("workflows", [])
+                )
+                and any(
+                    exp.get("id") == "hr_employee_lookup_ui"
+                    for exp in (current.get("definition") or {}).get("experiences", [])
+                )
             ):
                 return workflow_id
 
@@ -886,6 +1249,33 @@ class DemoTrafficRunner:
                         }
                     )
 
+            definition.setdefault("experiences", [])
+            if not any(
+                exp.get("id") == "hr_employee_lookup_ui" for exp in definition["experiences"]
+            ):
+                definition["experiences"].append(
+                    {
+                        "id": "hr_employee_lookup_ui",
+                        "resource_uri": "ui://mcpcodeaway/hr/employee-profile/r1",
+                        "renderer_schema": "mcpcodeaway-ui/1",
+                        "tool": tools["get_hr_employee"].qualified_name,
+                        "fallback": "Use hr_directory__get_hr_employee to inspect an employee.",
+                        "input_mapping": {"employee_id": "/form/employee_id"},
+                        "components": [
+                            {"type": "heading", "text": "Employee Profile"},
+                            {
+                                "type": "text_input",
+                                "id": "employee_id",
+                                "label": "Employee ID",
+                                "required": True,
+                                "max_length": 64,
+                            },
+                            {"type": "button", "label": "Inspect Profile", "action": "invoke_tool"},
+                            {"type": "record", "data": "tool_result"},
+                        ],
+                        "csp": {"connect_domains": [], "resource_domains": [], "frame_domains": []},
+                    }
+                )
             definition.setdefault("workflows", []).append(
                 {
                     "id": workflow_slug,
@@ -992,44 +1382,38 @@ class DemoTrafficRunner:
             calls_before = self.requests_sent
             write_count_before = self.write_calls_count
 
-            async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            demo_intent = (
+                "Update fictional employee EMP-01 role to senior_controller and verify profile"
+            )
+
+            async def call_tool(
+                name: str,
+                arguments: dict[str, Any],
+                *,
+                request_state: str | None = None,
+                input_responses: dict[str, Any] | None = None,
+            ) -> dict[str, Any]:
                 return await self._business_value_rpc(
                     client,
                     caller_token,
                     meta,
                     name,
                     arguments,
+                    request_state=request_state,
+                    input_responses=input_responses,
+                    intent=demo_intent,
                 )
 
-            start = await call_tool(
-                START_BUSINESS_EXECUTION_TOOL,
-                {"kind": "workflow", "workflow_id": workflow_id},
+            listing_resp = await call_tool("hr_directory__list_hr_employees", {"limit": 10})
+            listing = listing_resp.get("result", listing_resp)
+            before_resp = await call_tool(
+                "hr_directory__get_hr_employee", {"employee_id": "EMP-01"}
             )
-            execution_id = str(start.get("business_execution_id") or "")
-            if not execution_id:
-                return {
-                    "status": "failed",
-                    "workflow_id": workflow_id,
-                    "reason": "gateway did not start the attributed workflow",
-                    "requests": self.requests_sent - calls_before,
-                }
-
-            async def attributed(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-                response = await call_tool(
-                    f"{ATTRIBUTED_TOOL_PREFIX}hr_directory__{tool_name}",
-                    {"business_execution_id": execution_id, "arguments": arguments},
-                )
-                return response.get("result", response)
-
-            listing = await attributed("list_hr_employees", {"limit": 10})
-            before = await attributed("get_hr_employee", {"employee_id": "EMP-01"})
+            before = before_resp.get("result", before_resp)
             update_arguments = {"employee_id": "EMP-01", "role": "senior_controller"}
             self.write_calls_count += 1
-            update_name = f"{ATTRIBUTED_TOOL_PREFIX}hr_directory__update_hr_employee"
-            requested = await call_tool(
-                update_name,
-                {"business_execution_id": execution_id, "arguments": update_arguments},
-            )
+            update_name = "hr_directory__update_hr_employee"
+            requested = await call_tool(update_name, update_arguments)
             state = requested.get("requestState")
             if requested.get("resultType") != "input_required" or not isinstance(state, str):
                 return {
@@ -1038,37 +1422,64 @@ class DemoTrafficRunner:
                     "reason": "demo client did not receive the expected write confirmation",
                     "requests": self.requests_sent - calls_before,
                 }
-            update = await self._business_value_rpc(
-                client,
-                caller_token,
-                meta,
+            update_resp = await call_tool(
                 update_name,
-                {"business_execution_id": execution_id, "arguments": update_arguments},
+                update_arguments,
                 request_state=state,
                 input_responses={"confirm": {"action": "accept", "content": {"confirm": True}}},
             )
-            update = update.get("result", update)
-            verified = await attributed("get_hr_employee", {"employee_id": "EMP-01"})
+            update = update_resp.get("result", update_resp)
+            verified_resp = await call_tool(
+                "hr_directory__get_hr_employee", {"employee_id": "EMP-01"}
+            )
+            verified = verified_resp.get("result", verified_resp)
+            detection = verified_resp.get("workflow_detection") or {}
+            episode_id = str(detection.get("episode_id") or "")
             successful = (
                 listing.get("count", 0) >= 1
                 and before.get("employee_id") == "EMP-01"
                 and update.get("role") == "senior_controller"
                 and verified.get("role") == "senior_controller"
+                and detection.get("status") == "completed_verified"
             )
             events = await self.runtime.store.list_business_value_events(tenant_id)
             credited = [
                 event
                 for event in events
-                if event.get("business_execution_id") == execution_id and event.get("credited")
+                if event.get("business_execution_id") == episode_id and event.get("credited")
             ]
+            app_meta = request_meta(client_name="mcpcodeaway-demo-traffic")
+            app_meta[MCP_CLIENT_CAPABILITIES_META]["extensions"] = {
+                MCP_APP_EXTENSION: {"mimeTypes": [MCP_APP_MIME_TYPE]}
+            }
+            res_list = await client.post(
+                "/mcp",
+                headers={
+                    "Authorization": f"Bearer {caller_token}",
+                    **request_headers("resources/list"),
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "demo-hr-resources-list",
+                    "method": "resources/list",
+                    "params": {"_meta": app_meta},
+                },
+            )
+            listed_uris = (
+                [r.get("uri") for r in (res_list.json().get("result") or {}).get("resources", [])]
+                if res_list.status_code == 200
+                else []
+            )
             return {
                 "status": "completed" if successful and credited else "failed",
                 "workflow_id": workflow_id,
-                "business_execution_id": execution_id,
+                "episode_id": episode_id,
+                "attribution_mode": "passive_matched",
                 "completion_count": len(credited),
                 "manual_baseline_minutes": 8,
                 "requests": self.requests_sent - calls_before,
                 "write_calls": self.write_calls_count - write_count_before,
+                "mcp_app_ui_verified": "ui://mcpcodeaway/hr/employee-profile/r1" in listed_uris,
                 "confirmation": "accepted by the demo caller through MCP form elicitation",
             }
 
@@ -1082,18 +1493,22 @@ class DemoTrafficRunner:
         *,
         request_state: str | None = None,
         input_responses: dict[str, Any] | None = None,
+        intent: str | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"_meta": meta, "name": name, "arguments": arguments}
         if request_state is not None:
             params["requestState"] = request_state
         if input_responses is not None:
             params["inputResponses"] = input_responses
+        headers = {
+            "Authorization": f"Bearer {token}",
+            **request_headers("tools/call", tool_name=name),
+        }
+        if intent:
+            headers["X-Intent"] = intent
         response = await client.post(
             "/mcp?mode=traditional",
-            headers={
-                "Authorization": f"Bearer {token}",
-                **request_headers("tools/call", tool_name=name),
-            },
+            headers=headers,
             json={
                 "jsonrpc": "2.0",
                 "id": f"demo-business-{uuid4().hex}",

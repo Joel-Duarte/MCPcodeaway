@@ -1,5 +1,7 @@
 <script setup lang="ts">
+import { Switch, SwitchThumb } from "@ui-sdk/vue/switch";
 import { computed, onMounted, ref, watch } from "vue";
+import McpAppHostPreview from "~/components/McpAppHostPreview.vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
 
 interface AbFactor {
@@ -191,6 +193,59 @@ const promptDialogOpen = ref(false);
 const agentPromptText = ref("");
 const importDialogOpen = ref(false);
 const importJsonText = ref("");
+const bundleBusy = ref(false);
+const bundleValidationPreview = ref<Record<string, unknown> | null>(null);
+const discoveredCandidates = ref<Array<Record<string, any>>>([]);
+const discoverBusy = ref(false);
+
+const showManualBuilder = ref(false);
+const promptTargetSelection = ref("__new__");
+const targetChoiceItems = computed(() => [
+  { value: "__new__", label: "New API or MCP server (configure target)" },
+  ...existingUpstreams.value.map((name) => ({
+    value: name,
+    label: `Existing upstream: ${name}`,
+  })),
+]);
+const targetKindItems = [
+  { value: "openapi", label: "REST API (OpenAPI / Docs)" },
+  { value: "mcp_http", label: "Existing MCP Server" },
+];
+const generatedPrompt = ref("");
+const promptLoading = ref(false);
+const agentBundleJsonText = ref("");
+const bundleValidating = ref(false);
+const bundleApplying = ref(false);
+const bundleApplySuccess = ref<{
+  upstreamName: string;
+  workflows: number;
+  experiences: number;
+} | null>(null);
+const bundlePreview = ref<{
+  valid: boolean;
+  upstream: Record<string, any>;
+  integration_definition: Record<string, any> | null;
+  warnings: string[];
+  parsedBundle: Record<string, any>;
+  editableWorkflows: Array<{
+    id: string;
+    name: string;
+    description: string;
+    enabled: boolean;
+    manualMinutes: number;
+    intentsText: string;
+    completionTool: string;
+    participatingTools: string[];
+  }>;
+  experiencePreviews: Array<{
+    id: string;
+    title: string;
+    tool: string;
+    resource_uri: string;
+    html: string;
+    error?: string;
+  }>;
+} | null>(null);
 
 const typeOptions = [
   { value: "openapi", label: "openapi" },
@@ -701,13 +756,24 @@ async function loadUpstreams() {
     }>("/admin/upstreams");
     dynamicPermitted.value = res.dynamic_upstreams_permitted;
     existingUpstreams.value = res.upstreams.map((u) => u.name);
+    const route = typeof useRoute === "function" ? useRoute() : null;
+    const queryUpstream =
+      typeof route?.query?.upstream === "string" ? route.query.upstream.trim() : "";
+    if (queryUpstream) {
+      if (existingUpstreams.value.includes(queryUpstream)) {
+        promptTargetSelection.value = queryUpstream;
+      }
+      draftName.value = queryUpstream;
+    }
   } catch (err) {
     dynamicPermitted.value = false;
     upstreamsLoadError.value = extractErrorMessage(err);
   }
 }
 
-onMounted(() => { void loadUpstreams(); });
+onMounted(() => {
+  void loadUpstreams();
+});
 
 async function handleInspect() {
   errorMessage.value = "";
@@ -1027,15 +1093,94 @@ async function copyYaml() {
 async function openAgentPrompt() {
   errorMessage.value = "";
   try {
-    const res = await apiFetch<{ prompt: string }>("/admin/upstreams/agent-prompt");
-    const canonicalSteps = "1. Connect & Inspect; 2. Access & Execution; 3. Define workflows; 4. Test & Save.";
-    agentPromptText.value = `${res.prompt
-      .replace(/3\.\s*Test\s*&\s*Activate/gi, "3. Define workflows")
-      .replace(/4\.\s*Review\s*&\s*Publish/gi, "4. Test & Save")
-      .trim()}\n\nOnboarding steps in this page: ${canonicalSteps}`;
+    const query = draftName.value.trim()
+      ? `?upstream_name=${encodeURIComponent(draftName.value.trim())}`
+      : "";
+    const res = await apiFetch<{ prompt: string }>(`/admin/onboarding/prompt-pack${query}`);
+    agentPromptText.value = res.prompt;
     promptDialogOpen.value = true;
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
+  }
+}
+
+async function discoverWorkflowCandidates() {
+  if (!draftName.value.trim()) return;
+  errorMessage.value = "";
+  discoverBusy.value = true;
+  try {
+    const res = await apiFetch<{ candidates?: Array<Record<string, any>> }>(
+      `/admin/integration-definitions/${encodeURIComponent(draftName.value.trim())}/discover`,
+      { method: "POST", body: {} },
+    );
+    discoveredCandidates.value = res.candidates ?? [];
+    if (discoveredCandidates.value.length) {
+      statusMessage.value = `Discovered ${discoveredCandidates.value.length} workflow candidate(s) for '${draftName.value}'.`;
+    } else {
+      statusMessage.value = "No new workflow candidates were synthesized from current schemas/runs.";
+    }
+  } catch (err) {
+    errorMessage.value = extractErrorMessage(err);
+  } finally {
+    discoverBusy.value = false;
+  }
+}
+
+function loadDiscoveredCandidateIntoDraft(candidate: Record<string, any>) {
+  const draft = (candidate.draft_definition ?? {}) as Record<string, any>;
+  workflowDraftSequence.value += 1;
+  const reqTools = Array.isArray(draft.required_evidence) ? draft.required_evidence : [];
+  const next: WorkflowDraft = {
+    id: `workflow_${workflowDraftSequence.value}`,
+    name: String(draft.name ?? candidate.workflow_slug ?? ""),
+    description: String(draft.description ?? ""),
+    tools: Array.isArray(draft.participating_tools) ? draft.participating_tools.map(String) : [],
+    requiredTools: reqTools.map((r: any) => String(r.tool)),
+    evidencePredicates: Object.fromEntries(
+      reqTools
+        .filter((r: any) => r.result_when)
+        .map((r: any) => [String(r.tool), { path: String(r.result_when.path), type: String(r.result_when.type) }]),
+    ),
+    completionTool: String(draft.completion?.tool ?? ""),
+    completionPath: String(draft.completion?.success_when?.path ?? "/status"),
+    completionType: String(draft.completion?.success_when?.type ?? "non_empty_string"),
+    manualMinutes: 10,
+    baselineSource: "administrator_estimate",
+    confidence: "unvalidated",
+    effectiveFrom: new Date().toISOString().slice(0, 10),
+    evidenceNote: "Reviewed from auto-discovered workflow candidate.",
+  };
+  workflowDrafts.value = [next];
+  statusMessage.value = `Loaded '${next.name}' into the workflow builder. Confirm human minutes before publishing.`;
+}
+
+async function applyAgentBundleJson(publishImmediately = true) {
+  errorMessage.value = "";
+  bundleBusy.value = true;
+  try {
+    const parsed = JSON.parse(importJsonText.value) as Record<string, unknown>;
+    if ("upstream" in parsed || "integration_definition" in parsed) {
+      const payload = { ...parsed, publish: publishImmediately };
+      const preview = await apiFetch<Record<string, unknown>>("/admin/onboarding/bundle/validate", {
+        method: "POST",
+        body: payload,
+      });
+      bundleValidationPreview.value = preview;
+      const applied = await apiFetch<Record<string, any>>("/admin/onboarding/bundle/apply", {
+        method: "POST",
+        body: payload,
+      });
+      if (applied.upstream?.upstream?.name) draftName.value = String(applied.upstream.upstream.name);
+      importDialogOpen.value = false;
+      statusMessage.value = `Applied agent onboarding bundle${applied.integration_definition?.published ? " and published definition" : ""}.`;
+      await loadUpstreams();
+      return;
+    }
+    applyImportedJson();
+  } catch (err) {
+    errorMessage.value = extractErrorMessage(err);
+  } finally {
+    bundleBusy.value = false;
   }
 }
 
@@ -1126,6 +1271,191 @@ async function copyPromptText() {
     statusMessage.value = "Copied Agent Onboarding Prompt to clipboard.";
   }
 }
+
+async function generateGuidedPrompt(copyAfter = false) {
+  errorMessage.value = "";
+  promptLoading.value = true;
+  try {
+    const selectedExisting =
+      promptTargetSelection.value !== "__new__" ? promptTargetSelection.value : "";
+    const targetName = selectedExisting || draftName.value.trim();
+    const query = targetName ? `?upstream_name=${encodeURIComponent(targetName)}` : "";
+    const res = await apiFetch<{ prompt: string }>(`/admin/onboarding/prompt-pack${query}`);
+    const contextLines: string[] = [];
+    if (selectedExisting) {
+      contextLines.push(`Target Upstream (already registered): ${selectedExisting}`);
+    } else {
+      if (targetName) contextLines.push(`Target Upstream Name: ${targetName}`);
+      contextLines.push(`Target Integration Type: ${draftType.value}`);
+      if (draftUrl.value.trim()) {
+        contextLines.push(`Target API / MCP Base URL: ${draftUrl.value.trim()}`);
+      }
+      if (draftType.value === "openapi" && draftSpecUrl.value.trim()) {
+        contextLines.push(`OpenAPI / Documentation URL: ${draftSpecUrl.value.trim()}`);
+      }
+    }
+    generatedPrompt.value = contextLines.length
+      ? `${contextLines.join("\n")}\n\n${res.prompt}`
+      : res.prompt;
+    agentPromptText.value = generatedPrompt.value;
+    if (copyAfter && typeof navigator !== "undefined" && navigator.clipboard) {
+      await navigator.clipboard.writeText(generatedPrompt.value);
+      statusMessage.value =
+        "Copied clarifying-question prompt to clipboard. Send it to your frontier agent, answer its questions, then paste its JSON below.";
+    } else {
+      statusMessage.value = "Generated clarifying-question onboarding prompt.";
+    }
+  } catch (err) {
+    errorMessage.value = extractErrorMessage(err);
+  } finally {
+    promptLoading.value = false;
+  }
+}
+
+async function validateAndPreviewBundle() {
+  errorMessage.value = "";
+  bundleApplySuccess.value = null;
+  bundleValidating.value = true;
+  try {
+    const parsed = JSON.parse(agentBundleJsonText.value) as Record<string, any>;
+    const payload = { ...parsed, publish: true };
+    const validated = await apiFetch<{
+      valid: boolean;
+      upstream: Record<string, any>;
+      integration_definition: Record<string, any> | null;
+      warnings?: string[];
+    }>("/admin/onboarding/bundle/validate", {
+      method: "POST",
+      body: payload,
+    });
+    const def = validated.integration_definition;
+    const rawWorkflows = Array.isArray(def?.workflows) ? def.workflows : [];
+    const editableWorkflows = rawWorkflows.map((wf: Record<string, any>) => ({
+      id: String(wf.id ?? ""),
+      name: String(wf.name ?? wf.id ?? ""),
+      description: String(wf.description ?? ""),
+      enabled: wf.enabled !== false,
+      manualMinutes: Number(wf.business_value?.manual_baseline_minutes ?? 10),
+      intentsText: Array.isArray(wf.intent_examples) ? wf.intent_examples.join(", ") : "",
+      completionTool: String(wf.completion?.tool ?? ""),
+      participatingTools: Array.isArray(wf.participating_tools)
+        ? wf.participating_tools.map((t: any) => String(t))
+        : [],
+    }));
+    const rawExperiences = Array.isArray(def?.experiences) ? def.experiences : [];
+    const experiencePreviews: Array<{
+      id: string;
+      title: string;
+      tool: string;
+      resource_uri: string;
+      html: string;
+      error?: string;
+    }> = [];
+    for (const exp of rawExperiences) {
+      const headingNode = Array.isArray(exp.components)
+        ? exp.components.find((c: any) => c?.type === "heading" && c?.text)
+        : null;
+      const expTitle = String(exp.title ?? headingNode?.text ?? exp.id ?? "MCP App UI");
+      try {
+        const preview = await apiFetch<{ html: string }>("/admin/mcp-ui/preview", {
+          method: "POST",
+          body: { experience: exp },
+        });
+        experiencePreviews.push({
+          id: String(exp.id ?? ""),
+          title: expTitle,
+          tool: String(exp.tool ?? ""),
+          resource_uri: String(exp.resource_uri ?? ""),
+          html: preview.html,
+        });
+      } catch (err) {
+        experiencePreviews.push({
+          id: String(exp.id ?? ""),
+          title: expTitle,
+          tool: String(exp.tool ?? ""),
+          resource_uri: String(exp.resource_uri ?? ""),
+          html: "",
+          error: extractErrorMessage(err),
+        });
+      }
+    }
+    bundlePreview.value = {
+      valid: true,
+      upstream: validated.upstream,
+      integration_definition: def,
+      warnings: validated.warnings ?? [],
+      parsedBundle: parsed,
+      editableWorkflows,
+      experiencePreviews,
+    };
+    statusMessage.value = `Validated bundle for '${validated.upstream?.name}'. Review workflows and MCP App UI previews below, then click Apply.`;
+  } catch (err) {
+    bundlePreview.value = null;
+    errorMessage.value = extractErrorMessage(err);
+  } finally {
+    bundleValidating.value = false;
+  }
+}
+
+async function applyGuidedBundle() {
+  if (!bundlePreview.value) return;
+  errorMessage.value = "";
+  bundleApplying.value = true;
+  try {
+    const bundleToSend = JSON.parse(
+      JSON.stringify(bundlePreview.value.parsedBundle),
+    ) as Record<string, any>;
+    if (
+      bundleToSend.integration_definition &&
+      Array.isArray(bundleToSend.integration_definition.workflows)
+    ) {
+      const editsById = new Map(
+        bundlePreview.value.editableWorkflows.map((item) => [item.id, item]),
+      );
+      bundleToSend.integration_definition.workflows =
+        bundleToSend.integration_definition.workflows.map((wf: Record<string, any>) => {
+          const edited = editsById.get(String(wf.id));
+          if (!edited) return wf;
+          const nextBv = {
+            ...(wf.business_value ?? {}),
+            manual_baseline_minutes: Math.max(0.1, Number(edited.manualMinutes) || 10),
+          };
+          const parsedIntents = edited.intentsText
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+          return {
+            ...wf,
+            enabled: edited.enabled,
+            business_value: nextBv,
+            ...(parsedIntents.length ? { intent_examples: parsedIntents } : {}),
+          };
+        });
+    }
+    const res = await apiFetch<{
+      applied: boolean;
+      upstream?: { upstream?: { name?: string } };
+      integration_definition?: { published?: boolean };
+    }>("/admin/onboarding/bundle/apply", {
+      method: "POST",
+      body: { ...bundleToSend, publish: true },
+    });
+    const upstreamName = String(
+      res.upstream?.upstream?.name ?? bundlePreview.value.upstream?.name ?? "",
+    );
+    bundleApplySuccess.value = {
+      upstreamName,
+      workflows: bundlePreview.value.editableWorkflows.length,
+      experiences: bundlePreview.value.experiencePreviews.length,
+    };
+    statusMessage.value = `Applied and published '${upstreamName}' with ${bundleApplySuccess.value.workflows} workflow(s) and ${bundleApplySuccess.value.experiences} MCP App UI view(s).`;
+    await loadUpstreams();
+  } catch (err) {
+    errorMessage.value = extractErrorMessage(err);
+  } finally {
+    bundleApplying.value = false;
+  }
+}
 </script>
 
 <template>
@@ -1136,12 +1466,13 @@ async function copyPromptText() {
           Onboarding
         </h1>
         <p class="mt-0.5 text-[13px] text-[#52525B]">
-          Connect an API or MCP server, set access rules, describe business workflows from its tools, then test and publish.
+          Copy a structured prompt to your agent so it asks clarifying questions, discovers workflows, designs MCP Apps UI, and outputs one JSON bundle to apply.
         </p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
-        <Button @click="openAgentPrompt">Agent Onboarding Prompt</Button>
-        <Button @click="importDialogOpen = true">Import Agent JSON</Button>
+        <Button @click="showManualBuilder = !showManualBuilder">
+          {{ showManualBuilder ? "Hide Manual Builder" : "Manual Step-by-Step Builder" }}
+        </Button>
       </div>
     </div>
 
@@ -1178,6 +1509,232 @@ async function copyPromptText() {
       <Button class="min-h-11" @click="loadUpstreams">Retry settings lookup</Button>
     </div>
 
+    <section aria-label="Prompt-first guided onboarding" class="space-y-5 rounded-lg border border-[#E4E4E7] bg-white p-5">
+      <div class="border-b border-[#E4E4E7] pb-3">
+        <h2 class="text-[16px] font-semibold text-[#09090B]">Prompt-First Agent Onboarding</h2>
+        <p class="mt-0.5 text-[12px] text-[#52525B]">
+          Choose what API or MCP server you are onboarding, copy the prompt to your frontier agent, answer its clarifying questions, then paste and validate the resulting JSON bundle.
+        </p>
+      </div>
+
+      <div class="space-y-4">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h3 class="text-[14px] font-semibold text-[#09090B]">Step 1 — Choose Target &amp; Copy Agent Prompt</h3>
+            <p class="text-[12px] text-[#52525B]">
+              Pick an existing upstream or specify a new REST API / MCP server so your prompt targets the right service.
+            </p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <Button class="min-h-11 sm:min-h-9" :disabled="promptLoading" @click="generateGuidedPrompt(false)">
+              {{ promptLoading ? "Building…" : "Preview Prompt" }}
+            </Button>
+            <Button data-variant="primary" class="min-h-11 sm:min-h-9" :disabled="promptLoading" @click="generateGuidedPrompt(true)">
+              <AppIcon name="copy" :size="14" />
+              <span>Copy Onboarding Prompt</span>
+            </Button>
+          </div>
+        </div>
+        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <Field>
+            <FieldLabel>Target source</FieldLabel>
+            <Select
+              :items="targetChoiceItems"
+              :value="promptTargetSelection"
+              @value-change="(val) => { if (val) { promptTargetSelection = String(val); if (val !== '__new__') draftName = String(val); } }"
+            >
+              <SelectTrigger aria-label="Choose target integration" class="min-h-11 sm:min-h-9">
+                <SelectValue />
+                <AppIcon name="chevron-down" :size="14" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem v-for="opt in targetChoiceItems" :key="opt.value" :value="opt.value">
+                  {{ opt.label }}
+                  <SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator>
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+          <template v-if="promptTargetSelection === '__new__'">
+            <Field>
+              <FieldLabel>Integration kind</FieldLabel>
+              <Select
+                :items="targetKindItems"
+                :value="draftType"
+                @value-change="(val) => { if (val) draftType = String(val); }"
+              >
+                <SelectTrigger aria-label="Target integration type" class="min-h-11 sm:min-h-9">
+                  <SelectValue />
+                  <AppIcon name="chevron-down" :size="14" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="opt in targetKindItems" :key="opt.value" :value="opt.value">
+                    {{ opt.label }}
+                    <SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator>
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel for="guided-target-slug">Target upstream slug</FieldLabel>
+              <Input id="guided-target-slug" v-model="draftName" class="font-mono-data text-xs" placeholder="e.g. zendesk_support" />
+            </Field>
+            <Field>
+              <FieldLabel for="guided-target-url">API or MCP URL</FieldLabel>
+              <Input id="guided-target-url" v-model="draftUrl" class="font-mono-data text-xs" placeholder="https://api.example.com" />
+            </Field>
+          </template>
+        </div>
+        <pre v-if="generatedPrompt" class="max-h-56 overflow-auto rounded border border-[#E4E4E7] bg-[#F4F4F5] p-3 font-mono-data text-[11px] text-[#09090B]">{{ generatedPrompt }}</pre>
+      </div>
+
+      <div class="space-y-3 border-t border-[#E4E4E7] pt-4">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h3 class="text-[14px] font-semibold text-[#09090B]">Step 2 — Paste Agent JSON, Tune Timing &amp; Preview MCP UI</h3>
+            <p class="text-[12px] text-[#52525B]">
+              After answering your agent's clarifying questions, paste the final JSON bundle here to validate workflows and preview any MCP Apps UI.
+            </p>
+          </div>
+          <Button class="min-h-11 sm:min-h-9" :disabled="bundleValidating || !agentBundleJsonText.trim()" @click="validateAndPreviewBundle">
+            {{ bundleValidating ? "Validating…" : "Validate & Preview Bundle" }}
+          </Button>
+        </div>
+        <Textarea
+          v-model="agentBundleJsonText"
+          aria-label="Paste agent OnboardingBundle JSON"
+          rows="7"
+          class="font-mono-data text-xs"
+          placeholder='{"upstream": {"name": "...", "type": "openapi", "url": "..."}, "integration_definition": {"workflows": [...], "experiences": [...]}, "publish": true}'
+        />
+
+        <div v-if="bundlePreview" class="space-y-4 border-t border-[#E4E4E7] pt-4">
+          <div class="flex flex-wrap items-center justify-between gap-2 rounded bg-[#F0FDFA] border border-[#99F6E4] px-3 py-2 text-[12px] text-[#0F766E]">
+            <span>
+              Ready: <strong class="font-mono-data">{{ bundlePreview.upstream.name }}</strong>
+              ({{ bundlePreview.upstream.type }} · {{ bundlePreview.upstream.auth_type || "none" }} · {{ bundlePreview.editableWorkflows.length }} workflow(s), {{ bundlePreview.experiencePreviews.length }} UI view(s))
+            </span>
+            <div class="flex flex-wrap items-center gap-3">
+              <span v-if="bundlePreview.warnings.length" class="text-[#B45309]">
+                {{ bundlePreview.warnings.length }} warning(s)
+              </span>
+              <NuxtLink to="/workflows" class="font-medium text-[#0F766E] underline">
+                Manage Workflows
+              </NuxtLink>
+              <NuxtLink to="/mcp-ui" class="font-medium text-[#0F766E] underline">
+                Preview MCP Apps UI
+              </NuxtLink>
+            </div>
+          </div>
+
+          <ul v-if="bundlePreview.warnings.length" class="space-y-1 text-[12px] text-[#B45309]">
+            <li v-for="(warning, idx) in bundlePreview.warnings" :key="idx">• {{ warning }}</li>
+          </ul>
+
+          <div v-if="bundlePreview.editableWorkflows.length" class="space-y-2">
+            <h4 class="text-[13px] font-semibold text-[#09090B]">Proposed Workflows (toggle active or adjust human baseline)</h4>
+            <div class="divide-y divide-[#E4E4E7] border-y border-[#E4E4E7]">
+              <div
+                v-for="wf in bundlePreview.editableWorkflows"
+                :key="wf.id"
+                class="grid grid-cols-1 gap-3 py-3 md:grid-cols-12 md:items-center"
+              >
+                <div class="md:col-span-5 space-y-0.5">
+                  <div class="flex items-center gap-2">
+                    <span class="text-[13px] font-semibold text-[#09090B]">{{ wf.name }}</span>
+                    <span class="font-mono-data text-[11px] text-[#71717A]">{{ wf.completionTool }}</span>
+                  </div>
+                  <p class="text-[12px] text-[#52525B]">{{ wf.description }}</p>
+                </div>
+                <div class="md:col-span-3">
+                  <label class="block text-[11px] font-medium text-[#52525B]">
+                    Manual baseline (min)
+                    <Input
+                      :model-value="String(wf.manualMinutes)"
+                      type="number"
+                      min="0.1"
+                      step="0.1"
+                      class="mt-1 tabular-nums"
+                      @update:model-value="wf.manualMinutes = Number($event)"
+                    />
+                  </label>
+                </div>
+                <div class="md:col-span-2">
+                  <label class="block text-[11px] font-medium text-[#52525B]">
+                    Triggers
+                    <Input v-model="wf.intentsText" class="mt-1 text-xs" placeholder="comma separated" />
+                  </label>
+                </div>
+                <div class="md:col-span-2 flex items-center md:justify-end">
+                  <label class="inline-flex min-h-11 items-center gap-2 text-[12px] font-medium text-[#09090B]">
+                    <Switch
+                      :checked="wf.enabled"
+                      :aria-label="`Activate ${wf.name}`"
+                      @checked-change="(checked) => { wf.enabled = checked === true; }"
+                    >
+                      <SwitchThumb />
+                    </Switch>
+                    <span>{{ wf.enabled ? "Active" : "Paused" }}</span>
+                  </label>
+                </div>
+                <div
+                  v-if="wf.participatingTools.length"
+                  class="md:col-span-12 flex flex-wrap items-center gap-1.5 text-[11px] text-[#52525B]"
+                >
+                  <span class="font-medium">Steps:</span>
+                  <template
+                    v-for="(toolName, idx) in wf.participatingTools"
+                    :key="`${wf.id}-step-${toolName}-${idx}`"
+                  >
+                    <span class="rounded border border-[#E4E4E7] bg-[#F4F4F5] px-1.5 py-0.5 font-mono-data text-[#09090B]">
+                      {{ toolName }}
+                    </span>
+                    <span v-if="idx < wf.participatingTools.length - 1" aria-hidden="true">-&gt;</span>
+                  </template>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div v-if="bundlePreview.experiencePreviews.length" class="space-y-3">
+            <h4 class="text-[13px] font-semibold text-[#09090B]">MCP Apps UI Presentation Previews</h4>
+            <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              <div v-for="exp in bundlePreview.experiencePreviews" :key="exp.id" class="space-y-2 border-t border-[#E4E4E7] pt-3">
+                <div class="flex items-center justify-between gap-2 text-[12px]">
+                  <span class="font-semibold text-[#09090B]">{{ exp.title }}</span>
+                  <span class="font-mono-data text-[#0F766E]">{{ exp.tool }}</span>
+                </div>
+                <McpAppHostPreview
+                  :title="exp.title"
+                  :iframe-title="`Preview ${exp.title}`"
+                  :tool="exp.tool"
+                  :resource-uri="exp.resource_uri"
+                  :html="exp.html"
+                  :error="exp.error"
+                  compact
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap items-center justify-between gap-3 border-t border-[#E4E4E7] pt-4">
+        <div class="text-[12px] text-[#52525B]">
+          <template v-if="bundleApplySuccess">
+            Published <strong class="font-mono-data text-[#09090B]">{{ bundleApplySuccess.upstreamName }}</strong>:
+            <NuxtLink to="/workflows" class="ml-1 font-medium text-[#0F766E] underline">Open Workflows ({{ bundleApplySuccess.workflows }})</NuxtLink>
+            <NuxtLink to="/mcp-ui" class="ml-3 font-medium text-[#0F766E] underline">Open MCP Apps UI ({{ bundleApplySuccess.experiences }})</NuxtLink>
+          </template>
+          <span v-else>Step 3 — Validate the pasted bundle above, then apply and publish directly to the gateway.</span>
+        </div>
+        <Button data-variant="primary" class="min-h-11 sm:min-h-9" :disabled="bundleApplying || !bundlePreview" @click="applyGuidedBundle">
+          {{ bundleApplying ? "Applying…" : "Step 3 — Apply & Publish Bundle" }}
+        </Button>
+      </div>
+    </section>
+
+    <div v-show="showManualBuilder" class="space-y-6">
     <section
       aria-label="Onboarding workflow steps"
       class="flex flex-col gap-3 rounded-lg border border-[#E4E4E7] bg-white p-4 sm:flex-row sm:items-center sm:justify-between"
@@ -1690,7 +2247,20 @@ async function copyPromptText() {
           <h2 class="text-[15px] font-semibold text-[#09090B]">Step 3 — Define business workflows</h2>
           <p class="mt-1 max-w-3xl text-[13px] leading-5 text-[#52525B]">Describe a task a worker does, choose the tools involved, and say which successful result proves it is complete. Example: “Find an employee and verify their department” can use list employees, with the returned employee record as the completion result. This workflow describes and measures activity; its display order does not constrain runtime calls.</p>
         </div>
-        <Button class="min-h-11 shrink-0" @click="addWorkflowDraft">Add another workflow</Button>
+        <div class="flex flex-wrap items-center gap-2">
+          <Button class="min-h-11 shrink-0" :disabled="discoverBusy || !draftName.trim()" @click="discoverWorkflowCandidates">{{ discoverBusy ? "Discovering…" : "Auto-discover workflows" }}</Button>
+          <Button class="min-h-11 shrink-0" @click="addWorkflowDraft">Add another workflow</Button>
+        </div>
+      </div>
+
+      <div v-if="discoveredCandidates.length" class="space-y-2">
+        <div class="text-xs font-semibold text-[#09090B]">Auto-discovered workflow drafts</div>
+        <ul class="divide-y divide-[#E4E4E7] border-y border-[#E4E4E7]">
+          <li v-for="cand in discoveredCandidates" :key="cand.candidate_id || cand.workflow_slug" class="flex flex-wrap items-center justify-between gap-2 py-2.5 text-xs">
+            <div><span class="font-medium text-[#09090B]">{{ cand.draft_definition?.name || cand.workflow_slug }}</span> <span class="text-[#71717A]">· {{ cand.origin }}</span></div>
+            <Button class="min-h-11 text-xs" @click="loadDiscoveredCandidateIntoDraft(cand)">Use draft</Button>
+          </li>
+        </ul>
       </div>
 
       <div v-if="!inspectResult?.inspection.tools.length" class="rounded-md border border-[#E4E4E7] bg-[#FAFAFA] p-4 text-sm text-[#52525B]">
@@ -1934,6 +2504,7 @@ async function copyPromptText() {
         </div>
       </section>
     </div>
+    </div>
 
     <Dialog v-model:open="promptDialogOpen">
       <DialogBackdrop />
@@ -1972,22 +2543,23 @@ async function copyPromptText() {
     <Dialog v-model:open="importDialogOpen">
       <DialogBackdrop />
       <DialogContent class="sm:max-w-xl w-[calc(100%-2rem)]">
-        <DialogTitle>Import Agent-Generated Upstream JSON</DialogTitle>
+        <DialogTitle>Import Agent-Generated Onboarding JSON</DialogTitle>
         <DialogDescription>
-          Paste an UpstreamConfig JSON payload produced by your coding agent to populate the draft form.
+          Paste either a single UpstreamConfig JSON object or a full OnboardingBundle (upstream, workflows, and MCP App UI experiences) produced by your agent.
         </DialogDescription>
         <Field>
-          <FieldLabel>UpstreamConfig JSON</FieldLabel>
+          <FieldLabel>UpstreamConfig or OnboardingBundle JSON</FieldLabel>
           <Textarea
             v-model="importJsonText"
             rows="6"
             class="font-mono-data text-xs"
-            placeholder='{"name": "crm_api", "type": "openapi", "url": "http://localhost:8001"}'
+            placeholder='{"upstream": {...}, "integration_definition": {...}, "publish": true}'
           />
         </Field>
-        <div class="flex justify-end gap-2">
+        <div class="flex flex-wrap justify-end gap-2">
           <DialogClose>Cancel</DialogClose>
-          <Button data-variant="primary" @click="applyImportedJson">Apply JSON</Button>
+          <Button @click="applyImportedJson">Load Upstream Draft</Button>
+          <Button data-variant="primary" :disabled="bundleBusy" @click="applyAgentBundleJson(true)">{{ bundleBusy ? "Applying…" : "Apply Full Onboarding Bundle" }}</Button>
         </div>
       </DialogContent>
     </Dialog>
