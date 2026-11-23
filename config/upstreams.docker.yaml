@@ -170,3 +170,56 @@ upstreams:
     tool_effects: { list_ci_deployments: read, list_ci_deployments_summary: read, list_ci_deployments_health: read, list_ci_deployments_metrics: read }
     mutating_tools: []
     enabled: true
+
+  - name: global_ticketing
+    type: openapi
+    url: http://mock-backends:8001/ticketing
+    openapi_spec_url: http://mock-backends:8001/ticketing/openapi.json
+    auth_type: delegated_token
+    authorization_mode: gateway
+    downstream_audience: api://ticketing-system
+    downstream_scope: mcp.tools ops.write
+    preferred_mode: auto
+    allowed_roles: [ops_engineer, ticketing_reader, ticketing_writer, tool_approver, gateway_admin, admin]
+    allowed_groups: [operations, platform-admins, operations-approvers]
+    allowed_operations: [list_ticketing_queues, list_tickets, create_ticket, search_tickets, get_ticket, update_ticket, assign_ticket, escalate_ticket, resolve_ticket, close_ticket, reopen_ticket, list_ticket_comments, add_ticket_comment, get_ticket_sla, add_ticket_watcher, set_ticket_tags, request_ticket_approval, get_ticketing_metrics]
+    mutating_tools: [create_ticket, update_ticket, assign_ticket, escalate_ticket, resolve_ticket, close_ticket, reopen_ticket, add_ticket_comment, add_ticket_watcher, set_ticket_tags, request_ticket_approval]
+    tool_effects:
+      list_ticketing_queues: read
+      list_tickets: read
+      search_tickets: read
+      get_ticket: read
+      list_ticket_comments: read
+      get_ticket_sla: read
+      get_ticketing_metrics: read
+      create_ticket: write
+      update_ticket: write
+      assign_ticket: write
+      escalate_ticket: write
+      resolve_ticket: write
+      close_ticket: write
+      reopen_ticket: write
+      add_ticket_comment: write
+      add_ticket_watcher: write
+      set_ticket_tags: write
+      request_ticket_approval: write
+    tool_approval_policies:
+      list_ticketing_queues: { mode: none, version: 1 }
+      list_tickets: { mode: none, version: 1 }
+      search_tickets: { mode: none, version: 1 }
+      get_ticket: { mode: none, version: 1 }
+      list_ticket_comments: { mode: none, version: 1 }
+      get_ticket_sla: { mode: none, version: 1 }
+      get_ticketing_metrics: { mode: none, version: 1 }
+      create_ticket: { mode: requester_confirmation, version: 1, confirmation_message: "Confirm creating a new ticket in Global Ticketing." }
+      update_ticket: { mode: requester_confirmation, version: 1, confirmation_message: "Confirm updating ticket fields." }
+      assign_ticket: { mode: requester_confirmation, version: 1, confirmation_message: "Confirm assigning this ticket to an owner." }
+      escalate_ticket: { mode: requester_confirmation, version: 1, confirmation_message: "Confirm escalating this ticket." }
+      resolve_ticket: { mode: requester_confirmation, version: 1, confirmation_message: "Confirm marking this ticket resolved." }
+      close_ticket: { mode: requester_confirmation, version: 1, confirmation_message: "Confirm closing this ticket." }
+      reopen_ticket: { mode: requester_confirmation, version: 1, confirmation_message: "Confirm reopening this ticket." }
+      add_ticket_comment: { mode: requester_confirmation, version: 1, confirmation_message: "Confirm posting this ticket comment." }
+      add_ticket_watcher: { mode: requester_confirmation, version: 1, confirmation_message: "Confirm adding this ticket watcher." }
+      set_ticket_tags: { mode: requester_confirmation, version: 1, confirmation_message: "Confirm replacing ticket tags." }
+      request_ticket_approval: { mode: requester_confirmation, version: 1, confirmation_message: "Confirm requesting approval for this ticket." }
+    enabled: true

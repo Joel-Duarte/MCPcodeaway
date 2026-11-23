@@ -14,7 +14,6 @@ import pytest
 from examples.mock_backends import create_mock_backends_app
 from gateway.auth import LocalDevKeyManager
 from gateway.config import GatewaySettings
-from gateway.integration_validation import ATTRIBUTED_TOOL_PREFIX, START_BUSINESS_EXECUTION_TOOL
 from gateway.mcp_protocol import request_headers, request_meta
 from gateway.server import create_gateway_app
 from gateway.state import SQLiteAuditStore
@@ -38,13 +37,20 @@ async def _request(
     request_id: str,
     name: str,
     arguments: dict[str, Any],
+    intent: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        **request_headers("tools/call", tool_name=name),
+    }
+    if intent:
+        headers["X-Intent"] = intent
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
     response = await client.post(
         "/mcp",
-        headers={
-            "Authorization": f"Bearer {token}",
-            **request_headers("tools/call", tool_name=name),
-        },
+        headers=headers,
         json={
             "jsonrpc": "2.0",
             "id": request_id,
@@ -56,7 +62,7 @@ async def _request(
     body = response.json()
     assert "error" not in body, body
     structured = body["result"]["structuredContent"]
-    return structured.get("result", structured)
+    return structured
 
 
 async def _publish_hr_workflow(runtime: Any, store: SQLiteAuditStore) -> None:
@@ -243,65 +249,75 @@ async def test_fictional_employee_update_is_verified_by_terminal_readback(tmp_pa
                 "hr_directory__update_hr_employee",
             } <= listed_names, sorted(listed_names)
             await _publish_hr_workflow(app.state.runtime, store)
-            started = await _request(
-                gateway,
-                token,
-                request_id="hr-start-workflow",
-                name=START_BUSINESS_EXECUTION_TOOL,
-                arguments={"kind": "workflow", "workflow_id": _WORKFLOW_ID},
+            refreshed_listing = await gateway.post(
+                "/mcp",
+                headers={"Authorization": f"Bearer {token}", **request_headers("tools/list")},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "hr-list-tools-after-publish",
+                    "method": "tools/list",
+                    "params": {"_meta": request_meta()},
+                },
             )
-            execution_id = started["business_execution_id"]
+            refreshed_names = {tool["name"] for tool in refreshed_listing.json()["result"]["tools"]}
+            assert "mcpcodeaway_start_business_execution" not in refreshed_names
+            assert not any(name.startswith("mca_attr__") for name in refreshed_names)
 
-            listing = await _request(
+            intent = "Update fictional employee profile role and verify saved profile"
+            listing_resp = await _request(
                 gateway,
                 token,
                 request_id="hr-list-employees",
-                name=f"{ATTRIBUTED_TOOL_PREFIX}{_UPSTREAM}__list_hr_employees",
-                arguments={"business_execution_id": execution_id, "arguments": {"limit": 10}},
+                name=f"{_UPSTREAM}__list_hr_employees",
+                arguments={"limit": 10},
+                intent=intent,
             )
-            before = await _request(
+            before_resp = await _request(
                 gateway,
                 token,
                 request_id="hr-read-before-update",
-                name=f"{ATTRIBUTED_TOOL_PREFIX}{_UPSTREAM}__get_hr_employee",
-                arguments={
-                    "business_execution_id": execution_id,
-                    "arguments": {"employee_id": _GOLDEN["employee_id"]},
-                },
+                name=f"{_UPSTREAM}__get_hr_employee",
+                arguments={"employee_id": _GOLDEN["employee_id"]},
+                intent=intent,
             )
-            updated = await _request(
+            updated_resp = await _request(
                 gateway,
                 token,
                 request_id="hr-update-role",
-                name=f"{ATTRIBUTED_TOOL_PREFIX}{_UPSTREAM}__update_hr_employee",
+                name=f"{_UPSTREAM}__update_hr_employee",
                 arguments={
-                    "business_execution_id": execution_id,
-                    "arguments": {
-                        "employee_id": _GOLDEN["employee_id"],
-                        "role": _GOLDEN["updated_role"],
-                    },
+                    "employee_id": _GOLDEN["employee_id"],
+                    "role": _GOLDEN["updated_role"],
                 },
+                intent=intent,
             )
-            verified = await _request(
+            verified_resp = await _request(
                 gateway,
                 token,
                 request_id="hr-read-after-update",
-                name=f"{ATTRIBUTED_TOOL_PREFIX}{_UPSTREAM}__get_hr_employee",
-                arguments={
-                    "business_execution_id": execution_id,
-                    "arguments": {"employee_id": _GOLDEN["employee_id"]},
-                },
+                name=f"{_UPSTREAM}__get_hr_employee",
+                arguments={"employee_id": _GOLDEN["employee_id"]},
+                intent=intent,
             )
 
+            listing = listing_resp.get("result", listing_resp)
+            before = before_resp.get("result", before_resp)
+            updated = updated_resp.get("result", updated_resp)
+            verified = verified_resp.get("result", verified_resp)
             assert listing["count"] >= 3
             assert before["name"] == _GOLDEN["expected_name"]
             assert before["role"] == _GOLDEN["expected_initial_role"]
             assert updated["role"] == _GOLDEN["updated_role"]
             assert verified["role"] == _GOLDEN["updated_role"]
             assert verified["version"] == _GOLDEN["expected_final_version"]
+            assert verified_resp["workflow_detection"]["status"] == "completed_verified"
+            episode_id = verified_resp["workflow_detection"]["episode_id"]
+
             events = await store.list_business_value_events(_TENANT)
-            credited = [event for event in events if event["business_execution_id"] == execution_id]
+            credited = [event for event in events if event["business_execution_id"] == episode_id]
             assert len(credited) == _GOLDEN["expected_credited_completions"]
+            assert credited[0]["evidence"]["attribution_mode"] == "passive_matched"
+            assert credited[0]["evidence"]["selected_id"] == _WORKFLOW_ID
             assert (
                 credited[0]["evidence"]["baseline_snapshot"]["manual_baseline_minutes"]
                 == _GOLDEN["expected_manual_baseline_minutes"]

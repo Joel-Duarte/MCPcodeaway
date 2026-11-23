@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from gateway.integration_definition import compute_workflow_fingerprint
+
 
 def _postgres_dsn_with_secure_tls_default(dsn: str) -> str:
     """Default PostgreSQL connections to certificate and hostname verification.
@@ -382,6 +384,61 @@ class AuditStore(Protocol):
     async def list_business_value_events(
         self, tenant_id: str, *, since: str | None = None, limit: int = 1000
     ) -> list[dict[str, Any]]: ...
+
+    async def list_open_workflow_episodes(
+        self,
+        tenant_id: str,
+        user_sub: str,
+        client_id: str,
+        *,
+        session_key: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]: ...
+
+    async def upsert_workflow_episode(self, episode: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def append_workflow_episode_call(self, call: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def list_workflow_episode_calls(
+        self, tenant_id: str, episode_id: str
+    ) -> list[dict[str, Any]]: ...
+
+    async def list_workflow_episodes(
+        self, tenant_id: str, *, status: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]: ...
+
+    async def get_workflow_episode(
+        self, tenant_id: str, episode_id: str
+    ) -> dict[str, Any] | None: ...
+
+    async def claim_open_workflow_episode(
+        self, tenant_id: str, episode_id: str, *, next_status: str, closed_at: str
+    ) -> dict[str, Any] | None: ...
+
+    async def list_expired_open_workflow_episodes(
+        self, now_iso: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]: ...
+
+    async def upsert_discovered_workflow_candidate(
+        self, candidate: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def list_discovered_workflow_candidates(
+        self,
+        tenant_id: str,
+        *,
+        upstream_name: str | None = None,
+        status: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]: ...
+
+    async def get_discovered_workflow_candidate(
+        self, tenant_id: str, candidate_id: str
+    ) -> dict[str, Any] | None: ...
+
+    async def update_discovered_workflow_candidate_status(
+        self, tenant_id: str, candidate_id: str, status: str, updated_at: str
+    ) -> bool: ...
 
     async def record_run(self, run: dict[str, Any]) -> None: ...
 
@@ -854,6 +911,75 @@ class SQLiteAuditStore:
             CREATE TRIGGER IF NOT EXISTS append_only_business_value_delete
                 BEFORE DELETE ON business_value_events BEGIN SELECT RAISE(ABORT,
                 'append-only record'); END;
+            CREATE TABLE IF NOT EXISTS workflow_episodes (
+                episode_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                user_sub TEXT NOT NULL, client_id TEXT NOT NULL,
+                session_key TEXT NOT NULL, upstream_name TEXT,
+                matched_workflow_id TEXT, attribution_source TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN (
+                    'open','completed_verified','completed_unverified',
+                    'partial_or_incomplete','abandoned','read_only')),
+                completion_tier TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                completion_pct INTEGER NOT NULL DEFAULT 0,
+                redacted_intent TEXT,
+                entity_fingerprints_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL, closed_at TEXT,
+                judge_verdict_json TEXT, payload_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_episodes_open_lookup
+                ON workflow_episodes (tenant_id, user_sub, client_id, status, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_workflow_episodes_tenant_created
+                ON workflow_episodes (tenant_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS workflow_episode_calls (
+                call_id TEXT PRIMARY KEY, episode_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL, run_id TEXT,
+                ordinal INTEGER NOT NULL, upstream_name TEXT NOT NULL,
+                tool_qualified_name TEXT NOT NULL, effect TEXT NOT NULL,
+                status TEXT NOT NULL, sensitive_write_journal_status TEXT,
+                entity_fingerprints_json TEXT NOT NULL,
+                shape_diff_json TEXT NOT NULL,
+                evidence_matched INTEGER NOT NULL DEFAULT 0,
+                completion_matched INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_episode_calls_episode
+                ON workflow_episode_calls (tenant_id, episode_id, ordinal);
+            CREATE TABLE IF NOT EXISTS discovered_workflow_candidates (
+                candidate_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                upstream_name TEXT NOT NULL, workflow_slug TEXT NOT NULL,
+                fingerprint TEXT NOT NULL DEFAULT '',
+                origin TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN (
+                    'pending_review','promoted','dismissed')),
+                observed_count INTEGER NOT NULL DEFAULT 1,
+                verified_count INTEGER NOT NULL DEFAULT 0,
+                sample_intents_json TEXT NOT NULL,
+                draft_definition_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_discovered_candidates_slug
+                ON discovered_workflow_candidates (tenant_id, upstream_name, workflow_slug);
+            """
+        )
+        cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(discovered_workflow_candidates)").fetchall()
+        }
+        if "fingerprint" not in cols:
+            conn.execute(
+                "ALTER TABLE discovered_workflow_candidates "
+                "ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''"
+            )
+        conn.execute(
+            "UPDATE discovered_workflow_candidates "
+            "SET fingerprint = workflow_slug WHERE fingerprint = ''"
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_discovered_candidates_fingerprint
+                ON discovered_workflow_candidates (tenant_id, upstream_name, fingerprint)
             """
         )
         conn.commit()
@@ -2585,6 +2711,440 @@ class SQLiteAuditStore:
             )
         return [{**dict(row), "evidence": json.loads(row["evidence_json"])} for row in rows]
 
+    @staticmethod
+    def _decode_episode_row(row: Any) -> dict[str, Any]:
+        data = dict(row)
+        data["entity_fingerprints"] = json.loads(data.pop("entity_fingerprints_json"))
+        judge_raw = data.pop("judge_verdict_json", None)
+        data["judge_verdict"] = json.loads(judge_raw) if judge_raw else None
+        data["payload"] = json.loads(data.pop("payload_json"))
+        return data
+
+    @staticmethod
+    def _decode_episode_call_row(row: Any) -> dict[str, Any]:
+        data = dict(row)
+        data["entity_fingerprints"] = json.loads(data.pop("entity_fingerprints_json"))
+        data["shape_diff"] = json.loads(data.pop("shape_diff_json"))
+        data["evidence_matched"] = bool(data.get("evidence_matched"))
+        data["completion_matched"] = bool(data.get("completion_matched"))
+        return data
+
+    @staticmethod
+    def _decode_candidate_row(row: Any) -> dict[str, Any]:
+        data = dict(row)
+        data["sample_intents"] = json.loads(data.pop("sample_intents_json"))
+        data["draft_definition"] = json.loads(data.pop("draft_definition_json"))
+        if not data.get("fingerprint"):
+            data["fingerprint"] = str(data.get("workflow_slug") or "")
+        return data
+
+    async def list_open_workflow_episodes(
+        self,
+        tenant_id: str,
+        user_sub: str,
+        client_id: str,
+        *,
+        session_key: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = (
+                self._ensure_conn()
+                .execute(
+                    """
+                    SELECT * FROM workflow_episodes
+                    WHERE tenant_id=? AND user_sub=? AND client_id=? AND status='open'
+                      AND (? IS NULL OR session_key=?)
+                    ORDER BY updated_at DESC LIMIT ?
+                    """,
+                    (
+                        tenant_id,
+                        user_sub,
+                        client_id,
+                        session_key,
+                        session_key,
+                        max(1, min(limit, 100)),
+                    ),
+                )
+                .fetchall()
+            )
+        return [self._decode_episode_row(row) for row in rows]
+
+    async def upsert_workflow_episode(self, episode: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        row = dict(episode)
+        row.setdefault("episode_id", uuid.uuid4().hex)
+        row.setdefault("created_at", now)
+        row["updated_at"] = str(row.get("updated_at") or now)
+        entity_json = _business_json(row.get("entity_fingerprints", []))
+        judge_json = (
+            _business_json(row["judge_verdict"]) if row.get("judge_verdict") is not None else None
+        )
+        payload_json = _business_json(row.get("payload", {}))
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute(
+                """
+                INSERT INTO workflow_episodes (
+                    episode_id, tenant_id, user_sub, client_id, session_key, upstream_name,
+                    matched_workflow_id, attribution_source, status, completion_tier,
+                    confidence, completion_pct, redacted_intent, entity_fingerprints_json,
+                    created_at, updated_at, expires_at, closed_at, judge_verdict_json, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(episode_id) DO UPDATE SET
+                    upstream_name=excluded.upstream_name,
+                    matched_workflow_id=excluded.matched_workflow_id,
+                    attribution_source=excluded.attribution_source,
+                    status=excluded.status,
+                    completion_tier=excluded.completion_tier,
+                    confidence=excluded.confidence,
+                    completion_pct=excluded.completion_pct,
+                    redacted_intent=excluded.redacted_intent,
+                    entity_fingerprints_json=excluded.entity_fingerprints_json,
+                    updated_at=excluded.updated_at,
+                    expires_at=excluded.expires_at,
+                    closed_at=excluded.closed_at,
+                    judge_verdict_json=excluded.judge_verdict_json,
+                    payload_json=excluded.payload_json
+                """,
+                (
+                    row["episode_id"],
+                    row["tenant_id"],
+                    row["user_sub"],
+                    row["client_id"],
+                    row["session_key"],
+                    row.get("upstream_name"),
+                    row.get("matched_workflow_id"),
+                    row["attribution_source"],
+                    row["status"],
+                    row["completion_tier"],
+                    float(row.get("confidence", 0.0)),
+                    int(row.get("completion_pct", 0)),
+                    row.get("redacted_intent"),
+                    entity_json,
+                    row["created_at"],
+                    row["updated_at"],
+                    row["expires_at"],
+                    row.get("closed_at"),
+                    judge_json,
+                    payload_json,
+                ),
+            )
+            conn.commit()
+            saved = conn.execute(
+                "SELECT * FROM workflow_episodes WHERE episode_id=?",
+                (row["episode_id"],),
+            ).fetchone()
+        return self._decode_episode_row(saved)
+
+    async def append_workflow_episode_call(self, call: dict[str, Any]) -> dict[str, Any]:
+        row = dict(call)
+        row.setdefault("call_id", uuid.uuid4().hex)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        entity_json = _business_json(row.get("entity_fingerprints", []))
+        shape_diff_json = _business_json(row.get("shape_diff", {}))
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute(
+                """
+                INSERT INTO workflow_episode_calls (
+                    call_id, episode_id, tenant_id, run_id, ordinal, upstream_name,
+                    tool_qualified_name, effect, status, sensitive_write_journal_status,
+                    entity_fingerprints_json, shape_diff_json, evidence_matched,
+                    completion_matched, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["call_id"],
+                    row["episode_id"],
+                    row["tenant_id"],
+                    row.get("run_id"),
+                    int(row["ordinal"]),
+                    row["upstream_name"],
+                    row["tool_qualified_name"],
+                    row["effect"],
+                    row["status"],
+                    row.get("sensitive_write_journal_status"),
+                    entity_json,
+                    shape_diff_json,
+                    1 if row.get("evidence_matched") else 0,
+                    1 if row.get("completion_matched") else 0,
+                    row["created_at"],
+                ),
+            )
+            conn.commit()
+            saved = conn.execute(
+                "SELECT * FROM workflow_episode_calls WHERE call_id=?",
+                (row["call_id"],),
+            ).fetchone()
+        return self._decode_episode_call_row(saved)
+
+    async def list_workflow_episode_calls(
+        self, tenant_id: str, episode_id: str
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = (
+                self._ensure_conn()
+                .execute(
+                    """
+                    SELECT * FROM workflow_episode_calls
+                    WHERE tenant_id=? AND episode_id=?
+                    ORDER BY ordinal ASC, created_at ASC
+                    """,
+                    (tenant_id, episode_id),
+                )
+                .fetchall()
+            )
+        return [self._decode_episode_call_row(row) for row in rows]
+
+    async def list_workflow_episodes(
+        self, tenant_id: str, *, status: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = (
+                self._ensure_conn()
+                .execute(
+                    """
+                    SELECT * FROM workflow_episodes
+                    WHERE tenant_id=? AND (? IS NULL OR status=?)
+                    ORDER BY created_at DESC LIMIT ?
+                    """,
+                    (tenant_id, status, status, max(1, min(limit, 1000))),
+                )
+                .fetchall()
+            )
+        return [self._decode_episode_row(row) for row in rows]
+
+    async def get_workflow_episode(self, tenant_id: str, episode_id: str) -> dict[str, Any] | None:
+        async with self._lock:
+            row = (
+                self._ensure_conn()
+                .execute(
+                    "SELECT * FROM workflow_episodes WHERE tenant_id=? AND episode_id=?",
+                    (tenant_id, episode_id),
+                )
+                .fetchone()
+            )
+        return self._decode_episode_row(row) if row is not None else None
+
+    async def claim_open_workflow_episode(
+        self, tenant_id: str, episode_id: str, *, next_status: str, closed_at: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                """
+                UPDATE workflow_episodes
+                SET status=?, closed_at=?, updated_at=?
+                WHERE tenant_id=? AND episode_id=? AND status='open'
+                """,
+                (next_status, closed_at, closed_at, tenant_id, episode_id),
+            )
+            row = (
+                conn.execute(
+                    "SELECT * FROM workflow_episodes WHERE tenant_id=? AND episode_id=?",
+                    (tenant_id, episode_id),
+                ).fetchone()
+                if cur.rowcount
+                else None
+            )
+            conn.commit()
+        return self._decode_episode_row(row) if row is not None else None
+
+    async def list_expired_open_workflow_episodes(
+        self, now_iso: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = (
+                self._ensure_conn()
+                .execute(
+                    """
+                    SELECT * FROM workflow_episodes
+                    WHERE status='open' AND expires_at <= ?
+                    ORDER BY expires_at ASC LIMIT ?
+                    """,
+                    (now_iso, max(1, min(limit, 500))),
+                )
+                .fetchall()
+            )
+        return [self._decode_episode_row(row) for row in rows]
+
+    async def upsert_discovered_workflow_candidate(
+        self, candidate: dict[str, Any]
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        row = dict(candidate)
+        row.setdefault("candidate_id", uuid.uuid4().hex)
+        row.setdefault("created_at", now)
+        row["updated_at"] = str(row.get("updated_at") or now)
+        draft_def = row.get("draft_definition") or {}
+        fingerprint = str(row.get("fingerprint") or "").strip()
+        if not fingerprint and isinstance(draft_def, dict):
+            comp = draft_def.get("completion") or {}
+            if comp.get("tool") and draft_def.get("participating_tools"):
+                fingerprint = compute_workflow_fingerprint(
+                    upstream_name=str(row["upstream_name"]),
+                    participating_tools=draft_def.get("participating_tools") or [],
+                    completion_tool=str(comp.get("tool") or ""),
+                    completion_kind=str(comp.get("kind") or "terminal_tool_result"),
+                )
+        if not fingerprint:
+            fingerprint = str(row["workflow_slug"])
+        incoming_intents = [str(x) for x in (row.get("sample_intents") or []) if x]
+        draft_json = _business_json(draft_def)
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT candidate_id, status, origin, workflow_slug, fingerprint,
+                       observed_count, verified_count, sample_intents_json, draft_definition_json
+                FROM discovered_workflow_candidates
+                WHERE tenant_id=? AND upstream_name=? AND (fingerprint=? OR workflow_slug=?)
+                ORDER BY CASE WHEN fingerprint=? THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+                (
+                    row["tenant_id"],
+                    row["upstream_name"],
+                    fingerprint,
+                    row["workflow_slug"],
+                    fingerprint,
+                ),
+            ).fetchone()
+            if existing is not None:
+                prior_intents = json.loads(existing["sample_intents_json"])
+                merged_intents = list(dict.fromkeys([*prior_intents, *incoming_intents]))[:10]
+                intents_json = _business_json(merged_intents)
+                is_pending = str(existing["status"]) == "pending_review"
+                next_origin = str(row["origin"]) if is_pending else str(existing["origin"])
+                next_fp = fingerprint if is_pending else str(existing["fingerprint"] or fingerprint)
+                next_draft_json = (
+                    draft_json if is_pending else str(existing["draft_definition_json"])
+                )
+                conn.execute(
+                    """
+                    UPDATE discovered_workflow_candidates
+                    SET origin=?,
+                        fingerprint=?,
+                        observed_count=observed_count + ?,
+                        verified_count=verified_count + ?,
+                        sample_intents_json=?,
+                        draft_definition_json=?,
+                        updated_at=?
+                    WHERE candidate_id=?
+                    """,
+                    (
+                        next_origin,
+                        next_fp,
+                        int(row.get("observed_count", 1)),
+                        int(row.get("verified_count", 0)),
+                        intents_json,
+                        next_draft_json,
+                        row["updated_at"],
+                        existing["candidate_id"],
+                    ),
+                )
+                target_id = existing["candidate_id"]
+            else:
+                intents_json = _business_json(list(dict.fromkeys(incoming_intents))[:10])
+                conn.execute(
+                    """
+                    INSERT INTO discovered_workflow_candidates (
+                        candidate_id, tenant_id, upstream_name, workflow_slug, fingerprint,
+                        origin, status, observed_count, verified_count, sample_intents_json,
+                        draft_definition_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["candidate_id"],
+                        row["tenant_id"],
+                        row["upstream_name"],
+                        row["workflow_slug"],
+                        fingerprint,
+                        row["origin"],
+                        row.get("status", "pending_review"),
+                        int(row.get("observed_count", 1)),
+                        int(row.get("verified_count", 0)),
+                        intents_json,
+                        draft_json,
+                        row["created_at"],
+                        row["updated_at"],
+                    ),
+                )
+                target_id = row["candidate_id"]
+            conn.commit()
+            saved = conn.execute(
+                "SELECT * FROM discovered_workflow_candidates WHERE candidate_id=?",
+                (target_id,),
+            ).fetchone()
+        return self._decode_candidate_row(saved)
+
+    async def list_discovered_workflow_candidates(
+        self,
+        tenant_id: str,
+        *,
+        upstream_name: str | None = None,
+        status: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = (
+                self._ensure_conn()
+                .execute(
+                    """
+                    SELECT * FROM discovered_workflow_candidates
+                    WHERE tenant_id=? AND (? IS NULL OR upstream_name=?)
+                      AND (? IS NULL OR status=?)
+                    ORDER BY verified_count DESC, observed_count DESC, updated_at DESC LIMIT ?
+                    """,
+                    (
+                        tenant_id,
+                        upstream_name,
+                        upstream_name,
+                        status,
+                        status,
+                        max(1, min(limit, 1000)),
+                    ),
+                )
+                .fetchall()
+            )
+        return [self._decode_candidate_row(row) for row in rows]
+
+    async def get_discovered_workflow_candidate(
+        self, tenant_id: str, candidate_id: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            row = (
+                self._ensure_conn()
+                .execute(
+                    """
+                    SELECT * FROM discovered_workflow_candidates
+                    WHERE tenant_id=? AND candidate_id=?
+                    """,
+                    (tenant_id, candidate_id),
+                )
+                .fetchone()
+            )
+        return self._decode_candidate_row(row) if row is not None else None
+
+    async def update_discovered_workflow_candidate_status(
+        self, tenant_id: str, candidate_id: str, status: str, updated_at: str
+    ) -> bool:
+        async with self._lock:
+            conn = self._ensure_conn()
+            cur = conn.execute(
+                """
+                UPDATE discovered_workflow_candidates
+                SET status=?, updated_at=?
+                WHERE tenant_id=? AND candidate_id=?
+                """,
+                (status, updated_at, tenant_id, candidate_id),
+            )
+            conn.commit()
+        return bool(cur.rowcount)
+
 
 class PostgresAuditStore:
     """Postgres-backed AuditStore for multi-replica production deployments."""
@@ -4137,3 +4697,385 @@ class PostgresAuditStore:
                 max(1, min(limit, 10000)),
             )
         return [{**dict(row), "evidence": json.loads(row["evidence_json"])} for row in rows]
+
+    @staticmethod
+    def _decode_episode_row(row: Any) -> dict[str, Any]:
+        data = dict(row)
+        data["entity_fingerprints"] = json.loads(data.pop("entity_fingerprints_json"))
+        judge_raw = data.pop("judge_verdict_json", None)
+        data["judge_verdict"] = json.loads(judge_raw) if judge_raw else None
+        data["payload"] = json.loads(data.pop("payload_json"))
+        return data
+
+    @staticmethod
+    def _decode_episode_call_row(row: Any) -> dict[str, Any]:
+        data = dict(row)
+        data["entity_fingerprints"] = json.loads(data.pop("entity_fingerprints_json"))
+        data["shape_diff"] = json.loads(data.pop("shape_diff_json"))
+        return data
+
+    @staticmethod
+    def _decode_candidate_row(row: Any) -> dict[str, Any]:
+        data = dict(row)
+        data["sample_intents"] = json.loads(data.pop("sample_intents_json"))
+        data["draft_definition"] = json.loads(data.pop("draft_definition_json"))
+        if not data.get("fingerprint"):
+            data["fingerprint"] = str(data.get("workflow_slug") or "")
+        return data
+
+    async def list_open_workflow_episodes(
+        self,
+        tenant_id: str,
+        user_sub: str,
+        client_id: str,
+        *,
+        session_key: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM workflow_episodes
+                WHERE tenant_id=$1 AND user_sub=$2 AND client_id=$3 AND status='open'
+                  AND ($4::text IS NULL OR session_key=$4)
+                ORDER BY updated_at DESC LIMIT $5
+                """,
+                tenant_id,
+                user_sub,
+                client_id,
+                session_key,
+                max(1, min(limit, 100)),
+            )
+        return [self._decode_episode_row(row) for row in rows]
+
+    async def upsert_workflow_episode(self, episode: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        row = dict(episode)
+        row.setdefault("episode_id", uuid.uuid4().hex)
+        row.setdefault("created_at", now)
+        row["updated_at"] = str(row.get("updated_at") or now)
+        entity_json = _business_json(row.get("entity_fingerprints", []))
+        judge_json = (
+            _business_json(row["judge_verdict"]) if row.get("judge_verdict") is not None else None
+        )
+        payload_json = _business_json(row.get("payload", {}))
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            saved = await conn.fetchrow(
+                """
+                INSERT INTO workflow_episodes (
+                    episode_id, tenant_id, user_sub, client_id, session_key, upstream_name,
+                    matched_workflow_id, attribution_source, status, completion_tier,
+                    confidence, completion_pct, redacted_intent, entity_fingerprints_json,
+                    created_at, updated_at, expires_at, closed_at, judge_verdict_json, payload_json
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+                ON CONFLICT(episode_id) DO UPDATE SET
+                    upstream_name=EXCLUDED.upstream_name,
+                    matched_workflow_id=EXCLUDED.matched_workflow_id,
+                    attribution_source=EXCLUDED.attribution_source,
+                    status=EXCLUDED.status,
+                    completion_tier=EXCLUDED.completion_tier,
+                    confidence=EXCLUDED.confidence,
+                    completion_pct=EXCLUDED.completion_pct,
+                    redacted_intent=EXCLUDED.redacted_intent,
+                    entity_fingerprints_json=EXCLUDED.entity_fingerprints_json,
+                    updated_at=EXCLUDED.updated_at,
+                    expires_at=EXCLUDED.expires_at,
+                    closed_at=EXCLUDED.closed_at,
+                    judge_verdict_json=EXCLUDED.judge_verdict_json,
+                    payload_json=EXCLUDED.payload_json
+                RETURNING *
+                """,
+                row["episode_id"],
+                row["tenant_id"],
+                row["user_sub"],
+                row["client_id"],
+                row["session_key"],
+                row.get("upstream_name"),
+                row.get("matched_workflow_id"),
+                row["attribution_source"],
+                row["status"],
+                row["completion_tier"],
+                float(row.get("confidence", 0.0)),
+                int(row.get("completion_pct", 0)),
+                row.get("redacted_intent"),
+                entity_json,
+                row["created_at"],
+                row["updated_at"],
+                row["expires_at"],
+                row.get("closed_at"),
+                judge_json,
+                payload_json,
+            )
+        return self._decode_episode_row(saved)
+
+    async def append_workflow_episode_call(self, call: dict[str, Any]) -> dict[str, Any]:
+        row = dict(call)
+        row.setdefault("call_id", uuid.uuid4().hex)
+        row.setdefault("created_at", datetime.now(UTC).isoformat())
+        entity_json = _business_json(row.get("entity_fingerprints", []))
+        shape_diff_json = _business_json(row.get("shape_diff", {}))
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            saved = await conn.fetchrow(
+                """
+                INSERT INTO workflow_episode_calls (
+                    call_id, episode_id, tenant_id, run_id, ordinal, upstream_name,
+                    tool_qualified_name, effect, status, sensitive_write_journal_status,
+                    entity_fingerprints_json, shape_diff_json, evidence_matched,
+                    completion_matched, created_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                RETURNING *
+                """,
+                row["call_id"],
+                row["episode_id"],
+                row["tenant_id"],
+                row.get("run_id"),
+                int(row["ordinal"]),
+                row["upstream_name"],
+                row["tool_qualified_name"],
+                row["effect"],
+                row["status"],
+                row.get("sensitive_write_journal_status"),
+                entity_json,
+                shape_diff_json,
+                bool(row.get("evidence_matched")),
+                bool(row.get("completion_matched")),
+                row["created_at"],
+            )
+        return self._decode_episode_call_row(saved)
+
+    async def list_workflow_episode_calls(
+        self, tenant_id: str, episode_id: str
+    ) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM workflow_episode_calls
+                WHERE tenant_id=$1 AND episode_id=$2
+                ORDER BY ordinal ASC, created_at ASC
+                """,
+                tenant_id,
+                episode_id,
+            )
+        return [self._decode_episode_call_row(row) for row in rows]
+
+    async def list_workflow_episodes(
+        self, tenant_id: str, *, status: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM workflow_episodes
+                WHERE tenant_id=$1 AND ($2::text IS NULL OR status=$2)
+                ORDER BY created_at DESC LIMIT $3
+                """,
+                tenant_id,
+                status,
+                max(1, min(limit, 1000)),
+            )
+        return [self._decode_episode_row(row) for row in rows]
+
+    async def get_workflow_episode(self, tenant_id: str, episode_id: str) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM workflow_episodes WHERE tenant_id=$1 AND episode_id=$2",
+                tenant_id,
+                episode_id,
+            )
+        return self._decode_episode_row(row) if row is not None else None
+
+    async def claim_open_workflow_episode(
+        self, tenant_id: str, episode_id: str, *, next_status: str, closed_at: str
+    ) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE workflow_episodes
+                SET status=$1, closed_at=$2, updated_at=$2
+                WHERE tenant_id=$3 AND episode_id=$4 AND status='open'
+                RETURNING *
+                """,
+                next_status,
+                closed_at,
+                tenant_id,
+                episode_id,
+            )
+        return self._decode_episode_row(row) if row is not None else None
+
+    async def list_expired_open_workflow_episodes(
+        self, now_iso: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM workflow_episodes
+                WHERE status='open' AND expires_at <= $1
+                ORDER BY expires_at ASC LIMIT $2
+                """,
+                now_iso,
+                max(1, min(limit, 500)),
+            )
+        return [self._decode_episode_row(row) for row in rows]
+
+    async def upsert_discovered_workflow_candidate(
+        self, candidate: dict[str, Any]
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        row = dict(candidate)
+        row.setdefault("candidate_id", uuid.uuid4().hex)
+        row.setdefault("created_at", now)
+        row["updated_at"] = str(row.get("updated_at") or now)
+        draft_def = row.get("draft_definition") or {}
+        fingerprint = str(row.get("fingerprint") or "").strip()
+        if not fingerprint and isinstance(draft_def, dict):
+            comp = draft_def.get("completion") or {}
+            if comp.get("tool") and draft_def.get("participating_tools"):
+                fingerprint = compute_workflow_fingerprint(
+                    upstream_name=str(row["upstream_name"]),
+                    participating_tools=draft_def.get("participating_tools") or [],
+                    completion_tool=str(comp.get("tool") or ""),
+                    completion_kind=str(comp.get("kind") or "terminal_tool_result"),
+                )
+        if not fingerprint:
+            fingerprint = str(row["workflow_slug"])
+        incoming_intents = [str(x) for x in (row.get("sample_intents") or []) if x]
+        draft_json = _business_json(draft_def)
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            existing = await conn.fetchrow(
+                """
+                SELECT candidate_id, status, origin, workflow_slug, fingerprint,
+                       sample_intents_json, draft_definition_json
+                FROM discovered_workflow_candidates
+                WHERE tenant_id=$1 AND upstream_name=$2 AND (fingerprint=$3 OR workflow_slug=$4)
+                ORDER BY CASE WHEN fingerprint=$3 THEN 0 ELSE 1 END
+                LIMIT 1
+                FOR UPDATE
+                """,
+                row["tenant_id"],
+                row["upstream_name"],
+                fingerprint,
+                row["workflow_slug"],
+            )
+            if existing is not None:
+                prior_intents = json.loads(existing["sample_intents_json"])
+                merged_intents = list(dict.fromkeys([*prior_intents, *incoming_intents]))[:10]
+                intents_json = _business_json(merged_intents)
+                is_pending = str(existing["status"]) == "pending_review"
+                next_origin = str(row["origin"]) if is_pending else str(existing["origin"])
+                next_fp = fingerprint if is_pending else str(existing["fingerprint"] or fingerprint)
+                next_draft_json = (
+                    draft_json if is_pending else str(existing["draft_definition_json"])
+                )
+                saved = await conn.fetchrow(
+                    """
+                    UPDATE discovered_workflow_candidates
+                    SET origin=$1,
+                        fingerprint=$2,
+                        observed_count=observed_count + $3,
+                        verified_count=verified_count + $4,
+                        sample_intents_json=$5,
+                        draft_definition_json=$6,
+                        updated_at=$7
+                    WHERE candidate_id=$8
+                    RETURNING *
+                    """,
+                    next_origin,
+                    next_fp,
+                    int(row.get("observed_count", 1)),
+                    int(row.get("verified_count", 0)),
+                    intents_json,
+                    next_draft_json,
+                    row["updated_at"],
+                    existing["candidate_id"],
+                )
+            else:
+                intents_json = _business_json(list(dict.fromkeys(incoming_intents))[:10])
+                saved = await conn.fetchrow(
+                    """
+                    INSERT INTO discovered_workflow_candidates (
+                        candidate_id, tenant_id, upstream_name, workflow_slug, fingerprint,
+                        origin, status, observed_count, verified_count, sample_intents_json,
+                        draft_definition_json, created_at, updated_at
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                    RETURNING *
+                    """,
+                    row["candidate_id"],
+                    row["tenant_id"],
+                    row["upstream_name"],
+                    row["workflow_slug"],
+                    fingerprint,
+                    row["origin"],
+                    row.get("status", "pending_review"),
+                    int(row.get("observed_count", 1)),
+                    int(row.get("verified_count", 0)),
+                    intents_json,
+                    draft_json,
+                    row["created_at"],
+                    row["updated_at"],
+                )
+        return self._decode_candidate_row(saved)
+
+    async def list_discovered_workflow_candidates(
+        self,
+        tenant_id: str,
+        *,
+        upstream_name: str | None = None,
+        status: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM discovered_workflow_candidates
+                WHERE tenant_id=$1 AND ($2::text IS NULL OR upstream_name=$2)
+                  AND ($3::text IS NULL OR status=$3)
+                ORDER BY verified_count DESC, observed_count DESC, updated_at DESC LIMIT $4
+                """,
+                tenant_id,
+                upstream_name,
+                status,
+                max(1, min(limit, 1000)),
+            )
+        return [self._decode_candidate_row(row) for row in rows]
+
+    async def get_discovered_workflow_candidate(
+        self, tenant_id: str, candidate_id: str
+    ) -> dict[str, Any] | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM discovered_workflow_candidates
+                WHERE tenant_id=$1 AND candidate_id=$2
+                """,
+                tenant_id,
+                candidate_id,
+            )
+        return self._decode_candidate_row(row) if row is not None else None
+
+    async def update_discovered_workflow_candidate_status(
+        self, tenant_id: str, candidate_id: str, status: str, updated_at: str
+    ) -> bool:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            tag = await conn.execute(
+                """
+                UPDATE discovered_workflow_candidates
+                SET status=$1, updated_at=$2
+                WHERE tenant_id=$3 AND candidate_id=$4
+                """,
+                status,
+                updated_at,
+                tenant_id,
+                candidate_id,
+            )
+        return tag.endswith("1")

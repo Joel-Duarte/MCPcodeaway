@@ -21,7 +21,7 @@ import jwt
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.security import APIKeyHeader
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from jwt.algorithms import RSAAlgorithm
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -95,6 +95,166 @@ class IdempotencyOperationRequest(BaseModel):
     idempotency_key: str
     item_id: str
     simulate_lost_response: bool = False
+
+
+class TicketCreateRequest(BaseModel):
+    subject: str = Field(min_length=3, max_length=160)
+    description: str = Field(min_length=3, max_length=2000)
+    region: str = Field(default="EU", pattern="^(EU|US|APAC|LATAM)$")
+    queue_id: str = Field(default="Q-EU-OPS")
+    priority: str = Field(default="medium", pattern="^(low|medium|high|critical)$")
+    requester_email: str = Field(default="operator@example.test")
+
+
+class TicketUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    priority: str | None = Field(default=None, pattern="^(low|medium|high|critical)$")
+    status: str | None = Field(
+        default=None, pattern="^(open|in_progress|escalated|resolved|closed)$"
+    )
+    queue_id: str | None = None
+    assignee: str | None = None
+
+
+class TicketAssignRequest(BaseModel):
+    assignee: str = Field(min_length=2, max_length=120)
+    team: str = Field(default="tier2_sre")
+
+
+class TicketEscalateRequest(BaseModel):
+    escalation_tier: str = Field(default="tier3_incident")
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class TicketResolveRequest(BaseModel):
+    resolution_summary: str = Field(min_length=3, max_length=1000)
+    root_cause: str = Field(default="configuration_drift")
+
+
+class TicketCloseRequest(BaseModel):
+    closing_note: str = Field(default="Confirmed resolved with requester.")
+    force: bool = False
+
+
+class TicketReopenRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class TicketCommentRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=2000)
+    internal: bool = False
+
+
+class TicketWatcherRequest(BaseModel):
+    watcher_email: str = Field(min_length=3, max_length=160)
+
+
+class TicketTagsRequest(BaseModel):
+    tags: list[str] = Field(min_length=1, max_length=20)
+
+
+class TicketApprovalRequest(BaseModel):
+    approver_group: str = Field(default="operations-approvers")
+    action_summary: str = Field(min_length=3, max_length=500)
+    amount_usd: float = Field(default=0.0, ge=0.0)
+
+
+class TicketQueueRecord(BaseModel):
+    queue_id: str
+    region: str
+    name: str
+    sla_minutes: int
+
+
+class TicketQueueListResponse(BaseModel):
+    count: int
+    queues: list[TicketQueueRecord]
+
+
+class TicketRecord(BaseModel):
+    ticket_id: str
+    subject: str
+    description: str
+    region: str
+    queue_id: str
+    priority: str
+    status: str
+    assignee: str
+    requester_email: str
+    created_by: str | None = None
+    team: str | None = None
+    escalation_tier: str | None = None
+    escalation_reason: str | None = None
+    closing_note: str | None = None
+    reopen_reason: str | None = None
+    tags: list[str]
+    watchers: list[str]
+    sla_minutes_remaining: int
+    sla_breached: bool
+    resolution_summary: str | None = None
+    root_cause: str | None = None
+    version: int
+
+
+class TicketListResponse(BaseModel):
+    count: int
+    tickets: list[TicketRecord]
+
+
+class TicketSearchResponse(BaseModel):
+    query: str
+    count: int
+    tickets: list[TicketRecord]
+
+
+class TicketCommentRecord(BaseModel):
+    comment_id: str
+    ticket_id: str | None = None
+    author: str
+    body: str
+    internal: bool
+
+
+class TicketCommentListResponse(BaseModel):
+    ticket_id: str
+    count: int
+    comments: list[TicketCommentRecord]
+
+
+class TicketSlaResponse(BaseModel):
+    ticket_id: str
+    queue_id: str
+    target_minutes: int
+    sla_minutes_remaining: int
+    sla_breached: bool
+
+
+class TicketWatchersResponse(BaseModel):
+    ticket_id: str
+    watchers: list[str]
+
+
+class TicketTagsResponse(BaseModel):
+    ticket_id: str
+    tags: list[str]
+
+
+class TicketApprovalRecord(BaseModel):
+    approval_id: str
+    ticket_id: str
+    approver_group: str
+    action_summary: str
+    amount_usd: float
+    status: str
+    approved_by: str
+
+
+class TicketingMetricsResponse(BaseModel):
+    total_tickets: int
+    open_tickets: int
+    queues: int
+    by_region: dict[str, int]
 
 
 _READINESS_OIDC_IDENTITIES: dict[str, dict[str, Any]] = {
@@ -475,6 +635,520 @@ def _build_billing_subapp(
         if customer is None:
             raise HTTPException(status_code=404, detail=f"Customer '{customer_id}' not found")
         return CustomerRecord(**customer)
+
+    return subapp
+
+
+def _build_ticketing_subapp(verifier: _DownstreamTokenVerifier) -> FastAPI:
+    """Create a 18-endpoint global ticketing system OpenAPI mock protected by IDP JWTs."""
+    subapp = FastAPI(
+        title="Enterprise Global Ticketing API",
+        version="1.0.0",
+        servers=[{"url": "/ticketing"}],
+    )
+    bearer_scheme = HTTPBearer(auto_error=False)
+    bearer_dep = Security(bearer_scheme)
+    audience = "api://ticketing-system"
+    read_roles = {"ticketing_reader", "ticketing_writer", "ops_engineer", "gateway_admin"}
+    write_roles = {"ticketing_writer", "ops_engineer", "gateway_admin"}
+    approval_roles = {"tool_approver", "ops_engineer", "gateway_admin"}
+
+    queues: dict[str, dict[str, Any]] = {
+        "Q-EU-OPS": {
+            "queue_id": "Q-EU-OPS",
+            "region": "EU",
+            "name": "Europe Cloud Ops",
+            "sla_minutes": 120,
+        },
+        "Q-US-ENT": {
+            "queue_id": "Q-US-ENT",
+            "region": "US",
+            "name": "US Enterprise Support",
+            "sla_minutes": 60,
+        },
+        "Q-APAC-PAY": {
+            "queue_id": "Q-APAC-PAY",
+            "region": "APAC",
+            "name": "APAC Payments Desk",
+            "sla_minutes": 90,
+        },
+        "Q-LATAM-CARE": {
+            "queue_id": "Q-LATAM-CARE",
+            "region": "LATAM",
+            "name": "LATAM Customer Care",
+            "sla_minutes": 180,
+        },
+    }
+    tickets: dict[str, dict[str, Any]] = {
+        "TCK-1001": {
+            "ticket_id": "TCK-1001",
+            "subject": "EU settlement webhook returning 502",
+            "description": "Frankfurt merchant settlement webhook timed out during nightly batch.",
+            "region": "EU",
+            "queue_id": "Q-EU-OPS",
+            "priority": "high",
+            "status": "open",
+            "assignee": "elena.rostova@example.test",
+            "requester_email": "merchant-eu@example.test",
+            "tags": ["webhook", "settlement", "eu"],
+            "watchers": ["noc-eu@example.test"],
+            "sla_minutes_remaining": 48,
+            "sla_breached": False,
+            "resolution_summary": None,
+            "root_cause": None,
+            "version": 1,
+        },
+        "TCK-1002": {
+            "ticket_id": "TCK-1002",
+            "subject": "APAC card token vault latency spike",
+            "description": "Tokyo PoP p95 exceeded 900ms on tokenize endpoint.",
+            "region": "APAC",
+            "queue_id": "Q-APAC-PAY",
+            "priority": "critical",
+            "status": "in_progress",
+            "assignee": "kenji.sato@example.test",
+            "requester_email": "payments-apac@example.test",
+            "tags": ["latency", "vault", "apac"],
+            "watchers": ["sre-apac@example.test"],
+            "sla_minutes_remaining": 15,
+            "sla_breached": False,
+            "resolution_summary": None,
+            "root_cause": None,
+            "version": 2,
+        },
+        "TCK-1003": {
+            "ticket_id": "TCK-1003",
+            "subject": "US enterprise SSO metadata rotation request",
+            "description": "Rotate Okta SAML signing certificate for tenant-acme-us.",
+            "region": "US",
+            "queue_id": "Q-US-ENT",
+            "priority": "medium",
+            "status": "open",
+            "assignee": "unassigned",
+            "requester_email": "iam-us@example.test",
+            "tags": ["sso", "okta", "us"],
+            "watchers": [],
+            "sla_minutes_remaining": 52,
+            "sla_breached": False,
+            "resolution_summary": None,
+            "root_cause": None,
+            "version": 1,
+        },
+        "TCK-1004": {
+            "ticket_id": "TCK-1004",
+            "subject": "LATAM PIX reconciliation file checksum mismatch",
+            "description": "Daily São Paulo settlement CSV checksum did not match manifest.",
+            "region": "LATAM",
+            "queue_id": "Q-LATAM-CARE",
+            "priority": "low",
+            "status": "resolved",
+            "assignee": "sofia.mendes@example.test",
+            "requester_email": "fin-latam@example.test",
+            "tags": ["pix", "reconciliation"],
+            "watchers": [],
+            "sla_minutes_remaining": 140,
+            "sla_breached": False,
+            "resolution_summary": "Regenerated batch manifest after upstream retry.",
+            "root_cause": "partial_upload",
+            "version": 3,
+        },
+    }
+    comments: dict[str, list[dict[str, Any]]] = {
+        "TCK-1001": [
+            {
+                "comment_id": "CMT-1",
+                "author": "merchant-eu@example.test",
+                "body": "Batch retried twice after 02:00 UTC.",
+                "internal": False,
+            }
+        ],
+        "TCK-1002": [
+            {
+                "comment_id": "CMT-2",
+                "author": "kenji.sato@example.test",
+                "body": "Shifting 30% traffic to Osaka replica.",
+                "internal": True,
+            }
+        ],
+    }
+    approvals: dict[str, list[dict[str, Any]]] = {}
+    counter = {"ticket": 1004, "comment": 2, "approval": 0}
+
+    async def _auth(creds: HTTPAuthorizationCredentials | None, roles: set[str]) -> dict[str, Any]:
+        header = f"Bearer {creds.credentials}" if creds else None
+        return await verifier.verify(header, expected_audience=audience, required_roles=roles)
+
+    def _get_or_404(ticket_id: str) -> dict[str, Any]:
+        ticket = tickets.get(ticket_id)
+        if ticket is None:
+            raise HTTPException(status_code=404, detail=f"Ticket '{ticket_id}' not found")
+        return ticket
+
+    @subapp.get(
+        "/queues",
+        operation_id="list_ticketing_queues",
+        response_model=TicketQueueListResponse,
+    )
+    async def list_queues(
+        region: str | None = Query(default=None),
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketQueueListResponse:
+        await _auth(creds, read_roles)
+        items = [
+            TicketQueueRecord(**q) for q in queues.values() if not region or q["region"] == region
+        ]
+        return TicketQueueListResponse(count=len(items), queues=items)
+
+    @subapp.get(
+        "/tickets",
+        operation_id="list_tickets",
+        response_model=TicketListResponse,
+    )
+    async def list_tickets(
+        region: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+        priority: str | None = Query(default=None),
+        queue_id: str | None = Query(default=None),
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketListResponse:
+        await _auth(creds, read_roles)
+        filtered = [
+            TicketRecord(**t)
+            for t in tickets.values()
+            if (not region or t["region"] == region)
+            and (not status or t["status"] == status)
+            and (not priority or t["priority"] == priority)
+            and (not queue_id or t["queue_id"] == queue_id)
+        ]
+        return TicketListResponse(count=len(filtered), tickets=filtered)
+
+    @subapp.get(
+        "/tickets/search",
+        operation_id="search_tickets",
+        response_model=TicketSearchResponse,
+    )
+    async def search_tickets(
+        q: str = Query(min_length=1),
+        region: str | None = Query(default=None),
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketSearchResponse:
+        await _auth(creds, read_roles)
+        needle = q.strip().lower()
+        hits = [
+            TicketRecord(**t)
+            for t in tickets.values()
+            if (not region or t["region"] == region)
+            and (
+                needle in t["subject"].lower()
+                or needle in t["description"].lower()
+                or any(needle in tag.lower() for tag in t["tags"])
+            )
+        ]
+        return TicketSearchResponse(query=q, count=len(hits), tickets=hits)
+
+    @subapp.post(
+        "/tickets",
+        operation_id="create_ticket",
+        response_model=TicketRecord,
+    )
+    async def create_ticket(
+        payload: TicketCreateRequest,
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketRecord:
+        claims = await _auth(creds, write_roles)
+        counter["ticket"] += 1
+        tid = f"TCK-{counter['ticket']}"
+        queue_sla = queues.get(payload.queue_id, {}).get("sla_minutes", 120)
+        record = {
+            "ticket_id": tid,
+            "subject": payload.subject,
+            "description": payload.description,
+            "region": payload.region,
+            "queue_id": payload.queue_id,
+            "priority": payload.priority,
+            "status": "open",
+            "assignee": "unassigned",
+            "requester_email": payload.requester_email,
+            "created_by": claims.get("sub", "operator"),
+            "tags": [payload.region.lower()],
+            "watchers": [],
+            "sla_minutes_remaining": queue_sla,
+            "sla_breached": False,
+            "resolution_summary": None,
+            "root_cause": None,
+            "version": 1,
+        }
+        tickets[tid] = record
+        comments[tid] = []
+        return TicketRecord(**record)
+
+    @subapp.get(
+        "/tickets/{ticket_id}",
+        operation_id="get_ticket",
+        response_model=TicketRecord,
+    )
+    async def get_ticket(
+        ticket_id: str,
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketRecord:
+        await _auth(creds, read_roles)
+        return TicketRecord(**_get_or_404(ticket_id))
+
+    @subapp.patch(
+        "/tickets/{ticket_id}",
+        operation_id="update_ticket",
+        response_model=TicketRecord,
+    )
+    async def update_ticket(
+        ticket_id: str,
+        payload: TicketUpdateRequest,
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketRecord:
+        await _auth(creds, write_roles)
+        ticket = _get_or_404(ticket_id)
+        updates = payload.model_dump(exclude_unset=True)
+        if not updates:
+            raise HTTPException(status_code=422, detail="Provide at least one ticket field")
+        ticket.update(updates)
+        ticket["version"] += 1
+        return TicketRecord(**ticket)
+
+    @subapp.post(
+        "/tickets/{ticket_id}/assign",
+        operation_id="assign_ticket",
+        response_model=TicketRecord,
+    )
+    async def assign_ticket(
+        ticket_id: str,
+        payload: TicketAssignRequest,
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketRecord:
+        await _auth(creds, write_roles)
+        ticket = _get_or_404(ticket_id)
+        ticket["assignee"] = payload.assignee
+        ticket["team"] = payload.team
+        if ticket["status"] == "open":
+            ticket["status"] = "in_progress"
+        ticket["version"] += 1
+        return TicketRecord(**ticket)
+
+    @subapp.post(
+        "/tickets/{ticket_id}/escalate",
+        operation_id="escalate_ticket",
+        response_model=TicketRecord,
+    )
+    async def escalate_ticket(
+        ticket_id: str,
+        payload: TicketEscalateRequest,
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketRecord:
+        await _auth(creds, write_roles)
+        ticket = _get_or_404(ticket_id)
+        ticket["priority"] = "critical"
+        ticket["status"] = "escalated"
+        ticket["escalation_tier"] = payload.escalation_tier
+        ticket["escalation_reason"] = payload.reason
+        ticket["version"] += 1
+        return TicketRecord(**ticket)
+
+    @subapp.post(
+        "/tickets/{ticket_id}/resolve",
+        operation_id="resolve_ticket",
+        response_model=TicketRecord,
+    )
+    async def resolve_ticket(
+        ticket_id: str,
+        payload: TicketResolveRequest,
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketRecord:
+        await _auth(creds, write_roles)
+        ticket = _get_or_404(ticket_id)
+        ticket["status"] = "resolved"
+        ticket["resolution_summary"] = payload.resolution_summary
+        ticket["root_cause"] = payload.root_cause
+        ticket["version"] += 1
+        return TicketRecord(**ticket)
+
+    @subapp.post(
+        "/tickets/{ticket_id}/close",
+        operation_id="close_ticket",
+        response_model=TicketRecord,
+    )
+    async def close_ticket(
+        ticket_id: str,
+        payload: TicketCloseRequest,
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketRecord:
+        await _auth(creds, write_roles)
+        ticket = _get_or_404(ticket_id)
+        if ticket["status"] not in {"resolved", "closed"} and not payload.force:
+            raise HTTPException(
+                status_code=409,
+                detail="Ticket must be resolved before closing unless force=true",
+            )
+        ticket["status"] = "closed"
+        ticket["closing_note"] = payload.closing_note
+        ticket["version"] += 1
+        return TicketRecord(**ticket)
+
+    @subapp.post(
+        "/tickets/{ticket_id}/reopen",
+        operation_id="reopen_ticket",
+        response_model=TicketRecord,
+    )
+    async def reopen_ticket(
+        ticket_id: str,
+        payload: TicketReopenRequest,
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketRecord:
+        await _auth(creds, write_roles)
+        ticket = _get_or_404(ticket_id)
+        ticket["status"] = "open"
+        ticket["reopen_reason"] = payload.reason
+        ticket["version"] += 1
+        return TicketRecord(**ticket)
+
+    @subapp.get(
+        "/tickets/{ticket_id}/comments",
+        operation_id="list_ticket_comments",
+        response_model=TicketCommentListResponse,
+    )
+    async def list_ticket_comments(
+        ticket_id: str,
+        include_internal: bool = Query(default=True),
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketCommentListResponse:
+        await _auth(creds, read_roles)
+        _get_or_404(ticket_id)
+        entries = [
+            TicketCommentRecord(**c)
+            for c in comments.get(ticket_id, [])
+            if include_internal or not c.get("internal", False)
+        ]
+        return TicketCommentListResponse(ticket_id=ticket_id, count=len(entries), comments=entries)
+
+    @subapp.post(
+        "/tickets/{ticket_id}/comments",
+        operation_id="add_ticket_comment",
+        response_model=TicketCommentRecord,
+    )
+    async def add_ticket_comment(
+        ticket_id: str,
+        payload: TicketCommentRequest,
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketCommentRecord:
+        claims = await _auth(creds, write_roles)
+        _get_or_404(ticket_id)
+        counter["comment"] += 1
+        entry = {
+            "comment_id": f"CMT-{counter['comment']}",
+            "ticket_id": ticket_id,
+            "author": claims.get("email") or claims.get("sub", "operator"),
+            "body": payload.body,
+            "internal": payload.internal,
+        }
+        comments.setdefault(ticket_id, []).append(entry)
+        return TicketCommentRecord(**entry)
+
+    @subapp.get(
+        "/tickets/{ticket_id}/sla",
+        operation_id="get_ticket_sla",
+        response_model=TicketSlaResponse,
+    )
+    async def get_ticket_sla(
+        ticket_id: str,
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketSlaResponse:
+        await _auth(creds, read_roles)
+        ticket = _get_or_404(ticket_id)
+        queue = queues.get(ticket["queue_id"], {})
+        return TicketSlaResponse(
+            ticket_id=ticket_id,
+            queue_id=ticket["queue_id"],
+            target_minutes=queue.get("sla_minutes", 120),
+            sla_minutes_remaining=ticket["sla_minutes_remaining"],
+            sla_breached=ticket["sla_breached"],
+        )
+
+    @subapp.post(
+        "/tickets/{ticket_id}/watchers",
+        operation_id="add_ticket_watcher",
+        response_model=TicketWatchersResponse,
+    )
+    async def add_ticket_watcher(
+        ticket_id: str,
+        payload: TicketWatcherRequest,
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketWatchersResponse:
+        await _auth(creds, write_roles)
+        ticket = _get_or_404(ticket_id)
+        if payload.watcher_email not in ticket["watchers"]:
+            ticket["watchers"].append(payload.watcher_email)
+        ticket["version"] += 1
+        return TicketWatchersResponse(ticket_id=ticket_id, watchers=ticket["watchers"])
+
+    @subapp.put(
+        "/tickets/{ticket_id}/tags",
+        operation_id="set_ticket_tags",
+        response_model=TicketTagsResponse,
+    )
+    async def set_ticket_tags(
+        ticket_id: str,
+        payload: TicketTagsRequest,
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketTagsResponse:
+        await _auth(creds, write_roles)
+        ticket = _get_or_404(ticket_id)
+        ticket["tags"] = sorted({tag.strip().lower() for tag in payload.tags if tag.strip()})
+        ticket["version"] += 1
+        return TicketTagsResponse(ticket_id=ticket_id, tags=ticket["tags"])
+
+    @subapp.post(
+        "/tickets/{ticket_id}/approvals",
+        operation_id="request_ticket_approval",
+        response_model=TicketApprovalRecord,
+    )
+    async def request_ticket_approval(
+        ticket_id: str,
+        payload: TicketApprovalRequest,
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketApprovalRecord:
+        claims = await _auth(creds, approval_roles)
+        _get_or_404(ticket_id)
+        counter["approval"] += 1
+        req = {
+            "approval_id": f"APR-{counter['approval']}",
+            "ticket_id": ticket_id,
+            "approver_group": payload.approver_group,
+            "action_summary": payload.action_summary,
+            "amount_usd": payload.amount_usd,
+            "status": "approved",
+            "approved_by": claims.get("sub", "approver"),
+        }
+        approvals.setdefault(ticket_id, []).append(req)
+        return TicketApprovalRecord(**req)
+
+    @subapp.get(
+        "/analytics/summary",
+        operation_id="get_ticketing_metrics",
+        response_model=TicketingMetricsResponse,
+    )
+    async def get_ticketing_metrics(
+        creds: HTTPAuthorizationCredentials | None = bearer_dep,
+    ) -> TicketingMetricsResponse:
+        await _auth(creds, read_roles)
+        by_region: dict[str, int] = {}
+        open_count = 0
+        for t in tickets.values():
+            by_region[t["region"]] = by_region.get(t["region"], 0) + 1
+            if t["status"] in {"open", "in_progress", "escalated"}:
+                open_count += 1
+        return TicketingMetricsResponse(
+            total_tickets=len(tickets),
+            open_tickets=open_count,
+            queues=len(queues),
+            by_region=by_region,
+        )
 
     return subapp
 
@@ -1467,6 +2141,7 @@ def create_mock_backends_app(
             ],
         ),
     )
+    app.mount("/ticketing", _build_ticketing_subapp(verifier=verifier))
 
     mock_oidc_issuer = os.getenv("MOCK_OIDC_ISSUER", "http://127.0.0.1:8001/oidc").rstrip("/")
     mock_oidc_private_key_path = os.getenv("MOCK_OIDC_PRIVATE_KEY_PATH")

@@ -28,5 +28,17 @@
     "single_lookup": {
       "require_ok": true
     }
+  },
+  "workflow_classifier": {
+    "synthetic_heuristic": {
+      "min_accuracy": 1.0,
+      "max_false_credit_rate": 0.0,
+      "max_p95_ms": 25.0
+    },
+    "classifier_service": {
+      "min_accuracy": 1.0,
+      "max_false_credit_rate": 0.0,
+      "max_p95_ms": 25.0
+    }
   }
 }

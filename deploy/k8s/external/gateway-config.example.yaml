@@ -22,3 +22,7 @@ data:
   GATEWAY_ADMIN_OIDC_AUTHORIZATION_ENDPOINT: https://identity.example.invalid/authorize
   GATEWAY_ADMIN_OIDC_API_SCOPE: replace-with-gateway-api-scope
   GATEWAY_TOKEN_EXCHANGE_DIALECT: rfc8693
+  GATEWAY_WORKFLOW_DETECTION_MODE: passive
+  GATEWAY_WORKFLOW_CLASSIFIER_BACKEND: local_http
+  GATEWAY_WORKFLOW_CLASSIFIER_URL: http://workflow-classifier:8003
+  GATEWAY_WORKFLOW_CLASSIFIER_ALLOWED_HOSTS: '["workflow-classifier"]'

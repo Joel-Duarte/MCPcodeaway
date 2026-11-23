@@ -1,0 +1,130 @@
+{
+  "version": "1.0",
+  "episodes": [
+    {
+      "id": "hr_verified_readback_01",
+      "intent": "Update fictional employee profile role to senior_controller and verify",
+      "expected_completed": true,
+      "expected_verdict": "completed_verified",
+      "steps": [
+        {"tool_qualified_name": "hr_directory__list_hr_employees", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "hr_directory__get_hr_employee", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "hr_directory__update_hr_employee", "effect": "write", "status": "succeeded", "sensitive_write_journal_status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "hr_directory__get_hr_employee", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": true, "version_bumped": true, "changed_keys": ["/role", "/version"]}}
+      ]
+    },
+    {
+      "id": "support_verified_ticket_02",
+      "intent": "Look up customer account and orders then create a support ticket",
+      "expected_completed": true,
+      "expected_verdict": "completed_verified",
+      "steps": [
+        {"tool_qualified_name": "support_api__find_customer", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "support_api__get_account", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "support_api__get_order_history", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "support_api__create_ticket", "effect": "write", "status": "succeeded", "sensitive_write_journal_status": "succeeded", "completion_matched": true, "shape_diff": {"readback_verified": false}}
+      ]
+    },
+    {
+      "id": "hr_unverified_write_03",
+      "intent": "Change employee department to engineering",
+      "expected_completed": true,
+      "expected_verdict": "completed_unverified",
+      "steps": [
+        {"tool_qualified_name": "hr_directory__get_hr_employee", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "hr_directory__update_hr_employee", "effect": "write", "status": "succeeded", "sensitive_write_journal_status": "succeeded", "shape_diff": {"readback_verified": false}}
+      ]
+    },
+    {
+      "id": "hr_missing_requested_verify_04",
+      "intent": "Update employee role to director and confirm the updated version",
+      "expected_completed": false,
+      "expected_verdict": "partial_or_incomplete",
+      "steps": [
+        {"tool_qualified_name": "hr_directory__update_hr_employee", "effect": "write", "status": "succeeded", "sensitive_write_journal_status": "succeeded", "shape_diff": {"readback_verified": false}}
+      ]
+    },
+    {
+      "id": "hr_multi_target_partial_05",
+      "intent": "Update all 3 finance employees to senior_controller and verify",
+      "expected_completed": false,
+      "expected_verdict": "partial_or_incomplete",
+      "steps": [
+        {"tool_qualified_name": "hr_directory__list_hr_employees", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "hr_directory__update_hr_employee", "effect": "write", "status": "succeeded", "sensitive_write_journal_status": "succeeded", "shape_diff": {"readback_verified": false}}
+      ]
+    },
+    {
+      "id": "hr_write_failed_abandoned_06",
+      "intent": "Update employee role to staff_engineer",
+      "expected_completed": false,
+      "expected_verdict": "partial_or_incomplete",
+      "steps": [
+        {"tool_qualified_name": "hr_directory__get_hr_employee", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "hr_directory__update_hr_employee", "effect": "write", "status": "failed", "shape_diff": {"readback_verified": false}}
+      ]
+    },
+    {
+      "id": "hr_read_only_when_mutation_wanted_07",
+      "intent": "Update employee email and promote to manager",
+      "expected_completed": false,
+      "expected_verdict": "partial_or_incomplete",
+      "steps": [
+        {"tool_qualified_name": "hr_directory__list_hr_employees", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "hr_directory__get_hr_employee", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}}
+      ]
+    },
+    {
+      "id": "hr_pure_read_query_08",
+      "intent": "Inspect employee profile and list engineering team",
+      "expected_completed": false,
+      "expected_verdict": "read_only",
+      "steps": [
+        {"tool_qualified_name": "hr_directory__list_hr_employees", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "hr_directory__get_hr_employee", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}}
+      ]
+    },
+    {
+      "id": "finance_retry_then_verified_09",
+      "intent": "Post journal entry and verify posted balance",
+      "expected_completed": true,
+      "expected_verdict": "completed_verified",
+      "steps": [
+        {"tool_qualified_name": "ledger__get_account", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "ledger__post_entry", "effect": "write", "status": "failed", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "ledger__post_entry", "effect": "write", "status": "succeeded", "sensitive_write_journal_status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "ledger__get_account", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": true, "changed_keys": ["/balance", "/version"]}}
+      ]
+    },
+    {
+      "id": "inventory_restock_unverified_10",
+      "intent": "Adjust warehouse stock count for SKU-404",
+      "expected_completed": true,
+      "expected_verdict": "completed_unverified",
+      "steps": [
+        {"tool_qualified_name": "inventory__get_sku", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "inventory__adjust_stock", "effect": "write", "status": "succeeded", "sensitive_write_journal_status": "succeeded", "shape_diff": {"readback_verified": false}}
+      ]
+    },
+    {
+      "id": "inventory_abandoned_error_11",
+      "intent": "Check SKU-404 availability",
+      "expected_completed": false,
+      "expected_verdict": "abandoned",
+      "steps": [
+        {"tool_qualified_name": "inventory__get_sku", "effect": "read", "status": "failed", "shape_diff": {"readback_verified": false}}
+      ]
+    },
+    {
+      "id": "support_multi_ticket_verified_12",
+      "intent": "Create 2 support tickets for escalated accounts and confirm",
+      "expected_completed": true,
+      "expected_verdict": "completed_verified",
+      "steps": [
+        {"tool_qualified_name": "support_api__create_ticket", "effect": "write", "status": "succeeded", "sensitive_write_journal_status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "support_api__create_ticket", "effect": "write", "status": "succeeded", "sensitive_write_journal_status": "succeeded", "shape_diff": {"readback_verified": false}},
+        {"tool_qualified_name": "support_api__get_ticket", "effect": "read", "status": "succeeded", "shape_diff": {"readback_verified": true, "changed_keys": ["/status"]}}
+      ]
+    }
+  ]
+}

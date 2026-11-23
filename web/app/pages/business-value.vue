@@ -29,6 +29,12 @@ interface BusinessValueReport {
   executions_truncated: boolean;
   completed_count: number;
   execution_status_counts: Record<string, number>;
+  attribution_mode_counts?: Record<string, number>;
+  episode_summary?: {
+    total: number;
+    status_counts: Record<string, number>;
+    pending_baseline_candidates: number;
+  };
   by_integration_workflow_day: BusinessValueRow[];
   totals_by_currency: Record<string, { completed_count: number; estimated_manual_baseline_minutes: number; validated_manual_baseline_minutes: number; estimated_minutes_saved: number | null }>;
   validated_minutes_saved: number | null;
@@ -104,6 +110,22 @@ onMounted(() => { void loadReport(); });
       <div v-else-if="report && !report.by_integration_workflow_day.length" class="mt-5 rounded-md border border-dashed border-[#D4D4D8] p-5 text-sm text-[#52525B]">No completed outcomes are available in this reporting period. Execution status counts above show the current workflow population.</div>
       <div v-else-if="!reportError" class="mt-5 rounded-md border border-dashed border-[#D4D4D8] p-6 text-center">
         <h3 class="text-sm font-semibold text-[#09090B]">No attributed business outcomes yet</h3><p class="mt-1 text-sm text-[#52525B]">Create a workflow during upstream onboarding, choose its catalog tools and completion evidence, and record a human-time baseline. Eligible completions will appear here.</p>
+      </div>
+    </section>
+
+    <section v-if="report?.episode_summary" aria-labelledby="auto-activity-heading" class="rounded-lg border border-[#E4E4E7] bg-white p-4 sm:p-5">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 id="auto-activity-heading" class="text-[15px] font-semibold text-[#09090B]">Auto-detected workflow activity</h2>
+          <p class="mt-1 text-[13px] text-[#52525B]">Passive workflow episodes are tracked automatically from normal tool calls. Unbaselined discoveries do not receive financial ROI credit until an administrator confirms a manual baseline.</p>
+        </div>
+        <NuxtLink to="/onboarding" class="inline-flex min-h-11 items-center rounded-md border border-[#D4D4D8] bg-white px-3.5 text-sm font-medium text-[#09090B] hover:bg-[#F4F4F5]">Review &amp; confirm baselines</NuxtLink>
+      </div>
+      <div class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div class="rounded-md bg-[#F4F4F5] p-3"><div class="text-xs text-[#52525B]">Passive episodes observed</div><div class="mt-1 text-lg font-semibold tabular-nums text-[#09090B]">{{ number(report.episode_summary.total, 0) }}</div></div>
+        <div class="rounded-md bg-[#F4F4F5] p-3"><div class="text-xs text-[#52525B]">Verified completions</div><div class="mt-1 text-lg font-semibold tabular-nums text-[#09090B]">{{ number(report.episode_summary.status_counts?.completed_verified ?? 0, 0) }}</div></div>
+        <div class="rounded-md bg-[#F4F4F5] p-3"><div class="text-xs text-[#52525B]">Passive-matched credits</div><div class="mt-1 text-lg font-semibold tabular-nums text-[#09090B]">{{ number(report.attribution_mode_counts?.passive_matched ?? 0, 0) }}</div></div>
+        <div class="rounded-md bg-[#F4F4F5] p-3"><div class="text-xs text-[#52525B]">Pending baseline candidates</div><div class="mt-1 text-lg font-semibold tabular-nums text-[#09090B]">{{ number(report.episode_summary.pending_baseline_candidates, 0) }}</div></div>
       </div>
     </section>
 

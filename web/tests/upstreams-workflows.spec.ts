@@ -5,6 +5,7 @@ import { Drawer, DrawerBackdrop, DrawerClose, DrawerContent, DrawerDescription, 
 import { Field, FieldDescription, FieldLabel } from "@ui-sdk/vue/field";
 import { Input } from "@ui-sdk/vue/input";
 import { Select, SelectContent, SelectItem, SelectItemIndicator, SelectTrigger, SelectValue } from "@ui-sdk/vue/select";
+import { Switch, SwitchThumb } from "@ui-sdk/vue/switch";
 import { Textarea } from "@ui-sdk/vue/textarea";
 import { defineComponent, h, nextTick } from "vue";
 import { expect, test, vi } from "vitest";
@@ -26,10 +27,14 @@ const base = {
 };
 const schema = "d".repeat(64);
 const passthrough = defineComponent({ props: ["open"], setup(props, { slots }) { return () => h("div", props.open === false ? [] : slots.default?.()); } });
-function setup({ current = base, canEdit = true }: { current?: any; canEdit?: boolean } = {}) {
+const NuxtLinkStub = defineComponent({ name: "NuxtLink", props: ["to"], render() { return h("a", {}, this.$slots.default?.()); } });
+function setup({ current = base, canEdit = true, autoDiscoveryEnabled = true }: { current?: any; canEdit?: boolean; autoDiscoveryEnabled?: boolean } = {}) {
   let currentDefinition = current;
   const apiFetch = vi.fn(async (path: string, options?: { method?: string; body?: any }) => {
     if (path === "/admin/integration-definitions/support_api") return { current: currentDefinition ? { definition: currentDefinition } : null };
+    if (path === "/admin/upstreams/support_api/auto-discovery" && options?.method === "PATCH") {
+      return { upstream: "support_api", auto_discovery_enabled: Boolean(options.body?.enabled) };
+    }
     if (path.endsWith("/guidance")) return { schema_sha256: schema };
     if (path.endsWith("/validate")) return { valid: true };
     if (path.endsWith("/drafts")) return { revision: 11 };
@@ -39,8 +44,8 @@ function setup({ current = base, canEdit = true }: { current?: any; canEdit?: bo
   vi.stubGlobal("useAdminApi", () => ({ apiFetch }));
   const wrapper = mount(UpstreamWorkflowCatalog, {
     attachTo: document.body,
-    props: { upstream: "support_api", tools: ["support_api__find_customer", "support_api__create_ticket"], canEdit, refreshVersion: 0 },
-    global: { components: { Button, Checkbox, CheckboxIndicator, Drawer, DrawerBackdrop, DrawerClose, DrawerContent, DrawerDescription, DrawerTitle, Field, FieldDescription, FieldLabel, Input, Select, SelectContent, SelectItem, SelectItemIndicator, SelectTrigger, SelectValue, Textarea }, stubs: { Drawer: passthrough, DrawerBackdrop: true, DrawerClose: passthrough, DrawerContent: passthrough, DrawerDescription: passthrough, DrawerTitle: passthrough } },
+    props: { upstream: "support_api", tools: ["support_api__find_customer", "support_api__create_ticket"], canEdit, refreshVersion: 0, autoDiscoveryEnabled },
+    global: { components: { Button, Checkbox, CheckboxIndicator, Drawer, DrawerBackdrop, DrawerClose, DrawerContent, DrawerDescription, DrawerTitle, Field, FieldDescription, FieldLabel, Input, NuxtLink: NuxtLinkStub, Select, SelectContent, SelectItem, SelectItemIndicator, SelectTrigger, SelectValue, Switch, SwitchThumb, Textarea }, stubs: { Drawer: passthrough, DrawerBackdrop: true, DrawerClose: passthrough, DrawerContent: passthrough, DrawerDescription: passthrough, DrawerTitle: passthrough } },
   });
   return { apiFetch, wrapper, setCurrent: (next: typeof current) => { currentDefinition = next; } };
 }
@@ -55,20 +60,33 @@ async function chooseSelect(wrapper: ReturnType<typeof mount>, label: string, ch
   await nextTick();
 }
 
-test("workflow catalog has empty and read-only states and emits global refresh", async () => {
+test("workflow catalog shows empty and read-only states and toggles auto-discovery", async () => {
   const { apiFetch, wrapper, setCurrent } = setup({ canEdit: false });
   await vi.waitFor(() => expect(wrapper.text()).toContain("No workflows are defined"));
   expect(wrapper.text()).toContain("Read-only");
-  expect(wrapper.find("button").text()).toBe("Refresh API tools");
-  expect(wrapper.text()).toContain("every registered upstream");
-  await wrapper.get("button").trigger("click");
-  expect(wrapper.emitted("refresh-catalog")).toHaveLength(1);
+  expect(wrapper.text()).not.toContain("Refresh API tools");
+  expect(wrapper.text()).toContain("Manage & review unconfigured workflows");
   setCurrent({ ...base, workflows: [{ id: "refreshed_flow", name: "Refreshed flow", description: "Visible after reload", participating_tools: [], required_evidence: [], completion: { tool: "tool", success_when: { path: "/ok", type: "boolean", equals: true } }, business_value: { manual_baseline_minutes: 1, baseline_source: "administrator_estimate", confidence: "unvalidated" } }] });
   await wrapper.setProps({ refreshVersion: 1 });
   await vi.waitFor(() => expect(wrapper.text()).toContain("Refreshed flow"));
   expect(apiFetch.mock.calls.filter(([path]) => path === "/admin/integration-definitions/support_api")).toHaveLength(2);
   expect(wrapper.text()).not.toContain("Create workflow");
+  expect(wrapper.text()).not.toContain("Generate Workflows via Prompt");
   wrapper.unmount();
+
+  const editable = setup({ canEdit: true, autoDiscoveryEnabled: true });
+  await vi.waitFor(() => expect(editable.wrapper.text()).toContain("Auto-discover traffic (On)"));
+  expect(editable.wrapper.text()).toContain("Auto-discover workflows");
+  await editable.wrapper.get('[aria-label="Toggle background auto-discovery for support_api"]').trigger("click");
+  await vi.waitFor(() =>
+    expect(editable.apiFetch).toHaveBeenCalledWith(
+      "/admin/upstreams/support_api/auto-discovery",
+      expect.objectContaining({ method: "PATCH", body: { enabled: false } }),
+    ),
+  );
+  await vi.waitFor(() => expect(editable.wrapper.text()).toContain("Auto-discover traffic (Off)"));
+  expect(editable.wrapper.text()).not.toContain("Auto-discover workflows");
+  editable.wrapper.unmount();
 });
 
 test("creating a workflow validates then publishes while preserving unrelated manifest data", async () => {

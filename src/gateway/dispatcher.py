@@ -96,6 +96,13 @@ class OutputRedactor:
         return cls.redact_text_with_count(text)[0]
 
     @classmethod
+    def redact_intent(cls, text: str | None) -> str | None:
+        if not text:
+            return None
+        cleaned = _EMAIL_RE.sub("[REDACTED_EMAIL]", cls.redact_text(text.strip()))
+        return cleaned[:500] or None
+
+    @classmethod
     def redact_with_count(cls, value: Any) -> tuple[Any, int]:
         if isinstance(value, str):
             return cls.redact_text_with_count(value)

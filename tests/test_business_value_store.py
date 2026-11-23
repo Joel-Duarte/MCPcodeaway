@@ -312,7 +312,7 @@ async def test_business_execution_listing_and_completion_projection_are_tenant_s
 
 
 def test_postgres_migration_contract_includes_business_value_constraints() -> None:
-    assert MIGRATIONS[-1].version == 4
+    assert MIGRATIONS[-1].version == 6
     assert {
         "integration_definition_versions",
         "workflow_executions",
@@ -320,6 +320,9 @@ def test_postgres_migration_contract_includes_business_value_constraints() -> No
         "workflow_calls",
         "workflow_execution_events",
         "business_value_events",
+        "workflow_episodes",
+        "workflow_episode_calls",
+        "discovered_workflow_candidates",
     }.issubset(EXPECTED_COLUMNS)
     statements = "\n".join(
         statement for migration in MIGRATIONS for statement in migration.statements

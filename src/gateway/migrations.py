@@ -204,6 +204,71 @@ MIGRATIONS = (
                                    callback_ordinal)""",
         ),
     ),
+    Migration(
+        5,
+        "passive workflow episodes and discovered candidates",
+        (
+            """CREATE TABLE IF NOT EXISTS workflow_episodes (
+                episode_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                user_sub TEXT NOT NULL, client_id TEXT NOT NULL,
+                session_key TEXT NOT NULL, upstream_name TEXT,
+                matched_workflow_id TEXT, attribution_source TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN (
+                    'open','completed_verified','completed_unverified',
+                    'partial_or_incomplete','abandoned','read_only')),
+                completion_tier TEXT NOT NULL,
+                confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                completion_pct INTEGER NOT NULL DEFAULT 0,
+                redacted_intent TEXT,
+                entity_fingerprints_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL, closed_at TEXT,
+                judge_verdict_json TEXT, payload_json TEXT NOT NULL)""",
+            """CREATE INDEX IF NOT EXISTS idx_workflow_episodes_open_lookup
+                ON workflow_episodes (tenant_id, user_sub, client_id, status, expires_at)""",
+            """CREATE INDEX IF NOT EXISTS idx_workflow_episodes_tenant_created
+                ON workflow_episodes (tenant_id, created_at DESC)""",
+            """CREATE TABLE IF NOT EXISTS workflow_episode_calls (
+                call_id TEXT PRIMARY KEY, episode_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL, run_id TEXT,
+                ordinal INTEGER NOT NULL, upstream_name TEXT NOT NULL,
+                tool_qualified_name TEXT NOT NULL, effect TEXT NOT NULL,
+                status TEXT NOT NULL, sensitive_write_journal_status TEXT,
+                entity_fingerprints_json TEXT NOT NULL,
+                shape_diff_json TEXT NOT NULL,
+                evidence_matched BOOLEAN NOT NULL DEFAULT FALSE,
+                completion_matched BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TEXT NOT NULL)""",
+            """CREATE INDEX IF NOT EXISTS idx_workflow_episode_calls_episode
+                ON workflow_episode_calls (tenant_id, episode_id, ordinal)""",
+            """CREATE TABLE IF NOT EXISTS discovered_workflow_candidates (
+                candidate_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                upstream_name TEXT NOT NULL, workflow_slug TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN (
+                    'pending_review','promoted','dismissed')),
+                observed_count INTEGER NOT NULL DEFAULT 1,
+                verified_count INTEGER NOT NULL DEFAULT 0,
+                sample_intents_json TEXT NOT NULL,
+                draft_definition_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_discovered_candidates_slug
+                ON discovered_workflow_candidates (tenant_id, upstream_name, workflow_slug)""",
+        ),
+    ),
+    Migration(
+        6,
+        "canonical workflow candidate fingerprint deduplication",
+        (
+            """ALTER TABLE discovered_workflow_candidates
+                ADD COLUMN IF NOT EXISTS fingerprint TEXT NOT NULL DEFAULT ''""",
+            """UPDATE discovered_workflow_candidates
+                SET fingerprint = COALESCE(NULLIF(fingerprint, ''), workflow_slug)
+                WHERE fingerprint = ''""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_discovered_candidates_fingerprint
+                ON discovered_workflow_candidates (tenant_id, upstream_name, fingerprint)""",
+        ),
+    ),
 )
 
 EXPECTED_COLUMNS: dict[str, set[str]] = {
@@ -366,6 +431,60 @@ EXPECTED_COLUMNS: dict[str, set[str]] = {
         "created_at",
         "evidence_json",
     },
+    "workflow_episodes": {
+        "episode_id",
+        "tenant_id",
+        "user_sub",
+        "client_id",
+        "session_key",
+        "upstream_name",
+        "matched_workflow_id",
+        "attribution_source",
+        "status",
+        "completion_tier",
+        "confidence",
+        "completion_pct",
+        "redacted_intent",
+        "entity_fingerprints_json",
+        "created_at",
+        "updated_at",
+        "expires_at",
+        "closed_at",
+        "judge_verdict_json",
+        "payload_json",
+    },
+    "workflow_episode_calls": {
+        "call_id",
+        "episode_id",
+        "tenant_id",
+        "run_id",
+        "ordinal",
+        "upstream_name",
+        "tool_qualified_name",
+        "effect",
+        "status",
+        "sensitive_write_journal_status",
+        "entity_fingerprints_json",
+        "shape_diff_json",
+        "evidence_matched",
+        "completion_matched",
+        "created_at",
+    },
+    "discovered_workflow_candidates": {
+        "candidate_id",
+        "tenant_id",
+        "upstream_name",
+        "workflow_slug",
+        "fingerprint",
+        "origin",
+        "status",
+        "observed_count",
+        "verified_count",
+        "sample_intents_json",
+        "draft_definition_json",
+        "created_at",
+        "updated_at",
+    },
 }
 
 EXPECTED_INDEXES: dict[str, tuple[str, bool]] = {
@@ -405,6 +524,14 @@ EXPECTED_INDEXES: dict[str, tuple[str, bool]] = {
     "business_value_events_pkey": ("business_value_events", True),
     "idx_business_value_completion": ("business_value_events", True),
     "idx_business_value_outcome_identity": ("business_value_events", True),
+    "workflow_episodes_pkey": ("workflow_episodes", True),
+    "idx_workflow_episodes_open_lookup": ("workflow_episodes", False),
+    "idx_workflow_episodes_tenant_created": ("workflow_episodes", False),
+    "workflow_episode_calls_pkey": ("workflow_episode_calls", True),
+    "idx_workflow_episode_calls_episode": ("workflow_episode_calls", False),
+    "discovered_workflow_candidates_pkey": ("discovered_workflow_candidates", True),
+    "idx_discovered_candidates_slug": ("discovered_workflow_candidates", True),
+    "idx_discovered_candidates_fingerprint": ("discovered_workflow_candidates", True),
 }
 
 

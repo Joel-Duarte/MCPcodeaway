@@ -37,12 +37,16 @@ jobs:
         run: uv sync --extra dev
 
       - name: Execute Golden Dataset E2E flows & benchmark regression tests
-        run: uv run pytest tests/test_golden_flows.py tests/test_benchmark_regression.py -v
+        run: uv run pytest tests/test_golden_flows.py tests/test_auto_workflow_golden.py tests/test_business_value_hr_directory_golden.py tests/test_demo_traffic.py tests/test_benchmark_regression.py -v
 
       - name: Run locked offline benchmark threshold verification
         run: |
           uv run python benchmarks/run_benchmark.py \
             --output "${{ runner.temp }}/qa_benchmark_results.json" \
+            --verify-thresholds | tee -a "$GITHUB_STEP_SUMMARY"
+          uv run python benchmarks/benchmark_workflow_classifier.py \
+            --backends synthetic_heuristic,classifier_service \
+            --output "${{ runner.temp }}/qa_classifier_benchmark_results.json" \
             --verify-thresholds | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload QA benchmark report

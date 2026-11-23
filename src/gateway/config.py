@@ -239,6 +239,7 @@ class UpstreamConfig(BaseModel):
     request_timeout_seconds: float = Field(default=15.0, ge=0.2, le=120.0)
     max_requests_per_minute: int | None = Field(default=120, ge=1, le=100_000)
     max_concurrent_calls: int | None = Field(default=10, ge=1, le=10_000)
+    auto_discovery_enabled: bool = True
     enabled: bool = True
     demo_only: bool = False
 
@@ -375,6 +376,19 @@ class GatewaySettings(BaseSettings):
     require_tool_grounding: bool = False
     provenance_signing_secret: str = ""
     redis_url: str | None = None
+
+    workflow_detection_mode: Literal["off", "passive"] = "passive"
+    workflow_episode_idle_ttl_seconds: int = Field(default=1800, ge=30, le=86400)
+    workflow_rework_window_seconds: int = Field(default=300, ge=0, le=3600)
+    workflow_classifier_backend: Literal[
+        "none", "synthetic_heuristic", "local_http", "openai_compatible"
+    ] = "synthetic_heuristic"
+    workflow_classifier_url: str | None = None
+    workflow_classifier_secret: str = ""
+    workflow_classifier_model: str | None = None
+    workflow_classifier_timeout_seconds: float = Field(default=5.0, ge=0.5, le=30.0)
+    workflow_classifier_allowed_hosts: list[str] = Field(default_factory=list)
+    workflow_judge_confidence_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
 
     discovery_backend: DiscoveryBackendMode = "bm25"
 
@@ -516,6 +530,11 @@ class GatewaySettings(BaseSettings):
         return [s.strip() for s in self.sandbox_worker_secret.split(",") if s.strip()]
 
     @property
+    def workflow_classifier_secrets(self) -> list[str]:
+        """Parse active + previous workflow classifier secrets for zero-downtime key rotation."""
+        return [s.strip() for s in self.workflow_classifier_secret.split(",") if s.strip()]
+
+    @property
     def provenance_signing_secrets(self) -> list[str]:
         """Parse active + previous HMAC provenance keys for zero-downtime rotation."""
         keys = [s.strip() for s in self.provenance_signing_secret.split(",") if s.strip()]
@@ -615,6 +634,21 @@ class GatewaySettings(BaseSettings):
                     )
                 except ValueError as exc:
                     raise ValueError(f"Unsafe production setting '{setting_name}': {exc}") from exc
+        if (
+            self.workflow_classifier_backend in {"local_http", "openai_compatible"}
+            and self.workflow_classifier_url
+        ):
+            try:
+                validate_upstream_url(
+                    self.workflow_classifier_url,
+                    app_env=self.app_env,
+                    block_private_ips_in_prod=self.block_private_ips_in_prod,
+                    allowed_hosts=self.workflow_classifier_allowed_hosts,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unsafe production setting 'workflow_classifier_url': {exc}"
+                ) from exc
         known_weak = {
             "dev-sandbox-worker-secret",
             "dev-provenance-secret",
@@ -628,6 +662,8 @@ class GatewaySettings(BaseSettings):
         }
         if self.sandbox_backend == "remote":
             secrets_to_check["sandbox_worker_secret"] = self.sandbox_worker_secret
+        if self.workflow_classifier_backend == "local_http":
+            secrets_to_check["workflow_classifier_secret"] = self.workflow_classifier_secret
         errors: list[str] = []
         for name, raw_value in secrets_to_check.items():
             values = [value.strip() for value in raw_value.split(",") if value.strip()]
