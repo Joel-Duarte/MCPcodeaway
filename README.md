@@ -13,7 +13,7 @@
 
 <p align="center">
   <a href="#quickstart"><img src="https://img.shields.io/badge/quickstart-60s-0F766E?style=flat-square" alt="Quickstart"></a>
-  <a href="#benchmarks--efficiency"><img src="https://img.shields.io/badge/token_reduction-46.4%25-059669?style=flat-square" alt="Token Reduction"></a>
+  <a href="BENCHMARKS.md"><img src="https://img.shields.io/badge/bulk_pilot--46.4%25_tokens-059669?style=flat-square" alt="Bulk Pilot Token Reduction"></a>
   <img src="https://img.shields.io/badge/python-3.12%20%7C%203.13-blue?style=flat-square" alt="Python 3.12+">
   <img src="https://img.shields.io/badge/mcp_protocol-2026--07--28-orange?style=flat-square" alt="MCP 2026-07-28">
   <img src="https://img.shields.io/badge/frontend-Nuxt_4_%2B_Vue_3.5-teal?style=flat-square" alt="Nuxt 4">
@@ -32,11 +32,29 @@ MCPcodeaway solves this with **server-side Code Mode**:
 1. It injects typed Python stubs into an ephemeral, networkless **Monty (`pydantic-monty`)** sandbox.
 2. The model writes a Python script that joins, filters, and aggregates data server-side in a single execution turn.
 3. Callbacks to upstream tools remain strictly mediated and authorized by the host gateway.
-4. The client receives a clean, grounded summary — reducing token usage by **46%+** and cutting latency in half.
+4. The client receives a clean, grounded summary — cutting reported tokens by **46.4%** (`47,272` vs. `88,179`), wall time by **26.6%** (`12.7s` vs. `17.3s`), and gateway round-trips from `6` to `1` in our [Bulk Reconciliation paired test](BENCHMARKS.md#paired-pilot-results), while Adaptive Routing keeps simple single-call lookups on Classic MCP.
+
+<p align="center">
+  <img src="docs/images/codemode-vs-classic.png" alt="Classic MCP turn-by-turn tool calls vs. MCPcodeaway server-side Code Mode in Monty sandbox" width="820">
+</p>
 
 ---
 
 ## Architecture
+
+<p align="center">
+  <img src="docs/images/architecture.png" alt="MCPcodeaway Request Lifecycle and Zero-Trust Architecture" width="840">
+</p>
+
+Every request on `POST /mcp` is stateless and passes through five enforced stages before reaching an upstream service or returning data to the caller:
+
+1. **OIDC & Policy Boundary:** `OidcTokenValidator` verifies RS256 JWKS signatures and tenant allowlists; `PolicyEvaluator` enforces role/group RBAC and pre-call ABAC argument constraints.
+2. **Adaptive Route Engine:** Resolves `auto`, `codemode`, `classic`, or `hybrid` execution alongside `upfront`, `deferred` (BM25), or `intent` (`X-Intent`) tool discovery.
+3. **Dual Execution Lanes:** Single lookups and gated writes (`input_required`) run via Classic JSON-RPC; multi-step workflows run inside networkless remote `sandbox-worker` pods (`pydantic-monty`) with typed Python stubs.
+4. **Host Dispatcher & Post-Call Governance:** Upstream `host_call()` requests pass RFC 8693 / Entra ID OBO token exchange and SSRF guards, then responses undergo post-call ABAC row filtering, PII/secret redaction (`OutputRedactor`), and HMAC-SHA256 provenance grounding checks.
+
+<details>
+<summary>Text-only ASCII architecture diagram</summary>
 
 ```
                   Client / Agent Harness (Copilot Studio, Claude, Cursor)
@@ -80,6 +98,8 @@ MCPcodeaway solves this with **server-side Code Mode**:
        └────────────────────────┘                    └────────────────────────┘
 ```
 
+</details>
+
 ---
 
 ## Key Features
@@ -95,6 +115,19 @@ MCPcodeaway solves this with **server-side Code Mode**:
 - **Requester Confirmation Gates:** Sensitive mutating tools pause execution and elicit caller confirmation via native MCP `input_required` protocol messages before dispatching upstream.
 - **Stateless & Sessionless MCP (`2026-07-28`):** Adheres strictly to the modern sessionless MCP specification. Requests are self-contained and independently authorized across load-balanced replicas.
 - **Operate Control Plane (`/dashboard`):** Fully responsive Nuxt 4 + `@ui-sdk/vue` web console with real-time WebSocket telemetry, multi-worker Monty sandbox health cards, unified `Workflows & ROI` governance (`/workflows`), gateway reporting currency & regional labor rate configuration (`/settings`), request traces (`/traces`), usage analytics (`/analytics`), model A/B testing (`/model-performance`), and in-page workflow/prompt drawers across upstreams and MCP Apps (`/upstreams`, `/mcp-ui`).
+
+---
+
+## Operate Control Plane (`/dashboard`)
+
+Embedded **Nuxt 4** admin console captured live against the running demo stack (`docker compose up --build`). Click any thumbnail to open the full-resolution view.
+
+| Runtime, Telemetry & Traces | Execution, Governance & Apps |
+| :---: | :---: |
+| <a href="docs/images/ui-overview-runtime.png"><img src="docs/images/ui-overview-runtime.png" alt="Overview & Live Runtime" width="420"></a><br><sub>**Overview & Live Runtime** — Token/time savings, alert rules & live WebSocket feed</sub> | <a href="docs/images/ui-compute-telemetry.png"><img src="docs/images/ui-compute-telemetry.png" alt="Multi-Worker Monty Telemetry" width="420"></a><br><sub>**Multi-Worker Telemetry** — Gateway replica, remote `sandbox-worker` pods & mode split</sub> |
+| <a href="docs/images/ui-audit-waterfall.png"><img src="docs/images/ui-audit-waterfall.png" alt="Code Mode Audit & Latency Waterfall" width="420"></a><br><sub>**Audit & Latency Waterfall** — Per-stage ms breakdown, Monty spawn (`0.13 ms`) & HMAC grounding</sub> | <a href="docs/images/ui-traces-timeline.png"><img src="docs/images/ui-traces-timeline.png" alt="Traces & Per-Group Latency" width="420"></a><br><sub>**Traces & Latency Timeline** — `p50/p95` sandbox timing & time spent by caller group</sub> |
+| <a href="docs/images/ui-gateway-usage.png"><img src="docs/images/ui-gateway-usage.png" alt="Gateway Usage & Cost Attribution" width="420"></a><br><sub>**Gateway Usage & Cost** — Per-group Code Mode share, token reduction & spend estimates</sub> | <a href="docs/images/ui-workflows-roi.png"><img src="docs/images/ui-workflows-roi.png" alt="Workflows & ROI" width="420"></a><br><sub>**Workflows & ROI** — Validated time baselines, tool chains & regional labor value</sub> |
+| <a href="docs/images/ui-model-performance.png"><img src="docs/images/ui-model-performance.png" alt="Model Performance & Adaptive Routing" width="420"></a><br><sub>**Model Performance** — Paired Classic vs. Code Mode deltas powering Adaptive Routing</sub> | <a href="docs/images/ui-mcp-apps.png"><img src="docs/images/ui-mcp-apps.png" alt="Interactive MCP Apps UI" width="420"></a><br><sub>**Interactive MCP Apps (`ui://`)** — Declarative UI views & live simulated host preview</sub> |
 
 ---
 
@@ -193,15 +226,16 @@ upstreams:
 
 ## Benchmarks & Efficiency
 
-In paired benchmarks comparing Classic MCP against Code Mode on enterprise workflows:
+All figures below come from **paired test runs** against deterministic mock Snowflake and EU/US billing services (not universal production averages across all workloads). On multi-step bulk joins, Code Mode eliminates repeated round-trips; on simple single-tool lookups or smaller models, Classic MCP can use fewer tokens — which is why Adaptive Routing evaluates each model × workload pair empirically:
 
-| Model & Workload | Classic MCP | Code Mode | Token Savings | Gateway Calls |
-| :--- | ---: | ---: | ---: | :---: |
-| **GPT-6 Luna (Low)** — Bulk 200 Reconciliation | 88,179 tokens | **47,272 tokens** | **46.4% reduction** | 1 vs 6 |
-| **GPT-6 Luna (Low)** — Standard Reconciliation | 49,374 tokens (17.3s) | 64,937 tokens (**11.1s**) | Faster execution | 1 vs 3 |
-| **Local Qwen3.5 9B** — Single Lookup | **2,287 tokens** (5/5 verified) | 3,160 tokens (5/5 verified) | Classic preferred | 1 vs 1 |
+| Model & Mock Workload | Classic MCP | Code Mode | Measured Outcome | Gateway Calls |
+| :--- | ---: | ---: | :--- | :---: |
+| **GPT-6 Luna (Low)** — Bulk Reconciliation (`reconcile_bulk_200`) | 88,179 tokens (17.3s) | **47,272 tokens (12.7s)** | **46.4% fewer tokens**, 26.6% faster | 1 vs 6 |
+| **GPT-6 Luna (Low)** — Standard Reconciliation | **49,374 tokens** (17.3s) | 64,937 tokens (**11.1s**) | **35.8% faster** (`11.1s`), +31.5% tokens | 1 vs 3 |
+| **Local Qwen3.5 9B** — Single Lookup | **2,287 tokens** (5/5 verified) | 3,160 tokens (5/5 verified) | **Classic uses 27.6% fewer tokens** | 1 vs 1 |
 
-> See [BENCHMARKS.md](BENCHMARKS.md) for full benchmark methodology, token accounting, and Cloudflare enterprise portal comparisons.
+- **Schema-only catalog scaling ([`benchmarks/run_benchmark.py`](benchmarks/run_benchmark.py)):** Exposing a constant 3-tool Code Mode surface (`<600` tokens) cuts upfront tool-definition bloat by **98.5%+** at 500 synthetic tools compared to Classic `tools/list`.
+- **Full details & methodology:** See [BENCHMARKS.md](BENCHMARKS.md) for cached-input accounting, 1.5B/4B/9B Qwen runs, BM25 discovery latency up to 10,010 tools, and Cloudflare portal comparisons, plus the **Model Performance** preview in the [Operate Control Plane](#operate-control-plane-dashboard) gallery above.
 
 ---
 
