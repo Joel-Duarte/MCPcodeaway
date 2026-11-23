@@ -24,9 +24,11 @@ updates:
       frontend-tooling:
         patterns:
           - "nuxt*"
+          - "@nuxt/*"
           - "vite*"
           - "@vitejs/*"
           - "@ui-sdk/*"
+          - "@playwright/*"
           - "esbuild"
 
   - package-ecosystem: "pip"

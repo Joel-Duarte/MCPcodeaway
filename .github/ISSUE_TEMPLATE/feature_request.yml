@@ -1,0 +1,29 @@
+name: Feature Request
+description: Propose a new capability, upstream adapter, or control-plane enhancement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What workflow, enterprise integration, or operational bottleneck does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: Describe the behavior, API/CLI surface, or UI changes you envision.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any workarounds or alternative designs you evaluated.
+  - type: textarea
+    id: security
+    attributes:
+      label: Security & Governance Considerations
+      description: Does this affect auth/OBO delegation, ABAC, SSRF boundaries, sandbox isolation, or audit redaction?

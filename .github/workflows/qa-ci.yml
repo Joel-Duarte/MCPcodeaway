@@ -26,15 +26,15 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.13"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --frozen --extra dev
 
       - name: Execute Golden Dataset E2E flows & benchmark regression tests
         run: uv run pytest tests/test_golden_flows.py tests/test_auto_workflow_golden.py tests/test_business_value_hr_directory_golden.py tests/test_demo_traffic.py tests/test_benchmark_regression.py -v
@@ -54,5 +54,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: qa-benchmark-results-${{ github.run_id }}
-          path: ${{ runner.temp }}/qa_benchmark_results.json
+          path: |
+            ${{ runner.temp }}/qa_benchmark_results.json
+            ${{ runner.temp }}/qa_classifier_benchmark_results.json
           retention-days: 14

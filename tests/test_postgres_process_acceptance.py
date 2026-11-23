@@ -13,13 +13,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-import asyncpg
 import pytest
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from gateway.state import PostgresAuditStore
+
+asyncpg = pytest.importorskip("asyncpg")
 
 pytestmark = [
     pytest.mark.integration,

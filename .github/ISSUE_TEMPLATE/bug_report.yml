@@ -1,0 +1,48 @@
+name: Bug Report
+description: Report a reproducible bug in MCPcodeaway Gateway or Admin Console
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug! For security vulnerabilities, please use [GitHub Security Advisories](https://github.com/Joel-Duarte/MCPcodeaway/security/advisories/new) instead of a public issue.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Clear and concise summary of what went wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps, request payloads, or configuration needed to reproduce.
+      placeholder: |
+        1. Start gateway with ...
+        2. Send MCP request to ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version, deployment mode (local / Docker / K8s), profile, OS.
+      placeholder: |
+        - Python: 3.13
+        - Profile: demo / staging / production
+        - Sandbox backend: local / remote
+        - State store: sqlite / postgres
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs or Error Output
+      render: text

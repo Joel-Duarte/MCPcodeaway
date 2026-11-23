@@ -53,36 +53,44 @@ jobs:
         run: npm run generate
 
       - name: Set up Python & uv for gateway SPA asset, Playwright E2E & Bombadil smoke
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d
 
       - name: Install backend & Playwright Chromium
         run: |
-          uv sync --extra dev
+          uv sync --frozen --extra dev
           cd web && npx playwright install --with-deps chromium
 
       - name: Verify gateway serves /dashboard/ and all compiled _nuxt assets
         run: |
           uv run python - <<'PY'
-          import asyncio, re, httpx
+          import asyncio, re, tempfile, httpx
+          from pathlib import Path
           from gateway.config import GatewaySettings
           from gateway.server import create_gateway_app
 
           async def main():
-              app = create_gateway_app(settings=GatewaySettings(profile="demo", require_admin_auth=True, sqlite_path=":memory:"))
-              rt = app.state.runtime
-              await rt.startup()
-              try:
-                  async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gw") as c:
-                      r = await c.get("/dashboard/")
-                      assert r.status_code == 200
-                      assets = sorted(set(re.findall(r'/dashboard/_nuxt/[^"]+', r.text)))
-                      assert any(a.endswith(".css") for a in assets)
-                      assert any(a.endswith(".js") for a in assets)
-                      for a in assets:
-                          ar = await c.get(a)
-                          assert ar.status_code == 200, (a, ar.status_code)
-              finally:
-                  await rt.shutdown()
+              with tempfile.TemporaryDirectory() as tmpdir:
+                  app = create_gateway_app(
+                      settings=GatewaySettings(
+                          profile="demo",
+                          require_admin_auth=True,
+                          sqlite_path=str(Path(tmpdir) / "spa_smoke.db"),
+                      )
+                  )
+                  rt = app.state.runtime
+                  await rt.startup()
+                  try:
+                      async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gw") as c:
+                          r = await c.get("/dashboard/")
+                          assert r.status_code == 200
+                          assets = sorted(set(re.findall(r'/dashboard/_nuxt/[^"]+', r.text)))
+                          assert any(a.endswith(".css") for a in assets)
+                          assert any(a.endswith(".js") for a in assets)
+                          for a in assets:
+                              ar = await c.get(a)
+                              assert ar.status_code == 200, (a, ar.status_code)
+                  finally:
+                      await rt.shutdown()
 
           asyncio.run(main())
           PY
@@ -91,19 +99,33 @@ jobs:
         run: |
           nohup uv run uvicorn examples.mock_backends:app --host 127.0.0.1 --port 8001 >/tmp/ci_mock.log 2>&1 &
           echo "MOCK_PID=$!" >> "$GITHUB_ENV"
-          GATEWAY_PROFILE=demo GATEWAY_SQLITE_PATH=/tmp/ci_ui.db nohup uv run uvicorn gateway.server:app --host 127.0.0.1 --port 8000 >/tmp/ci_gw.log 2>&1 &
-          echo "GW_PID=$!" >> "$GITHUB_ENV"
-          for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:8000/health | grep -q '"startup_warnings":\[\]' && break
+          for i in $(seq 1 40); do
+            curl -sf http://127.0.0.1:8001/health >/dev/null && break
             sleep 0.25
           done
+          if ! curl -sf http://127.0.0.1:8001/health >/dev/null; then
+            cat /tmp/ci_mock.log || true
+            exit 1
+          fi
+
+          GATEWAY_PROFILE=demo GATEWAY_SQLITE_PATH=/tmp/ci_ui.db nohup uv run uvicorn gateway.server:app --host 127.0.0.1 --port 8000 >/tmp/ci_gw.log 2>&1 &
+          echo "GW_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8000/health | grep -q '"startup_warnings":\[\]' && break
+            sleep 0.5
+          done
+          if ! curl -sf http://127.0.0.1:8000/health | grep -q '"startup_warnings":\[\]'; then
+            curl -s http://127.0.0.1:8000/health || true
+            cat /tmp/ci_gw.log || true
+            exit 1
+          fi
 
       - name: Run Playwright E2E tests against live gateway
         working-directory: web
         run: npm run test:e2e
 
       - name: Run Antithesis Bombadil UI fuzzer
-        uses: antithesishq/bombadil-action@v2
+        uses: antithesishq/bombadil-action@d4f3fa478dfd54605f544d2c0d5f0fcfdeeec893
         with:
           driver: browser
           origin: http://127.0.0.1:8000/dashboard/

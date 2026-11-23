@@ -11,10 +11,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-import asyncpg
 import pytest
 
 from gateway.state import PostgresAuditStore
+
+asyncpg = pytest.importorskip("asyncpg")
 
 pytestmark = [pytest.mark.integration, pytest.mark.postgres]
 

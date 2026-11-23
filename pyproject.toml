@@ -6,7 +6,32 @@ build-backend = "hatchling.build"
 name = "mcpcodeaway"
 version = "0.1.0"
 description = "Vendor-agnostic Code-Mode Universal MCP Gateway with OIDC/RFC 8693 delegation and Monty sandboxing"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Joel Duarte" }]
 requires-python = ">=3.12"
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "gateway",
+    "codemode",
+    "oidc",
+    "zero-trust",
+    "openapi",
+    "fastapi",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
@@ -37,6 +62,12 @@ dev = [
 
 [project.scripts]
 gateway = "gateway.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Joel-Duarte/MCPcodeaway"
+Repository = "https://github.com/Joel-Duarte/MCPcodeaway"
+Issues = "https://github.com/Joel-Duarte/MCPcodeaway/issues"
+Documentation = "https://github.com/Joel-Duarte/MCPcodeaway/tree/main/docs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gateway"]

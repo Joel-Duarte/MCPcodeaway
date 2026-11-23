@@ -5,12 +5,19 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/Joel-Duarte/MCPcodeaway/actions/workflows/backend-ci.yml"><img src="https://github.com/Joel-Duarte/MCPcodeaway/actions/workflows/backend-ci.yml/badge.svg" alt="Backend CI"></a>
+  <a href="https://github.com/Joel-Duarte/MCPcodeaway/actions/workflows/frontend-ci.yml"><img src="https://github.com/Joel-Duarte/MCPcodeaway/actions/workflows/frontend-ci.yml/badge.svg" alt="Frontend CI"></a>
+  <a href="https://github.com/Joel-Duarte/MCPcodeaway/actions/workflows/qa-ci.yml"><img src="https://github.com/Joel-Duarte/MCPcodeaway/actions/workflows/qa-ci.yml/badge.svg" alt="QA & Benchmarks CI"></a>
+  <a href="https://github.com/Joel-Duarte/MCPcodeaway/actions/workflows/security-ci.yml"><img src="https://github.com/Joel-Duarte/MCPcodeaway/actions/workflows/security-ci.yml/badge.svg" alt="Security CI"></a>
+</p>
+
+<p align="center">
   <a href="#quickstart"><img src="https://img.shields.io/badge/quickstart-60s-0F766E?style=flat-square" alt="Quickstart"></a>
-  <a href="#benchmarks"><img src="https://img.shields.io/badge/token_reduction-46.4%25-059669?style=flat-square" alt="Token Reduction"></a>
+  <a href="#benchmarks--efficiency"><img src="https://img.shields.io/badge/token_reduction-46.4%25-059669?style=flat-square" alt="Token Reduction"></a>
   <img src="https://img.shields.io/badge/python-3.12%20%7C%203.13-blue?style=flat-square" alt="Python 3.12+">
   <img src="https://img.shields.io/badge/mcp_protocol-2026--07--28-orange?style=flat-square" alt="MCP 2026-07-28">
   <img src="https://img.shields.io/badge/frontend-Nuxt_4_%2B_Vue_3.5-teal?style=flat-square" alt="Nuxt 4">
-  <img src="https://img.shields.io/badge/license-MIT-zinc?style=flat-square" alt="License">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-zinc?style=flat-square" alt="MIT License"></a>
 </p>
 
 ---
@@ -104,24 +111,43 @@ Callers can configure execution and discovery strategies independently via query
 
 ---
 
-## Quickstart (Zero External Dependencies)
+## Quickstart
 
-Get up and running locally in under 60 seconds with Python 3.12+ and `uv`:
+### Option A: Docker Compose (Recommended)
+
+Run the full demo stack (gateway, isolated `sandbox-worker` replicas, mock enterprise backends, and pre-built Nuxt 4 control plane) in one command:
 
 ```bash
-# 1. Clone and install dependencies
-git clone https://github.com/your-org/MCPcodeaway.git
+git clone https://github.com/Joel-Duarte/MCPcodeaway.git
 cd MCPcodeaway
-uv sync --extra dev
+docker compose up --build
+```
+
+### Option B: Local Development (`uv` + Node.js 22+)
+
+Get up and running locally with Python 3.12+, [`uv`](https://docs.astral.sh/uv/), and Node.js 22+:
+
+```bash
+# 1. Clone and install backend + frontend dependencies
+git clone https://github.com/Joel-Duarte/MCPcodeaway.git
+cd MCPcodeaway
+uv sync --extra dev --extra postgres
+(cd web && npm ci && npm run generate)
 
 # 2. Start mock enterprise backends (Snowflake MCP, Billing OpenAPI, Ticketing MCP)
 uv run uvicorn examples.mock_backends:app --port 8001 &
 
-# 3. Start the MCPcodeaway gateway
-uv run uvicorn gateway.server:app --port 8000
+# 3. Start the MCPcodeaway gateway in demo profile
+GATEWAY_PROFILE=demo uv run uvicorn gateway.server:app --port 8000
 ```
 
 Open **`http://127.0.0.1:8000/dashboard`** in your browser to access the control plane, inspect registered upstreams, and test live tool executions.
+
+You can also use the `gateway` CLI to inspect/onboard upstreams or run Classic vs. Code Mode comparisons:
+
+```bash
+uv run gateway compare --scenario reconcile_overdue
+```
 
 ---
 
@@ -232,3 +258,11 @@ Run the local verification suite:
 | [Approval Gate Proposal](docs/approval-gate-enhancements.md) | Requester confirmation design, protocol elicitation, and safety boundaries. |
 | [Local Integration Testing](docs/local-integration-testing.md) | Running local integration and disposable PostgreSQL acceptance suites. |
 | [Architecture Decision Records](docs/adr/) | 14 architectural decisions documenting core gateway invariants. |
+
+---
+
+## Contributing, Security & License
+
+- **Contributing:** See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, coding standards, and pre-CI verification, and adhere to our [Code of Conduct](CODE_OF_CONDUCT.md).
+- **Security:** Please report vulnerabilities privately via [GitHub Security Advisories](https://github.com/Joel-Duarte/MCPcodeaway/security/advisories/new) as described in [SECURITY.md](SECURITY.md).
+- **License:** Released under the [MIT License](LICENSE).

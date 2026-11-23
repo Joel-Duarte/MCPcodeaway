@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 
-import asyncpg
 import pytest
 
 from gateway.auth import CallerIdentity
@@ -17,6 +16,7 @@ from gateway.upstream_clients import DiscoveredTool
 
 @pytest.mark.asyncio
 async def test_postgres_pool_uses_bounded_connection_and_command_timeouts(monkeypatch) -> None:
+    asyncpg = pytest.importorskip("asyncpg")
     created = {}
 
     async def create_pool(dsn, **kwargs):
