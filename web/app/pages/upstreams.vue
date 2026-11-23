@@ -558,7 +558,8 @@ onMounted(() => {
                 </tr>
                 <tr v-if="expandedUpstreamName === u.name" class="bg-[#FAFAFA]">
                   <td :colspan="upstreamsData.dynamic_upstreams_permitted ? 10 : 9" class="px-3 py-3 sm:px-6">
-                    <section class="mb-3 max-w-[calc(100vw-4rem)] border-b border-zinc-200 pb-3 lg:max-w-none" aria-label="Tool catalog">
+                    <div class="sticky left-0 max-w-[calc(100vw-3rem)] space-y-3 lg:max-w-[calc(100vw-20rem)]">
+                    <section class="mb-3 border-b border-zinc-200 pb-3" aria-label="Tool catalog">
                       <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
                         <div>
                           <h3 class="text-[0.9375rem] font-semibold text-zinc-950">Tool catalog</h3>
@@ -594,6 +595,7 @@ onMounted(() => {
                       :can-edit="upstreamsData.dynamic_upstreams_permitted"
                       :refresh-version="catalogRefreshVersion"
                     />
+                    </div>
                     <div v-if="healthForUpstream(u.name)" class="mb-3 border-b border-[#E4E4E7] pb-3 text-xs" role="status">
                       <span class="font-medium text-[#09090B]">Active probe: {{ healthForUpstream(u.name)?.status }}</span>
                       <span class="ml-2 text-[#52525B]">Checked {{ healthForUpstream(u.name)?.checked_at ? new Date(healthForUpstream(u.name)!.checked_at).toLocaleString() : "not yet" }}</span>

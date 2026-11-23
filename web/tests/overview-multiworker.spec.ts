@@ -256,6 +256,10 @@ test("overview renders multi-worker sandbox telemetry, monty telemetry, governan
   expect(text).toContain("PII / secrets redacted");
   expect(text).toContain("55,200");
 
+  expect(text).toContain("Overall Gateway Impact & Time Saved");
+  expect(text).toContain("Human Time Saved (Workflows)");
+  expect(text).toContain("Workflows & ROI");
+
   expect(text).toContain("Business Value & Workflows");
   expect(text).toContain("2 active / 3 total");
   expect(text).toContain("Pending Candidates");
@@ -335,6 +339,10 @@ test("overview falls back cleanly to legacy single sandbox_worker and tolerates 
   expect(text).toContain("0.00 ms / 0.00 ms");
   expect(text).toContain("crm_api");
   expect(text).toContain("19.4 ms");
+  expect(text).toContain("Overall Gateway Impact & Time Saved");
+  expect(text).toContain("Human Time Saved (Workflows)");
+  expect(text).toContain("Workflows & ROI");
+
   expect(text).toContain("Business Value & Workflows");
   expect(text).toContain("Unavailable");
 

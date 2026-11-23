@@ -30,7 +30,7 @@ import {
 import { Switch, SwitchThumb } from "@ui-sdk/vue/switch";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "@ui-sdk/vue/tabs";
 import { Textarea } from "@ui-sdk/vue/textarea";
-import { defineComponent, h, nextTick } from "vue";
+import { defineComponent, h, nextTick, ref } from "vue";
 import { afterEach, expect, test, vi } from "vitest";
 import UpstreamMcpUiCatalog from "~/components/UpstreamMcpUiCatalog.vue";
 import McpUiPage from "~/pages/mcp-ui.vue";
@@ -836,6 +836,151 @@ test("Workflows page syncs confidence and baseline_source, shows drawer errors i
     await vi.waitFor(() =>
       expect(document.body.textContent).toContain("1. Target Upstream & Agent Prompt"),
     );
+  } finally {
+    wrapper.unmount();
+  }
+});
+
+test("Workflows & ROI renders top ROI summary, validation badges, per-workflow evidences, and ledger tab", async () => {
+  const catalog = {
+    upstreams: ["crm_accounts"],
+    workflows: [
+      {
+        upstream_name: "crm_accounts",
+        definition_revision: 1,
+        workflow: {
+          id: "account_risk_review",
+          name: "Account Risk Review",
+          description: "Inspect enterprise accounts.",
+          enabled: true,
+          participating_tools: ["crm_accounts__list_crm_accounts"],
+          completion: {
+            kind: "verified_followup",
+            tool: "crm_accounts__list_crm_accounts_metrics",
+            success_when: { path: "/active_items", type: "integer" },
+          },
+          business_value: {
+            manual_baseline_minutes: 12,
+            baseline_source: "validated_external_measurement",
+            confidence: "validated",
+            loaded_labor_cost_per_hour: 110,
+            currency: "USD",
+            evidence_note: "Validated RevOps benchmark across 40 QBRs.",
+          },
+        },
+      },
+      {
+        upstream_name: "crm_accounts",
+        definition_revision: 1,
+        workflow: {
+          id: "account_draft_review",
+          name: "Account Draft Review",
+          description: "Draft unvalidated review flow.",
+          enabled: false,
+          participating_tools: ["crm_accounts__list_crm_accounts"],
+          completion: {
+            kind: "terminal_tool_result",
+            tool: "crm_accounts__list_crm_accounts",
+            success_when: { path: "/count", type: "integer" },
+          },
+          business_value: {
+            manual_baseline_minutes: 8,
+            baseline_source: "administrator_estimate",
+            confidence: "unvalidated",
+          },
+        },
+      },
+    ],
+    candidates: [],
+    episodes: [
+      {
+        episode_id: "ep-101",
+        upstream_name: "crm_accounts",
+        matched_workflow_id: "crm_accounts/account_risk_review",
+        status: "completed_verified",
+        completion_tier: "predicate_matched",
+        manual_baseline_minutes: 12,
+        updated_at: "2026-11-23T14:00:00Z",
+      },
+    ],
+  };
+
+  const report = {
+    tenant_scope: "tenant-acme-dev",
+    since: null,
+    events_returned: 2,
+    truncated: false,
+    executions_returned: 2,
+    executions_truncated: false,
+    completed_count: 2,
+    execution_status_counts: { active: 0, completed: 2, outcome_unknown: 0, failed: 0, expired: 0 },
+    by_integration_workflow_day: [
+      {
+        integration_id: "crm_accounts",
+        integration_display_name: "Enterprise CRM Accounts",
+        upstream_name: "crm_accounts",
+        selected_kind: "workflow",
+        selected_id: "crm_accounts/account_risk_review",
+        definition_revision: 1,
+        period_utc: "2026-11-23",
+        baseline_source: "validated_external_measurement",
+        baseline_confidence: "validated",
+        currency: "USD",
+        completed_count: 2,
+        estimated_manual_baseline_minutes: 24,
+        validated_manual_baseline_minutes: 24,
+        estimated_minutes_saved: 20,
+        estimated_labor_value: { amount: 36.67, currency: "USD" },
+      },
+    ],
+    totals_by_currency: {
+      USD: {
+        completed_count: 2,
+        estimated_manual_baseline_minutes: 24,
+        validated_manual_baseline_minutes: 24,
+        estimated_minutes_saved: 20,
+      },
+    },
+    validated_minutes_saved: 20,
+    cost_coverage: {
+      captured_categories: [],
+      missing_categories: ["llm_inference"],
+      roi_available: false,
+    },
+  };
+
+  const apiFetch = vi.fn(async (path: string) => {
+    if (path === "/admin/workflows/catalog") return catalog;
+    if (path === "/admin/business-value/report") return report;
+    throw new Error(`Unexpected ${path}`);
+  });
+  vi.stubGlobal("useAdminApi", () => ({ apiFetch, session: ref({ is_admin: true }) }));
+
+  const wrapper = mount(WorkflowsPage, {
+    attachTo: document.body,
+    global: { components: sharedComponents },
+  });
+  try {
+    await vi.waitFor(() => expect(wrapper.text()).toContain("Account Risk Review"));
+    await nextTick();
+    expect(wrapper.text()).toContain("Workflows & ROI");
+    expect(wrapper.text()).toContain("20 min");
+    expect(wrapper.text()).toContain("USD 36.67");
+    expect(wrapper.text()).toContain("1 validated");
+    expect(wrapper.text()).toContain("1 est.");
+    expect(wrapper.text()).toContain("Validated baseline");
+    expect(wrapper.text()).toContain("Unvalidated estimate");
+    expect(wrapper.text()).toContain("2 completed outcomes");
+    expect(wrapper.text()).toContain("1 verified run");
+    expect(wrapper.text()).toContain("Validated RevOps benchmark across 40 QBRs.");
+    expect(wrapper.text()).toContain("No completed run evidence yet");
+    expect(wrapper.text()).toContain("completed verified");
+
+    const ledgerTab = wrapper.findAll('[role="tab"]').find((el) => el.text().includes("Outcome & ROI Ledger"));
+    expect(ledgerTab).toBeDefined();
+    await ledgerTab!.trigger("click");
+    await vi.waitFor(() => expect(wrapper.text()).toContain("Outcome report"));
+    expect(wrapper.text()).toContain("Enterprise CRM Accounts");
   } finally {
     wrapper.unmount();
   }

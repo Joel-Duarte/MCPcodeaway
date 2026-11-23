@@ -122,17 +122,22 @@ interface RecoverySummary {
 
 interface BusinessValueReport {
   completed_count: number;
+  validated_minutes_saved?: number | null;
   summary?: {
     estimated_manual_baseline_minutes?: number | null;
   };
   by_integration_workflow_day?: {
     estimated_manual_baseline_minutes?: number | null;
+    estimated_minutes_saved?: number | null;
+    estimated_labor_value?: { amount: number; currency: string } | null;
+    baseline_confidence?: string;
   }[];
   totals_by_currency?: Record<
     string,
     {
       completed_count?: number;
       estimated_manual_baseline_minutes?: number;
+      estimated_minutes_saved?: number | null;
     }
   >;
 }
@@ -392,6 +397,49 @@ const estimatedBaselineMinutes = computed<number | null>(() => {
   return 0;
 });
 
+const totalTimeSavedMinutes = computed<number | null>(() => {
+  const bv = businessValueData.value;
+  if (!bv) return null;
+  const rows = bv.by_integration_workflow_day ?? [];
+  if (rows.length > 0 && rows.some((row) => typeof row.estimated_minutes_saved === "number")) {
+    return rows.reduce(
+      (sum, row) => sum + Number(row.estimated_minutes_saved ?? row.estimated_manual_baseline_minutes ?? 0),
+      0,
+    );
+  }
+  return estimatedBaselineMinutes.value;
+});
+
+const totalLaborValueLabel = computed<string | null>(() => {
+  const rows = businessValueData.value?.by_integration_workflow_day ?? [];
+  const totals: Record<string, number> = {};
+  for (const row of rows) {
+    if (row.estimated_labor_value && typeof row.estimated_labor_value.amount === "number") {
+      const cur = row.estimated_labor_value.currency || "USD";
+      totals[cur] = (totals[cur] ?? 0) + row.estimated_labor_value.amount;
+    }
+  }
+  const entries = Object.entries(totals);
+  if (!entries.length) return null;
+  return entries
+    .map(
+      ([cur, amt]) =>
+        `${cur} ${amt.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+    )
+    .join(" + ");
+});
+
+function formatDurationMinutes(minutes: number | null): string {
+  if (minutes === null) return "Unavailable";
+  const rounded = Math.round(minutes * 10) / 10;
+  if (rounded >= 60) {
+    const hrs = Math.floor(rounded / 60);
+    const rem = Math.round(rounded % 60);
+    return rem ? `${hrs}h ${rem}m` : `${hrs}h`;
+  }
+  return `${rounded.toLocaleString("en-US", { maximumFractionDigits: 1 })} min`;
+}
+
 const pairedModeRunCount = computed(() =>
   (analyticsData.value?.summary.codemode_runs || 0) + (analyticsData.value?.summary.classic_runs || 0),
 );
@@ -647,6 +695,66 @@ function hasPoolConfig(worker: SandboxWorkerEntry): boolean {
         <NuxtLink to="/operations" class="inline-flex min-h-11 shrink-0 items-center font-medium text-[#0F766E] underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">Review recovery activity</NuxtLink>
       </section>
 
+      <section aria-label="Overall time saved and ROI summary" class="rounded-lg border border-[#99F6E4] bg-white p-4">
+        <div class="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-[#E4E4E7]">
+          <div>
+            <h2 class="text-[15px] font-semibold text-[#09090B]">
+              Overall Gateway Impact &amp; Time Saved
+            </h2>
+            <p class="mt-0.5 text-xs text-[#52525B]">
+              Human time saved across completed automated workflows plus Code Mode token &amp; turn savings.
+            </p>
+          </div>
+          <NuxtLink
+            to="/workflows?tab=ledger"
+            class="inline-flex min-h-11 items-center text-xs font-medium text-[#0F766E] underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E] sm:min-h-9"
+          >
+            Workflows &amp; ROI →
+          </NuxtLink>
+        </div>
+        <dl class="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-3">
+          <div>
+            <dt class="text-xs font-medium text-[#52525B]">Human Time Saved (Workflows)</dt>
+            <dd class="mt-1 text-2xl font-semibold text-[#0F766E] tabular-nums">
+              {{ formatDurationMinutes(totalTimeSavedMinutes) }}
+            </dd>
+            <dd class="mt-0.5 text-xs text-[#71717A] tabular-nums">
+              <template v-if="businessValueData">
+                {{ formatInt(businessValueData.completed_count) }} completed outcomes ·
+                {{
+                  businessValueData.validated_minutes_saved != null
+                    ? `${formatDurationMinutes(businessValueData.validated_minutes_saved)} validated`
+                    : `${formatDurationMinutes(estimatedBaselineMinutes)} gross baseline`
+                }}
+              </template>
+              <span v-else>Workflow telemetry loading</span>
+            </dd>
+          </div>
+          <div>
+            <dt class="text-xs font-medium text-[#52525B]">Estimated Workflow Value</dt>
+            <dd class="mt-1 text-2xl font-semibold text-[#09090B] tabular-nums">
+              {{ totalLaborValueLabel || "Unavailable" }}
+            </dd>
+            <dd class="mt-0.5 text-xs text-[#71717A] tabular-nums">
+              Across {{ activeWorkflowsCount }} active / {{ totalWorkflowsCount }} configured workflows
+            </dd>
+          </div>
+          <div>
+            <dt class="text-xs font-medium text-[#52525B]">Code Mode Payload &amp; Turns Saved</dt>
+            <dd class="mt-1 text-2xl font-semibold text-[#09090B] tabular-nums">
+              {{ valueData ? formatInt(valueData.efficiency.total_tokens_saved) : "Unavailable" }} tokens
+            </dd>
+            <dd class="mt-0.5 text-xs text-[#71717A] tabular-nums">
+              <template v-if="valueData">
+                {{ valueData.efficiency.payload_reduction_pct.toFixed(1) }}% payload reduction ·
+                {{ formatInt(valueData.efficiency.llm_turns_avoided) }} turns avoided
+              </template>
+              <span v-else>Gateway efficiency unavailable</span>
+            </dd>
+          </div>
+        </dl>
+      </section>
+
       <section aria-label="Gateway value summary" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div class="rounded-lg border border-[#E4E4E7] bg-white p-4">
           <div class="text-xs font-medium text-[#52525B]">Gateway-reported token reduction</div>
@@ -696,7 +804,7 @@ function hasPoolConfig(worker: SandboxWorkerEntry): boolean {
         <p v-if="valueData">Totals cover the latest {{ formatInt(valueData.window_runs) }} runs. Token and USD reductions are gateway estimates; USD uses configured model rates and is not reconciled against provider invoices.</p>
         <p v-else>Summary metrics are unavailable until the gateway report loads. Token and USD reductions are gateway estimates.</p>
         <div class="flex shrink-0 flex-wrap gap-x-3">
-          <NuxtLink to="/business-value" class="min-h-11 py-2 font-medium text-[#0F766E] underline underline-offset-2">Review business outcomes</NuxtLink>
+          <NuxtLink to="/workflows?tab=ledger" class="min-h-11 py-2 font-medium text-[#0F766E] underline underline-offset-2">Workflows &amp; ROI</NuxtLink>
           <NuxtLink to="/audit" class="min-h-11 py-2 font-medium text-[#0F766E] underline underline-offset-2">Review audit activity</NuxtLink>
         </div>
       </div>
@@ -1065,8 +1173,8 @@ function hasPoolConfig(worker: SandboxWorkerEntry): boolean {
             <NuxtLink to="/workflows" class="inline-flex min-h-11 items-center font-medium text-[#0F766E] underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">
               Manage workflows
             </NuxtLink>
-            <NuxtLink to="/business-value" class="inline-flex min-h-11 items-center font-medium text-[#0F766E] underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">
-              Business Value report
+            <NuxtLink to="/workflows?tab=ledger" class="inline-flex min-h-11 items-center font-medium text-[#0F766E] underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#0F766E]">
+              Outcome &amp; ROI ledger
             </NuxtLink>
           </div>
         </div>

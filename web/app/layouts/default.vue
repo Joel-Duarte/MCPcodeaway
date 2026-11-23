@@ -41,13 +41,7 @@ const navigation = [
     icon: "models",
   },
   {
-    label: "Business Value",
-    to: "/business-value",
-    group: "Optimize",
-    icon: "business-value",
-  },
-  {
-    label: "Workflows",
+    label: "Workflows & ROI",
     to: "/workflows",
     group: "Optimize",
     icon: "workflows",

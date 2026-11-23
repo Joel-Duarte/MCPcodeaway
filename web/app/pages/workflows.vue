@@ -27,8 +27,12 @@ import {
   SelectValue,
 } from "@ui-sdk/vue/select";
 import { Switch, SwitchThumb } from "@ui-sdk/vue/switch";
+import { Tabs, TabsList, TabsPanel, TabsTab } from "@ui-sdk/vue/tabs";
 import { Textarea } from "@ui-sdk/vue/textarea";
 import { computed, onMounted, ref } from "vue";
+import BusinessValueReportSection, {
+  type BusinessValueReport,
+} from "~/components/BusinessValueReportSection.vue";
 import PromptBundleDrawer from "~/components/PromptBundleDrawer.vue";
 import WorkflowEditorDrawer from "~/components/WorkflowEditorDrawer.vue";
 import { extractErrorMessage } from "~/composables/useAdminApi";
@@ -57,8 +61,11 @@ interface DetectedEpisode {
   episode_id: string;
   upstream_name: string;
   workflow_id?: string | null;
+  matched_workflow_id?: string | null;
   status: string;
   outcome_status?: string | null;
+  completion_tier?: string | null;
+  confidence?: number | null;
   step_count?: number;
   manual_baseline_minutes?: number | null;
   updated_at?: string;
@@ -76,10 +83,19 @@ const workflows = ref<WorkflowCatalogEntry[]>([]);
 const candidates = ref<DiscoveredCandidate[]>([]);
 const episodes = ref<DetectedEpisode[]>([]);
 
-const routeUpstream =
-  typeof useRoute === "function" ? useRoute()?.query?.upstream : undefined;
+const bvReport = ref<BusinessValueReport | null>(null);
+const bvLoading = ref(false);
+const bvError = ref("");
+const bvFetchedAt = ref<Date | null>(null);
+
+const routeObj = typeof useRoute === "function" ? useRoute() : null;
+const routeUpstream = routeObj?.query?.upstream;
+const routeTab = routeObj?.query?.tab;
 const initialUpstreamFilter =
   typeof routeUpstream === "string" && routeUpstream.trim() ? routeUpstream.trim() : "__all__";
+const activeTab = ref<"workflows" | "ledger">(
+  routeTab === "ledger" ? "ledger" : "workflows",
+);
 
 const upstreamFilter = ref(initialUpstreamFilter);
 const searchQuery = ref("");
@@ -180,28 +196,178 @@ const inactiveCount = computed(
   () => filteredWorkflows.value.filter((entry) => entry.workflow?.enabled === false).length,
 );
 const verifiedOutcomeCount = computed(
-  () => filteredEpisodes.value.filter((ep) => ep.outcome_status === "verified").length,
+  () =>
+    filteredEpisodes.value.filter(
+      (ep) => ep.status === "completed_verified" || ep.outcome_status === "verified",
+    ).length,
 );
+
+function workflowConfidence(entry: WorkflowCatalogEntry): "validated" | "sampled" | "unvalidated" {
+  const conf = String(entry.workflow?.business_value?.confidence ?? "unvalidated").toLowerCase();
+  if (conf === "validated" || conf === "sampled") return conf;
+  return "unvalidated";
+}
+
+function confidenceBadgeLabel(conf: string): string {
+  if (conf === "validated") return "Validated baseline";
+  if (conf === "sampled") return "Sampled baseline";
+  return "Unvalidated estimate";
+}
+
+function confidenceBadgeClass(conf: string): string {
+  if (conf === "validated") return "border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]";
+  if (conf === "sampled") return "border-[#FDE68A] bg-[#FFFBEB] text-[#B45309]";
+  return "border-[#E4E4E7] bg-[#F4F4F5] text-[#52525B]";
+}
+
+const validationMix = computed(() => {
+  let validated = 0;
+  let sampled = 0;
+  let unvalidated = 0;
+  for (const entry of filteredWorkflows.value) {
+    const c = workflowConfidence(entry);
+    if (c === "validated") validated += 1;
+    else if (c === "sampled") sampled += 1;
+    else unvalidated += 1;
+  }
+  return { validated, sampled, unvalidated };
+});
+
+const filteredReportRows = computed(() => {
+  const rows = bvReport.value?.by_integration_workflow_day ?? [];
+  if (upstreamFilter.value === "__all__") return rows;
+  return rows.filter((row) => row.upstream_name === upstreamFilter.value);
+});
+
+const roiSummary = computed(() => {
+  let completedOutcomes = 0;
+  let totalMinutesSaved = 0;
+  let hasSavings = false;
+  let validatedMinutes = 0;
+  let grossMinutes = 0;
+  const currencyTotals: Record<string, number> = {};
+  for (const row of filteredReportRows.value) {
+    completedOutcomes += Number(row.completed_count ?? 0);
+    grossMinutes += Number(row.estimated_manual_baseline_minutes ?? 0);
+    if (row.baseline_confidence === "validated") {
+      validatedMinutes += Number(
+        row.estimated_minutes_saved ?? row.validated_manual_baseline_minutes ?? 0,
+      );
+    }
+    if (typeof row.estimated_minutes_saved === "number") {
+      totalMinutesSaved += row.estimated_minutes_saved;
+      hasSavings = true;
+    }
+    if (row.estimated_labor_value && typeof row.estimated_labor_value.amount === "number") {
+      const cur = row.estimated_labor_value.currency || "USD";
+      currencyTotals[cur] = (currencyTotals[cur] ?? 0) + row.estimated_labor_value.amount;
+    }
+  }
+  const currencies = Object.entries(currencyTotals);
+  const primaryValue = currencies.length
+    ? currencies
+        .map(
+          ([cur, amt]) =>
+            `${cur} ${amt.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+        )
+        .join(" + ")
+    : null;
+  const effectiveSaved = hasSavings ? totalMinutesSaved : grossMinutes;
+  return {
+    completedOutcomes:
+      upstreamFilter.value === "__all__" && bvReport.value
+        ? Math.max(bvReport.value.completed_count ?? 0, completedOutcomes)
+        : completedOutcomes,
+    effectiveSavedMinutes: effectiveSaved,
+    hasNetSavings: hasSavings,
+    validatedMinutes,
+    grossMinutes,
+    primaryValue,
+  };
+});
+
+function formatDurationMinutes(minutes: number): string {
+  const rounded = Math.round(minutes * 10) / 10;
+  if (rounded >= 60) {
+    const hrs = Math.floor(rounded / 60);
+    const rem = Math.round(rounded % 60);
+    return rem ? `${hrs}h ${rem}m` : `${hrs}h`;
+  }
+  return `${rounded.toLocaleString("en-US", { maximumFractionDigits: 1 })} min`;
+}
+
+function workflowEvidenceSummary(entry: WorkflowCatalogEntry) {
+  const qualifiedId = `${entry.upstream_name}/${entry.workflow?.id}`;
+  const matchedEpisodes = episodes.value.filter(
+    (ep) =>
+      ep.matched_workflow_id === qualifiedId ||
+      (ep.upstream_name === entry.upstream_name && ep.workflow_id === entry.workflow?.id),
+  );
+  const verifiedRuns = matchedEpisodes.filter(
+    (ep) => ep.status === "completed_verified" || ep.outcome_status === "verified",
+  ).length;
+  const matchedRows = (bvReport.value?.by_integration_workflow_day ?? []).filter(
+    (row) => row.selected_id === qualifiedId,
+  );
+  const completions = matchedRows.reduce((s, r) => s + Number(r.completed_count ?? 0), 0);
+  const savedMinutes = matchedRows.reduce(
+    (s, r) =>
+      s + Number(r.estimated_minutes_saved ?? r.estimated_manual_baseline_minutes ?? 0),
+    0,
+  );
+  let valueText: string | null = null;
+  const firstVal = matchedRows.find((r) => r.estimated_labor_value?.amount != null);
+  if (firstVal?.estimated_labor_value) {
+    const cur = firstVal.estimated_labor_value.currency || "USD";
+    const totalAmt = matchedRows.reduce(
+      (s, r) => s + Number(r.estimated_labor_value?.amount ?? 0),
+      0,
+    );
+    valueText = `${cur} ${totalAmt.toLocaleString("en-US", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })}`;
+  }
+  return {
+    verifiedRuns,
+    completions,
+    savedMinutes,
+    valueText,
+    hasEvidence: verifiedRuns > 0 || completions > 0,
+  };
+}
 
 async function loadCatalog() {
   loading.value = true;
+  bvLoading.value = true;
   loadError.value = "";
-  try {
-    const res = await apiFetch<{
+  bvError.value = "";
+  const [catResult, bvResult] = await Promise.allSettled([
+    apiFetch<{
       upstreams?: string[];
       workflows?: WorkflowCatalogEntry[];
       candidates?: DiscoveredCandidate[];
       episodes?: DetectedEpisode[];
-    }>("/admin/workflows/catalog");
-    upstreams.value = res.upstreams ?? [];
-    workflows.value = res.workflows ?? [];
-    candidates.value = res.candidates ?? [];
-    episodes.value = res.episodes ?? [];
-  } catch (err) {
-    loadError.value = extractErrorMessage(err);
-  } finally {
-    loading.value = false;
+    }>("/admin/workflows/catalog"),
+    apiFetch<BusinessValueReport>("/admin/business-value/report"),
+  ]);
+  if (catResult.status === "fulfilled") {
+    upstreams.value = catResult.value.upstreams ?? [];
+    workflows.value = catResult.value.workflows ?? [];
+    candidates.value = catResult.value.candidates ?? [];
+    episodes.value = catResult.value.episodes ?? [];
+  } else {
+    loadError.value = extractErrorMessage(catResult.reason);
   }
+  if (bvResult.status === "fulfilled") {
+    bvReport.value = bvResult.value;
+    bvFetchedAt.value = new Date();
+  } else {
+    bvReport.value = null;
+    bvError.value = "";
+  }
+  loading.value = false;
+  bvLoading.value = false;
 }
 
 onMounted(() => {
@@ -464,27 +630,29 @@ async function dismissAllSchemaSuggestions() {
 
 <template>
   <div class="space-y-6">
-    <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-      <div>
-        <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">Workflows</h1>
+    <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+      <div class="min-w-0">
+        <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[#09090B]">
+          Workflows &amp; ROI
+        </h1>
         <p class="mt-0.5 text-[13px] text-[#52525B]">
-          Activate or pause workflows, tune manual human time baselines and trigger intents, and review auto-discovered processes.
+          Track time saved and labor value across automated processes, inspect completion evidence, toggle active workflows, and audit the outcome ledger.
         </p>
       </div>
-      <div class="flex flex-wrap items-center gap-2">
-        <Button class="min-h-11 sm:min-h-9" :disabled="discoverBusy" @click="runDiscoverForSelection">
+      <div class="flex flex-wrap items-center gap-2 shrink-0">
+        <Button class="min-h-11 whitespace-nowrap sm:min-h-9" :disabled="discoverBusy" @click="runDiscoverForSelection">
           {{ discoverBusy ? "Discovering…" : "Discover from Schema & Traffic" }}
         </Button>
-        <Button class="min-h-11 sm:min-h-9" @click="loadCatalog">
+        <Button class="min-h-11 whitespace-nowrap sm:min-h-9" @click="loadCatalog">
           <AppIcon name="refresh" :size="14" />
           <span>Refresh</span>
         </Button>
-        <Button class="min-h-11 sm:min-h-9" @click="promptDrawerOpen = true">
+        <Button class="min-h-11 whitespace-nowrap sm:min-h-9" @click="promptDrawerOpen = true">
           Generate Workflows via Prompt
         </Button>
         <Button
           data-variant="primary"
-          class="min-h-11 sm:min-h-9"
+          class="min-h-11 whitespace-nowrap sm:min-h-9"
           :disabled="!upstreams.length"
           @click="createWorkflowDrawerOpen = true"
         >
@@ -514,297 +682,412 @@ async function dismissAllSchemaSuggestions() {
       class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#FECACA] bg-[#FEF2F2] px-4 py-3 text-[13px] text-[#DC2626]"
     >
       <span>Failed to load workflows: {{ loadError }}</span>
-      <Button class="min-h-11" @click="loadCatalog">Retry</Button>
+      <Button class="min-h-11 sm:min-h-9" @click="loadCatalog">Retry</Button>
     </div>
 
-    <section class="grid grid-cols-2 gap-3 rounded-lg border border-[#E4E4E7] bg-white p-4 sm:grid-cols-4">
+    <section class="grid grid-cols-1 gap-3 rounded-lg border border-[#E4E4E7] bg-white p-4 sm:grid-cols-2 xl:grid-cols-4">
       <div>
-        <div class="text-[12px] font-medium text-[#52525B]">Active workflows</div>
-        <div class="mt-1 text-[20px] font-semibold tabular-nums text-[#0F766E]">{{ activeCount }}</div>
+        <div class="text-[12px] font-medium text-[#52525B]">Workflow time saved</div>
+        <div class="mt-1 text-[20px] font-semibold tabular-nums text-[#0F766E]">
+          {{
+            roiSummary.effectiveSavedMinutes > 0
+              ? formatDurationMinutes(roiSummary.effectiveSavedMinutes)
+              : "0 min"
+          }}
+        </div>
+        <p class="mt-0.5 text-[11px] tabular-nums text-[#71717A]">
+          {{
+            roiSummary.validatedMinutes > 0
+              ? `${formatDurationMinutes(roiSummary.validatedMinutes)} validated savings`
+              : `${formatDurationMinutes(roiSummary.grossMinutes)} gross baseline`
+          }}
+        </p>
       </div>
       <div>
-        <div class="text-[12px] font-medium text-[#52525B]">Paused workflows</div>
-        <div class="mt-1 text-[20px] font-semibold tabular-nums text-[#09090B]">{{ inactiveCount }}</div>
+        <div class="text-[12px] font-medium text-[#52525B]">Estimated value &amp; outcomes</div>
+        <div class="mt-1 text-[20px] font-semibold tabular-nums text-[#09090B]">
+          {{ roiSummary.primaryValue || `${roiSummary.completedOutcomes} completed` }}
+        </div>
+        <p class="mt-0.5 text-[11px] tabular-nums text-[#71717A]">
+          {{ roiSummary.completedOutcomes }} attributed · {{ verifiedOutcomeCount }} verified episodes
+        </p>
+      </div>
+      <div>
+        <div class="text-[12px] font-medium text-[#52525B]">Active workflows</div>
+        <div class="mt-1 text-[20px] font-semibold tabular-nums text-[#09090B]">
+          {{ activeCount }}
+          <span class="text-[13px] font-normal text-[#71717A]">/ {{ activeCount + inactiveCount }}</span>
+        </div>
+        <p class="mt-0.5 text-[11px] tabular-nums text-[#71717A]">
+          {{ validationMix.validated }} validated · {{ validationMix.sampled }} sampled · {{ validationMix.unvalidated }} est.
+        </p>
       </div>
       <div>
         <div class="text-[12px] font-medium text-[#52525B]">Candidates to review</div>
         <div class="mt-1 text-[20px] font-semibold tabular-nums text-[#09090B]">{{ pendingCandidates.length }}</div>
-      </div>
-      <div>
-        <div class="text-[12px] font-medium text-[#52525B]">Verified outcomes</div>
-        <div class="mt-1 text-[20px] font-semibold tabular-nums text-[#09090B]">{{ verifiedOutcomeCount }}</div>
-      </div>
-    </section>
-
-    <section class="flex flex-col gap-3 rounded-lg border border-[#E4E4E7] bg-white p-4 sm:flex-row sm:items-end">
-      <Field class="sm:w-64">
-        <FieldLabel>Filter by upstream</FieldLabel>
-        <Select
-          :items="upstreamSelectItems"
-          :value="upstreamFilter"
-          @value-change="(value) => { if (value) upstreamFilter = String(value); }"
-        >
-          <SelectTrigger aria-label="Filter workflows by upstream" class="min-h-11 sm:min-h-9">
-            <SelectValue />
-            <AppIcon name="chevron-down" :size="14" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem v-for="item in upstreamSelectItems" :key="item.value" :value="item.value">
-              {{ item.label }}
-              <SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator>
-            </SelectItem>
-          </SelectContent>
-        </Select>
-      </Field>
-      <Field class="flex-1">
-        <FieldLabel for="workflow-search">Search workflows</FieldLabel>
-        <Input
-          id="workflow-search"
-          v-model="searchQuery"
-          placeholder="Search by workflow name, slug, or upstream..."
-        />
-      </Field>
-    </section>
-
-    <section class="rounded-lg border border-[#E4E4E7] bg-white p-5">
-      <div class="flex flex-wrap items-baseline justify-between gap-2 pb-3 border-b border-[#E4E4E7]">
-        <div>
-          <h2 class="text-[16px] font-semibold text-[#09090B]">Configured Workflows</h2>
-          <p class="text-[12px] text-[#52525B]">
-            Toggle workflows active or paused without deleting definitions, or tune manual time baselines and intent triggers.
-          </p>
-        </div>
-        <span class="text-[12px] tabular-nums text-[#71717A]">
-          {{ filteredWorkflows.length }} total
-        </span>
-      </div>
-
-      <div v-if="loading" class="py-6 text-[13px] text-[#52525B]" role="status">
-        Loading workflow catalog…
-      </div>
-      <div v-else-if="!filteredWorkflows.length" class="py-6 text-[13px] text-[#52525B] space-y-3">
-        <p>
-          No workflows configured yet. Create one directly here, generate an agent bundle via
-          prompt, or run discovery above.
+        <p class="mt-0.5 text-[11px] text-[#71717A]">
+          {{ inactiveCount }} paused · auto-discovered awaiting baseline
         </p>
-        <div class="flex flex-wrap items-center gap-2">
-          <Button
-            data-variant="primary"
-            class="min-h-9 text-xs"
-            :disabled="!upstreams.length"
-            @click="createWorkflowDrawerOpen = true"
-          >
-            Create Workflow
-          </Button>
-          <Button class="min-h-9 text-xs" @click="promptDrawerOpen = true">
-            Generate Workflows via Prompt
-          </Button>
-        </div>
       </div>
-      <div v-else class="divide-y divide-[#E4E4E7]">
-        <div
-          v-for="entry in filteredWorkflows"
-          :key="`${entry.upstream_name}:${entry.workflow.id}`"
-          class="flex flex-col gap-3 py-4 lg:flex-row lg:items-center lg:justify-between"
-        >
-          <div class="min-w-0 flex-1 space-y-1.5">
-            <div class="flex flex-wrap items-center gap-2">
-              <span class="text-[14px] font-semibold text-[#09090B]">
-                {{ entry.workflow.name }}
-              </span>
-              <span class="rounded border border-[#E4E4E7] bg-[#F4F4F5] px-1.5 py-0.5 font-mono-data text-[11px] text-[#52525B]">
-                {{ entry.upstream_name }}
-              </span>
-              <span
-                class="rounded px-1.5 py-0.5 text-[11px] font-medium"
-                :class="
-                  entry.workflow.enabled !== false
-                    ? 'border border-[#99F6E4] bg-[#F0FDFA] text-[#0F766E]'
-                    : 'border border-[#E4E4E7] bg-[#F4F4F5] text-[#52525B]'
-                "
-              >
-                {{ entry.workflow.enabled !== false ? "Active" : "Paused" }}
-              </span>
-            </div>
-            <p class="text-[13px] text-[#52525B]">{{ entry.workflow.description }}</p>
-            <div v-if="Array.isArray(entry.workflow.participating_tools) && entry.workflow.participating_tools.length" class="flex flex-wrap items-center gap-1 pt-0.5 text-[11px] font-mono-data text-[#09090B]">
-              <template v-for="(toolName, tIdx) in entry.workflow.participating_tools" :key="`${entry.workflow.id}:${toolName}`">
-                <span class="rounded border border-[#E4E4E7] bg-[#FAFAFA] px-1.5 py-0.5">
-                  {{ String(toolName).replace(`${entry.upstream_name}__`, "") }}
-                </span>
-                <span v-if="Number(tIdx) < entry.workflow.participating_tools.length - 1" class="text-[#71717A]">→</span>
-              </template>
-            </div>
-            <div class="flex flex-wrap gap-x-5 gap-y-1 text-[12px] text-[#52525B]">
-              <span>
-                Baseline:
-                <strong class="font-mono-data tabular-nums text-[#09090B]">
-                  {{ entry.workflow.business_value?.manual_baseline_minutes }} min
-                </strong>
-                ({{ entry.workflow.business_value?.confidence || "unvalidated" }})
-              </span>
-              <span class="font-mono-data">
-                Terminal: {{ entry.workflow.completion?.tool }} · {{ entry.workflow.completion?.success_when?.path }}
-              </span>
-            </div>
-            <div
-              v-if="Array.isArray(entry.workflow.intent_examples) && entry.workflow.intent_examples.length"
-              class="flex flex-wrap items-center gap-1.5 pt-0.5"
+    </section>
+
+    <Tabs
+      :value="activeTab"
+      @value-change="(value) => { if (value === 'workflows' || value === 'ledger') activeTab = value; }"
+    >
+      <TabsList aria-label="Workflows and ROI views">
+        <TabsTab value="workflows">
+          Configured Workflows &amp; Evidence ({{ filteredWorkflows.length }})
+        </TabsTab>
+        <TabsTab value="ledger">
+          Outcome &amp; ROI Ledger ({{ filteredReportRows.length }})
+        </TabsTab>
+      </TabsList>
+
+      <TabsPanel value="workflows" class="mt-4 space-y-6">
+        <section class="flex flex-col gap-3 rounded-lg border border-[#E4E4E7] bg-white p-4 sm:flex-row sm:items-end">
+          <Field class="sm:w-64">
+            <FieldLabel>Filter by upstream</FieldLabel>
+            <Select
+              :items="upstreamSelectItems"
+              :value="upstreamFilter"
+              @value-change="(value) => { if (value) upstreamFilter = String(value); }"
             >
-              <span class="text-[11px] font-medium text-[#71717A]">Triggers:</span>
-              <span
-                v-for="(intent, idx) in entry.workflow.intent_examples.slice(0, 5)"
-                :key="idx"
-                class="rounded bg-[#F4F4F5] px-2 py-0.5 text-[11px] text-[#09090B]"
-              >
-                {{ intent }}
-              </span>
+              <SelectTrigger aria-label="Filter workflows by upstream" class="min-h-11 sm:min-h-9">
+                <SelectValue />
+                <AppIcon name="chevron-down" :size="14" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem v-for="item in upstreamSelectItems" :key="item.value" :value="item.value">
+                  {{ item.label }}
+                  <SelectItemIndicator><AppIcon name="check" :size="14" /></SelectItemIndicator>
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field class="flex-1">
+            <FieldLabel for="workflow-search">Search workflows</FieldLabel>
+            <Input
+              id="workflow-search"
+              v-model="searchQuery"
+              placeholder="Search by workflow name, slug, or upstream..."
+            />
+          </Field>
+        </section>
+
+        <section class="rounded-lg border border-[#E4E4E7] bg-white p-5">
+          <div class="flex flex-wrap items-baseline justify-between gap-2 pb-3 border-b border-[#E4E4E7]">
+            <div>
+              <h2 class="text-[16px] font-semibold text-[#09090B]">Configured Workflows</h2>
+              <p class="text-[12px] text-[#52525B]">
+                Toggle workflows active or paused cleanly, check verified completion evidence and baseline status badges, or tune manual time baselines and triggers.
+              </p>
             </div>
+            <span class="text-[12px] tabular-nums text-[#71717A]">
+              {{ filteredWorkflows.length }} total
+            </span>
           </div>
 
-          <div class="flex flex-wrap items-center gap-3 shrink-0">
-            <label class="inline-flex min-h-11 items-center gap-2 text-[12px] font-medium text-[#09090B] sm:min-h-9">
-              <Switch
-                :checked="entry.workflow.enabled !== false"
-                :disabled="togglingKey === `${entry.upstream_name}:${entry.workflow.id}`"
-                :aria-label="`Toggle ${entry.workflow.name} active state`"
-                @checked-change="(checked) => toggleWorkflowEnabled(entry, checked === true)"
-              >
-                <SwitchThumb />
-              </Switch>
-              <span>{{ entry.workflow.enabled !== false ? "On" : "Off" }}</span>
-            </label>
-            <Button class="min-h-11 sm:min-h-9" @click="openEditDrawer(entry)">
-              Edit Timing &amp; Triggers
-            </Button>
-            <Button class="min-h-11 sm:min-h-9" @click="confirmDeleteWorkflow(entry)">
-              <AppIcon name="trash" :size="14" />
-              <span>Delete</span>
-            </Button>
+          <div v-if="loading" class="py-6 text-[13px] text-[#52525B]" role="status">
+            Loading workflow catalog…
           </div>
-        </div>
-      </div>
-    </section>
-
-    <section class="rounded-lg border border-[#E4E4E7] bg-white p-5">
-      <div class="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-[#E4E4E7]">
-        <div>
-          <h2 class="text-[16px] font-semibold text-[#09090B]">Unconfigured Discovered Workflows</h2>
-          <p class="text-[12px] text-[#52525B]">
-            Ranked by verified live traffic first, then schema dataflow patterns. Confirm a human baseline to activate, or dismiss false positives.
-          </p>
-        </div>
-        <div class="flex flex-wrap items-center gap-2">
-          <Button
-            v-if="pendingCandidates.some((c) => c.origin === 'auto_schema' && c.verified_count === 0)"
-            class="min-h-9 text-xs"
-            :disabled="dismissSchemaBusy"
-            @click="dismissAllSchemaSuggestions"
-          >
-            {{ dismissSchemaBusy ? "Dismissing…" : "Dismiss Schema Suggestions" }}
-          </Button>
-          <span class="text-[12px] tabular-nums text-[#71717A]">
-            {{ pendingCandidates.length }} pending
-          </span>
-        </div>
-      </div>
-
-      <div v-if="!pendingCandidates.length" class="py-6 text-[13px] text-[#52525B]">
-        No unreviewed workflow candidates right now.
-      </div>
-      <div v-else class="divide-y divide-[#E4E4E7]">
-        <div
-          v-for="cand in pendingCandidates"
-          :key="cand.candidate_id"
-          class="flex flex-col gap-3 py-4 lg:flex-row lg:items-center lg:justify-between"
-        >
-          <div class="min-w-0 flex-1 space-y-1">
-            <div class="flex flex-wrap items-center gap-2">
-              <span class="text-[14px] font-semibold text-[#09090B]">
-                {{ cand.draft_definition?.name || cand.workflow_slug }}
-              </span>
-              <span class="rounded border border-[#E4E4E7] bg-[#F4F4F5] px-1.5 py-0.5 font-mono-data text-[11px] text-[#52525B]">
-                {{ cand.upstream_name }}
-              </span>
-              <span
-                class="rounded px-1.5 py-0.5 text-[11px] font-medium tabular-nums"
-                :class="
-                  cand.verified_count > 0
-                    ? 'border border-[#99F6E4] bg-[#F0FDFA] text-[#0F766E]'
-                    : 'border border-[#FDE68A] bg-[#FFFBEB] text-[#B45309]'
-                "
-              >
-                {{
-                  cand.verified_count > 0
-                    ? `Verified by traffic (${cand.verified_count}×)`
-                    : `${cand.origin} · observed ${cand.observed_count}×`
-                }}
-              </span>
-            </div>
-            <p class="text-[12px] text-[#52525B]">
-              {{ cand.draft_definition?.description || "Candidate mined from tool flow." }}
+          <div v-else-if="!filteredWorkflows.length" class="py-6 text-[13px] text-[#52525B] space-y-3">
+            <p>
+              No workflows configured yet. Create one directly here, generate an agent bundle via
+              prompt, or run discovery above.
             </p>
-            <div class="text-[12px] font-mono-data text-[#52525B] break-words">
-              {{ (cand.draft_definition?.participating_tools || []).join(" → ") }}
-            </div>
-            <div v-if="cand.sample_intents && cand.sample_intents.length" class="text-[11px] text-[#71717A]">
-              Sample intents: {{ cand.sample_intents.slice(0, 3).join(" · ") }}
+            <div class="flex flex-wrap items-center gap-2">
+              <Button
+                data-variant="primary"
+                class="min-h-9 text-xs"
+                :disabled="!upstreams.length"
+                @click="createWorkflowDrawerOpen = true"
+              >
+                Create Workflow
+              </Button>
+              <Button class="min-h-9 text-xs" @click="promptDrawerOpen = true">
+                Generate Workflows via Prompt
+              </Button>
             </div>
           </div>
-          <div class="flex flex-wrap items-center gap-2 shrink-0">
-            <Button data-variant="primary" class="min-h-11 sm:min-h-9" @click="openPromoteDrawer(cand)">
-              Set Baseline &amp; Activate
-            </Button>
-            <Button class="min-h-11 sm:min-h-9" @click="dismissCandidate(cand)">
-              Dismiss
-            </Button>
-          </div>
-        </div>
-      </div>
-    </section>
+          <div v-else class="divide-y divide-[#E4E4E7]">
+            <div
+              v-for="entry in filteredWorkflows"
+              :key="`${entry.upstream_name}:${entry.workflow.id}`"
+              class="flex flex-col gap-3 py-4 lg:flex-row lg:items-center lg:justify-between"
+            >
+              <div class="min-w-0 flex-1 space-y-1.5">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="text-[14px] font-semibold text-[#09090B]">
+                    {{ entry.workflow.name }}
+                  </span>
+                  <span class="rounded border border-[#E4E4E7] bg-[#F4F4F5] px-1.5 py-0.5 font-mono-data text-[11px] text-[#52525B]">
+                    {{ entry.upstream_name }}
+                  </span>
+                  <span
+                    class="rounded px-1.5 py-0.5 text-[11px] font-medium"
+                    :class="
+                      entry.workflow.enabled !== false
+                        ? 'border border-[#99F6E4] bg-[#F0FDFA] text-[#0F766E]'
+                        : 'border border-[#E4E4E7] bg-[#F4F4F5] text-[#52525B]'
+                    "
+                  >
+                    {{ entry.workflow.enabled !== false ? "Active" : "Paused" }}
+                  </span>
+                  <span
+                    class="rounded border px-1.5 py-0.5 text-[11px] font-medium"
+                    :class="confidenceBadgeClass(workflowConfidence(entry))"
+                  >
+                    {{ confidenceBadgeLabel(workflowConfidence(entry)) }}
+                  </span>
+                </div>
+                <p class="text-[13px] text-[#52525B]">{{ entry.workflow.description }}</p>
+                <div v-if="Array.isArray(entry.workflow.participating_tools) && entry.workflow.participating_tools.length" class="flex flex-wrap items-center gap-1 pt-0.5 text-[11px] font-mono-data text-[#09090B]">
+                  <template v-for="(toolName, tIdx) in entry.workflow.participating_tools" :key="`${entry.workflow.id}:${toolName}`">
+                    <span class="rounded border border-[#E4E4E7] bg-[#FAFAFA] px-1.5 py-0.5">
+                      {{ String(toolName).replace(`${entry.upstream_name}__`, "") }}
+                    </span>
+                    <span v-if="Number(tIdx) < entry.workflow.participating_tools.length - 1" class="text-[#71717A]">→</span>
+                  </template>
+                </div>
+                <div class="flex flex-wrap gap-x-5 gap-y-1 text-[12px] text-[#52525B]">
+                  <span>
+                    Baseline:
+                    <strong class="font-mono-data tabular-nums text-[#09090B]">
+                      {{ entry.workflow.business_value?.manual_baseline_minutes }} min
+                    </strong>
+                    <span v-if="entry.workflow.business_value?.loaded_labor_cost_per_hour">
+                      · {{ entry.workflow.business_value?.currency || "USD" }} {{ entry.workflow.business_value?.loaded_labor_cost_per_hour }}/hr
+                    </span>
+                  </span>
+                  <span class="font-mono-data">
+                    Terminal: {{ entry.workflow.completion?.tool }} · {{ entry.workflow.completion?.success_when?.path }}
+                  </span>
+                </div>
+                <div class="flex flex-wrap items-center gap-2 text-[11px]">
+                  <span
+                    v-if="workflowEvidenceSummary(entry).hasEvidence"
+                    class="inline-flex items-center gap-1.5 rounded border border-[#E4E4E7] bg-[#FAFAFA] px-2 py-0.5 tabular-nums text-[#09090B]"
+                  >
+                    <span class="font-medium text-[#0F766E]">
+                      {{ workflowEvidenceSummary(entry).completions }} completed outcome{{
+                        workflowEvidenceSummary(entry).completions === 1 ? "" : "s"
+                      }}
+                    </span>
+                    <span v-if="workflowEvidenceSummary(entry).verifiedRuns > 0" class="text-[#52525B]">
+                      · {{ workflowEvidenceSummary(entry).verifiedRuns }} verified run{{
+                        workflowEvidenceSummary(entry).verifiedRuns === 1 ? "" : "s"
+                      }}
+                    </span>
+                    <span v-if="workflowEvidenceSummary(entry).savedMinutes > 0" class="text-[#52525B]">
+                      · {{ formatDurationMinutes(workflowEvidenceSummary(entry).savedMinutes) }} saved
+                    </span>
+                    <span v-if="workflowEvidenceSummary(entry).valueText" class="font-medium text-[#059669]">
+                      · {{ workflowEvidenceSummary(entry).valueText }}
+                    </span>
+                  </span>
+                  <span
+                    v-else
+                    class="inline-flex items-center rounded border border-[#E4E4E7] bg-[#FAFAFA] px-2 py-0.5 text-[#71717A]"
+                  >
+                    No completed run evidence yet
+                  </span>
+                  <span
+                    v-if="entry.workflow.business_value?.evidence_note"
+                    class="text-[#52525B]"
+                  >
+                    {{ entry.workflow.business_value.evidence_note }}
+                  </span>
+                </div>
+                <div
+                  v-if="Array.isArray(entry.workflow.intent_examples) && entry.workflow.intent_examples.length"
+                  class="flex flex-wrap items-center gap-1.5 pt-0.5"
+                >
+                  <span class="text-[11px] font-medium text-[#71717A]">Triggers:</span>
+                  <span
+                    v-for="(intent, idx) in entry.workflow.intent_examples.slice(0, 5)"
+                    :key="idx"
+                    class="rounded bg-[#F4F4F5] px-2 py-0.5 text-[11px] text-[#09090B]"
+                  >
+                    {{ intent }}
+                  </span>
+                </div>
+              </div>
 
-    <section class="rounded-lg border border-[#E4E4E7] bg-white p-5">
-      <div class="flex flex-wrap items-baseline justify-between gap-2 pb-3 border-b border-[#E4E4E7]">
-        <div>
-          <h2 class="text-[16px] font-semibold text-[#09090B]">Recent Detected Episodes</h2>
-          <p class="text-[12px] text-[#52525B]">
-            Live workflow episodes classified across MCP requests and tool calls.
-          </p>
-        </div>
-        <span class="text-[12px] tabular-nums text-[#71717A]">
-          {{ filteredEpisodes.length }} recent
-        </span>
-      </div>
-      <div v-if="!filteredEpisodes.length" class="py-5 text-[13px] text-[#52525B]">
-        No workflow episodes detected yet. Send requests through <code class="font-mono-data">/mcp</code> to observe completion.
-      </div>
-      <div v-else class="overflow-x-auto pt-2">
-        <table class="w-full border-collapse text-left text-[12px]">
-          <thead>
-            <tr class="border-b border-[#E4E4E7] text-[#52525B]">
-              <th class="py-2 pr-3 font-medium">Upstream</th>
-              <th class="py-2 pr-3 font-medium">Workflow</th>
-              <th class="py-2 pr-3 font-medium">Outcome</th>
-              <th class="py-2 pr-3 font-medium">Steps</th>
-              <th class="py-2 pr-3 font-medium">Baseline</th>
-              <th class="py-2 font-medium">Updated</th>
-            </tr>
-          </thead>
-          <tbody class="divide-y divide-[#E4E4E7]">
-            <tr v-for="ep in filteredEpisodes.slice(0, 25)" :key="ep.episode_id">
-              <td class="py-2 pr-3 font-mono-data">{{ ep.upstream_name }}</td>
-              <td class="py-2 pr-3 font-mono-data">{{ ep.workflow_id || ep.episode_id }}</td>
-              <td class="py-2 pr-3">{{ ep.outcome_status || ep.status }}</td>
-              <td class="py-2 pr-3 tabular-nums">{{ ep.step_count ?? 1 }}</td>
-              <td class="py-2 pr-3 tabular-nums">
-                {{ ep.manual_baseline_minutes ? `${ep.manual_baseline_minutes} min` : "—" }}
-              </td>
-              <td class="py-2 font-mono-data text-[#71717A]">{{ ep.updated_at || "—" }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
+              <div class="flex flex-wrap items-center gap-3 shrink-0">
+                <div class="inline-flex min-h-11 items-center gap-2 text-[12px] font-medium text-[#09090B] sm:min-h-9">
+                  <Switch
+                    :checked="entry.workflow.enabled !== false"
+                    :disabled="togglingKey === `${entry.upstream_name}:${entry.workflow.id}`"
+                    :aria-label="`Toggle ${entry.workflow.name} active state`"
+                    @checked-change="(checked) => toggleWorkflowEnabled(entry, checked === true)"
+                  >
+                    <SwitchThumb />
+                  </Switch>
+                  <span class="min-w-[1.5rem] tabular-nums">
+                    {{ entry.workflow.enabled !== false ? "On" : "Off" }}
+                  </span>
+                </div>
+                <Button class="min-h-11 whitespace-nowrap sm:min-h-9" @click="openEditDrawer(entry)">
+                  Edit Timing &amp; Triggers
+                </Button>
+                <Button class="min-h-11 whitespace-nowrap sm:min-h-9" @click="confirmDeleteWorkflow(entry)">
+                  <AppIcon name="trash" :size="14" />
+                  <span>Delete</span>
+                </Button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="rounded-lg border border-[#E4E4E7] bg-white p-5">
+          <div class="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-[#E4E4E7]">
+            <div>
+              <h2 class="text-[16px] font-semibold text-[#09090B]">Unconfigured Discovered Workflows</h2>
+              <p class="text-[12px] text-[#52525B]">
+                Ranked by verified live traffic first, then schema dataflow patterns. Confirm a human baseline to activate, or dismiss false positives.
+              </p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <Button
+                v-if="pendingCandidates.some((c) => c.origin === 'auto_schema' && c.verified_count === 0)"
+                class="min-h-9 text-xs"
+                :disabled="dismissSchemaBusy"
+                @click="dismissAllSchemaSuggestions"
+              >
+                {{ dismissSchemaBusy ? "Dismissing…" : "Dismiss Schema Suggestions" }}
+              </Button>
+              <span class="text-[12px] tabular-nums text-[#71717A]">
+                {{ pendingCandidates.length }} pending
+              </span>
+            </div>
+          </div>
+
+          <div v-if="!pendingCandidates.length" class="py-6 text-[13px] text-[#52525B]">
+            No unreviewed workflow candidates right now.
+          </div>
+          <div v-else class="divide-y divide-[#E4E4E7]">
+            <div
+              v-for="cand in pendingCandidates"
+              :key="cand.candidate_id"
+              class="flex flex-col gap-3 py-4 lg:flex-row lg:items-center lg:justify-between"
+            >
+              <div class="min-w-0 flex-1 space-y-1">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="text-[14px] font-semibold text-[#09090B]">
+                    {{ cand.draft_definition?.name || cand.workflow_slug }}
+                  </span>
+                  <span class="rounded border border-[#E4E4E7] bg-[#F4F4F5] px-1.5 py-0.5 font-mono-data text-[11px] text-[#52525B]">
+                    {{ cand.upstream_name }}
+                  </span>
+                  <span
+                    class="rounded px-1.5 py-0.5 text-[11px] font-medium tabular-nums"
+                    :class="
+                      cand.verified_count > 0
+                        ? 'border border-[#99F6E4] bg-[#F0FDFA] text-[#0F766E]'
+                        : 'border border-[#FDE68A] bg-[#FFFBEB] text-[#B45309]'
+                    "
+                  >
+                    {{
+                      cand.verified_count > 0
+                        ? `Verified by traffic (${cand.verified_count}×)`
+                        : `${cand.origin} · observed ${cand.observed_count}×`
+                    }}
+                  </span>
+                </div>
+                <p class="text-[12px] text-[#52525B]">
+                  {{ cand.draft_definition?.description || "Candidate mined from tool flow." }}
+                </p>
+                <div class="text-[12px] font-mono-data text-[#52525B] break-words">
+                  {{ (cand.draft_definition?.participating_tools || []).join(" → ") }}
+                </div>
+                <div v-if="cand.sample_intents && cand.sample_intents.length" class="text-[11px] text-[#71717A]">
+                  Sample intents: {{ cand.sample_intents.slice(0, 3).join(" · ") }}
+                </div>
+              </div>
+              <div class="flex flex-wrap items-center gap-2 shrink-0">
+                <Button data-variant="primary" class="min-h-11 sm:min-h-9" @click="openPromoteDrawer(cand)">
+                  Set Baseline &amp; Activate
+                </Button>
+                <Button class="min-h-11 sm:min-h-9" @click="dismissCandidate(cand)">
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="rounded-lg border border-[#E4E4E7] bg-white p-5">
+          <div class="flex flex-wrap items-baseline justify-between gap-2 pb-3 border-b border-[#E4E4E7]">
+            <div>
+              <h2 class="text-[16px] font-semibold text-[#09090B]">Recent Detected Episodes</h2>
+              <p class="text-[12px] text-[#52525B]">
+                Live workflow episodes and verification evidence classified across MCP requests and tool calls.
+              </p>
+            </div>
+            <span class="text-[12px] tabular-nums text-[#71717A]">
+              {{ filteredEpisodes.length }} recent
+            </span>
+          </div>
+          <div v-if="!filteredEpisodes.length" class="py-5 text-[13px] text-[#52525B]">
+            No workflow episodes detected yet. Send requests through <code class="font-mono-data">/mcp</code> to observe completion.
+          </div>
+          <div v-else class="overflow-x-auto pt-2">
+            <table class="w-full border-collapse text-left text-[12px]">
+              <thead>
+                <tr class="border-b border-[#E4E4E7] text-[#52525B]">
+                  <th class="py-2 pr-3 font-medium">Upstream</th>
+                  <th class="py-2 pr-3 font-medium">Workflow</th>
+                  <th class="py-2 pr-3 font-medium">Outcome</th>
+                  <th class="py-2 pr-3 font-medium">Tier</th>
+                  <th class="py-2 pr-3 font-medium">Baseline</th>
+                  <th class="py-2 font-medium">Updated</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-[#E4E4E7]">
+                <tr v-for="ep in filteredEpisodes.slice(0, 25)" :key="ep.episode_id">
+                  <td class="py-2 pr-3 font-mono-data">{{ ep.upstream_name }}</td>
+                  <td class="py-2 pr-3 font-mono-data">
+                    {{ ep.matched_workflow_id || ep.workflow_id || ep.episode_id }}
+                  </td>
+                  <td class="py-2 pr-3">
+                    <span
+                      class="rounded px-1.5 py-0.5 text-[11px] font-medium"
+                      :class="
+                        ep.status === 'completed_verified' || ep.outcome_status === 'verified'
+                          ? 'border border-[#A7F3D0] bg-[#ECFDF5] text-[#059669]'
+                          : 'border border-[#E4E4E7] bg-[#F4F4F5] text-[#52525B]'
+                      "
+                    >
+                      {{ (ep.outcome_status || ep.status).replaceAll("_", " ") }}
+                    </span>
+                  </td>
+                  <td class="py-2 pr-3 text-[#52525B]">
+                    {{ (ep.completion_tier || "observed").replaceAll("_", " ") }}
+                  </td>
+                  <td class="py-2 pr-3 tabular-nums">
+                    {{ ep.manual_baseline_minutes ? `${ep.manual_baseline_minutes} min` : "—" }}
+                  </td>
+                  <td class="py-2 font-mono-data text-[#71717A]">{{ ep.updated_at || "—" }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </TabsPanel>
+
+      <TabsPanel value="ledger" class="mt-4">
+        <BusinessValueReportSection
+          :external-report="bvReport"
+          :external-loading="bvLoading"
+          :external-error="bvError"
+          :external-fetched-at="bvFetchedAt"
+          embedded
+          @refresh="loadCatalog"
+          @open-review="activeTab = 'workflows'"
+        />
+      </TabsPanel>
+    </Tabs>
 
     <Drawer v-model:open="editDrawerOpen" side="right" prevent-edge-swipe>
       <DrawerBackdrop />

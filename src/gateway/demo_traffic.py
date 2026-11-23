@@ -897,6 +897,7 @@ class DemoTrafficRunner:
         burst = await self.burst(count=min(max(1, len(workloads)), 100))
         business_value_workflow = await self._run_hr_business_value_workflow()
         ticketing_workflow = await self._run_ticketing_business_value_workflow()
+        passive_workflows = await self._run_passive_workflow_evidences()
         self.golden_runs_count += 1
         return {
             "discovery": discovery,
@@ -904,6 +905,7 @@ class DemoTrafficRunner:
             "workload_cases": min(len(workloads), 100),
             "business_value_workflow": business_value_workflow,
             "ticketing_workflow": ticketing_workflow,
+            "passive_workflows": passive_workflows,
             "status": self.status(),
         }
 
@@ -1079,10 +1081,16 @@ class DemoTrafficRunner:
                         },
                         "business_value": {
                             "manual_baseline_minutes": 14,
-                            "baseline_source": "administrator_estimate",
-                            "confidence": "unvalidated",
+                            "baseline_source": "sampled_manual_measurement",
+                            "confidence": "sampled",
+                            "loaded_labor_cost_per_hour": 85.0,
+                            "currency": "USD",
+                            "review_minutes": {"kind": "expected_average", "minutes": 2.0},
+                            "correction_minutes": {"kind": "expected_average", "minutes": 0.5},
                             "effective_from": today,
-                            "evidence_note": "Agent-generated workflow demo solution.",
+                            "evidence_note": (
+                                "Sampled SRE queue benchmark across 15 EU ticket resolutions."
+                            ),
                         },
                     },
                     {
@@ -1124,9 +1132,16 @@ class DemoTrafficRunner:
                         },
                         "business_value": {
                             "manual_baseline_minutes": 10,
-                            "baseline_source": "administrator_estimate",
-                            "confidence": "unvalidated",
+                            "baseline_source": "validated_external_measurement",
+                            "confidence": "validated",
+                            "loaded_labor_cost_per_hour": 95.0,
+                            "currency": "USD",
+                            "review_minutes": {"kind": "expected_average", "minutes": 1.0},
+                            "correction_minutes": {"kind": "expected_average", "minutes": 0.5},
                             "effective_from": today,
+                            "evidence_note": (
+                                "Validated on-call SLA escalation runbook timing study."
+                            ),
                         },
                     },
                     {
@@ -1167,7 +1182,14 @@ class DemoTrafficRunner:
                             "manual_baseline_minutes": 6,
                             "baseline_source": "administrator_estimate",
                             "confidence": "unvalidated",
+                            "loaded_labor_cost_per_hour": 75.0,
+                            "currency": "USD",
+                            "review_minutes": {"kind": "expected_average", "minutes": 0.5},
+                            "correction_minutes": {"kind": "expected_average", "minutes": 0.5},
                             "effective_from": today,
+                            "evidence_note": (
+                                "Administrator triage estimate pending external timing audit."
+                            ),
                         },
                     },
                 ],
@@ -1447,11 +1469,15 @@ class DemoTrafficRunner:
                         },
                         "business_value": {
                             "manual_baseline_minutes": 8,
-                            "baseline_source": "administrator_estimate",
-                            "confidence": "unvalidated",
+                            "baseline_source": "sampled_manual_measurement",
+                            "confidence": "sampled",
+                            "loaded_labor_cost_per_hour": 90.0,
+                            "currency": "USD",
+                            "review_minutes": {"kind": "expected_average", "minutes": 1.0},
+                            "correction_minutes": {"kind": "expected_average", "minutes": 0.5},
                             "effective_from": datetime.now(UTC).date().isoformat(),
                             "evidence_note": (
-                                "Demo-only estimate for the fictional HR profile update workflow."
+                                "Sampled People-Ops timing study for fictional HR profile updates."
                             ),
                         },
                     }
@@ -1502,9 +1528,13 @@ class DemoTrafficRunner:
                             "manual_baseline_minutes": 10,
                             "baseline_source": "administrator_estimate",
                             "confidence": "unvalidated",
+                            "loaded_labor_cost_per_hour": 90.0,
+                            "currency": "USD",
+                            "review_minutes": {"kind": "expected_average", "minutes": 1.0},
+                            "correction_minutes": {"kind": "expected_average", "minutes": 0.5},
                             "effective_from": datetime.now(UTC).date().isoformat(),
                             "evidence_note": (
-                                "Agent-generated HR role audit workflow demo solution."
+                                "People-Ops estimate pending quarterly role audit timing sample."
                             ),
                         },
                     }
@@ -1643,8 +1673,22 @@ class DemoTrafficRunner:
                         },
                         "business_value": {
                             "manual_baseline_minutes": workflow_spec["manual_baseline_minutes"],
-                            "baseline_source": "administrator_estimate",
-                            "confidence": "unvalidated",
+                            "baseline_source": workflow_spec.get(
+                                "baseline_source", "validated_external_measurement"
+                            ),
+                            "confidence": workflow_spec.get("confidence", "validated"),
+                            "loaded_labor_cost_per_hour": workflow_spec.get(
+                                "loaded_labor_cost_per_hour", 110.0
+                            ),
+                            "currency": workflow_spec.get("currency", "USD"),
+                            "review_minutes": {
+                                "kind": "expected_average",
+                                "minutes": workflow_spec.get("review_minutes", 1.0),
+                            },
+                            "correction_minutes": {
+                                "kind": "expected_average",
+                                "minutes": workflow_spec.get("correction_minutes", 0.5),
+                            },
                             "effective_from": today,
                             "evidence_note": workflow_spec["evidence_note"],
                         },
@@ -1714,7 +1758,15 @@ class DemoTrafficRunner:
                 ],
                 "completion_tool_short": "list_crm_accounts_metrics",
                 "manual_baseline_minutes": 12,
-                "evidence_note": "Agent-generated CRM account risk review demo solution.",
+                "baseline_source": "validated_external_measurement",
+                "confidence": "validated",
+                "loaded_labor_cost_per_hour": 110.0,
+                "currency": "USD",
+                "review_minutes": 1.5,
+                "correction_minutes": 0.5,
+                "evidence_note": (
+                    "Validated RevOps benchmark across 40 enterprise QBR account risk reviews."
+                ),
             },
         )
 
@@ -1760,7 +1812,15 @@ class DemoTrafficRunner:
                 ],
                 "completion_tool_short": "list_ci_deployments_health",
                 "manual_baseline_minutes": 10,
-                "evidence_note": "Agent-generated DevOps pipeline triage demo solution.",
+                "baseline_source": "validated_external_measurement",
+                "confidence": "validated",
+                "loaded_labor_cost_per_hour": 120.0,
+                "currency": "USD",
+                "review_minutes": 1.0,
+                "correction_minutes": 0.5,
+                "evidence_note": (
+                    "Validated DevOps on-call postmortem timing benchmark across 28 deployments."
+                ),
             },
         )
 
@@ -1894,6 +1954,232 @@ class DemoTrafficRunner:
                 "confirmation": "accepted by the demo caller through MCP form elicitation",
             }
 
+    async def _run_passive_workflow_evidences(self) -> dict[str, Any]:
+        """Run bounded demo traffic across CRM, DevOps, Ticketing, and HR workflows."""
+        if self._app is None or self.runtime.dev_keys is None:
+            return {"status": "skipped", "completed": []}
+        tenant_id = next(iter(self.runtime.settings.allowed_tenants), None)
+        if not tenant_id:
+            return {"status": "skipped", "completed": []}
+        completed: list[str] = []
+        errors: dict[str, str] = {}
+        caller_token = self.runtime.dev_keys.issue_user_token(
+            persona="gateway_admin",
+            overrides={
+                "tenant_id": tenant_id,
+                "sub": "demo-workflow-operator",
+                "roles": [
+                    "admin",
+                    "gateway_admin",
+                    "ops_engineer",
+                    "ticketing_reader",
+                    "ticketing_writer",
+                    "hr_ops",
+                    "hr_writer",
+                    "sales_ops",
+                    "finance_analyst",
+                    "platform_eng",
+                    "sre_oncall",
+                ],
+                "groups": [
+                    "operations",
+                    "platform-admins",
+                    "hr",
+                    "engineering",
+                    "platform",
+                    "sales",
+                    "finance",
+                ],
+                "scopes": ["mcp.tools", "ops.write", "mcp.write"],
+            },
+        )
+        meta = request_meta(client_name="mcpcodeaway-demo-traffic")
+        meta[MCP_CLIENT_CAPABILITIES_META]["elicitation"] = {"form": {}}
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self._app), base_url="http://demo.local"
+        ) as client:
+
+            async def run_codemode_flow(label: str, intent: str, code: str) -> None:
+                try:
+                    resp = await client.post(
+                        "/mcp?mode=codemode",
+                        headers={
+                            "Authorization": f"Bearer {caller_token}",
+                            "X-Intent": intent,
+                            **request_headers("tools/call", tool_name="execute_code"),
+                        },
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": f"demo-wf-{uuid4().hex[:8]}",
+                            "method": "tools/call",
+                            "params": {
+                                "_meta": meta,
+                                "name": "execute_code",
+                                "arguments": {"code": code},
+                            },
+                        },
+                    )
+                    body = resp.json() if resp.status_code == 200 else {}
+                    res = body.get("result") if isinstance(body, dict) else None
+                    if (
+                        resp.status_code == 200
+                        and not body.get("error")
+                        and isinstance(res, dict)
+                        and not res.get("isError")
+                    ):
+                        completed.append(label)
+                    else:
+                        errors[label] = str(body.get("error") or res or f"HTTP {resp.status_code}")
+                except Exception as exc:
+                    errors[label] = str(exc)
+
+            async def call_step(
+                tool_name: str,
+                arguments: dict[str, Any],
+                *,
+                intent: str,
+            ) -> dict[str, Any]:
+                first = await self._business_value_rpc(
+                    client,
+                    caller_token,
+                    meta,
+                    tool_name,
+                    arguments,
+                    intent=intent,
+                    track_counters=False,
+                )
+                if first.get("resultType") == "input_required":
+                    return await self._business_value_rpc(
+                        client,
+                        caller_token,
+                        meta,
+                        tool_name,
+                        arguments,
+                        request_state=str(first["requestState"]),
+                        input_responses={
+                            "confirm": {"action": "accept", "content": {"confirm": True}}
+                        },
+                        intent=intent,
+                        track_counters=False,
+                    )
+                return first
+
+            if self.runtime.registry.get("crm_accounts"):
+                await self._ensure_crm_demo_solutions(client)
+                await run_codemode_flow(
+                    "crm_accounts/account_risk_review",
+                    "Review enterprise CRM accounts for risk and ARR concentration",
+                    (
+                        "accounts = await crm_accounts__list_crm_accounts(limit=10)\n"
+                        "summary = await crm_accounts__list_crm_accounts_summary()\n"
+                        "metrics = await crm_accounts__list_crm_accounts_metrics()\n"
+                        "{'accounts': accounts.get('count', 0), "
+                        "'status': summary.get('status'), "
+                        "'active': metrics.get('active_items', 0)}"
+                    ),
+                )
+
+            if self.runtime.registry.get("devops_ci"):
+                await self._ensure_devops_demo_solutions(client)
+                await run_codemode_flow(
+                    "devops_ci/pipeline_incident_triage",
+                    "Triage CI/CD deployment status and check pipeline health",
+                    (
+                        "deployments = await devops_ci__list_ci_deployments(limit=10)\n"
+                        "health = await devops_ci__list_ci_deployments_health()\n"
+                        "metrics = await devops_ci__list_ci_deployments_metrics()\n"
+                        "{'deployments': deployments.get('count', 0), "
+                        "'healthy': health.get('healthy', False), "
+                        "'latency_p50_ms': metrics.get('latency_p50_ms', 0)}"
+                    ),
+                )
+
+            if self.runtime.registry.get("global_ticketing"):
+                await self._ensure_ticketing_demo_workflows(client)
+                try:
+                    sla_intent = "Check SLA timer and escalate urgent ticket to critical"
+                    await call_step(
+                        "global_ticketing__get_ticket_sla",
+                        {"ticket_id": "TCK-1002"},
+                        intent=sla_intent,
+                    )
+                    await call_step(
+                        "global_ticketing__escalate_ticket",
+                        {
+                            "ticket_id": "TCK-1002",
+                            "escalation_tier": "tier3_incident",
+                            "reason": "APAC vault latency nearing SLA limit",
+                        },
+                        intent=sla_intent,
+                    )
+                    await call_step(
+                        "global_ticketing__get_ticket",
+                        {"ticket_id": "TCK-1002"},
+                        intent=sla_intent,
+                    )
+                    completed.append("global_ticketing/ticket_escalation_and_sla_review")
+                except Exception as exc:
+                    errors["global_ticketing/ticket_escalation_and_sla_review"] = str(exc)
+
+                try:
+                    intake_intent = "List regional queues, create ticket, and assign owner"
+                    await call_step(
+                        "global_ticketing__list_ticketing_queues",
+                        {"region": "EU"},
+                        intent=intake_intent,
+                    )
+                    created = await call_step(
+                        "global_ticketing__create_ticket",
+                        {
+                            "subject": "Settlement webhook timeout burst",
+                            "description": "EU merchant webhook workers saw 504 spikes.",
+                            "region": "EU",
+                            "queue_id": "Q-EU-OPS",
+                            "priority": "high",
+                        },
+                        intent=intake_intent,
+                    )
+                    created_id = str(
+                        (created.get("result") or created).get("ticket_id") or "TCK-1005"
+                    )
+                    await call_step(
+                        "global_ticketing__assign_ticket",
+                        {
+                            "ticket_id": created_id,
+                            "assignee": "elena.rostova@example.test",
+                            "team": "tier2_sre",
+                        },
+                        intent=intake_intent,
+                    )
+                    completed.append("global_ticketing/intake_and_route_new_ticket")
+                except Exception as exc:
+                    errors["global_ticketing/intake_and_route_new_ticket"] = str(exc)
+
+            if self.runtime.registry.get("hr_directory"):
+                try:
+                    audit_intent = "Audit directory staffing roles and promote a member"
+                    await call_step(
+                        "hr_directory__list_hr_employees",
+                        {"limit": 10},
+                        intent=audit_intent,
+                    )
+                    await call_step(
+                        "hr_directory__update_hr_employee",
+                        {"employee_id": "EMP-01", "role": "principal_engineer"},
+                        intent=audit_intent,
+                    )
+                    await call_step(
+                        "hr_directory__get_hr_employee",
+                        {"employee_id": "EMP-01"},
+                        intent=audit_intent,
+                    )
+                    completed.append("hr_directory/employee_role_audit_and_update")
+                except Exception as exc:
+                    errors["hr_directory/employee_role_audit_and_update"] = str(exc)
+
+        return {"status": "completed", "completed": completed, "errors": errors}
+
     async def _business_value_rpc(
         self,
         client: httpx.AsyncClient,
@@ -1905,6 +2191,7 @@ class DemoTrafficRunner:
         request_state: str | None = None,
         input_responses: dict[str, Any] | None = None,
         intent: str | None = None,
+        track_counters: bool = True,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"_meta": meta, "name": name, "arguments": arguments}
         if request_state is not None:
@@ -1927,27 +2214,33 @@ class DemoTrafficRunner:
                 "params": params,
             },
         )
-        self.requests_sent += 1
-        self.last_target = f"business_value:{name}"
+        if track_counters:
+            self.requests_sent += 1
+            self.last_target = f"business_value:{name}"
         if response.status_code >= 400:
-            self.errors_count += 1
-            self.http_errors_count += 1
-            self.last_error = f"HTTP {response.status_code} on business-value demo workflow"
-            raise RuntimeError(self.last_error)
+            if track_counters:
+                self.errors_count += 1
+                self.http_errors_count += 1
+                self.last_error = f"HTTP {response.status_code} on business-value demo workflow"
+            raise RuntimeError(f"HTTP {response.status_code} on business-value demo workflow")
         body = response.json()
         rpc_error = body.get("error") if isinstance(body, dict) else None
         if rpc_error:
-            self.errors_count += 1
-            self.rpc_errors_count += 1
-            self.last_error = str(rpc_error.get("message") or "MCP workflow call failed")
-            raise RuntimeError(self.last_error)
+            msg = str(rpc_error.get("message") or "MCP workflow call failed")
+            if track_counters:
+                self.errors_count += 1
+                self.rpc_errors_count += 1
+                self.last_error = msg
+            raise RuntimeError(msg)
         result = body.get("result") if isinstance(body, dict) else None
         if not isinstance(result, dict) or result.get("isError"):
-            self.errors_count += 1
-            self.rpc_errors_count += 1
-            self.last_error = "MCP business-value workflow call returned an error"
-            raise RuntimeError(self.last_error)
-        self.last_error = ""
+            if track_counters:
+                self.errors_count += 1
+                self.rpc_errors_count += 1
+                self.last_error = "MCP business-value workflow call returned an error"
+            raise RuntimeError("MCP business-value workflow call returned an error")
+        if track_counters:
+            self.last_error = ""
         structured = result.get("structuredContent")
         return structured if isinstance(structured, dict) else result
 

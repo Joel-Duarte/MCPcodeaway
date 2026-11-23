@@ -1470,6 +1470,8 @@ class GatewayRuntime:
             manifest_data = row["definition"]
             item_key = "workflows" if kind == "workflow" else "standalone_tool_values"
             for item in manifest_data.get(item_key, []):
+                if kind == "workflow" and item.get("enabled") is False:
+                    continue
                 qualified_id = f"{row['upstream_name']}/{item['id']}"
                 if qualified_id != selected_id:
                     continue

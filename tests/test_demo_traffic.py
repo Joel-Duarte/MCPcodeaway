@@ -503,6 +503,62 @@ async def test_ensure_demo_solutions_seeds_all_upstreams_with_zero_runs(tmp_path
             assert golden["traffic"]["sent"] > 0
             assert golden["ticketing_workflow"]["status"] == "completed"
             assert golden["business_value_workflow"]["status"] == "completed"
+            assert set(golden["passive_workflows"]["completed"]) >= {
+                "crm_accounts/account_risk_review",
+                "devops_ci/pipeline_incident_triage",
+                "global_ticketing/ticket_escalation_and_sla_review",
+                "global_ticketing/intake_and_route_new_ticket",
+                "hr_directory/employee_role_audit_and_update",
+            }
+            assert golden["passive_workflows"]["errors"] == {}
+            events = await rt.store.list_business_value_events("tenant-acme-dev")
+            credited_ids = {
+                str((ev.get("evidence") or {}).get("selected_id") or "")
+                for ev in events
+                if ev.get("credited")
+            }
+            assert credited_ids >= {
+                "crm_accounts/account_risk_review",
+                "devops_ci/pipeline_incident_triage",
+                "global_ticketing/triage_and_resolve_ticket",
+                "global_ticketing/ticket_escalation_and_sla_review",
+                "global_ticketing/intake_and_route_new_ticket",
+                "hr_directory/demo_fictional_employee_profile_update",
+                "hr_directory/employee_role_audit_and_update",
+            }
+            report = await rt.telemetry.business_value_report(tenant_id="tenant-acme-dev")
+            assert report["completed_count"] >= 7
+            assert any(
+                row.get("baseline_confidence") == "validated"
+                and (row.get("estimated_minutes_saved") or 0) > 0
+                and (row.get("estimated_labor_value") or {}).get("currency") == "USD"
+                for row in report["by_integration_workflow_day"]
+            )
+            episodes = await rt.store.list_workflow_episodes("tenant-acme-dev", limit=100)
+            assert any(ep.get("status") == "completed_verified" for ep in episodes)
+
+            admin_token = keys.issue_user_token(persona="gateway_admin")
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+            ) as patch_client:
+                paused = await patch_client.patch(
+                    "/admin/integration-definitions/crm_accounts/workflows/account_risk_review",
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                    json={"enabled": False},
+                )
+            assert paused.status_code == 200
+            assert paused.json()["workflow"]["enabled"] is False
+            with pytest.raises(ValueError, match="unavailable"):
+                await rt.start_business_execution_for_identity(
+                    identity=await rt.validator.validate_token(admin_token),
+                    selection={
+                        "kind": "workflow",
+                        "workflow_id": "crm_accounts/account_risk_review",
+                    },
+                    request_id="paused-check",
+                    request_payload={},
+                    allowed_servers=None,
+                )
             published_after = await rt.store.list_current_published_integration_definitions(
                 "tenant-acme-dev"
             )
