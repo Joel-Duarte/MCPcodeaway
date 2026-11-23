@@ -12,6 +12,7 @@ const healthRows = ref<Array<{ server: string; tool: string; count: number; byte
 const activeHealth = ref<Array<{ server: string; status: string; checked_at: string; error_type?: string | null; error?: string | null; consecutive_failures: number }>>([]);
 const performanceError = ref("");
 const performanceLoading = ref(true);
+const catalogRefreshVersion = ref(0);
 
 async function loadPerf() {
   performanceError.value = "";
@@ -240,6 +241,7 @@ async function handleRefreshCatalog() {
     );
     statusMessage.value = `Catalog refreshed (${res.catalog_version}, epoch ${res.catalog_epoch ?? 0}).`;
     await fetchData();
+    catalogRefreshVersion.value += 1;
   } catch (err) {
     errorMessage.value = extractErrorMessage(err);
   }
@@ -502,6 +504,13 @@ onMounted(() => {
                       </ul>
                       <p v-else class="text-xs text-zinc-600">No tools discovered for this upstream yet.</p>
                     </section>
+                    <UpstreamWorkflowCatalog
+                      :upstream="u.name"
+                      :tools="u.tools ?? []"
+                      :can-edit="upstreamsData.dynamic_upstreams_permitted"
+                      :refresh-version="catalogRefreshVersion"
+                      @refresh-catalog="handleRefreshCatalog"
+                    />
                     <div v-if="healthForUpstream(u.name)" class="mb-3 border-b border-[#E4E4E7] pb-3 text-xs" role="status">
                       <span class="font-medium text-[#09090B]">Active probe: {{ healthForUpstream(u.name)?.status }}</span>
                       <span class="ml-2 text-[#52525B]">Checked {{ healthForUpstream(u.name)?.checked_at ? new Date(healthForUpstream(u.name)!.checked_at).toLocaleString() : "not yet" }}</span>

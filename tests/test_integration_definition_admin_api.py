@@ -106,6 +106,13 @@ async def test_integration_definition_admin_rbac_tenant_scope_and_validation(
     tmp_path: Path,
 ) -> None:
     async with _admin_gateway(tmp_path) as (_runtime, _store, client, admin, viewer):
+        first_tool = _runtime.catalog.get_server_tools("support_api")[0]
+        guidance = await client.get(
+            f"/admin/upstreams/support_api/tools/{first_tool.qualified_name}/guidance",
+            headers=_auth(viewer),
+        )
+        assert guidance.status_code == 200, guidance.text
+        assert guidance.json()["schema_sha256"] == compute_schema_digest([first_tool])
         viewer_read = await client.get(
             "/admin/integration-definitions/support_api", headers=_auth(viewer)
         )

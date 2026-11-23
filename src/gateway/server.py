@@ -167,6 +167,7 @@ from gateway.upstream_clients import (
     ToolGuidance,
     UpstreamClientManager,
     build_agent_onboarding_prompt,
+    compute_schema_digest,
     inspect_upstream,
     validate_upstream_url,
 )
@@ -5428,6 +5429,7 @@ def create_gateway_app(
                 "description": tool.description,
                 "input_schema": tool.input_schema,
                 "output_schema": tool.output_schema,
+                "schema_sha256": compute_schema_digest([tool]),
                 "guidance": guidance,
                 "mutating": tool.mutating,
                 "effect": effect,
